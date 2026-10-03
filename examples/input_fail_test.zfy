@@ -1,0 +1,8 @@
+// input 解析失败：直接报运行时错误退出（fail-fast，exit 1）
+// 运行：echo notanumber | input_fail_test.exe（"notanumber" 不是合法整数）
+// 预期：stderr 输出 "runtime error: input: 无法把输入解析为整数"，不执行后续语句
+void main()
+    long int a = 0
+    input(a)
+    output("[", a, "]", end='\n')
+    output("unreachable", end='\n')

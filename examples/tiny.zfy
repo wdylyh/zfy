@@ -1,0 +1,4 @@
+// 最小示例
+void main()
+    long int x = 42
+    output(x)

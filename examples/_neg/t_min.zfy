@@ -1,0 +1,6 @@
+void main()
+    i64 i = 5
+    for i, i > 0, i--
+        output(i, end=' ')
+    output("")
+    output("")

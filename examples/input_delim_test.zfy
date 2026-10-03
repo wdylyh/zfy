@@ -1,0 +1,9 @@
+// input delim 整串匹配测试：多字符分隔符、每个命中切换下一目标、
+// 目标耗尽后剩余内容归下一个 input
+// 注意：EOF/解析失败运行时报错（fail-fast），示例输入需保证所有目标都能读到值
+// 运行：输入一行 a1xb2xxc3xxkxxhello<回车>
+void main()
+    input(string s1, string s2, string s3, delim="xx")
+    output(s1, s2, s3, sep="|", end='\n')   // 期望 a1xb2|c3|k
+    input(string t)                          // 读取剩余 token
+    output(t, end='\n')                      // 期望 hello

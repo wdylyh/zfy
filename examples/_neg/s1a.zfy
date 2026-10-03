@@ -1,0 +1,3 @@
+void main()
+    i32 frac unreduced ur = 6/48
+    output(ur)

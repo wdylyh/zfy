@@ -1,0 +1,34 @@
+void task2()
+    // 筛法：100000 以内素数个数
+    long int const LCG_A = 1103515245
+    long int const LCG_C = 12345
+    long int const LCG_MOD = 2147483647
+    bool array comp[100001]
+    long int cnt = 0
+    for long int i = 2, i <= 100000, i++
+        if not comp[i]
+            cnt++
+            long int j = i * i
+            for j, j <= 100000, j += i
+                comp[j] = true
+    // LCG 伪随机 + 插入排序
+    long int array arr[2000]
+    long int state = 42
+    for int k = 0, k < 2000, k++
+        state = (state * LCG_A + LCG_C) % LCG_MOD
+        arr[k] = state
+    for int i = 1, i < 2000, i++
+        long int key = arr[i]
+        long int j = cast(i, long int) - 1
+        // 限制记录：and/or 不短路，arr[-1] 会先求值越界，只能改写循环
+        while j >= 0
+            if arr[j] > key
+                arr[j + 1] = arr[j]
+                j--
+            else
+                break
+        arr[j + 1] = key
+    output("T2 primes=", cnt, " first=", arr[0], " last=", arr[1999])
+
+void main()
+    task2()

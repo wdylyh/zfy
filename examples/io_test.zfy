@@ -1,0 +1,8 @@
+// input/output 端到端测试
+// 运行：echo "3 4.5 zfy k 42" | io_test.exe
+// 第一条 input 以空格分段读取 3 个目标，第二条 input 按默认空白集（' '/'\n' 任一切分）读取下一个 token
+void main()
+    input(int a, double b, string name, delim=' ')
+    output("a=", a, ",b=", b, ",name=", name, sep="")
+    input(string line)
+    output("line=", line)

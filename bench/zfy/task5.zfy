@@ -1,0 +1,27 @@
+void task5()
+    // 256x256 矩阵乘（一维展开）+ i128 LCG 哈希循环
+    long long const M1 = 6364136223846793005
+    long long const M2 = 1442695040888963407
+    long long const MOD7 = 9223372036854775807
+    double array a[65536]
+    double array b[65536]
+    double array c[65536]
+    for int i = 0, i < 256, i++
+        for int j = 0, j < 256, j++
+            a[i * 256 + j] = cast((i * 256 + j) % 97, double) * 0.5
+            b[i * 256 + j] = cast((i + j) % 89, double) * 0.25
+    for int i = 0, i < 256, i++
+        for int k = 0, k < 256, k++
+            double aik = a[i * 256 + k]
+            for int j = 0, j < 256, j++
+                c[i * 256 + j] += aik * b[k * 256 + j]
+    double tr = 0.0
+    for int i = 0, i < 256, i++
+        tr += c[i * 256 + i]
+    long long hs = 7
+    for int k = 0, k < 5000000, k++
+        hs = (hs * M1 + M2) % MOD7
+    output("T5 trace=", prec(tr, 17), " hash=", hs)
+
+void main()
+    task5()

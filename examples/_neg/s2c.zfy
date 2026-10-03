@@ -1,0 +1,4 @@
+void main()
+    output("A\tB\vC\aD")
+    i64 pos = find("hello", 'l', count=2)
+    output(pos)

@@ -1,0 +1,7 @@
+use mathlib.zfy as m
+
+void main()
+    output(m.add(1, 2), end=' ')    // 期望 3
+    output(m.twice(5), end=' ')     // 期望 10
+    output(m.quad(5), end=' ')      // 期望 20
+    output("")

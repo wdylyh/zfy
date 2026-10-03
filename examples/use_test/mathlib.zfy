@@ -1,0 +1,10 @@
+// 被导入的库
+int add(int a, int b)
+    return a + b
+
+int twice(int x)
+    return x * 2
+
+// 库内互相调用（应随映射改名 m.twice）
+int quad(int x)
+    return twice(x) * 2

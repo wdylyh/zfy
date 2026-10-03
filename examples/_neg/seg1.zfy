@@ -1,0 +1,22 @@
+void main()
+    i32 frac unreduced ur = 6/48
+    output(ur, end=' ')
+    output("")
+    i32 frac a = 6/48
+    output(a, end=' ')
+    output("")
+    i32 frac ur2 = 2/4
+    i32 frac c = ur * ur2
+    output(c, end=' ')
+    output("")
+    i64 array arr[5] = 1,2,3
+    remove(arr, 1)
+    output(arr[0], arr[1], arr[2], arr[4], sep=',', end=' ')
+    output(length(arr))
+    f64 list lst = 1.5,2.5,3.5,4.5
+    remove(lst, 1)
+    output(lst[0], lst[1], lst[2], sep=',', end=' ')
+    output(length(lst))
+    i64 m = 17
+    m %= 5
+    output(m)

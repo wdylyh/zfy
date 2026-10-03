@@ -1,0 +1,46 @@
+// 新特性测试：转义字符 / 声明与零值槽位 / cast 显式转换 / RAII return 路径
+void main()
+    // ---- 转义字符（char 与 string 统一 \n \t \\ \' \"） ----
+    output("a\tb")               // 期望 a<TAB>b
+    output("引:\"q\" 反斜:\\")   // 期望 引:"q" 反斜:\
+    output('\'', end='\n')       // 期望 '
+    output("换\n行", end='!')    // 期望 换/行!(end 覆盖默认换行)
+    output("")
+
+    // ---- 声明必带初值；数组未初始化槽位为零值 ----
+    long int m = 42
+    output("[", m, "]", end='\n')   // 期望 [42]
+    int array n[4] = 1,2
+    m = cast(n[2], long int)             // 未初始化槽位零值 -> 0（跨宽度读也需显式 cast）
+    output("[", m, "]", end='\n')   // 期望 [0]
+    long int m2 = m + 1
+    output("[", m2, "]", end='\n')  // 期望 [1]
+    long int m3 = m
+    output("[", m3, "]", end='\n')  // 期望 [0]
+    m = cast(n[0], long int)             // 恢复为 1
+    output("[", m, "]", end='\n')   // 期望 [1]
+
+    // ---- cast 显式转换（宽化/窄化/浮点都必须写 cast） ----
+    int a = 100
+    long int b = cast(a, long int)
+    double d = cast(a, double)
+    output(b, d, sep=",", end='\n')        // 期望 100,100.000000
+    float f = cast(d, float)
+    output(cast(f, double), end='\n')         // 期望 100.000000（经 double 打印）
+    double dd = 3.99
+    output(cast(dd, int), end='\n')        // 期望 3（向零截断）
+    double dn = -3.99
+    output(cast(dn, int), end='\n')        // 期望 -3（向零截断）
+    long int big = 300
+    output(cast(big, int), end='\n')       // 期望 300（窄化显式）
+
+    // ---- RAII：return 路径的释放与所有权转移 ----
+    output(pick(true), end='\n')    // 期望 from-var（提前 return，所有权转移）
+    output(pick(false), end='\n')   // 期望 lit（字面量返回 strdup 副本）
+
+// 提前 return：跳过返回值变量的释放；字面量返回走 strdup
+string pick(bool c)
+    string s = "from-var"
+    if c
+        return s
+    return "lit"

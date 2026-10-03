@@ -1,0 +1,5 @@
+void main()
+    i64 array arr[5] = 1,2,3
+    remove(arr, 1)
+    output(arr[0], arr[1], arr[2], arr[4], sep=',', end=' ')
+    output(length(arr))

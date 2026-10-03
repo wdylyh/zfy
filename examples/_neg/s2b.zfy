@@ -1,0 +1,4 @@
+void main()
+    f64 pi = 3.75
+    cast(pi, i32)
+    output(pi)

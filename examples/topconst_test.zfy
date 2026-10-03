@@ -1,0 +1,14 @@
+// 顶层 const 测试：函数外声明编译期常量，使用处内联
+int const MAX = 100
+long int const BIG = 5000000000
+
+void main()
+    int array arr[MAX]
+    output("len=", length(arr), end='\n')
+    // 混算：i32 变量与顶层 const（i64）自动宽化
+    long int h2 = BIG / 2
+    output("h2=", h2, end='\n')
+    int x = MAX - 1
+    output("x=", x, end='\n')
+    bool lt = x < MAX
+    output("lt=", lt, end='\n')

@@ -1,0 +1,40 @@
+// zfy 端到端测试程序（output/input + 逻辑单词 + cast 显式转换 + C 风格 for）
+int add(int a, int b)
+    return a + b
+
+void main()
+    // 注释仅支持 // 单行（块注释已删除）
+    int x = 42
+    int y = x + add(1, 2)
+    if y > 2 and not false
+        y = y - 1
+    else
+        y = y + 1
+    while y > 0
+        y = y - 1
+    for long int i = 0, i < 3, i++
+        output(i)
+    for long int i = 0, long int j = 10, i < 5 and j > 5, i++, j--
+        output(i + j, sep=',', end=';')
+    output("")
+    output("y=", y)
+    string msg = "hello"
+    char c = 'z'
+    output(msg, c, sep='-', end='\n')
+    bool flag = false
+    output(flag)
+    // 复合赋值与自增
+    int acc = 10
+    acc += 5
+    acc *= 2
+    acc -= 3
+    acc /= 2
+    output(acc)
+    acc++
+    output(acc)
+    acc--
+    output(acc)
+    // 显式转换：数值转换（含宽化）必须写 cast(表达式, 类型)
+    output(cast(7, double) / 2.0, end='\n')
+    // 字符串内建：长度
+    output(length(msg))

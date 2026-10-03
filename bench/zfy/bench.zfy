@@ -1,0 +1,112 @@
+// zfy 语言基准测试 - zfy 版本
+// 五类任务，与 Python/C++/Rust 版本功能等效，输出校验和
+// 编译: zfyc build bench.zfy
+// 限制记录：顶层不支持 const 常量声明，常量只能放函数内
+
+void task1()
+    // 构建 0..199999，筛选偶数，求和 + 计数
+    int list src
+    for int i = 0, i < 200000, i++
+        src[length(src)] = i
+    int list evens
+    for long int i = 0, i < length(src), i++
+        if src[i] % 2 == 0
+            evens[length(evens)] = src[i]
+    long int s = 0
+    for long int i = 0, i < length(evens), i++
+        s += cast(evens[i], long int)
+    output("T1 sum=", s, " count=", length(evens))
+
+void task2()
+    // 筛法：100000 以内素数个数
+    long int const LCG_A = 1103515245
+    long int const LCG_C = 12345
+    long int const LCG_MOD = 2147483647
+    bool array comp[100001]
+    long int cnt = 0
+    for long int i = 2, i <= 100000, i++
+        if not comp[i]
+            cnt++
+            long int j = i * i
+            for j, j <= 100000, j += i
+                comp[j] = true
+    // LCG 伪随机 + 插入排序
+    long int array arr[2000]
+    long int state = 42
+    for int k = 0, k < 2000, k++
+        state = (state * LCG_A + LCG_C) % LCG_MOD
+        arr[k] = state
+    for int i = 1, i < 2000, i++
+        long int key = arr[i]
+        long int j = cast(i, long int) - 1
+        // 限制记录：and/or 不短路，arr[-1] 会先求值越界，只能改写循环
+        while j >= 0
+            if arr[j] > key
+                arr[j + 1] = arr[j]
+                j--
+            else
+                break
+        arr[j + 1] = key
+    output("T2 primes=", cnt, " first=", arr[0], " last=", arr[1999])
+
+void task3()
+    // 读 n 个整数，逐个 *2，输出
+    long int n = 0
+    input(n)
+    long int s = 0
+    long int v = 0
+    for int k = 0, k < cast(n, int), k++
+        v = 0
+        input(v)
+        v = v * 2
+        s += v
+        output(v)
+    output("T3 sum=", s)
+
+void task4()
+    // 5 万元素列表，200 轮深拷贝 + 步长切片 + 写
+    // 限制记录：列表声明初值不支持整体拷贝（只收逐元素初值），改用数组
+    int array base[50000]
+    for int i = 0, i < 50000, i++
+        base[i] = i
+    long int acc = 0
+    long int const LCG_MOD = 2147483647
+    for int r = 0, r < 200, r++
+        int array cp[50000] = base
+        int array sl[25000] = base[0, 49998:2]
+        long int idx = cast(r, long int) % length(sl)
+        sl[idx] += r
+        acc = (acc + cast(sl[idx], long int)) % LCG_MOD
+    output("T4 acc=", acc, " len=", length(base))
+
+void task5()
+    // 256x256 矩阵乘（一维展开）+ i128 LCG 哈希循环
+    long long const M1 = 6364136223846793005
+    long long const M2 = 1442695040888963407
+    long long const MOD7 = 9223372036854775807
+    double array a[65536]
+    double array b[65536]
+    double array c[65536]
+    for int i = 0, i < 256, i++
+        for int j = 0, j < 256, j++
+            a[i * 256 + j] = cast((i * 256 + j) % 97, double) * 0.5
+            b[i * 256 + j] = cast((i + j) % 89, double) * 0.25
+    for int i = 0, i < 256, i++
+        for int k = 0, k < 256, k++
+            double aik = a[i * 256 + k]
+            for int j = 0, j < 256, j++
+                c[i * 256 + j] += aik * b[k * 256 + j]
+    double tr = 0.0
+    for int i = 0, i < 256, i++
+        tr += c[i * 256 + i]
+    long long hs = 7
+    for int k = 0, k < 5000000, k++
+        hs = (hs * M1 + M2) % MOD7
+    output("T5 trace=", prec(tr, 17), " hash=", hs)
+
+void main()
+    task1()
+    task2()
+    task3()
+    task4()
+    task5()

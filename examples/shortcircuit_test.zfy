@@ -1,0 +1,22 @@
+// and/or 短路求值测试：右边不应被求值
+void main()
+    int array arr[5]
+    for int i = 0, i < 5, i++
+        arr[i] = i * 10
+    int idx = 7
+    // 不短路的话 arr[7] 越界崩溃；短路后右边不求值
+    bool a = idx < 5 and arr[idx] > 0
+    output("a=", a, end='\n')
+    // or：左边为真时右边不求值
+    bool b2 = idx >= 5 or arr[idx] > 0
+    output("b=", b2, end='\n')
+    // 两边都求值的普通情形
+    bool c = idx < 5 and arr[2] == 20
+    output("c=", c, end='\n')
+    bool d = idx > 5 or arr[1] == 10
+    output("d=", d, end='\n')
+    // rhs 真正被求值的路径
+    bool e2 = arr[2] == 20 and arr[3] == 30
+    output("e=", e2, end='\n')
+    bool f = arr[0] == 99 or arr[4] == 40
+    output("f=", f, end='\n')

@@ -1,0 +1,16 @@
+void task1()
+    // 构建 0..199999，筛选偶数，求和 + 计数
+    int list src
+    for int i = 0, i < 200000, i++
+        src[length(src)] = i
+    int list evens
+    for long int i = 0, i < length(src), i++
+        if src[i] % 2 == 0
+            evens[length(evens)] = src[i]
+    long int s = 0
+    for long int i = 0, i < length(evens), i++
+        s += cast(evens[i], long int)
+    output("T1 sum=", s, " count=", length(evens))
+
+void main()
+    task1()

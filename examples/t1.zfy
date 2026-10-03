@@ -1,0 +1,7 @@
+void main()
+    try
+        output("in try")
+        throw "x"
+    catch e
+        output(e)
+    output("done")

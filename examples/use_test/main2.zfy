@@ -1,0 +1,6 @@
+use mathlib.zfy
+
+void main()
+    output(mathlib.add(1, 2), end=' ')    // 期望 3
+    output(mathlib.quad(7), end=' ')      // 期望 28
+    output("")

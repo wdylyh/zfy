@@ -1,0 +1,3 @@
+warning: overriding the module target triple with x86_64-w64-windows-gnu [-Woverride-module]
+1 warning generated.
+OK: str_test.exe

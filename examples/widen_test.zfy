@@ -1,0 +1,18 @@
+// 整数自动宽化测试：i32 与 i64 混算不再需要显式 cast
+void main()
+    int a = 100000
+    long int b = 2000000000
+    // a * 2 是 i32，与 b (i64) 相加：自动宽化到 i64
+    long int c = a * 2 + b
+    output("c=", c, end='\n')
+    // length() 返回 i64，与 i32 变量直接比较
+    int array arr[10]
+    bool ok = a < length(arr)
+    output("ok=", ok, end='\n')
+    // i32 % i64 混算
+    long int m = a % length(arr)
+    output("m=", m, end='\n')
+    // 比较结果作为 bool 初值
+    long int big = 5000000000
+    bool lt = a < big
+    output("lt=", lt, end='\n')

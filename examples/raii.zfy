@@ -1,0 +1,23 @@
+// RAII 演示：作用域退出（含 break/continue/return 路径）自动释放
+// string/数组/列表等资源
+void main()
+    output("== 循环演示 ==")
+    for long int i = 1, i <= 5, i++
+        output("i=", i, sep='=', end=' ')
+    output("")
+    // 1 累加到 10
+    long int sum = 0
+    for long int i = 1, i <= 10, i++
+        sum += i
+    output("1+...+10 =", sum, sep=' ')
+    // continue/break：跳出前仍会按逆序释放循环体作用域内的资源
+    for long int i = 0, i < 5, i++
+        if i == 1
+            continue
+        if i == 3
+            break
+        output("round", i, sep=' ')
+    // input 演示：先输入名字（回车），再输入年龄（回车）
+    output("== input 演示 ==")
+    input(string name, long int age)
+    output("你好,", name, ",明年你就", age + 1, "岁了", sep="")

@@ -1,0 +1,5 @@
+void main()
+    f64 list lst = 1.5,2.5,3.5,4.5
+    remove(lst, 1)
+    output(lst[0], lst[1], lst[2], sep=',', end=' ')
+    output(length(lst))

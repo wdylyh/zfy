@@ -1,0 +1,46 @@
+// 数组/列表端到端测试
+// 覆盖：定长数组初始化/读取/写入、未初始化槽位零值输出、cast 显式宽化、
+//       表达式下标、列表动态扩长、string 列表、bool/char 数组
+// 语义：数值转换（含宽化）必须显式 cast；数组读越界运行时报错，列表写越界自动扩长；
+//       未初始化槽位填零值（0/false/'\0'/""）
+void main()
+    // ---- 定长数组 ----
+    int array n[8] = 3,4,5,6
+    output(n[0], n[1], n[2], n[3], sep=",")   // 期望 3,4,5,6
+    output("[", n[4], "]", end='\n')          // 未初始化槽位零值 -> [0]
+    n[4] = 7
+    output(n[4])                              // 期望 7（写入后再读）
+    long int m = cast(n[2], long int)                   // 宽化也必须显式 cast
+    output(m)                                 // 期望 5
+    int i = 1
+    output(n[i + 1])                          // 表达式下标，n[2]=5 -> 期望 5
+    output(n[1 + 2])                          // 常量表达式下标，n[3]=6 -> 期望 6
+
+    // ---- 列表（完全动态，不写长度） ----
+    double list big = 23.34,34.45,4545.45555
+    output(length(big))                       // 期望 3（初值个数）
+    output(big[0], big[1], big[2], sep=";")   // 期望 23.340000;34.450000;4545.455550
+    big[length(big)] = 34.4                   // 下标 3 == 长度，扩长到 4
+    output(length(big))                       // 期望 4
+    output(big[3])                            // 期望 34.400000
+    big[256] = 1.5                            // 越界写入，扩长到 257
+    output(length(big))                       // 期望 257
+    output("[", big[129], ",", big[255], "]", end='\n')
+    // 中间新槽位零值 -> [0.000000,0.000000]
+    output(big[256])                          // 期望 1.500000
+
+    // ---- 全空 string 列表 ----
+    string list w
+    output(length(w))                         // 期望 0（无初值列表为空）
+    w[0] = "abc"                              // 写入自动扩长
+    w[2] = "xyz"
+    output(length(w))                         // 期望 3
+    output(w[0], w[1], w[2], sep="|")         // 期望 abc||xyz（w[1] 零值空串输出空）
+
+    // ---- bool / char 数组 ----
+    bool array flags[4] = true,false,true
+    output(flags[0], flags[1], flags[2], flags[3], sep=",")
+    // 期望 true,false,true,false（最后槽位零值）
+    output("")
+    char array cs[3] = 'a','b'
+    output(cs[0], cs[1], cs[2], sep=",")      // 期望 a,b,（最后槽位零值 '\0'）

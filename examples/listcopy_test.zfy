@@ -1,0 +1,11 @@
+// 列表整体拷贝初值：b 深拷贝 a，改 b 不影响 a
+void main()
+    int list a = 1,2,3
+    int list b = a
+    b[0] = 100
+    output(a[0], b[0])   // 期望 1 100
+    b[2] = 7
+    output(a[2], b[2])   // 期望 3 7
+    int list c = a
+    c[0] = 5
+    output(a[0], c[0])   // 期望 1 5

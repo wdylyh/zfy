@@ -1,0 +1,81 @@
+// 整改验证：数组/列表/frac 参数 + 顶层全局变量 + for 作用域 + 目标窄化 + split 一等值
+
+// 全局变量（可带可不带初值，零值填充）
+int gcount = 10
+string gname = "zfy"
+int list gnums
+double gd
+
+// frac 参数（聚合传参）
+int frac fr_sum(int frac a, int frac b)
+    return a + b
+
+// 数组参数：带长度声明（长度可为字面量或参数名）
+int arr_sum(int array a[5])
+    int s = 0
+    for int i = 0, i < 5, i++
+        s += a[i]
+    return s
+
+// 长度引用另一参数（深拷贝语义：函数内修改不影响调用方数组）
+int arr_fill(int n, int array b[n])
+    for int i = 0, i < n, i++
+        b[i] = i * 2
+    return b[2]
+
+// 列表参数
+int list_len(int list xs)
+    return length(xs)
+
+int list_len_str(string list xs)
+    return length(xs)
+
+long int main()
+    // 全局变量读写
+    output(gcount, gname, "sep=", end="\n")
+    push(gnums, 3)
+    push(gnums, 4)
+    output(gnums[0], gnums[1], end="\n")
+
+    // frac 参数
+    int frac x = 1/2
+    int frac y = 1/3
+    int frac s = fr_sum(x, y)
+    output(s, end="\n")
+
+    // 数组参数（静态长度）
+    int array a[5] = 1, 2, 3, 4, 5
+    output(arr_sum(a), end="\n")
+
+    // 数组参数（长度=另一参数）
+    int m = 4
+    int array d[4]
+    arr_fill(m, d)
+    output(arr_fill(m, d), d[2], end="\n")  // 4（函数内写入成功） 0（深拷贝不影响调用方）
+
+    // 列表参数
+    int list xs = 7, 8, 9
+    output(list_len(xs), end="\n")
+
+    // for 循环变量作用域扩到所在块（循环变量在循环后仍可见）
+    int last = 0
+    for int i = 0, i < 3, i++
+        last = i * i
+    output(i, end="\n")
+    output(last, end="\n")
+
+    // 目标驱动窄化：i64 -> i32 无需 cast
+    long int big = 100
+    int small = big
+    output(small, end="\n")
+    // length 返回 i64，直接赋给 int
+    int n = length(xs)
+    output(n, end="\n")
+
+    // split 一等值：直接赋值 / length / 下标 / 传参
+    string line = "a,b,c"
+    string list parts = split(line, ',')
+    output(length(parts), end="\n")
+    output(parts[1], end="\n")
+    output(list_len_str(parts), end="\n")
+    return 0

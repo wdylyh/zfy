@@ -1,0 +1,18 @@
+void task4()
+    // 5 万元素列表，200 轮深拷贝 + 步长切片 + 写
+    // 限制记录：列表声明初值不支持整体拷贝（只收逐元素初值），改用数组
+    int array base[50000]
+    for int i = 0, i < 50000, i++
+        base[i] = i
+    long int acc = 0
+    long int const LCG_MOD = 2147483647
+    for int r = 0, r < 200, r++
+        int array cp[50000] = base
+        int array sl[25000] = base[0, 49998:2]
+        long int idx = cast(r, long int) % length(sl)
+        sl[idx] += r
+        acc = (acc + cast(sl[idx], long int)) % LCG_MOD
+    output("T4 acc=", acc, " len=", length(base))
+
+void main()
+    task4()

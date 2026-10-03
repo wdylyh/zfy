@@ -1,0 +1,13 @@
+// push 内建：追加元素自动扩长，覆盖 int/double/string 列表
+void main()
+    int list a = 1,2
+    push(a, 3)
+    push(a, 4)
+    output(length(a), sep=' ')          // 期望 4
+    output(a[0], a[1], a[2], a[3], sep=',')  // 期望 1,2,3,4
+    double list d = 1.5
+    push(d, 2.5)
+    output(d[1])                        // 期望 2.5
+    string list s = "x"
+    push(s, "yz")
+    output(s[1])                        // 期望 yz

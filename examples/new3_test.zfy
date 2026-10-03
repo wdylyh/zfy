@@ -1,0 +1,89 @@
+// 第三轮改造（new.md）冒烟测试
+void main()
+    int frac unreduced ur = 6/48
+    output(ur, end=' ')                       // 期望 6/48（不约分）
+    output("")
+
+    int frac a = 6/48
+    output(a, end=' ')                        // 期望 1/8（自动约分）
+    output("")
+
+    // unreduced 运算 → 赋给普通 frac 约分（6/48 * 2/4 = 12/192 = 1/16）
+    int frac ur2 = 2/4
+    int frac c = ur * ur2
+    output(c, end=' ')                        // 期望 1/16
+    output("")
+
+    // remove：数组槽位填零值，长度不变
+    long int array arr[5] = 1,2,3
+    remove(arr, 1)
+    output(arr[0], arr[1], arr[2], arr[4], sep=',', end=' ')   // 期望 1,0,3,0
+    output(length(arr))                       // 期望 5
+
+    // remove：列表删除并左移
+    double list lst = 1.5,2.5,3.5,4.5
+    remove(lst, 1)
+    output(lst[0], lst[1], lst[2], sep=',', end=' ')   // 期望 1.500000,3.500000,4.500000
+    output(length(lst))                       // 期望 3
+
+    // %=
+    long int m = 17
+    m %= 5
+    output(m, end=' ')                        // 期望 2
+    output("")
+
+    // 切片左值复合赋值：区间每个元素原地加 10
+    long int array sa[6] = 1,2,3,4,5,6
+    sa[1,3] += 10
+    output(sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sep=',', end=' ')  // 期望 1,12,13,14,5,6
+    output("")
+
+    // 步长切片复合赋值
+    long int array sb[6] = 1,2,3,4,5,6
+    sb[0,5:2] *= 3
+    output(sb[0], sb[2], sb[4], sep=',', end=' ')   // 期望 3,9,18
+    output("")
+
+    // cast 语句重绑定
+    double pi = 3.75
+    cast(pi, int)
+    output(pi, end=' ')                       // 期望 3
+    output("")
+
+    // 转义序列新增 \a \b \f \v \r \0
+    output("A\tB\vC\aD")
+
+    // find count > 0
+    long int pos = find("hello", 'l', count=2)
+    output(pos, end=' ')                      // 期望 3
+    output("")
+
+    // trim 空子串 / split 空分隔符
+    string s0 = "abc"
+    output(trim(s0, ""), end='|')             // 期望 abc
+    string list one = split(s0, "")
+    output(length(one), end='|')              // 期望 1
+    output(one[0], end=' ')                   // 期望 abc
+    output("")
+
+    // 孤立 for 头占位变量
+    long int k = 3
+    for k, k > 0, k--
+        output(k, end=' ')                    // 期望 3 2 1
+    output("")
+
+    // const 数组
+    long int array const carr[3] = 7,8,9
+    output(carr[2], end=' ')                  // 期望 9
+    output("")
+
+    // 深拷贝语义
+    string s1 = "123"
+    string s2 = s1
+    s2 += "xyz"
+    output(s1, s2, sep='|', end=' ')          // 期望 123|123xyz
+    int array ia[3] = 1,2,3
+    int array ib[3] = ia
+    ib[0] = 99
+    output(ia[0], ib[0], sep='|', end=' ')    // 期望 1|99
+    output("")

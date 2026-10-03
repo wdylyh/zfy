@@ -1,0 +1,155 @@
+// report.zfy
+// 简易成绩统计与报告生成器
+// 数组声明放在 main 内部；frac 只用于局部变量；所有跨宽度赋值显式 cast
+
+// 计算整数和（只接收标量）
+long int sum_int(int a, int b, int c, int d, int e, int f)
+    long int s = 0
+    s += cast(a, long int)
+    s += cast(b, long int)
+    s += cast(c, long int)
+    s += cast(d, long int)
+    s += cast(e, long int)
+    s += cast(f, long int)
+    return s
+
+// 生成报告：avg 用分子/分母两个普通整数传入
+string make_report(string name, long int total, long int avg_num, long int avg_den, long int best)
+    string line = ""
+    line += "学生: "
+    line += name
+    line += "\n"
+
+    line += "总分: "
+    line += prec(total, 8)
+    line += "\n"
+
+    line += "平均分: "
+    line += prec(avg_num, 8)
+    line += "/"
+    line += prec(avg_den, 4)
+    line += "\n"
+
+    line += "最高分下标: "
+    line += prec(best, 4)
+    line += "\n"
+
+    string raw = "  zfy-report  "
+    string cleaned = trim(raw, " ")
+    line += "标题: "
+    line += cleaned
+    line += "\n"
+
+    // find 返回下标，显式 cast 到 long int
+    long int dash_pos = cast(find(cleaned, '-'), long int)
+    line += "标题中 '-' 的位置: "
+    line += prec(dash_pos, 4)
+    line += "\n"
+
+    string replaced = replace(cleaned, 0, 2, "ZFY")
+    line += "替换后: "
+    line += replaced
+    line += "\n"
+
+    return line
+
+void main()
+    // 1. 成绩数组声明在函数内部
+    int array scores[6] = 88, 92, 79, 95, 67, 84
+    int n = cast(length(scores), int)
+
+    // 2. 输入学生姓名
+    string name
+    output("请输入学生姓名：", end="")
+    input(name, delim="\n")
+
+    // 3. 计算总分、平均分、最高分下标
+    long int total = sum_int(scores[0], scores[1], scores[2], scores[3], scores[4], scores[5])
+
+    long int frac avg = total / cast(n, long int)
+    long int avg_num = 0
+    long int avg_den = 1
+
+    // 找最高分下标：用 while
+    int idx = 0
+    long int best = 0
+    while idx < n
+        if scores[idx] > scores[cast(best, int)]
+            best = cast(idx, long int)
+        idx++
+
+    // 4. 生成报告
+    string report = make_report(name, total, avg_num, avg_den, best)
+    output(report, end="")
+
+    // 5. 用列表收集所有及格分数
+    int list passed
+    idx = 0
+    while idx < n
+        if scores[idx] >= 60
+            push(passed, scores[idx])
+        idx++
+
+    int passed_count = cast(length(passed), int)
+
+    output("及格人数: ", passed_count, sep="", end="\n")
+    output("及格分数: ", end="")
+    idx = 0
+    while idx < passed_count
+        output(passed[idx], sep=" ", end="")
+        idx++
+    output("", end="\n")
+
+    // 6. 分数运算：计算及格率
+    int frac pass_rate = passed_count / n
+    output("及格率(分数): ", pass_rate, end="\n")
+
+    // 7. 用命名参数调用 find，显式 cast 到 long int
+    string s = "hello zfy"
+    long int pos = cast(find(s, 'l', count=2), long int)
+    output("第二个 l 的位置: ", pos, end="\n")
+
+    // 8. 用 replace 做字符串替换
+    string replaced = replace(s, 0, 4, "HELLO")
+    output("替换后: ", replaced, end="\n")
+
+    // 9. 用 cast 做显式窄化与浮点转换
+    long int big = 123456
+    int small = cast(big, int)
+    float f = cast(small, float)
+    output("窄化后: ", small, " 转浮点: ", f, end="\n")
+
+    // 10. 用 reduce 手动约分
+    long int frac r = 8/12
+    reduce(r, 1, 2)
+    output("约分后: ", r, end="\n")
+
+    // 11. 用 remove 删除列表元素
+    if passed_count > 0
+        remove(passed, 0)
+        passed_count = cast(length(passed), int)
+        output("删除第一个及格分数后，剩余: ", passed_count, end="\n")
+
+    // 12. 用 while 做倒计时
+    output("倒计时: ", end="")
+    int t = 5
+    while t > 0
+        output(t, sep=" ", end="")
+        t--
+    output("", end="\n")
+
+    // 13. 用 while 做简单累加
+    int k2 = 0
+    long int acc = 0
+    while k2 < 10
+        acc += cast(k2, long int)
+        k2++
+    output("0..9 累加和: ", acc, end="\n")
+
+    // 14. 用 if / else if / else 链
+    if acc > cast(100, long int)
+        output("累加和超过 100", end="\n")
+    else if acc == cast(45, long int)
+        output("累加和正好 45", end="\n")
+    else
+        output("累加和是 ", acc, end="\n")

@@ -1,0 +1,23 @@
+void main()
+    string s0 = "abc"
+    output(trim(s0, ""), end='|')
+    string list one = split(s0, "")
+    output(length(one), end='|')
+    output(one[0], end=' ')
+    output("")
+    i64 k = 3
+    for k, k > 0, k--
+        output(k, end=' ')
+    output("")
+    i64 array const carr[3] = 7,8,9
+    output(carr[2])
+    string s1 = "123"
+    string s2 = s1
+    s2 += "xyz"
+    output(s1, s2, sep='|', end=' ')
+    output("")
+    i32 array ia[3] = 1,2,3
+    i32 array ib[3] = ia
+    ib[0] = 99
+    output(ia[0], ib[0], sep='|', end=' ')
+    output("")

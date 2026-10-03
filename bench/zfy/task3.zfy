@@ -1,0 +1,16 @@
+void task3()
+    // 读 n 个整数，逐个 *2，输出
+    long int n = 0
+    input(n)
+    long int s = 0
+    long int v = 0
+    for int k = 0, k < cast(n, int), k++
+        v = 0
+        input(v)
+        v = v * 2
+        s += v
+        output(v)
+    output("T3 sum=", s)
+
+void main()
+    task3()

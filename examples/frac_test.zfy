@@ -1,0 +1,33 @@
+// frac 分数类型与 reduce 验证
+// 规则：字面量/初值不自动约分；运算结果（如 a*b）自动约分到最简
+void main()
+    int frac j = 23/34
+    output(j)
+    long int frac x = 6/216
+    reduce(x, 1, 2)
+    output(x)
+    long int frac y = 6/216
+    reduce(y, 2, 2)
+    output(y)
+    // 分数四则：运算结果自动约分到最简
+    int frac a = 1/2
+    int frac b = 1/3
+    int frac c = a + b
+    output(c)
+    int frac m = a * b
+    output(m)
+    int frac d = a / b
+    output(d)
+    // 标量提升：整数转分数
+    int frac e = a + 1
+    output(e)
+    // 小数分子分母：乘 10^n 化整后按分数规则运算（初值不自动约分）
+    double frac k = 34.3434/34.3434
+    double frac k2 = k + 1
+    output(k)
+    output(k2)
+    // 比较
+    if a < b
+        output(1)
+    int const frac pi2 = 22/7
+    output(pi2)

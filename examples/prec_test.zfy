@@ -1,0 +1,40 @@
+// prec 输出长度控制 + string cast 冒烟测试
+void main()
+    long double x = 3.14159265358
+    output(prec(x, 5))                       // 期望 3.141
+    int y = 6
+    output(prec(x, y))                       // 期望 3.1415
+    char cy = '6'
+    output(prec(x, cy))                      // 期望 3.1415
+    string s = "hello_zfy"
+    output(prec(s, 2))                       // 期望 he
+    output(prec(s, 20), end="|\n")           // 期望 hello_zfy + 11 空格
+    output(prec(x, 1))                       // 期望 3
+    output(prec(x, 2))                       // 期望 3.
+    output("nothing")                        // 无 prec 全输出
+    output(x, end="|\n")                     // 浮点默认全输出
+    // cast string -> 数值
+    string n1 = "123"
+    string n2 = "3.14abc"
+    int i1 = cast(n1, int)
+    double d1 = cast(n2, double)
+    output(i1, d1)                           // 期望 123 3.140000
+    long long big = cast(n1, long long)
+    output(big)                              // 123
+    // cast 数值 -> string
+    int q = 42
+    string sq = cast(q, string)
+    output(sq, end="|\n")                    // 42
+    double dq = 2.5
+    output(cast(dq, string), end="|\n")      // 2.500000
+    // cast -> bool
+    int nz = 7
+    bool b1 = cast(nz, bool)
+    int zero = 0
+    bool b2 = cast(zero, bool)
+    string es = ""
+    bool b3 = cast(es, bool)
+    output(b1, b2, b3)                       // true false false
+    // prec 与 frac
+    int frac f = 6/48
+    output(prec(f, 3), end="|\n")            // 1/8 截 3 -> 1/8（恰4字符截3 -> "1/8"？1/8 是3字符）

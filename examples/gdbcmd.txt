@@ -1,0 +1,12 @@
+break zfy_longjmp
+run
+info registers rcx rdx rsp
+x/2gx $rcx+64
+x/1gx $rcx+72
+nexti 9
+info registers rip rsp rbx
+stepi
+info registers rip rsp
+stepi
+info registers rip
+continue

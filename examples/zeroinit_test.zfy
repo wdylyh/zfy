@@ -1,0 +1,15 @@
+// 标量声明省略初值：填类型零值；const 必须带初值
+void main()
+    int x
+    double d
+    bool b
+    char c
+    string s
+    output(x, d, b, c, s, sep='|')   // 期望 0|0|false||（char 零值不可见）
+    int y
+    y = 5
+    output(y)                        // 期望 5
+    int list lst
+    push(lst, x)
+    push(lst, y)
+    output(lst[0], lst[1], sep=',')  // 期望 0,5

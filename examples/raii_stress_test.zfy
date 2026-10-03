@@ -1,0 +1,30 @@
+// RAII 压力测试：循环内大量数组/字符串分配与释放（含 break/continue 路径）、
+// for 头使用已有变量（i-- 递减方向合法）、replace 替换参数为任意 string 表达式
+string dup4(string s)
+    return s + s + s + s
+
+void main()
+    // ---- for 头使用已有变量：递减方向不是错误 ----
+    long int i = 5
+    for i, i > 0, i--
+        output(i, end=' ')
+    output("")
+
+    // ---- 10000 轮：每轮分配 string 数组并释放，break/continue 提前退出作用域 ----
+    long int rounds = 0
+    for i, i < 10000, i++
+        string array names[8] = "aa","bb"
+        if i == 2
+            continue
+        if i == 999
+            break
+        names[7] = dup4("x")     // 堆串写入数组元素（深拷贝，作用域退出时逐个释放）
+        rounds++
+    output(rounds)               // 期望 998：i=0..999 共 1000 轮，
+                                 // i==2 continue 一次、i==999 break 一次均不计数
+
+    // ---- replace 替换参数：变量与表达式（全逗号函数式调用） ----
+    string n = "Hello World"
+    string rep = "zfy"
+    output(replace(n, 6, 10, rep), end='\n')       // 期望 Hello zfy
+    output(replace(n, 6, 10, rep + "!"), end='\n') // 期望 Hello zfy!
