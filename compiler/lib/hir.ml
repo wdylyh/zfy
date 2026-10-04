@@ -112,6 +112,9 @@ and tstmt_kind =
        仅数值标量字段（load + op + store 同一字段） *)
   | SDerefSetK of texpr * texpr
     (* 指针解引用写入：p* = v（p 表达式, 值——目标类型 = v.ety，仅标量/指针） *)
+  | SFieldSeqSetK of string * int list * zty * zty * texpr * texpr * bool
+    (* 字段链下数组/列表元素写入：b.data[i] = v（根槽名, 字段链, 根类型,
+       元素类型, 元素下标, 值, 是否列表）——第 7 条顺带修 *)
   | SAugDerefK of texpr * binop * texpr
     (* 指针解引用复合赋值：p* op= v（p 表达式, 运算, 右值）；p*++ 亦归此 *)
   | SUnsafeK of tblock

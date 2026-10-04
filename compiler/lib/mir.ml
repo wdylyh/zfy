@@ -647,6 +647,12 @@ and lstmt_inner l (s : tstmt) : unit =
   | SFieldSetK (root, idxs, rootty, v) ->
     (* 字段写入：GEP 直达字段，深拷贝新值 + 释放旧值（llvmgen 按字段类型分派） *)
     emit l (MFieldStore (op (OLocal root) rootty, rootty, idxs, lexpr l v))
+  | SFieldSeqSetK (root, idxs, rootty, elem, i, v, grow) ->
+    (* 字段链下数组/列表元素写入：b.data[i] = v（第 7 条顺带修）——
+       先 load 字段值（= seq 指针），再按元素写入（与 SSeqSetK 同路径） *)
+    let d = fresh l in
+    emit l (MFieldGet (d, op (OLocal root) rootty, rootty, idxs, TList elem));
+    emit l (MSeqSet (d, elem, lexpr l i, lexpr l v, grow, l.unchecked))
   | SAugFieldK (root, idxs, rootty, bop, v) ->
     (* 字段增广：load 字段 + op + 写回（字段只求值一次；字段类型 = 右值类型） *)
     let fty = v.ety in
@@ -1016,7 +1022,10 @@ let uses_of (i : instr) : string list =
   | MPrintVal o -> operand_names o
   | MInput (_, _, d) -> operand_names d
   | MSeqAlloc _ -> []
-  | MSeqSet (_, _, idx, v, _, _) -> operand_names idx @ operand_names v
+  | MSeqSet (name, _, idx, v, _, _) ->
+    (* name 亦为 use：字段链下数组写（SFieldSeqSetK）经 MFieldAddr 临时
+       指针 %tN 作为 seq 来源，须保持其纯指令不被死代码消除 *)
+    name :: operand_names idx @ operand_names v
   | MFreeVar _ -> []
   | MFreeTemp _ -> []
   | MFreeSeqTemp _ -> []

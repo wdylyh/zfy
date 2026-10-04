@@ -1549,7 +1549,31 @@ and check_stmt env (st : stmt) : tstmt =
               | t' ->
                 terr ap "dereference assignment supports only scalar/pointer types (for now), got %s" (pp_zty t'))
            | t -> terr ap "type %s does not support index assignment" (pp_zty t))
-        | None -> terr ap "undefined variable: %s" arr)
+        | None ->
+          (* 第 7 条顺带修：字段链下数组/列表元素写入 b.data[i] = v *)
+          (match split_field_path arr with
+           | Some (first, segs) ->
+             (match lookup_var env first with
+              | Some l ->
+                (match resolve l.lty with
+                 | TStruct _ | TPtr (TStruct _) ->
+                   if l.lconst then
+                     terr ap "cannot modify elements of constant %s (const is deeply immutable)" first;
+                   if Hashtbl.mem env.moved l.lslot then
+                     terr ap "array %s has been moved and cannot be written" arr;
+                   let (fidxs, fty) = chain_fields env ap l.lty segs in
+                   (match resolve fty with
+                    | TArray (e, _) | TList e as seqty ->
+                      let grow = (match seqty with TList _ -> true | _ -> false) in
+                      let ti = to_i64 (check_expr env idx) in
+                      let trhs = check_expr env rhs in
+                      let trhs = coerce ip trhs e in
+                      mk (SFieldSeqSetK (l.lslot, fidxs, l.lty, e, ti, trhs, grow))
+                    | t' ->
+                      terr ap "type %s does not support index assignment" (pp_zty t'))
+                 | t -> terr ap "type %s does not support index assignment %s" (pp_zty t) arr)
+              | None -> terr ap "undefined variable: %s" first)
+           | None -> terr ap "undefined variable: %s" arr))
      | EIndex (_, _, ip), _ ->
        terr ip "index-assignment target must be an array/list variable, e.g. n[3] = value"
      | EDeref (pe, dp), _ ->
@@ -2222,6 +2246,8 @@ let check_program (prog : program) : hir =
         SUnwrapBlockK (d, n, subst_ty t, fix_texpr a, es, List.map fix_stmt b)
       | SFieldSetK (n, idxs, rt, v) ->
         SFieldSetK (n, idxs, subst_ty rt, fix_texpr v)
+      | SFieldSeqSetK (n, idxs, rt, e, i, v, g) ->
+        SFieldSeqSetK (n, idxs, subst_ty rt, subst_ty e, fix_texpr i, fix_texpr v, g)
       | SAugFieldK (n, idxs, rt, op, v) ->
         SAugFieldK (n, idxs, subst_ty rt, op, fix_texpr v)
       | SDerefSetK (p, v) -> SDerefSetK (fix_texpr p, fix_texpr v)
