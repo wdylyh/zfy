@@ -315,6 +315,7 @@
 | E3152 | move 后 remove：`move f(arr)` 后 `remove(arr, 0)` | array %s has been moved and cannot be removed from |
 | E3153 | `const arr` 后 `remove(arr, 0)` | cannot remove from constant %s |
 | E3154 | struct A 内含 B、B 内含 A（循环嵌套） | struct %s has circular nesting (infinite size) |
+| E3155 | 窄化转换未加显式 cast（new2.md #5：宽化自动，窄化显式） | narrowing conversion from %s to %s requires an explicit cast |
 
 > 跳号（类型段）：E3002/E3003 并入 E3001、E3006 并入 E3005、E3012 并入 E3011、E3030 并入 E3011、E3044 并入 E3043、E3046 并入 E3045、E3050/E3051 并入 E3047、E3060 并入 E3101、E3090 并入 E3001、E3112 删除（归 E4012）、E3116 并入 E3115、E3134 并入 E3133、E3143 删除（TErr 元素非法归 E4002）。
 

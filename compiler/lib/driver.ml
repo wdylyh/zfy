@@ -134,6 +134,7 @@ let code_of = function
       ["undefined type: "], "E3001";
       ["circular type inference constraint"], "E3004";
       ["type mismatch: expected "], "E3005";
+      ["narrowing conversion from "], "E3155";
       ["unsupported cast: "], "E3008";
       ["cannot omit an initializer"], "E3009";
       ["cannot convert to string"], "E3007";

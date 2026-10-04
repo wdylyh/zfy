@@ -93,7 +93,7 @@ void main()
     output(sum(10, 20))                      // 期望 30
     ushort x = 100
     i64 y = 22
-    output(sum(x, y))                        // 期望 122（sum 内 cast 到 int 相加）
+    output(sum(cast(x, short), y))           // 期望 122（u8→i8 显式 cast，new2.md #5）
 
     // ⑧ cast 用别名（语句重绑定 + 表达式）
     double pi = 3.75

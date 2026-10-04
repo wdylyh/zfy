@@ -880,7 +880,21 @@ and coerce p (te : texpr) (want : zty) : texpr =
       { e = EErrOkK te2; ety = want; epos = te.epos }
     | TVar _, _ | _, TVar _ -> unify p te.ety want; te
     | (TInt _ | TUint _), (TInt _ | TUint _) ->
-      { e = ECastK (te, want); ety = want; epos = te.epos }
+      (* new2.md #5：宽化自动、窄化必须显式 cast。
+         安全判定：同符号 dst 不窄于 src；u→i 需 dst 更宽（u8→i16 ✓）；
+         i→u 目标无符号必有负值不可表示 → 一律显式 *)
+      let width = function TInt w | TUint w -> w | _ -> 0 in
+      let signed = function TInt _ -> true | _ -> false in
+      let safe =
+        if signed a = signed b then width a <= width b
+        else if signed b then width b > width a
+        else false
+      in
+      if safe then
+        { e = ECastK (te, want); ety = want; epos = te.epos }
+      else
+        terr p "narrowing conversion from %s to %s requires an explicit cast"
+          (pp_zty a) (pp_zty b)
     (* 定长数组 -> 动态长度数组参数（TList 运行期与 TArray 同构） *)
     | TArray (ea, _), TList eb when ea = eb ->
       if (match resolve ea with TStruct _ -> true | _ -> false) then

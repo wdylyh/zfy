@@ -1,0 +1,5 @@
+// new2.md #5: narrowing without cast -> E3155
+void main()
+    i64 big = 100
+    i32 small = big
+    output(small)
