@@ -579,17 +579,65 @@ and check_expr env (e : expr) : texpr =
                in
                mk (EIndirectCallK (tfnexpr, targs)) ret
               | _ ->
-               (* 普通函数调用：要求全部位置参数；实参可带显式 move（f(move p)） *)
-               let moves = ref [] in
-               let targs =
-                 List.map
-                   (function
-                     | CPos e -> moves := false :: !moves; check_expr env e
-                     | CMove e -> moves := true :: !moves; check_move_arg env e
-                     | CNamed (n, _) -> terr p' "function calls do not support named argument %s=" n)
-                   args
-               in
-               check_call env p' name targs (List.rev !moves))))
+               (* 字段链 callee（h.op(...)，new2.md 9a）：根为局部变量且
+                  字段链为函数指针时间接调用；否则按普通函数调用处理
+                  （模块扁平化后的点名 math.add 走 check_call） *)
+               (match split_field_path name with
+                | Some (first, _) ->
+                  (match lookup_var env first with
+                   | Some _ ->
+                     let tcallee = check_expr env callee in
+                     (match resolve tcallee.ety with
+                      | TPtr (TFunSig (ptys, ret)) ->
+                        if List.length ptys <> List.length args then
+                          terr p' "function pointer expects %d arguments, got %d"
+                            (List.length ptys) (List.length args);
+                        let targs =
+                          List.map2
+                            (fun (ca : call_arg) pt ->
+                              match ca with
+                              | CPos e -> coerce p' (check_expr env e) pt
+                              | CMove _ -> terr p' "function pointer calls do not support move arguments"
+                              | CNamed (n, _) -> terr p' "function pointer calls do not support named argument %s=" n)
+                            args ptys
+                        in
+                        mk (EIndirectCallK (tcallee, targs)) ret
+                      | _ ->
+                        (* 普通/未知函数调用：要求全部位置参数；实参可带显式 move *)
+                        let moves = ref [] in
+                        let targs =
+                          List.map
+                            (function
+                              | CPos e -> moves := false :: !moves; check_expr env e
+                              | CMove e -> moves := true :: !moves; check_move_arg env e
+                              | CNamed (n, _) -> terr p' "function calls do not support named argument %s=" n)
+                            args
+                        in
+                        check_call env p' name targs (List.rev !moves))
+                   | None ->
+                     (* 普通函数调用：要求全部位置参数；实参可带显式 move（f(move p)） *)
+                     let moves = ref [] in
+                     let targs =
+                       List.map
+                         (function
+                           | CPos e -> moves := false :: !moves; check_expr env e
+                           | CMove e -> moves := true :: !moves; check_move_arg env e
+                           | CNamed (n, _) -> terr p' "function calls do not support named argument %s=" n)
+                         args
+                     in
+                     check_call env p' name targs (List.rev !moves))
+                | None ->
+                 (* 普通函数调用：要求全部位置参数；实参可带显式 move（f(move p)） *)
+                 let moves = ref [] in
+                 let targs =
+                   List.map
+                     (function
+                       | CPos e -> moves := false :: !moves; check_expr env e
+                       | CMove e -> moves := true :: !moves; check_move_arg env e
+                       | CNamed (n, _) -> terr p' "function calls do not support named argument %s=" n)
+                     args
+                 in
+                 check_call env p' name targs (List.rev !moves)))))
      | _ -> terr p' "unsupported callee expression")
   | EIndex (base, idx, p') ->
     let tb = check_expr env base in

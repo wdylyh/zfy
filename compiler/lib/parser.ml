@@ -974,7 +974,8 @@ let top_is_fn p =
    列表：<类型> 名字[]（中括号必须为空） *)
 let parse_param p =
   let (tk0, tp0) = peek p in
-  let pt = parse_ty p in
+  (* 函数类型允许作参数类型（new2.md 9a）：i32(i32,i32) g *)
+  let pt = parse_ty ~allow_fun:true p in
   let (isc, is_frac, is_unred) = parse_modifiers p in
   if isc then err tp0 "parameters do not support const";
   if is_unred then err tp0 "parameters do not support unred";
@@ -1004,8 +1005,8 @@ let rec parse_struct_fields p acc =
   | (Ident _, ftp)
   | (Keyword (KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad), ftp) ->
     (* 字段类型：任意标识符（基础宽度类型或已声明 struct 名，typeck 校验）
-       或多词传统别名（short int 等），可带 * 指针后缀 *)
-    let fty = parse_ty p in
+       或多词传统别名（short int 等），可带 * 指针后缀；函数类型允许（9a） *)
+    let fty = parse_ty ~allow_fun:true p in
     let name = expect_ident p "field name" in
     let fseq =
       match peek p with
