@@ -1,0 +1,44 @@
+// 第2条：完整泛型（泛型函数 + 泛型 struct，new2.md #2 方案B）
+// 语法：<T, U> ret name(params)；struct Box<T, U>；类型实参仅自动推断
+struct Box<T>
+    T v = 0
+    T* pv = null
+
+// 泛型函数：返回首个参数
+<T> T first(T a, T b)
+    return a
+
+// 双类型参数 + 泛型 struct 作参数类型
+<T, U> U pair_first(Box<T> b, U d)
+    return d
+
+// 泛型函数体内对 T 使用比较（实例化后按具体类型检查）
+<T> T pick(T a, T b)
+    if a < b
+        return a
+    return b
+
+// 泛型 struct 作返回类型
+<T> Box<T> make_box(T x)
+    return Box(x)
+
+i64 main()
+    // 泛型函数：同一函数多个实例
+    output(first(1, 2), first(1.5, 2.5), sep=',')
+    // 泛型 struct：声明类型位置实例化，字段读
+    Box<i32> a = Box(7)
+    Box<f64> b = Box(2.5)
+    output(a.v, b.v, sep=',')
+    // 字段写（实例 struct 可变）
+    a.v = 8
+    output(a.v)
+    // 嵌套实例 Box<Box<i32>>
+    Box<Box<i32>> n = Box(Box(4))
+    output(n.v.v)
+    // 泛型 struct 作实参/返回值
+    output(pair_first(a, 3.25))
+    Box<i32> m = make_box(11)
+    output(m.v)
+    // 推断调用
+    output(pick(3, 4), pick(7, 6), sep=',')
+    return 0

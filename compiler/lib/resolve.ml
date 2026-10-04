@@ -395,6 +395,7 @@ let resolve (main : program) (main_dir : string)
       | TPtrC (t2, p) -> TPtrC (rw_ty m t2, p)
       | TErr (t2, p) -> TErr (rw_ty m t2, p)
       | TFun (r, ps, p) -> TFun (rw_ty m r, List.map (rw_ty m) ps, p)
+      | TApp (n, ts, p) -> TApp (resolve_name m n p, List.map (rw_ty m) ts, p)
     in
     let rec rw_expr (m : modt) (e : expr) : expr =
       match e with
@@ -502,10 +503,12 @@ let resolve (main : program) (main_dir : string)
                      ret = Option.map (rw_ty m) f.ret;
                      rfrac = f.rfrac;
                      body = rw_block m f.body;
-                     pos = f.pos } :: !out
+                     pos = f.pos;
+                     tparams = f.tparams } :: !out
       | IStruct s ->
         out := IStruct { name = flat_prefix m.mpath ^ s.name; packed = s.packed;
-                         fields = List.map (rw_field m) s.fields; pos = s.pos } :: !out
+                         fields = List.map (rw_field m) s.fields; pos = s.pos;
+                         tparams = s.tparams } :: !out
       | ITypeAlias a ->
         out := ITypeAlias { name = flat_prefix m.mpath ^ a.name;
                             ty = rw_ty m a.ty; pos = a.pos } :: !out

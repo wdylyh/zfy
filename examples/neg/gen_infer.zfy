@@ -1,0 +1,8 @@
+// negative: generic type argument cannot be inferred -> E3172
+// （T 只出现在返回类型，调用处无期望上下文可绑定 T）
+<T> i64 zero()
+    return 0
+
+i64 main()
+    output(zero())
+    return 0

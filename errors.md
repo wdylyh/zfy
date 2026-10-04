@@ -329,6 +329,13 @@
 | E3166 | 函数指针调用带 ref 实参 | function pointer calls do not support ref arguments |
 | E3167 | struct 构造/内建函数带 ref 实参 | %s does not support ref arguments（struct 构造为固定文案） |
 | E3168 | move 赋值源非聚合变量槽（内部错误兜底） | move assignment requires an aggregate variable source |
+| E3169 | `Box<i32> x`（未定义的泛型 struct） | undefined generic struct: %s |
+| E3170 | `Box<i32, f64> b = Box(1)`（泛型实参数不符） | generic struct %s expects %d type arguments, got %d |
+| E3171 | `Box<T!> x` / `Box<frac<i32>> x` / `Box<T> x`（T 未绑定）（实参类型非法） | T! cannot be a type argument / frac cannot be a type argument / a generic type argument must be a concrete type / this type cannot be used as a generic type argument |
+| E3172 | `zero()`（泛型函数/构造的类型实参无法推断） | cannot infer type argument for %s (in call to %s) / cannot infer type argument for %s (constructor of %s) / cannot infer type argument for field %s of %s (got %s) / cannot infer type argument for parameter %s of %s (got %s) |
+| E3173 | `<T> void f(T ref x)`（泛型函数带 ref 参数） | generic functions do not support ref parameters |
+| E3174 | `<T> void main()` | main cannot be a generic function |
+| E3175 | `<T, T> void f(T x)`（类型参数重名） | duplicate type parameter in %s |
 
 > 跳号（类型段）：E3002/E3003 并入 E3001、E3006 并入 E3005、E3012 并入 E3011、E3030 并入 E3011、E3044 并入 E3043、E3046 并入 E3045、E3050/E3051 并入 E3047、E3060 并入 E3101、E3090 并入 E3001、E3112 删除（归 E4012）、E3116 并入 E3115、E3134 并入 E3133、E3143 删除（TErr 元素非法归 E4002）。
 

@@ -1,0 +1,9 @@
+// negative: generic struct value-form self reference -> E3098
+// （模板本身不实例化不报错；声明 A<i32> 实例化后字段自引用被拦截）
+struct A<T>
+    A<T> v = null
+
+i64 main()
+    A<i32> a
+    output(1)
+    return 0

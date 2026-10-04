@@ -91,6 +91,15 @@ let code_of = function
       ] m
   | `Type ->
     code_of_tbl "E3000" [
+      ["undefined generic struct: "], "E3169";
+      [" type arguments, got "], "E3170";
+      [" type parameters, got "], "E3170";
+      ["cannot be a type argument"], "E3171";
+      ["generic type argument must be a concrete type"], "E3171";
+      ["cannot infer type argument"], "E3172";
+      ["generic functions do not support ref parameters"], "E3173";
+      ["main cannot be a generic function"], "E3174";
+      ["duplicate type parameter in "], "E3175";
       ["(extern conflicts with an existing function)"], "E3106";
       ["duplicate function definition: "], "E3105";
       ["dot access is only for structs"], "E3088";
@@ -519,7 +528,7 @@ let expand_uses (main : program) (main_dir : string)
     let emit_fn name fpos fparams fret fbody =
       reg name fpos;
       out := IFn { name; params = fparams; ret = fret; rfrac = false;
-                  body = rw_block m fbody; pos = fpos } :: !out
+                  body = rw_block m fbody; pos = fpos; tparams = [] } :: !out
     in
     let rec go_mod ns_mod mname its2 =
       List.iter

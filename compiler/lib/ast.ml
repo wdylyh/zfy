@@ -9,6 +9,7 @@ type ty =
   | TPtrC of ty * pos                 (* T const*：指向 const T 的指针（解引用写报错） *)
   | TErr of ty * pos                  (* T!：可失败值（错误模型 ZEM） *)
   | TFun of ty * ty list * pos        (* 返回类型, 参数类型列表（仅 type 别名） *)
+  | TApp of string * ty list * pos    (* 泛型实例化：Box<i32, T*>（名字 + 类型实参） *)
 
 type binop = Add | Sub | Mul | Div | Mod | Eq | Ne | Lt | Gt | Le | Ge | And | Or
 type unop = Neg | Not
@@ -130,9 +131,12 @@ type item =
        use a::b::{x, y as z}; binds=[("x", [...;"x"]); ("z", [...;"y"])]
        use a::b as m;       binds=[("m", ["a";"b"])]（绑定模块） *)
   | IFn of { name : string; params : param list; ret : ty option; rfrac : bool;
-             body : block; pos : pos }
-    (* rfrac：返回类型带 frac 修饰（返回 TFrac） *)
-  | IStruct of { name : string; packed : bool; fields : sfield list; pos : pos }
+             body : block; pos : pos; tparams : string list }
+    (* rfrac：返回类型带 frac 修饰（返回 TFrac）；
+       tparams：泛型类型参数（<T, U> ret name(params)），空 = 普通函数 *)
+  | IStruct of { name : string; packed : bool; fields : sfield list; pos : pos;
+                 tparams : string list }
+    (* tparams：泛型类型参数（struct Box<T, U>），空 = 普通 struct *)
   | IMod of string * item list * pos
     (* 内联模块 mod name（缩进块体，可嵌套）；resolve 展开为扁平名 *)
   | IModFile of string * pos

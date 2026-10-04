@@ -196,7 +196,13 @@ let rec parse_ty ?(allow_fun = false) p =
     ignore (next p);
     let s = qpath_extend p s in    (* 模块路径类型 m::Point *)
     check_no_dup_ty p;
-    suffixes (TNamed (s, tp))
+    (* 泛型实例化 Box<i32>（仅类型位置）：Ident 后跟 < 走类型实参 *)
+    let base =
+      match peek p with
+      | (Lt, _) -> parse_tyargs p s tp
+      | _ -> TNamed (s, tp)
+    in
+    suffixes base
   | Keyword k when is_alias_kw k ->
     (* 传统类型别名：归一化为内部宽度名（short int→i16 等，零后端改动） *)
     (match alias_ty p.toks with
@@ -212,6 +218,34 @@ let rec parse_ty ?(allow_fun = false) p =
   | LBracket ->
     err tp "'[]T' / '[T;N]' (slice/array type) syntax removed"
   | _ -> err tp (Printf.sprintf "expected a type, got %s" (pp_token tk))
+
+(* 泛型类型参数列表 <T, U>：泛型函数/struct 声明处（仅 Ident 名单） *)
+and parse_tparams p =
+  expect p Lt "<";
+  let rec go acc =
+    let n = expect_ident p "type parameter" in
+    let acc = n :: acc in
+    match peek p with
+    | (Comma, _) -> ignore (next p); go acc
+    | (Gt, _) -> ignore (next p); List.rev acc
+    | (_, tp) -> err tp "expected ',' or '>' to end the type parameter list"
+  in
+  go []
+
+(* 泛型实参列表 <i32, T*>：类型位置 T 后跟 <（仅类型位置无歧义，表达式
+   比较不受影响） *)
+and parse_tyargs p base_name npos =
+  expect p Lt "<";
+  let rec go acc =
+    let t = parse_ty p in
+    let acc = t :: acc in
+    match peek p with
+    | (Comma, _) -> ignore (next p); go acc
+    | (Gt, _) -> ignore (next p); List.rev acc
+    | (_, tp) -> err tp "expected ',' or '>' to end the type argument list"
+  in
+  let targs = go [] in
+  TApp (base_name, targs, npos)
 
 (* ---------- 表达式 ---------- *)
 (* 优先级（低->高）：?? < or < and < not < 比较 < 加减 < 乘除模 < 一元负号 < 后缀 *)
@@ -652,6 +686,7 @@ and looks_like_decl p =
         | (Ident _, _) :: _ -> true
         | (Keyword (KConst | KFrac | KUnreduced | KRef), _) :: _ -> true
         | _ -> false)
+     | (Lt, _) :: _ -> tyname_ok   (* 泛型实例化声明 Box<i32> x = ... *)
      | (Ident _, _) :: _ -> true
      | (Keyword (KConst | KFrac | KUnreduced | KRef), _) :: _ -> true
      | _ -> false)
@@ -1108,6 +1143,31 @@ and parse_item p =
   skip_trivia p;
   let (tk, tp) = peek p in
   match tk with
+  | Lt ->
+    (* 泛型函数：<T, U> ret name(params) 块（仅函数，非函数报错） *)
+    let tparams = parse_tparams p in
+    (match peek p with
+     | (Ident _, _) | (Keyword _, _) ->
+       let ty0 = parse_ty p in
+       let (_c, rf, _u, _r3) = parse_modifiers p in
+       let name = expect_ident p "function name" in
+       expect p LParen "(";
+       let params =
+         let rec go acc =
+           match peek p with
+           | (RParen, _) -> ignore (next p); List.rev acc
+           | _ ->
+             let pd = parse_param p in
+             (match peek p with
+              | (Comma, _) -> ignore (next p); go (pd :: acc)
+              | (RParen, _) -> ignore (next p); List.rev (pd :: acc)
+              | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
+         in
+         go []
+       in
+       let body = parse_block p in
+       IFn { name; params; ret = Some ty0; rfrac = rf; body; pos = tp; tparams }
+     | (_, tp') -> err tp' "expected a function after generic parameters (<T> ret name(params))")
   | Keyword KPub ->
     (* pub 修饰：仅模块内顶层合法（root 顶层 pub 由 resolve 忽略并告警容忍） *)
     ignore (next p);
@@ -1247,9 +1307,15 @@ and parse_item p =
       | _ -> false
     in
     let name = expect_ident p "struct name" in
+    (* 泛型 struct：struct Box<T, U>（名字后跟类型参数列表） *)
+    let tparams =
+      match peek p with
+      | (Lt, _) -> parse_tparams p
+      | _ -> []
+    in
     let fields = parse_struct_fields p [] in
     p.tynames <- name :: p.tynames;
-    IStruct { name; packed; fields; pos = tp }
+    IStruct { name; packed; fields; pos = tp; tparams }
   | Keyword KExtern ->
     (* extern "C"：缩进块内每行一个 C 函数声明（类型 (frac)? 名字(参数)），
        解析为多个 IExtern 函数（块结构不保留） *)
@@ -1317,7 +1383,7 @@ and parse_item p =
         go []
       in
       let body = parse_block p in
-      IFn { name; params; ret = Some ty0; rfrac = rf; body; pos = tp }
+      IFn { name; params; ret = Some ty0; rfrac = rf; body; pos = tp; tparams = [] }
     end
     else begin
       (* 顶层声明：const/frac/unred 标量、数组、列表均可 *)

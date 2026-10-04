@@ -93,9 +93,20 @@ type fn_sig = { params : zty list; prefs : bool list; ret : zty }
 (* struct 声明信息（字段 default 为 AST 表达式，构造时检查） *)
 type sdefk = { spacked : bool; sfields : (string * zty * expr option) list }
 
+(* 泛型声明模板（new2.md 第2条 方案B）：tparams 非空才入表 *)
+type gstructk = { gtp : string list; gpacked : bool; gfields : sfield list; gpos : pos }
+type gfnk = { gtp : string list; gparams : param list; gret : ty option;
+              grfrac : bool; gbody : block; gpos : pos }
+
 type genv = { fns : (string, fn_sig) Hashtbl.t;
               structs : (string, sdefk) Hashtbl.t;
-              aliases : (string, zty) Hashtbl.t }   (* type 别名 *)
+              aliases : (string, zty) Hashtbl.t;   (* type 别名 *)
+              gstructs : (string, gstructk) Hashtbl.t;
+              gfns : (string, gfnk) Hashtbl.t;
+              gtargs : (string, zty list) Hashtbl.t;
+                (* 已实例化 struct 的类型实参（mangled 名 -> zty 列表），
+                   泛型构造/调用推断时反向匹配用 *)
+              gstructpos : (string, pos) Hashtbl.t } (* 循环嵌套检测报错位置 *)
 
 type local = { lconst : bool; lty : zty; lslot : string; lunred : bool;
                lconstp : bool }   (* 指向 const 的指针（T const*，9c）：解引用写报错 *)
@@ -116,6 +127,19 @@ type env = {
 let builtin_fns_aux : (string * (zty list * zty)) list =
   List.map (fun (n, ps, r) -> (n, (ps, r)))
     [ ("str_len", [ TString ], TInt 64) ]
+
+(* 泛型函数调用钩子（check_program 内装配）：按已检查实参（texpr）推断
+   实例化后返回 mangled 名；未装配时（不应发生）直接报未定义 *)
+let generic_call_hook
+    : (env -> string -> texpr list -> pos -> string) ref =
+  ref (fun _ name _ p -> terr p "undefined function: %s" name)
+
+(* 期望类型提示（new2.md 第2条）：声明/字段上下文把已知的期望类型传给
+   泛型推断，字面量实参按期望落型（如 Box<i32> a = Box(7) 中 7 → i32
+   而非默认 i64）。仅在"即将检查的顶层表达式是对泛型函数/泛型 struct
+   的调用"时置位，由消费者（hook_impl / check_struct_new_generic）读取
+   并立即清除 *)
+let expect_hint : zty option ref = ref None
 
 let lookup_var env name =
   let rec go = function
@@ -150,6 +174,50 @@ let declare env name l =
 
 (* ---------- 类型转换 ---------- *)
 
+(* 实例化 mangle：名字 $ tag（多类型实参再以 $ 连接）。LLVM 未引号标识符
+   允许 $，而源码标识符不能写 $，故与用户名无碰撞：
+   Box<i32> -> "Box$i32"，Pair<A, i32> -> "Pair$A$i32" *)
+let rec tag_of_zty (z : zty) : string =
+  match resolve z with
+  | TInt n -> "i" ^ string_of_int n
+  | TUint n -> "u" ^ string_of_int n
+  | TFloat n -> "f" ^ string_of_int n
+  | TBool -> "bool" | TChar -> "char" | TString -> "string" | TVoid -> "void"
+  | TStruct s -> s
+  | TPtr t -> "p" ^ tag_of_zty t
+  | TFrac e -> "frac" ^ tag_of_zty e
+  | TArray (t, n) -> "a" ^ string_of_int n ^ "$" ^ tag_of_zty t
+  | TList t -> "l$" ^ tag_of_zty t
+  | TErr _ | TFunSig _ | TVar _ -> assert false   (* 类型实参校验拦截 *)
+
+(* zty -> AST 类型叶子（实例化 subst 用；数组/列表形态由 pseq 单独携带，
+   不经 fty/pty 表达，故不会到达） *)
+let rec ast_of_zty (p : pos) (z : zty) : ty =
+  match resolve z with
+  | TInt n -> TNamed (Printf.sprintf "i%d" n, p)
+  | TUint n -> TNamed (Printf.sprintf "u%d" n, p)
+  | TFloat n -> TNamed (Printf.sprintf "f%d" n, p)
+  | TBool -> TNamed ("bool", p) | TChar -> TNamed ("char", p)
+  | TString -> TNamed ("string", p) | TVoid -> TNamed ("void", p)
+  | TStruct s -> TNamed (s, p)
+  | TPtr t -> TPtr (ast_of_zty p t, p)
+  | TErr t -> TErr (ast_of_zty p t, p)
+  | TFrac _ | TArray _ | TList _ | TFunSig _ | TVar _ ->
+    terr p "this type cannot be used as a generic type argument"
+
+(* AST 类型层替换：TNamed（类型参数名）-> 实参类型的 AST 形态 *)
+let rec subst_ty_ast (map : (string * zty) list) (t : ty) : ty =
+  match t with
+  | TNamed (s, sp) ->
+    (match List.assoc_opt s map with
+     | Some z -> ast_of_zty sp z
+     | None -> t)
+  | TPtr (t2, sp) -> TPtr (subst_ty_ast map t2, sp)
+  | TPtrC (t2, sp) -> TPtrC (subst_ty_ast map t2, sp)
+  | TErr (t2, sp) -> TErr (subst_ty_ast map t2, sp)
+  | TFun (r, ts, sp) -> TFun (subst_ty_ast map r, List.map (subst_ty_ast map) ts, sp)
+  | TApp (n, ts, sp) -> TApp (n, List.map (subst_ty_ast map) ts, sp)
+
 let rec conv_ty (g : genv) p (t : ty) : zty =
   match t with
   | TNamed (s, pp) ->
@@ -169,6 +237,115 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
     (* 函数类型统一表示为指针：TPtr (TFunSig ...)（与函数名引用/函数指针
        变量一致，LLVM 层均为 ptr） *)
     TPtr (TFunSig (List.map (fun pt -> conv_ty g pp pt) ptys, conv_ty g pp ret))
+  | TApp (n, targs, pp) ->
+    (* 泛型实例化 Box<i32, T*>（new2.md 第2条）：按模板展开注册具体
+       struct，monomorphization 完全在 typeck 内完成 *)
+    (match Hashtbl.find_opt g.gstructs n with
+     | None -> terr pp "undefined generic struct: %s" n
+     | Some gs ->
+       if List.length targs <> List.length gs.gtp then
+         terr pp "generic struct %s expects %d type arguments, got %d"
+           n (List.length gs.gtp) (List.length targs);
+       let ztys =
+         List.map
+           (fun ta ->
+             let z = resolve (conv_ty g pp ta) in
+             (match z with
+              | TErr _ -> terr pp "T! cannot be a type argument"
+              | TFrac _ -> terr pp "frac cannot be a type argument"
+              | TVar _ -> terr pp "a generic type argument must be a concrete type"
+              | _ -> ());
+             z)
+           targs
+       in
+       instantiate_struct_zty g n (List.combine gs.gtp ztys) pp)
+
+(* 注册具体实例（幂等）：先占位再展开字段（自引用指针字段可引用）；
+   值形态自引用由字段自查拦截，跨实例值环由检查末尾的循环嵌套复检拦截 *)
+and instantiate_struct_zty (g : genv) (gname : string)
+    (map : (string * zty) list) (p : pos) : zty =
+  let gs = Hashtbl.find g.gstructs gname in
+  let mangle =
+    gname ^ "$" ^ String.concat "$" (List.map (fun (_, z) -> tag_of_zty z) map) in
+  if Hashtbl.mem g.structs mangle then TStruct mangle
+  else begin
+    Hashtbl.replace g.structs mangle { spacked = gs.gpacked; sfields = [] };
+    Hashtbl.replace g.gstructpos mangle p;
+    let seen = ref [] in
+    let sfields =
+      List.map
+        (fun (sf : sfield) ->
+          let fty2 = subst_ty_ast map sf.fty in
+          let base = conv_ty g sf.fpos fty2 in
+          let ft =
+            match sf.fseq with
+            | PScalar -> base
+            | PList -> TList base
+            | PArray len ->
+              (match len with
+               | EInt (n, _) when n >= 0L -> TArray (base, Int64.to_int n)
+               | _ ->
+                 terr sf.fpos "struct field array length must be a compile-time literal")
+          in
+          (match resolve ft with
+           | TStruct s2 when s2 = mangle ->
+             terr sf.fpos "struct %s field type cannot be itself (infinite size)" mangle
+           | TErr _ ->
+             terr sf.fpos "T! cannot be a struct field (error values are aggregates and cannot be loaded as a field)"
+           | _ -> ());
+          if List.mem sf.fname !seen then
+            terr p "struct %s has duplicate field %s" mangle sf.fname;
+          seen := sf.fname :: !seen;
+          (sf.fname, ft, sf.fdefault))
+        gs.gfields
+    in
+    Hashtbl.replace g.structs mangle { spacked = gs.gpacked; sfields };
+    Hashtbl.replace g.gtargs mangle (List.map snd map);
+    TStruct mangle
+  end
+
+(* 泛型实参推断：AST 参数类型（含类型参数名）匹配实参 zty，绑定写入 map。
+   重复绑定时要求一致；结构性不匹配返回 false（由调用方报错） *)
+let rec match_gty (g : genv) (tparams : string list) (p : pos)
+    (t : ty) (z0 : zty) (mref : (string * zty) list ref) : bool =
+  let z = resolve z0 in
+  match t with
+  | TNamed (s, _) when List.mem s tparams ->
+    (match List.assoc_opt s !mref with
+     | Some z' -> resolve z' = z
+     | None -> mref := (s, z) :: !mref; true)
+  | TNamed _ -> resolve (conv_ty g p t) = z
+  | TPtr (t2, _) -> (match z with TPtr z2 -> match_gty g tparams p t2 z2 mref | _ -> false)
+  | TPtrC (t2, _) -> (match z with TPtr z2 -> match_gty g tparams p t2 z2 mref | _ -> false)
+  | TErr _ -> false
+  | TFun (r, ps, _) ->
+    (match z with
+     | TPtr (TFunSig (zs, rz)) ->
+       List.length ps = List.length zs &&
+       match_gty g tparams p r rz mref &&
+       List.for_all2 (fun pa zb -> match_gty g tparams p pa zb mref) ps zs
+     | _ -> false)
+  | TApp (n, targs, _) ->
+    (match z with
+     | TStruct m ->
+       (match Hashtbl.find_opt g.gtargs m with
+        | Some zs when List.length zs = List.length targs ->
+          List.for_all2 (fun ta zb -> match_gty g tparams p ta zb mref) targs zs
+        | _ -> false)
+     | _ -> false)
+
+(* 参数级匹配（数组/列表形态由 pseq 携带：T x[] 匹配 TList（元素比对）） *)
+let match_param (g : genv) (tparams : string list) (p : pos)
+    (pd : param) (z : zty) (mref : (string * zty) list ref) : bool =
+  let z = resolve z in
+  match pd.pseq, pd.pfrac with
+  | PScalar, false -> match_gty g tparams p pd.pty z mref
+  | PScalar, true ->
+    (match z with TFrac z2 -> match_gty g tparams p pd.pty z2 mref | _ -> false)
+  | PList, _ ->
+    (match z with TList z2 -> match_gty g tparams p pd.pty z2 mref | _ -> false)
+  | PArray _, _ ->
+    (match z with TArray (z2, _) -> match_gty g tparams p pd.pty z2 mref | _ -> false)
 
 let pos_of_expr = function
   | EInt (_, p) | EFloat (_, p) | EStr (_, p) | EChar (_, p) | EBool (_, p)
@@ -565,6 +742,9 @@ and check_expr env (e : expr) : texpr =
              (* struct 构造：位置参数按字段序，命名参数按字段名，
                 未给字段用 default，再退零值（数组/列表字段填空 seq） *)
              check_struct_new env p' name args
+           | None when Hashtbl.mem env.g.gstructs name ->
+             (* 泛型 struct 构造：推断类型实参后按实例构造（new2.md 第2条） *)
+             check_struct_new env p' name args
            | None ->
              (match lookup_var env name with
               | Some l when (match resolve l.lty with
@@ -779,31 +959,39 @@ and check_expr env (e : expr) : texpr =
        terr p' "? propagation requires the enclosing function to return %s! (current: %s)" (pp_zty elem) (pp_zty rt));
     mk (EPropagateK ta) elem
 
-and check_call env p name targs modes =
+and check_call env p name0 targs modes =
+  let name = ref name0 in
   let sig_ =
-    match List.assoc_opt name builtin_fns_aux with
+    match List.assoc_opt name0 builtin_fns_aux with
     | Some (ptys, ret) -> { params = ptys; prefs = List.map (fun _ -> false) ptys; ret }
     | None ->
-      (match Hashtbl.find_opt env.g.fns name with
+      (match Hashtbl.find_opt env.g.fns name0 with
        | Some s -> s
-       | None -> terr p "undefined function: %s" name)
+       | None ->
+         if Hashtbl.mem env.g.gfns name0 then begin
+           (* 泛型函数：按实参类型推断实例化，再按普通函数调用（new2.md 第2条）；
+              调用目标用 mangled 名（first$i32 等）落 ECallK *)
+           let mangled = !generic_call_hook env name0 targs p in
+           name := mangled;
+           Hashtbl.find env.g.fns mangled
+         end else terr p "undefined function: %s" name0)
   in
   if List.length sig_.params <> List.length targs then
     terr p "function %s expects %d arguments, got %d"
-      name (List.length sig_.params) (List.length targs);
+      !name (List.length sig_.params) (List.length targs);
   (* ref 参数/实参匹配（new2.md #1）：ref 参数必须 f(ref x)，反之亦然 *)
   List.iteri
     (fun i m ->
       let pref = try List.nth sig_.prefs i with _ -> false in
       if m = 2 && not pref then
-        terr p "argument %d of %s is passed by ref, but the parameter is not declared ref" (i + 1) name
+        terr p "argument %d of %s is passed by ref, but the parameter is not declared ref" (i + 1) !name
       else if pref && m <> 2 then
-        terr p "parameter %d of %s is ref, pass the argument with ref (f(ref x))" (i + 1) name)
+        terr p "parameter %d of %s is ref, pass the argument with ref (f(ref x))" (i + 1) !name)
     modes;
   let targs =
     List.map2 (fun ta pt -> coerce p ta pt) targs sig_.params in
   let moves = List.map (fun m -> m = 1) modes in
-  { e = ECallK (name, targs, moves); ety = sig_.ret; epos = p }
+  { e = ECallK (!name, targs, moves); ety = sig_.ret; epos = p }
 
 (* 显式 move 实参（f(move p)，change.md 1.6）：仅局部 owned 变量
    （string/数组/列表，非 const、非全局、未被 move 过）；标记该变量
@@ -1136,7 +1324,10 @@ and chain_fields env p (ty0 : zty) (segs : string list) : int list * zty =
 and check_struct_new env p name (args : call_arg list) : texpr =
   let mk k ty = { e = k; ety = ty; epos = p } in
   match Hashtbl.find_opt env.g.structs name with
-  | None -> terr p "undefined type: %s" name
+  | None ->
+    if Hashtbl.mem env.g.gstructs name then
+      check_struct_new_generic env p name args
+    else terr p "undefined type: %s" name
   | Some sd ->
     let nfields = List.length sd.sfields in
     let pos_args =
@@ -1171,7 +1362,17 @@ and check_struct_new env p name (args : call_arg list) : texpr =
       List.mapi
         (fun i (_, ft, fdef) ->
           match vals.(i) with
-          | Some a -> coerce p (check_expr env a) ft
+          | Some a ->
+            (* 字段实参为泛型构造/泛型函数调用时传期望（嵌套
+               Box<Box<i32>> n = Box(Box(4)) 的内层 Box(4) 需要） *)
+            let ta =
+              (match a with
+               | ECall (EVar _, _, _) -> expect_hint := Some ft
+               | _ -> ())
+            in
+            let ta2 = check_expr env a in
+            expect_hint := None;
+            coerce p ta2 ft
           | None ->
             (match fdef with
              | Some de -> coerce p (check_expr env de) ft
@@ -1179,6 +1380,124 @@ and check_struct_new env p name (args : call_arg list) : texpr =
         sd.sfields
     in
     mk (EStructNewK (name, tvals)) (TStruct name)
+
+(* 泛型 struct 构造（new2.md 第2条）：从实参推断类型实参 → 实例化 →
+   按实例字段构造。每个实参只检查一次（推断与构造共用检查结果） *)
+and check_struct_new_generic env p name (args : call_arg list) : texpr =
+  let mk k ty = { e = k; ety = ty; epos = p } in
+  let gs = Hashtbl.find env.g.gstructs name in
+  (* 期望类型提示：声明上下文（Box<i32> a = Box(7)）已给出实例
+     （gtargs 中有该 mangle 名的实参表），以其为准（字面量按期望落型） *)
+  let hint = !expect_hint in
+  expect_hint := None;
+  let hint_mapl =
+    match hint with
+    | Some z0 ->
+      (match resolve z0 with
+       | TStruct m
+         when String.length m > String.length name + 1
+              && String.sub m 0 (String.length name + 1) = name ^ "$"
+              && Hashtbl.mem env.g.gtargs m ->
+         let zs = Hashtbl.find env.g.gtargs m in
+         if List.length zs = List.length gs.gtp then
+           Some (List.combine gs.gtp zs)
+         else None
+       | _ -> None)
+    | None -> None
+  in
+  let mref = ref [] in
+  let match_field (sf : sfield) z =
+    match_param env.g gs.gtp p
+      { pname = sf.fname; pty = sf.fty; pfrac = false;
+        pseq = sf.fseq; pref = false; ppos = sf.fpos } z mref
+  in
+  let pos_args =
+    List.filter_map
+      (function
+        | CPos e -> Some e
+        | CCopy e -> Some e
+        | CRef _ -> terr p "struct constructor does not support ref arguments"
+        | CMove _ -> terr p "struct constructor does not support move arguments"
+        | _ -> None)
+      args in
+  let named = List.filter_map (function CNamed (nm, e) -> Some (nm, e) | _ -> None) args in
+  let nfields = List.length gs.gfields in
+  if List.length pos_args > nfields then
+    terr p "struct %s has %d fields, got %d positional arguments"
+      name nfields (List.length pos_args);
+  let checked : texpr option array = Array.make nfields None in
+  let arg_zty (ta : texpr) =
+    (* 字面量实参 ety 为未求解 TVar：推断时落默认类型（int→i64、float→f64） *)
+    match ta.e, resolve ta.ety with
+    | EIntK _, TVar _ -> TInt 64
+    | EFloatK _, TVar _ -> TFloat 64
+    | _, z -> z
+  in
+  List.iteri
+    (fun i a ->
+      let sf = List.nth gs.gfields i in
+      let ta =
+        (* 实参为泛型构造/泛型函数调用时下传期望（嵌套构造需要；
+           期望字段类型 = 模板字段类型按 hint 实参 subst 后的具体型） *)
+        (match a, hint_mapl with
+         | ECall (EVar _, _, _), Some hl ->
+           expect_hint := Some (conv_ty env.g sf.fpos (subst_ty_ast hl sf.fty))
+         | _ -> ());
+        let ta = check_expr env a in
+        expect_hint := None;
+        ta
+      in
+      if not (match_field sf (arg_zty ta)) then
+        terr p "cannot infer type argument for field %s of %s (got %s)"
+          sf.fname name (pp_zty (resolve ta.ety));
+      checked.(i) <- Some ta)
+    pos_args;
+  List.iter
+    (fun (nm, a) ->
+      let rec go i = function
+        | [] -> terr p "struct %s has no field %s" name nm
+        | (sf : sfield) :: rest ->
+          if sf.fname = nm then begin
+            if checked.(i) <> None then terr p "field %s initialized twice" nm;
+            let ta = check_expr env a in
+            if not (match_field sf (arg_zty ta)) then
+              terr p "cannot infer type argument for field %s of %s (got %s)"
+                sf.fname name (pp_zty (resolve ta.ety));
+            checked.(i) <- Some ta
+          end
+          else go (i + 1) rest
+      in
+      go 0 gs.gfields)
+    named;
+  List.iter
+    (fun tp ->
+      let from_hint = match hint_mapl with Some hl -> List.assoc_opt tp hl | None -> None in
+      if List.assoc_opt tp !mref = None && from_hint = None then
+        terr p "cannot infer type argument for %s (constructor of %s)" tp name)
+    gs.gtp;
+  let mapl =
+    match hint_mapl with
+    | Some hl -> hl
+    | None -> List.map (fun tp -> (tp, List.assoc tp !mref)) gs.gtp
+  in
+  let mangled =
+    match instantiate_struct_zty env.g name mapl p with
+    | TStruct m -> m
+    | _ -> assert false
+  in
+  let sd = Hashtbl.find env.g.structs mangled in
+  let tvals =
+    List.mapi
+      (fun i (_, ft, fdef) ->
+        match checked.(i) with
+        | Some ta -> coerce p ta ft
+        | None ->
+          (match fdef with
+           | Some de -> coerce p (check_expr env de) ft
+           | None -> field_zero env p ft))
+      sd.sfields
+  in
+  mk (EStructNewK (mangled, tvals)) (TStruct mangled)
 
 (* 下标/整数参数统一转成 i64（小整数隐式拓宽） *)
 and to_i64 (ti : texpr) : texpr =
@@ -1418,6 +1737,14 @@ let rec check_decl env p isconst is_frac is_unred name ty init =
        | TFrac _ -> terr p "mismatched frac element types"
        | TInt _ | TUint _ | TFloat _ | TVar _ -> mk_frac_from t (match resolve want with TFrac e -> e | _ -> assert false) p
        | _ -> terr p "cannot initialize %s as frac" (pp_zty t.ety))
+    | _, ECall (EVar (n, _), _, _)
+        when Hashtbl.mem env.g.gstructs n || Hashtbl.mem env.g.gfns n ->
+      (* 泛型构造/泛型函数调用在声明上下文：把声明类型作为期望提示
+         传给推断（字面量实参按期望落型，而非默认 i64/f64） *)
+      expect_hint := Some want;
+      let t = check_expr env init in
+      expect_hint := None;
+      t
     | _, _ -> check_expr env init)
   in
   let tinit = coerce p tinit want in
@@ -2164,7 +2491,9 @@ let check_program (prog : program) : hir =
   collected := [];                             (* 多错误收集：每次检查重置 *)
   let g : genv =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16;
-      aliases = Hashtbl.create 16 } in
+      aliases = Hashtbl.create 16;
+      gstructs = Hashtbl.create 8; gfns = Hashtbl.create 8;
+      gtargs = Hashtbl.create 8; gstructpos = Hashtbl.create 8 } in
   (* 内建 Err struct（解包块内 err 变量的类型）：code + msg。
      ErrCode 为虚拟常量命名空间（编译期查表），无对应 struct *)
   Hashtbl.replace g.structs "Err"
@@ -2181,25 +2510,36 @@ let check_program (prog : program) : hir =
   let seen_structs : (string, unit) Hashtbl.t = Hashtbl.create 8 in
   List.iter
     (function
-      | IStruct { name; pos; _ } ->
+      | IStruct { name; pos; tparams; _ } ->
         if Hashtbl.mem seen_structs name then
           terr pos "duplicate struct definition: %s" name
         else begin
           Hashtbl.add seen_structs name ();
-          Hashtbl.replace g.structs name { spacked = false; sfields = [] }
+          (* 泛型 struct 不入普通表（裸名 Box 报 undefined type） *)
+          if tparams = [] then
+            Hashtbl.replace g.structs name { spacked = false; sfields = [] }
         end
       | _ -> ())
     prog;
   (* 第一遍 A：按声明序登记 struct（字段类型只展开已声明 struct 的字段；
      函数签名引用 struct 同样要求已声明） *)
-  let struct_pos : (string, pos) Hashtbl.t = Hashtbl.create 8 in
+  let struct_pos : (string, pos) Hashtbl.t = g.gstructpos in
   List.iter
     (function
-      | IStruct { name; packed; fields; pos } ->
+      | IStruct { name; packed; fields; pos; tparams } ->
         if List.mem name builtin_names then
           terr pos "struct name %s conflicts with a builtin, rename it" name;
         if Hashtbl.mem fn_names name then
           terr pos "%s is already a function and cannot also be a struct name" name;
+        if tparams <> [] then begin
+          (* 泛型 struct：存模板（实例化在 conv_ty/构造时惰性展开） *)
+          if List.length (List.sort_uniq compare tparams) <> List.length tparams then
+            terr pos "duplicate type parameter in %s" name;
+          Hashtbl.replace g.gstructs name
+            { gtp = tparams; gpacked = packed; gfields = fields; gpos = pos };
+          Hashtbl.replace struct_pos name pos
+        end
+        else begin
         let sfields =
           List.map
             (fun (sf : Ast.sfield) ->
@@ -2233,6 +2573,7 @@ let check_program (prog : program) : hir =
           sfields;
         Hashtbl.replace g.structs name { spacked = packed; sfields };
         Hashtbl.replace struct_pos name pos
+        end
       | _ -> ())
     prog;
   (* struct 循环嵌套检测（A 含 B、B 含 A → 递归展开无限大小） *)
@@ -2274,9 +2615,34 @@ let check_program (prog : program) : hir =
   (* 第一遍 B：收集函数签名（参数含数组/列表/frac） *)
   List.iter
     (function
-      | IFn { name; params; ret; rfrac; pos; _ } ->
+      | IFn { name; params; ret; rfrac; pos; body; tparams } ->
         if List.mem name builtin_names then
           terr pos "function name %s conflicts with a builtin, rename it" name;
+        if tparams <> [] then begin
+          (* 泛型函数：存模板（调用时按实参类型推断实例化，new2.md 第2条） *)
+          if name = "main" then
+            terr pos "main cannot be a generic function";
+          if Hashtbl.mem g.fns name || Hashtbl.mem g.gfns name then
+            terr pos "duplicate function definition: %s" name;
+          if List.length (List.sort_uniq compare tparams) <> List.length tparams then
+            terr pos "duplicate type parameter in %s" name;
+          List.iter
+            (fun (pd : param) ->
+              if pd.pref then
+                terr pd.ppos "generic functions do not support ref parameters";
+              match pd.pseq with
+              | PArray len ->
+                (match len with
+                 | EInt _ -> ()
+                 | _ ->
+                   terr pd.ppos "generic function array parameter length must be a literal")
+              | _ -> ())
+            params;
+          Hashtbl.replace g.gfns name
+            { gtp = tparams; gparams = params; gret = ret; grfrac = rfrac;
+              gbody = body; gpos = pos }
+        end
+        else begin
         if Hashtbl.mem g.fns name then
           terr pos "duplicate function definition: %s" name;
         let prev = ref [] in
@@ -2312,6 +2678,7 @@ let check_program (prog : program) : hir =
             end else base
         in
         Hashtbl.replace g.fns name { params = ptys; prefs; ret = rty }
+        end
       | IExtern { funcs; pos = _ } ->
         (* extern "C"：登记签名（调用直通 LLVM 符号，与 C 链接一致） *)
         List.iter
@@ -2419,12 +2786,15 @@ let check_program (prog : program) : hir =
          with TypeError (p, m) -> collected := (p, m) :: !collected)
       | _ -> ())
     prog;
-  let hfns =
-    List.filter_map
-      (function
-        | IFn { name; params; ret; body; pos } ->
-          (* 函数级错误恢复：签名/返回检查失败记录后跳过该函数 *)
-          let depth = List.length env.scopes in
+  (* 函数体检查（普通函数与泛型实例共用）：独立成函数，供泛型调用钩子
+     在任意检查点按需实例化并立即检查（检查期间保存/恢复外层状态，
+     避免污染进行中的函数体） *)
+  let check_one_fn name (params : param list) body pos : tfn option =
+    let depth = List.length env.scopes in
+    let saved_uses = env.uses in
+    let saved_fnvars = env.fnvars in
+    let saved_moved = env.moved in
+    let saved_ret = env.fncur_ret in
           let r =
             try
               let sig_ = Hashtbl.find g.fns name in
@@ -2469,14 +2839,112 @@ let check_program (prog : program) : hir =
               collected := (p, m) :: !collected;
               None
           in
-          while List.length env.scopes > depth do pop_scope env done;
-          r
+    env.uses <- saved_uses;
+    env.fnvars <- saved_fnvars;
+    env.moved <- saved_moved;
+    env.fncur_ret <- saved_ret;
+    while List.length env.scopes > depth do pop_scope env done;
+    r
+  in
+  (* 泛型函数调用钩子：按实参 zty 推断类型实参 → 实例化签名注册
+     （mangled 名，如 first$i32）→ 检查实例函数体；幂等（递归调用
+     直接命中已注册签名）。实例函数体收集到 generic_fns_acc，
+     随 hfns 一起下传代码生成 *)
+  let generic_fns_acc = ref [] in
+  let hook_impl env name argtys p =
+      let gf = Hashtbl.find env.g.gfns name in
+      if List.length argtys <> List.length gf.gparams then
+        terr p "function %s expects %d arguments, got %d"
+          name (List.length gf.gparams) (List.length argtys);
+      (* 字面量实参 ety 为未求解 TVar：推断时落默认类型（int→i64、float→f64） *)
+      let argtys =
+        List.map
+          (fun (t : texpr) ->
+            match t.e, resolve t.ety with
+            | EIntK _, TVar _ -> TInt 64
+            | EFloatK _, TVar _ -> TFloat 64
+            | _, z -> z)
+          argtys
+      in
+      let mref = ref [] in
+      (* 期望类型提示：先从声明的返回类型（如 Box<i32>）反推类型实参
+         （返回类型 Box<T> 匹配期望 Box$i32 → T=i32），参数推断随之校验 *)
+      let expect = !expect_hint in
+      expect_hint := None;
+      (match expect, gf.gret with
+       | Some ez, Some rt ->
+         ignore (match_gty env.g gf.gtp p rt ez mref)
+       | _ -> ());
+      let lit_default z = match resolve z with TInt 64 | TFloat 64 -> true | _ -> false in
+      List.iter2
+        (fun (pd : param) z ->
+          if not (match_param env.g gf.gtp p pd z mref) then begin
+            (* 字面量默认型（int→i64/float→f64）与期望绑定的实参冲突：
+               字面量可按实例参数类型重解释，放行（coerce 处对字面量 unify） *)
+            if lit_default z && List.for_all (fun tp -> List.assoc_opt tp !mref <> None) gf.gtp then ()
+            else terr p "cannot infer type argument for parameter %s of %s (got %s)"
+              pd.pname name (pp_zty (resolve z))
+          end)
+        gf.gparams argtys;
+      List.iter
+        (fun tp ->
+          if List.assoc_opt tp !mref = None then
+            terr p "cannot infer type argument for %s (in call to %s)" tp name)
+        gf.gtp;
+      let mapl = List.map (fun tp -> (tp, List.assoc tp !mref)) gf.gtp in
+      let mangle =
+        name ^ "$" ^ String.concat "$" (List.map (fun (_, z) -> tag_of_zty z) mapl) in
+      if not (Hashtbl.mem g.fns mangle) then begin
+        let iparams =
+          List.map
+            (fun (pd : param) -> { pd with pty = subst_ty_ast mapl pd.pty })
+            gf.gparams
+        in
+        let prev = ref [] in
+        let ptys =
+          List.map
+            (fun (pd : param) ->
+              let t = conv_param g p !prev pd in
+              prev := pd.pname :: !prev;
+              t)
+            iparams
+        in
+        let rty =
+          match gf.gret with
+          | None -> TVoid
+          | Some t ->
+            let base = conv_ty g gf.gpos (subst_ty_ast mapl t) in
+            if gf.grfrac then begin
+              if not (frac_elem_ok base) then
+                terr gf.gpos "frac return type does not support element type %s" (pp_zty base);
+              TFrac base
+            end else base
+        in
+        Hashtbl.replace g.fns mangle
+          { params = ptys; prefs = List.map (fun _ -> false) ptys; ret = rty };
+        (match check_one_fn mangle iparams gf.gbody gf.gpos with
+         | Some tf -> generic_fns_acc := !generic_fns_acc @ [ tf ]
+         | None -> ())
+      end;
+      mangle
+  in
+  generic_call_hook := hook_impl;
+  let hfns =
+    List.filter_map
+      (function
+        | IFn { name; params; body; pos; tparams; _ } when tparams = [] ->
+          check_one_fn name params body pos
         | _ -> None)
       prog
   in
   (* 必须有 main *)
   if not (Hashtbl.mem g.fns "main") then
     terr { file = ""; line = 1; col = 1 } "missing main()";
+  (* 泛型实例化可能新增 struct（Box<i32> 等）：复检循环嵌套
+     （A<i32> 含 B<i32>、B<i32> 含 A<i32> 的跨实例值环） *)
+  Hashtbl.reset visiting;
+  Hashtbl.reset finished;
+  Hashtbl.iter (fun name _ -> visit name) g.structs;
   (* 类型变量求解落地 *)
   let rec fix_texpr (e : texpr) : texpr =
     let ety0 = subst_ty e.ety in
@@ -2565,13 +3033,14 @@ let check_program (prog : program) : hir =
     { s = s'; spos = s.spos }
   in
   let hfns =
+    (* 泛型实例化的函数体（first$i32 等）一并下传 *)
     List.map
       (fun (f : tfn) ->
         { f with
           fparams = List.map (fun (m, n, t) -> (m, n, subst_ty t)) f.fparams;
           fret = subst_ty f.fret;
           fbody = List.map fix_stmt f.fbody })
-      hfns
+      (hfns @ !generic_fns_acc)
   in
   { hfns; hglobals = List.rev !gdeclared; ginit = List.map fix_stmt (List.rev !ginit);
     hstructs = structs_list g }

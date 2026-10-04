@@ -1,0 +1,8 @@
+// negative: generic struct expects 1 type argument, got 2 -> E3170
+struct Box<T>
+    T v = null
+
+i64 main()
+    Box<i32, f64> b = Box(1)
+    output(b.v)
+    return 0
