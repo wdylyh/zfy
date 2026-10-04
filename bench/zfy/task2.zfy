@@ -1,25 +1,25 @@
 void task2()
     // 筛法：100000 以内素数个数
-    long int const LCG_A = 1103515245
-    long int const LCG_C = 12345
-    long int const LCG_MOD = 2147483647
-    bool array comp[100001]
-    long int cnt = 0
-    for long int i = 2, i <= 100000, i++
+    i64 const LCG_A = 1103515245
+    i64 const LCG_C = 12345
+    i64 const LCG_MOD = 2147483647
+    bool comp[100001]
+    i64 cnt = 0
+    for i64 i = 2, i <= 100000, i++
         if not comp[i]
             cnt++
-            long int j = i * i
+            i64 j = i * i
             for j, j <= 100000, j += i
                 comp[j] = true
     // LCG 伪随机 + 插入排序
-    long int array arr[2000]
-    long int state = 42
-    for int k = 0, k < 2000, k++
+    i64 arr[2000]
+    i64 state = 42
+    for i32 k = 0, k < 2000, k++
         state = (state * LCG_A + LCG_C) % LCG_MOD
         arr[k] = state
-    for int i = 1, i < 2000, i++
-        long int key = arr[i]
-        long int j = cast(i, long int) - 1
+    for i32 i = 1, i < 2000, i++
+        i64 key = arr[i]
+        i64 j = cast(i, i64) - 1
         // 限制记录：and/or 不短路，arr[-1] 会先求值越界，只能改写循环
         while j >= 0
             if arr[j] > key

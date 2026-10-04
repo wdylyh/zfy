@@ -1,9 +1,13 @@
 (* zfy 抽象语法树（Parser 产物，未做语义分析） *)
 open Tokens
 
-(* 类型一律为裸名字：i8..i128 / u8..u128 / f16..f128 / bool / char / string / void
-   （int. / float. / double. / frac. 前缀与 &T *T []T [T;N] 已删除） *)
-type ty = TNamed of string * pos
+(* 类型：裸名字（i8..f128 / bool / char / string / void / struct 名 / type 别名），
+   加指针 T*（T* const 为不可变指针）与函数类型（仅 type 别名处允许） *)
+type ty =
+  | TNamed of string * pos
+  | TPtr of ty * pos                  (* T*：指向 T 的指针 *)
+  | TErr of ty * pos                  (* T!：可失败值（错误模型 ZEM） *)
+  | TFun of ty * ty list * pos        (* 返回类型, 参数类型列表（仅 type 别名） *)
 
 type binop = Add | Sub | Mul | Div | Mod | Eq | Ne | Lt | Gt | Le | Ge | And | Or
 type unop = Neg | Not
@@ -27,12 +31,22 @@ type expr =
   | ESlice of expr * expr * expr * expr option * pos
     (* s[a,b] / s[a,b:step]（两端含，step 可省略；步长用冒号） *)
   | ECast of expr * ty * pos               (* cast(e, T) *)
+  | EStructNew of string * call_arg list * pos
+    (* struct 构造：Point(1.0, 2.0) / Point(x=1.0) / Point()；位置参数在前命名在后 *)
+  | EField of expr * string * pos          (* p.x：点号字段访问（链式） *)
   | EBlock of block * pos                  (* 块表达式，值为最后一个表达式 *)
+  | EAddrOf of expr * pos                  (* &x：取地址（变量/字段/元素/解引用） *)
+  | EDeref of expr * pos                   (* p*：后缀解引用 *)
+  | ENull of pos                           (* null：空指针字面量 *)
+  | EFail of expr * expr * pos             (* fail(code, msg)：构造 T! 错误值 *)
+  | EPanic of expr option * expr * pos     (* panic(msg) / panic(code, msg)：不可恢复终止 *)
+  | EUnwrap of expr * expr * pos           (* a ?? b：解包；b 为 EBlock 时为解包块形式 *)
+  | EPropagate of expr * pos               (* a?：错误传播（函数返回类型须 T!） *)
 
 and stmt =
   | SDecl of bool * bool * bool * string * ty * expr option * pos
-    (* 标量声明：(is_const, is_frac, is_unreduced, 名, 类型, 初值(可省略, 省略时填零值))；
-       const/frac/unreduced 在类型后名字前；const 必须带初值；
+    (* 标量声明：(is_const, is_frac, is_unred, 名, 类型, 初值(可省略, 省略时填零值))；
+       const/frac/unred 在类型后名字前；const 必须带初值；
        is_frac 时初值 a/b 解释为分数字面量 *)
   | SSeqDecl of bool * string * ty * expr option * bool * expr list * pos
     (* 数组/列表声明：(is_const, 名, 元素类型, 长度表达式(列表为 None, 可用 const
@@ -54,12 +68,10 @@ and stmt =
   | SRemove of expr * expr * pos               (* remove(数组/列表名, 下标) *)
   | SBreak of pos
   | SContinue of pos
-  | SThrow of expr * pos
-    (* throw 表达式：表达式为 char/string（运行时统一为 string 消息） *)
-  | STry of block * (string option * block) * pos
-    (* try 块 + catch (名字)? 块：异常消息为 string，catch 名字可省略 *)
+  | SUnsafe of block * pos
+    (* unsafe 块：允许指针算术（p+n / p-n / p2-p1）；其余语义与普通块一致 *)
 
-(* for 头部初始化项：新声明（类型 [const] [frac] [unreduced] 名 = 值）
+(* for 头部初始化项：新声明（类型 [const] [frac] [unred] 名 = 值）
    或占位表达式（孤立变量名，如 for i, i<5, i++ 的 i，执行一次，无效果） *)
 and for_init =
   | FIDecl of bool * string * ty * expr option * pos  (* (is_const, 名, 类型, 初值(可省略)) *)
@@ -74,10 +86,12 @@ and for_update =
 
 and block = stmt list
 
-(* 调用实参：位置参数在前，命名参数在后（如 find 的 count=、output 的 sep=） *)
+(* 调用实参：位置参数在前，命名参数在后（如 find 的 count=、output 的 sep=）；
+   CMove 为显式 move 实参（f(move p)：所有权移交，p 之后不可再用） *)
 and call_arg =
   | CPos of expr
   | CNamed of string * expr
+  | CMove of expr
 
 (* 参数种类：标量 / 定长数组（长度为表达式：字面量或之前参数名）/ 列表 *)
 type pseq_kind =
@@ -87,6 +101,14 @@ type pseq_kind =
 
 type param = { pname : string; pty : ty; pfrac : bool; pseq : pseq_kind; ppos : pos }
 
+(* extern "C" 块内的单个 C 函数声明 *)
+type extern_fn =
+  { ename : string; eparams : param list; eret : ty; erfrac : bool; epos : pos }
+
+(* struct 字段：类型 名字 [= 默认值]；类型可为标量/T[N]/T[]/其他 struct *)
+type sfield =
+  { fname : string; fty : ty; fseq : pseq_kind; fdefault : expr option; fpos : pos }
+
 type item =
   | IUse of { path : string; import : string option; alias : string option;
               pos : pos }
@@ -94,7 +116,12 @@ type item =
   | IFn of { name : string; params : param list; ret : ty option; rfrac : bool;
              body : block; pos : pos }
     (* rfrac：返回类型带 frac 修饰（返回 TFrac） *)
+  | IStruct of { name : string; packed : bool; fields : sfield list; pos : pos }
   | IMod of string * item list * pos
+  | IExtern of { funcs : extern_fn list; pos : pos }
+    (* extern "C" 块：多个 C 函数声明（签名直通 LLVM，调用不门禁） *)
+  | ITypeAlias of { name : string; ty : ty; pos : pos }
+    (* type 别名：type 名 = 类型（可含函数类型） *)
   | IDecl of stmt * pos
     (* 顶层声明：仅允许 const 标量（编译期常量，使用处内联，不生成运行时槽） *)
 

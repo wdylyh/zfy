@@ -16,17 +16,35 @@ let rec ll_ty (t : zty) : string =
   | TFloat 32 -> "float"
   | TFloat 64 -> "double"
   | TFloat 128 -> "x86_fp80"   (* MinGW long double：80 位扩展精度（fp128 软浮点在 MinGW 下不可用） *)
-  | TFloat n -> lerr None "不支持的浮点宽度 f%d" n
+  | TFloat n -> lerr None "unsupported float width f%d" n
   | TBool -> "i1"
   | TChar -> "i8"
   | TString -> "ptr"
   | TVoid -> "void"
   | TFrac e -> Printf.sprintf "%%frac.%s" (Hir.suffix_of e)
   | TArray _ | TList _ -> "ptr"      (* 槽内是指向 zfy_seq 的指针 *)
-  | TVar _ -> lerr None "未求解的类型变量"
+  | TStruct s -> Printf.sprintf "%%struct.%s" s
+  | TPtr _ | TFunSig _ -> "ptr"      (* 指针/函数指针：裸地址 *)
+  | TErr e ->
+    (* T! 错误值聚合：%err.<elem> = { i32 code; ptr msg; <value 容器> }。
+       value 容器统一 8 字节：整数/bool/char → i64，浮点 → double（C 端
+       zfy_stod_err 按 double 写），string/指针 → ptr（与 C 端 zfy_err
+       { int32_t; char*; union {int64_t; double; void*} } 布局一致） *)
+    (match e with
+     | TInt 128 | TUint 128 | TFloat 128 ->
+       lerr None "error value element type does not support 128-bit width (T! is limited to <=64-bit scalars/string/pointers)"
+     | TFloat w -> Printf.sprintf "%%err.f%d" w
+     | TInt w -> Printf.sprintf "%%err.i%d" w
+     | TUint w -> Printf.sprintf "%%err.u%d" w
+     | TBool -> "%err.bool"
+     | TChar -> "%err.char"
+     | TString -> "%err.str"
+     | TPtr _ -> "%err.ptr"
+     | _ -> lerr None "invalid error value element type (scalar/string/pointer only)")
+  | TVar _ -> lerr None "unresolved type variable"
 
-(* 只有 frac 是真正的 LLVM 聚合；数组/列表槽是 ptr 标量 *)
-let is_agg = function TFrac _ -> true | _ -> false
+(* frac 与 struct 是真正的 LLVM 聚合；数组/列表槽是 ptr 标量 *)
+let is_agg = function TFrac _ | TStruct _ | TErr _ -> true | _ -> false
 
 let width_of (t : zty) : int =
   match t with
@@ -44,7 +62,13 @@ type gctx = {
   mbuf : Buffer.t;                 (* 模块级定义（全局常量等） *)
   mutable nstr : int;
   globals : (string, unit) Hashtbl.t;  (* 顶层变量槽（'@' 前缀）去重表 *)
+  structs : sdef list;             (* struct 定义表（布局与辅助函数生成用） *)
 }
+
+let struct_ty_name (s : string) : string = Printf.sprintf "%%struct.%s" s
+
+let find_struct (g : gctx) (s : string) : sdef option =
+  List.find_opt (fun sd -> sd.sname = s) g.structs
 
 let rec size_of g (t : zty) : int =
   match t with
@@ -52,9 +76,15 @@ let rec size_of g (t : zty) : int =
   | TFloat n -> n / 8
   | TBool | TChar -> 1
   | TString -> 8
+  | TPtr _ | TFunSig _ -> 8
   | TFrac e -> 2 * size_of g e
   | TArray _ | TList _ -> 8        (* 槽：seq 指针 *)
-  | TVoid | TVar _ -> lerr None "无法确定类型大小"
+  | TErr _ -> 24                   (* { i32 code; ptr msg; 8 字节 value 容器 } *)
+  | TStruct s ->
+    (match find_struct g s with
+     | Some sd -> fst (Hir.struct_size_align g.structs sd)
+     | None -> lerr None "undefined struct %s" s)
+  | TVoid | TVar _ -> lerr None "cannot determine type size"
 
 let string_escape (s : string) : string * int =
   let b = Buffer.create (String.length s + 8) in
@@ -201,7 +231,7 @@ let from_bits fc (raw : string) (e : zty) : string * string =
     let r = fresh_r fc in
     emitf fc "  %s = inttoptr i64 %s to ptr" r i;
     (r, "ptr")
-  | _ -> lerr None "数组/列表不支持该元素类型"
+  | _ -> lerr None "unsupported array/list element type"
 
 (* 标量操作数 -> LLVM 值 *)
 let rec val_of fc (o : operand) : string * string =
@@ -212,6 +242,9 @@ let rec val_of fc (o : operand) : string * string =
      | TFloat w ->
        let f = Int64.to_float n in
        (float_const o.oty f, ll_ty (TFloat w))
+     | TPtr _ | TFunSig _ ->
+       if n = 0L then ("null", t)
+       else lerr None "pointer constant must be null"
      | _ -> (Printf.sprintf "%Ld" n, t))
   | OFloat f -> (float_const o.oty f, t)
   | OBool b -> ((if b then "1" else "0"), t)
@@ -220,13 +253,13 @@ let rec val_of fc (o : operand) : string * string =
   | OLocal n ->
     if Hashtbl.mem fc.regs n then (Hashtbl.find fc.regs n, t)
     else if Hashtbl.mem fc.allocas n then begin
-      if is_agg o.oty then lerr None "聚合值 %s 需按指针使用" n;
+      if is_agg o.oty then lerr None "aggregate value %s must be used as a pointer" n;
       let (addr, _) = Hashtbl.find fc.allocas n in
       let r = fresh_r fc in
       emitf fc "  %s = load %s, ptr %s" r t addr;
       (r, t)
     end
-    else lerr None "未定义的局部变量 %s" n
+    else lerr None "undefined local variable %s" n
 
 (* 标量值 -> i128 位模式（数组/列表元素统一按位模式存储，宽度由 elemsz 决定） *)
 let bits_of fc (o : operand) : string =
@@ -277,17 +310,25 @@ let bits_of fc (o : operand) : string =
     let i = fresh_r fc in
     emitf fc "  %s = ptrtoint ptr %s to i64" i v;
     to_i128 i "i64" false
-  | _ -> lerr None "该类型不能存入数组/列表元素"
+  | _ -> lerr None "type cannot be stored as an array/list element"
 
 (* 聚合操作数 -> 指针（槽位地址） *)
 let ptr_of fc (o : operand) : string * string =
+  let dbg = function
+    | OInt n -> Printf.sprintf "OInt %Ld" n
+    | OFloat f -> Printf.sprintf "OFloat %g" f
+    | OStr s -> Printf.sprintf "OStr \"%s\"" (String.escaped s)
+    | OBool b -> Printf.sprintf "OBool %b" b
+    | OChar c -> Printf.sprintf "OChar %C" c
+    | OLocal n -> Printf.sprintf "OLocal %s" n
+  in
   match o.o with
   | OLocal n ->
     if Hashtbl.mem fc.allocas n then
       let (addr, ty) = Hashtbl.find fc.allocas n in
       (addr, ll_ty ty)
-    else lerr None "未定义的变量 %s" n
-  | _ -> lerr None "期望聚合局部变量"
+    else lerr None "undefined variable %s" n
+  | _ -> lerr None "expected aggregate local: %s (oty=%s)" (dbg o.o) (Hir.pp_zty o.oty)
 
 let operand_of_name (n : string) (t : zty) : operand = { o = OLocal n; oty = t }
 
@@ -311,16 +352,41 @@ let cmp_op_int unsigned = function
   | _ -> assert false
 
 let gen_binop fc d bop (a : operand) (b : operand) =
-  if is_agg a.oty then lerr None "聚合类型不支持算术运算";
+  if is_agg a.oty then lerr None "aggregate type does not support arithmetic";
   let (va, tya) = val_of fc a and (vb, _) = val_of fc b in
   match a.oty with
+  | TPtr _ ->
+    (* 指针运算（typeck 限定 unsafe 块内）：p±n 走 GEP（按指向元素步长），
+       p-q 走 ptrtoint 差再除元素大小；比较按地址 icmp *)
+    let elem = (match a.oty with TPtr e -> e | _ -> assert false) in
+    let b_is_ptr = (match b.oty with TPtr _ | TFunSig _ -> true | _ -> false) in
+    (match bop with
+     | BAdd when not b_is_ptr ->
+       emitf fc "  %s = getelementptr inbounds %s, ptr %s, i64 %s"
+         d (ll_ty elem) va vb
+     | BSub when b_is_ptr ->
+       let ia = fresh_r fc in
+       emitf fc "  %s = ptrtoint ptr %s to i64" ia va;
+       let ib = fresh_r fc in
+       emitf fc "  %s = ptrtoint ptr %s to i64" ib vb;
+       let raw = fresh_r fc in
+       emitf fc "  %s = sub i64 %s, %s" raw ia ib;
+       emitf fc "  %s = sdiv i64 %s, %d" d raw (size_of fc.g elem)
+     | BSub ->
+       let neg = fresh_r fc in
+       emitf fc "  %s = sub i64 0, %s" neg vb;
+       emitf fc "  %s = getelementptr inbounds %s, ptr %s, i64 %s"
+         d (ll_ty elem) va neg
+     | BEq | BNe | BLt | BGt | BLe | BGe ->
+       emitf fc "  %s = icmp %s ptr %s, %s" d (cmp_op_int false bop) va vb
+     | _ -> lerr None "unsupported pointer operation")
   | TFloat _ ->
     (match bop with
      | BAdd -> emitf fc "  %s = fadd %s %s, %s" d tya va vb
      | BSub -> emitf fc "  %s = fsub %s %s, %s" d tya va vb
      | BMul -> emitf fc "  %s = fmul %s %s, %s" d tya va vb
      | BDiv -> emitf fc "  %s = fdiv %s %s, %s" d tya va vb
-     | BMod -> lerr None "浮点类型不支持取模"
+     | BMod -> lerr None "float type does not support modulo"
      | bopc ->
        let c =
          match bopc with
@@ -334,7 +400,7 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | BOr -> emitf fc "  %s = or i1 %s, %s" d va vb
      | BEq -> emitf fc "  %s = icmp eq i1 %s, %s" d va vb
      | BNe -> emitf fc "  %s = icmp ne i1 %s, %s" d va vb
-     | _ -> lerr None "布尔类型不支持该运算")
+     | _ -> lerr None "bool type does not support this operation")
   | TUint _ ->
     (match bop with
      | BAdd -> emitf fc "  %s = add %s %s, %s" d tya va vb
@@ -353,7 +419,7 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | bopc -> emitf fc "  %s = icmp %s %s %s, %s" d (cmp_op_int false bopc) tya va vb)
 
 let gen_unop fc d u (a : operand) =
-  if is_agg a.oty then lerr None "聚合类型不支持一元运算";
+  if is_agg a.oty then lerr None "aggregate type does not support unary operations";
   let (va, tya) = val_of fc a in
   match u with
   | UNeg ->
@@ -442,10 +508,10 @@ let tostr_ptr fc (o : operand) : string =
     let r = fresh_r fc in
     emitf fc "  %s = call ptr @zfy_frac_str_%s(ptr %s)" r (Hir.suffix_of e) p;
     r
-  | _ -> lerr None "该类型不能转为 string"
+  | _ -> lerr None "type cannot convert to string"
 
 let gen_cast fc d (a : operand) (t : zty) =
-  if is_agg a.oty || is_agg t then lerr None "聚合类型不支持 cast";
+  if is_agg a.oty || is_agg t then lerr None "aggregate type does not support cast";
   let (va, ta) = val_of fc a in
   let tb = ll_ty t in
   let int_like = function TInt _ | TUint _ | TBool | TChar -> true | _ -> false in
@@ -453,10 +519,17 @@ let gen_cast fc d (a : operand) (t : zty) =
   if ta = tb then begin
     match a.oty with
     | TFloat _ -> emitf fc "  %s = fadd %s %s, 0.0" d ta va
+    | TPtr _ | TFunSig _ -> emitf fc "  %s = bitcast ptr %s to ptr" d va
     | _ -> emitf fc "  %s = add %s %s, 0" d ta va
   end
   else
     match a.oty, t with
+    | (TPtr _ | TFunSig _), (TPtr _ | TFunSig _) ->
+      emitf fc "  %s = bitcast ptr %s to ptr" d va
+    | (TInt 64 | TUint 64), (TPtr _ | TFunSig _) ->
+      emitf fc "  %s = inttoptr i64 %s to ptr" d va
+    | (TPtr _ | TFunSig _), (TInt 64 | TUint 64) ->
+      emitf fc "  %s = ptrtoint ptr %s to i64" d va
     | _, TBool when int_like a.oty ->
       (* 整数/bool/char -> bool：非 0 为 true *)
       emitf fc "  %s = icmp ne %s %s, 0" d ta va
@@ -510,7 +583,7 @@ let gen_cast fc d (a : operand) (t : zty) =
         else emitf fc "  %s = sext %s %s to %s" d ta va tb
       end
       else emitf fc "  %s = trunc %s %s to %s" d ta va tb
-    | _ -> lerr None "不支持的转换 %s -> %s" ta tb
+    | _ -> lerr None "unsupported conversion %s -> %s" ta tb
 
 (* ---------- output / input ---------- *)
 
@@ -523,7 +596,7 @@ let elem_width (e : zty) : int =
   | TInt 32 | TUint 32 | TFloat 32 -> 4
   | TInt 64 | TUint 64 | TFloat 64 | TString -> 8
   | TInt 128 | TUint 128 | TFloat 128 -> 16
-  | _ -> lerr None "数组/列表不支持该元素类型"
+  | _ -> lerr None "unsupported array/list element type"
 
 (* 元素读出时的扩展方式：有符号整数符号扩展，其余零扩展 *)
 let elem_signed (e : zty) : int =
@@ -622,14 +695,14 @@ let gen_print_val fc (o : operand) =
       end else v
     in
     emitf fc "  call void @zfy_print_i64(i64 %s)" v64
-  | _ -> lerr None "output 不支持该参数类型"
+  | _ -> lerr None "output does not support this argument type"
 
 (* 读入一段输入存入变量槽：runtime 按 delim 分段、解析并写入值槽
    （EOF 或解析失败直接报运行时错误退出）；delim 为空串时用
    默认"换行和空格"字符集（' ' 或 '\n' 任一命中即切分） *)
 let gen_input fc name (ty : zty) delim =
   match Hashtbl.find_opt fc.allocas name with
-  | None -> lerr None "未定义的变量 %s" name
+  | None -> lerr None "undefined variable %s" name
   | Some (addr, _) ->
     let (dp, _) = val_of fc delim in
     let (fname, extra) =
@@ -644,7 +717,16 @@ let gen_input fc name (ty : zty) delim =
       | TFloat 32 -> ("zfy_input_f64", ", i32 1")   (* as_f32：按 4 字节写槽 *)
       | TFloat 64 -> ("zfy_input_f64", ", i32 0")
       | TFloat 128 -> ("zfy_input_f64", ", i32 3")
-      | _ -> lerr None "input 不支持该目标类型"
+      | TErr e ->
+        (* T! 目标：失败不退出，写错误值（code=INPUT, msg=原因）；value 容器按元素 *)
+        (match e with
+         | TInt _ | TUint _ -> ("zfy_input_err_i64", "")
+         | TFloat 16 | TFloat 32 | TFloat 64 -> ("zfy_input_err_f64", "")
+         | TString -> ("zfy_input_err_str", "")
+         | TBool -> ("zfy_input_err_bool", "")
+         | TChar -> ("zfy_input_err_char", "")
+         | _ -> lerr None "input does not support this error-value element type")
+      | _ -> lerr None "input does not support this target type"
     in
     emitf fc "  call void @%s(ptr %s, ptr %s%s)"
       fname addr dp extra
@@ -720,7 +802,7 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
            let r = fresh_r fc in
            emitf fc "  %s = fptosi %s %s to i64" r (ll_ty n.oty) nv;
            r
-         | _ -> lerr None "prec 长度参数类型错误"
+         | _ -> lerr None "invalid prec length parameter type"
        in
        let sp = tostr_ptr fc v in
        emitf fc "  %s = call ptr @zfy_prec_str(ptr %s, i64 %s)" d sp n64)
@@ -733,10 +815,10 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
     in
     if is_agg ret_ty then begin
       match dst with
-      | None -> lerr None "聚合返回值必须被接收"
+      | None -> lerr None "aggregate return value must be captured"
       | Some d ->
         if not (Hashtbl.mem fc.allocas d) then
-          lerr None "接收聚合返回值的必须是变量";
+          lerr None "aggregate return value must be captured into a variable";
         let (addr, _) = Hashtbl.find fc.allocas d in
         emitf fc "  call void %s(ptr %s%s)" callee addr args_str
     end
@@ -749,18 +831,29 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
       | TVoid, _ -> emitf fc "  call void %s(%s)" callee args_str
       | rt, Some d ->
         emitf fc "  %s = call %s %s(%s)" d (ll_ty rt) callee args_str
-      | _ -> lerr None "非 void 返回值必须被使用"
+      | _ -> lerr None "non-void return value must be used"
     end
 
 (* ---------- 用户函数调用（所有权传参） ---------- *)
+
+(* 用户定义函数名集合：MCallOwn 仅对用户函数生效；内建/运行时调用走普通调用 *)
+let user_fns : (string, unit) Hashtbl.t = Hashtbl.create 16
 
 (* MCallOwn 实参：move=true 直接移交指针值；false 由调用方克隆（值语义）。
    frac 借传槽地址（被调方 memcpy 值拷贝） *)
 let own_arg fc (o : operand) (mv : bool) : string * string =
   match o.oty with
   | TFrac _ ->
-    let (p, t) = ptr_of fc o in
-    (t, p)
+    let (p, _) = ptr_of fc o in
+    ("ptr", p)
+  | TErr _ ->
+    (* 错误值：借传槽地址（被调方 memcpy 接管，值语义） *)
+    let (p, _) = ptr_of fc o in
+    ("ptr", p)
+  | TStruct _ ->
+    (* struct 始终借传槽地址：被调方深拷贝接管（值语义），调用方槽保持不变 *)
+    let (p, _) = ptr_of fc o in
+    ("ptr", p)
   | TString ->
     let (v, t) = val_of fc o in
     if mv then (t, v)
@@ -779,7 +872,7 @@ let own_arg fc (o : operand) (mv : bool) : string * string =
       emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" r v is_str;
       (t, r)
     end
-  | _ -> val_of fc o
+  | _ -> let (v, t) = val_of fc o in (t, v)
 
 let gen_call_own fc dst name (args : (operand * bool) list) (ret_ty : zty)
     (clears : (string * zty) list) =
@@ -791,10 +884,10 @@ let gen_call_own fc dst name (args : (operand * bool) list) (ret_ty : zty)
   in
   if is_agg ret_ty then begin
     match dst with
-    | None -> lerr None "聚合返回值必须被接收"
+    | None -> lerr None "aggregate return value must be captured"
     | Some d ->
       if not (Hashtbl.mem fc.allocas d) then
-        lerr None "接收聚合返回值的必须是变量";
+        lerr None "aggregate return value must be captured into a variable";
       let (addr, _) = Hashtbl.find fc.allocas d in
       emitf fc "  call void %s(ptr %s%s)" callee addr args_str
   end
@@ -807,7 +900,7 @@ let gen_call_own fc dst name (args : (operand * bool) list) (ret_ty : zty)
     | TVoid, _ -> emitf fc "  call void %s(%s)" callee args_str
     | rt, Some d ->
       emitf fc "  %s = call %s %s(%s)" d (ll_ty rt) callee args_str
-    | _ -> lerr None "非 void 返回值必须被使用"
+    | _ -> lerr None "non-void return value must be used"
   end;
   (* move 的变量实参：调用完成后清槽（所有权已移交，防 RAII 双释放） *)
   List.iter
@@ -817,6 +910,60 @@ let gen_call_own fc dst name (args : (operand * bool) list) (ret_ty : zty)
     clears
 
 (* ---------- 指令生成 ---------- *)
+
+(* ---------- struct 字段访问辅助 ---------- *)
+
+(* 按字段序号链逐级 GEP（LLVM 布局与 hir 手算 C 布局一致） *)
+let rec gen_field_path fc (p : string) (ty : zty) (idxs : int list) : string =
+  match idxs with
+  | [] -> p
+  | i :: rest ->
+    let s =
+      match ty with
+      | TStruct s -> s
+      | _ -> lerr None "field access target is not a struct"
+    in
+    let fp = gen_gep fc p (ll_ty ty) i in
+    let fty =
+      match find_struct fc.g s with
+      | Some sd ->
+        (match List.nth_opt sd.sfields i with
+         | Some (_, ft) -> ft
+         | None -> lerr None "struct %s has no field index %d" s i)
+      | None -> lerr None "undefined struct %s" s
+    in
+    gen_field_path fc fp fty rest
+
+(* 字段写入（值语义：深拷贝新值；free_old 时先释放旧资源） *)
+let gen_field_store ~(free_old : bool) fc (fp : string) (v : operand) : unit =
+  match v.oty with
+  | TString ->
+    if free_old then begin
+      let old = fresh_r fc in
+      emitf fc "  %s = load ptr, ptr %s" old fp;
+      emitf fc "  call void @zfy_free_str(ptr %s)" old
+    end;
+    let (sv, _) = val_of fc v in
+    let r = fresh_r fc in
+    emitf fc "  %s = call ptr @zfy_strdup(ptr %s)" r sv;
+    emitf fc "  store ptr %s, ptr %s" r fp
+  | TArray _ | TList _ ->
+    let fe = (match v.oty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
+    if free_old then begin
+      let old = fresh_r fc in
+      emitf fc "  %s = load ptr, ptr %s" old fp;
+      emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" old fe
+    end;
+    let (sv, _) = val_of fc v in
+    let r = fresh_r fc in
+    emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" r sv fe;
+    emitf fc "  store ptr %s, ptr %s" r fp
+  | TStruct s ->
+    let (sp, _) = ptr_of fc v in
+    emitf fc "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" s fp sp
+  | _ ->
+    let (vv, tt) = val_of fc v in
+    emitf fc "  store %s %s, ptr %s" tt vv fp
 
 let gen_instr fc (i : instr) : unit =
   match i with
@@ -861,26 +1008,42 @@ let gen_instr fc (i : instr) : unit =
          (* frac 聚合：memcpy *)
          let (srcp, _) = ptr_of fc v in
          gen_memcpy fc dstp srcp (size_of fc.g ty)
+       | TErr _ ->
+         (* 错误值聚合：memcpy（msg 指针共享但 strdup 泄漏约定下安全；
+         code≠0 时 value 不读，浅拷无悬垂风险） *)
+         let (srcp, _) = ptr_of fc v in
+         gen_memcpy fc dstp srcp (size_of fc.g ty)
+       | TStruct s ->
+         (* 深拷贝 struct：assign 先释放旧资源再逐字段复制 *)
+         let (sp, _) = ptr_of fc v in
+         emitf fc "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" s dstp sp
        | _ ->
          let (v', t) = val_of fc v in
          let tt = ll_ty ty in
-         if t <> tt then lerr None "槽位类型 %s 与值类型 %s 不一致" tt t;
+         if t <> tt then lerr None "slot type %s does not match value type %s" tt t;
          emitf fc "  store %s %s, ptr %s" tt v' dstp)
     end
   | MMoveSeq (name, v, ty) ->
-    (* 所有权转移：释放目标旧值后直接接管临时指针（免克隆）。
+    (* 所有权转移：释放目标旧值后直接接管临时（免克隆）。
        临时从 stmt_temps 移除，语句末不会再释放（mir 侧保证）。 *)
     let (dstp, _) = ptr_of fc (operand_of_name name ty) in
-    let ov = fresh_r fc in
-    emitf fc "  %s = load ptr, ptr %s" ov dstp;
     (match ty with
-     | TString -> emitf fc "  call void @zfy_free_str(ptr %s)" ov
+     | TStruct s ->
+       (* struct：释放目标旧资源后槽 memcpy（资源所有权随临时移交） *)
+       emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s dstp;
+       let (sp, _) = ptr_of fc v in
+       gen_memcpy fc dstp sp (size_of fc.g ty)
      | _ ->
-       let fe = (match ty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
-       emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" ov fe);
-    let (sv, st) = val_of fc v in
-    if st <> "ptr" then lerr None "move 目标槽类型 %s 非法" st;
-    emitf fc "  store ptr %s, ptr %s" sv dstp
+       let ov = fresh_r fc in
+       emitf fc "  %s = load ptr, ptr %s" ov dstp;
+       (match ty with
+        | TString -> emitf fc "  call void @zfy_free_str(ptr %s)" ov
+        | _ ->
+          let fe = (match ty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
+          emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" ov fe);
+       let (sv, st) = val_of fc v in
+       if st <> "ptr" then lerr None "invalid move target slot type %s" st;
+       emitf fc "  store ptr %s, ptr %s" sv dstp)
   | MClear (name, ty) ->
     (* move 后清槽：资源所有权已移交，置空防 RAII 双释放 *)
     let (dstp, _) = ptr_of fc (operand_of_name name ty) in
@@ -911,38 +1074,206 @@ let gen_instr fc (i : instr) : unit =
           Hashtbl.replace fc.regs d' d'
         | _ -> ()))
   | MCallOwn (d, name, args, ret, clears) ->
-    (match d with
-     | Some d' when is_agg ret ->
-       let addr = fresh_r fc in
-       emitf_entry fc "  %s = alloca %s" addr (ll_ty ret);
-       Hashtbl.replace fc.allocas d' (addr, ret);
-       gen_call_own fc (Some d') name args ret clears
-     | _ ->
-       gen_call_own fc d name args ret clears;
-       (match d with
-        | Some d' when ret <> TVoid ->
-          Hashtbl.replace fc.regs d' d'
-        | _ -> ()))
-  | MThrow v ->
-    let (vv, _) = val_of fc v in
-    emitf fc "  call void @zfy_throw(ptr %s)" vv
-  | MTryFrame name ->
-    emitf_entry fc "  %s = alloca [512 x i8], align 16" name
-  | MTrySetup (res, frame) ->
+    if Hashtbl.mem user_fns name || name = "main" then begin
+      (match d with
+       | Some d' when is_agg ret ->
+         let addr = fresh_r fc in
+         emitf_entry fc "  %s = alloca %s" addr (ll_ty ret);
+         Hashtbl.replace fc.allocas d' (addr, ret);
+         gen_call_own fc (Some d') name args ret clears
+       | _ ->
+         gen_call_own fc d name args ret clears;
+         (match d with
+          | Some d' when ret <> TVoid ->
+            Hashtbl.replace fc.regs d' d'
+          | _ -> ()))
+    end else begin
+      (* 内建/运行时调用：无所有权语义，退化为普通调用 *)
+      let plain = List.map fst args in
+      (match d with
+       | Some d' when is_agg ret ->
+         let addr = fresh_r fc in
+         emitf_entry fc "  %s = alloca %s" addr (ll_ty ret);
+         Hashtbl.replace fc.allocas d' (addr, ret);
+         gen_call fc (Some d') name plain ret
+       | _ ->
+         gen_call fc d name plain ret;
+         (match d with
+          | Some d' when ret <> TVoid ->
+            Hashtbl.replace fc.regs d' d'
+          | _ -> ()))
+    end
+  | MErrNew (d, ty, code, msg) ->
+    (* fail(code, msg)：错误值槽清零后写 code/msg（value 保持 0 = 元素零值，
+       误读安全）；msg strdup 一份永不释放（有意的最小泄漏，免生命周期管理） *)
+    let addr = fresh_r fc in
+    emitf_entry fc "  %s = alloca %s" addr (ll_ty ty);
+    Hashtbl.replace fc.allocas d (addr, ty);
+    emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr;
+    let cp = gen_gep fc addr (ll_ty ty) 0 in
+    let (cv, ct) = val_of fc code in
+    if ct <> "i32" then lerr None "fail's code must be i32";
+    emitf fc "  store i32 %s, ptr %s" cv cp;
+    let mp = gen_gep fc addr (ll_ty ty) 1 in
+    let (mv, _) = val_of fc msg in
     let r = fresh_r fc in
-    emitf fc "  %s = call i32 @zfy_try_setup(ptr %s) returns_twice" r frame;
-    let b = fresh_r fc in
-    emitf fc "  %s = icmp ne i32 %s, 0" b r;
-    Hashtbl.replace fc.regs res b
-  | MTryLeave ->
-    emitf fc "  call void @zfy_try_leave()"
-  | MTryMsg (name, _ty) ->
-    (match Hashtbl.find_opt fc.allocas name with
-     | Some (addr, _) ->
+    emitf fc "  %s = call ptr @zfy_strdup(ptr %s)" r mv;
+    emitf fc "  store ptr %s, ptr %s" r mp
+  | MErrOk (d, ty, v) ->
+    (* 成功包装：错误值槽清零（code=0, msg=null）后写 value 字段。
+       string 元素 strdup 深拷贝（值语义）；标量按容器宽度转换 *)
+    let addr = fresh_r fc in
+    emitf_entry fc "  %s = alloca %s" addr (ll_ty ty);
+    Hashtbl.replace fc.allocas d (addr, ty);
+    emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr;
+    let vp = gen_gep fc addr (ll_ty ty) 2 in
+    let elem = (match ty with TErr e -> e | _ -> lerr None "MErrOk type error: %s" (Hir.pp_zty ty)) in
+    (match elem with
+     | TString ->
+       let (sv, _) = val_of fc v in
        let r = fresh_r fc in
-       emitf fc "  %s = call ptr @zfy_try_msg()" r;
-       emitf fc "  store ptr %s, ptr %s" r addr
-     | None -> lerr None "未定义的变量 %s" name)
+       emitf fc "  %s = call ptr @zfy_strdup(ptr %s)" r sv;
+       emitf fc "  store ptr %s, ptr %s" r vp
+     | TPtr _ ->
+       let (pv, pt) = val_of fc v in
+       emitf fc "  store %s %s, ptr %s" pt pv vp
+     | TFloat 64 ->
+       let (fv, ft) = val_of fc v in
+       emitf fc "  store %s %s, ptr %s" ft fv vp
+     | TFloat _ ->
+       let (fv, ft) = val_of fc v in
+       let d64 = fresh_r fc in
+       emitf fc "  %s = fpext %s %s to double" d64 ft fv;
+       emitf fc "  store double %s, ptr %s" d64 vp
+     | TBool ->
+       let (bv, _) = val_of fc v in
+       let z = fresh_r fc in
+       emitf fc "  %s = zext i1 %s to i64" z bv;
+       emitf fc "  store i64 %s, ptr %s" z vp
+     | TChar ->
+       let (cv2, _) = val_of fc v in
+       let z = fresh_r fc in
+       emitf fc "  %s = zext i8 %s to i64" z cv2;
+       emitf fc "  store i64 %s, ptr %s" z vp
+     | TUint _ ->
+       let (iv, it) = val_of fc v in
+       let z =
+         if it = "i64" then iv
+         else begin
+           let r = fresh_r fc in
+           emitf fc "  %s = zext %s %s to i64" r it iv;
+           r
+         end
+       in
+       emitf fc "  store i64 %s, ptr %s" z vp
+     | TInt _ ->
+       let (iv, it) = val_of fc v in
+       let z =
+         if it = "i64" then iv
+         else begin
+           let r = fresh_r fc in
+           emitf fc "  %s = sext %s %s to i64" r it iv;
+           r
+         end
+       in
+       emitf fc "  store i64 %s, ptr %s" z vp
+     | _ -> lerr None "invalid error value element type")
+  | MErrIsOk (d, slot, ty) ->
+    (* 判定成功：code == 0 *)
+    let (sp, _) = ptr_of fc slot in
+    let cp = gen_gep fc sp (ll_ty ty) 0 in
+    let c = fresh_r fc in
+    emitf fc "  %s = load i32, ptr %s" c cp;
+    let r = fresh_r fc in
+    emitf fc "  %s = icmp eq i32 %s, 0" r c;
+    Hashtbl.replace fc.regs d r
+  | MErrValue (d, slot, ty) ->
+    (* 取成功值：load value 字段并按元素类型还原（窄整数截断、
+       浮点 fptrunc、string/指针 inttoptr 由容器类型直接匹配） *)
+    let (sp, _) = ptr_of fc slot in
+    let vp = gen_gep fc sp (ll_ty ty) 2 in
+    let elem = (match ty with TErr e -> e | _ -> lerr None "MErrValue type error") in
+    (match elem with
+     | TString | TPtr _ ->
+       let r = fresh_r fc in
+       emitf fc "  %s = load ptr, ptr %s" r vp;
+       Hashtbl.replace fc.regs d r
+     | TFloat 64 ->
+       let r = fresh_r fc in
+       emitf fc "  %s = load double, ptr %s" r vp;
+       Hashtbl.replace fc.regs d r
+     | TFloat _ ->
+       let d64 = fresh_r fc in
+       emitf fc "  %s = load double, ptr %s" d64 vp;
+       let r = fresh_r fc in
+       emitf fc "  %s = fptrunc double %s to %s" r d64 (ll_ty elem);
+       Hashtbl.replace fc.regs d r
+     | TBool ->
+       let raw = fresh_r fc in
+       emitf fc "  %s = load i64, ptr %s" raw vp;
+       let r = fresh_r fc in
+       emitf fc "  %s = trunc i64 %s to i1" r raw;
+       Hashtbl.replace fc.regs d r
+     | TChar ->
+       let raw = fresh_r fc in
+       emitf fc "  %s = load i64, ptr %s" raw vp;
+       let r = fresh_r fc in
+       emitf fc "  %s = trunc i64 %s to i8" r raw;
+       Hashtbl.replace fc.regs d r
+     | TUint w ->
+       let raw = fresh_r fc in
+       emitf fc "  %s = load i64, ptr %s" raw vp;
+       let r =
+         if w < 64 then begin
+           let t = fresh_r fc in
+           emitf fc "  %s = trunc i64 %s to i%d" t raw w;
+           t
+         end else raw
+       in
+       Hashtbl.replace fc.regs d r
+     | TInt w ->
+       let raw = fresh_r fc in
+       emitf fc "  %s = load i64, ptr %s" raw vp;
+       let r =
+         if w < 64 then begin
+           let t = fresh_r fc in
+           emitf fc "  %s = trunc i64 %s to i%d" t raw w;
+           t
+         end else raw
+       in
+       Hashtbl.replace fc.regs d r
+     | _ -> lerr None "invalid error value element type")
+  | MErrFillErr (errslot, v, ty) ->
+    (* TErr 值 → Err struct 槽：拷 code/msg 两字段（Err = { i32 code; ptr msg }） *)
+    let (ep, _) = ptr_of fc (operand_of_name errslot (TStruct "Err")) in
+    let (sp, _) = ptr_of fc v in
+    let cp = gen_gep fc sp (ll_ty ty) 0 in
+    let c = fresh_r fc in
+    emitf fc "  %s = load i32, ptr %s" c cp;
+    let ecp = gen_gep fc ep "%struct.Err" 0 in
+    emitf fc "  store i32 %s, ptr %s" c ecp;
+    let mp = gen_gep fc sp (ll_ty ty) 1 in
+    let m = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" m mp;
+    let emp = gen_gep fc ep "%struct.Err" 1 in
+    emitf fc "  store ptr %s, ptr %s" m emp
+  | MErrFillOut (v, ty) ->
+    (* a? 失败路径：错误值 memcpy 到 sret 返回槽 %out（随后 TRet None → ret void） *)
+    let (sp, _) = ptr_of fc v in
+    gen_memcpy fc "%out" sp (size_of fc.g ty)
+  | MPanic (code, msg) ->
+    (* panic：调 zfy_panic（不可恢复：先调 handler 再退出进程）；
+       后继由 mir 置 TUnreachable *)
+    let cv =
+      match code with
+      | Some o ->
+        let (v, t) = val_of fc o in
+        if t <> "i32" then lerr None "panic's code must be i32";
+        v
+      | None -> "0"
+    in
+    let (mv, _) = val_of fc msg in
+    emitf fc "  call void @zfy_panic(i32 %s, ptr %s)" cv mv
   | MAlloca (name, ty) ->
     if String.length name > 0 && name.[0] = '@' then begin
       (* 顶层变量槽：模块级 global 定义（零初始化即 zfy 零值），去重 *)
@@ -979,12 +1310,12 @@ let gen_instr fc (i : instr) : unit =
     let (dv, dt) = val_of fc den in
     emitf fc "  store %s %s, ptr %s" dt dv dp
   | MNorm (name, ty) ->
-    (* 非 unreduced frac 槽存入后自动约分 *)
-    let elem = (match ty with TFrac e -> e | _ -> lerr None "norm 类型错误") in
+    (* 非 unred frac 槽存入后自动约分 *)
+    let elem = (match ty with TFrac e -> e | _ -> lerr None "norm type error") in
     (match Hashtbl.find_opt fc.allocas name with
      | Some (p, _) ->
        emitf fc "  call void @zfy_frac_norm_%s(ptr %s)" (Hir.suffix_of elem) p
-     | None -> lerr None "未定义的变量 %s" name)
+     | None -> lerr None "undefined variable %s" name)
   | MSeqRemove (name, elem, idx, is_list) ->
     (* remove：数组=槽位填零值（string 元素先释放旧串）；列表=删除并左移，长度-1 *)
     let (seqp, _) = val_of fc (operand_of_name name (TList (TInt 64))) in
@@ -1004,7 +1335,7 @@ let gen_instr fc (i : instr) : unit =
     let opn =
       match bop with
       | BAdd -> 0 | BSub -> 1 | BMul -> 2 | BDiv -> 3 | BMod -> 4
-      | _ -> lerr None "切片复合赋值不支持的运算"
+      | _ -> lerr None "unsupported augmented-assignment operation on slices"
     in
     let width = elem_width elem in
     let sgn = elem_signed elem in
@@ -1043,7 +1374,7 @@ let gen_instr fc (i : instr) : unit =
           emitf fc "  %s = zext i64 %s to i128" z c;
           z
         end
-      | _ -> lerr None "切片复合赋值不支持的元素类型"
+      | _ -> lerr None "unsupported element type for slice augmented assignment"
     in
     emitf fc "  store i128 %s, ptr %s" z bits;
     emitf fc
@@ -1052,11 +1383,11 @@ let gen_instr fc (i : instr) : unit =
   | MReduce (root, ty, cnt, start) ->
     (match Hashtbl.find_opt fc.allocas root with
      | Some (p, _) ->
-       let elem = (match ty with TFrac e -> e | _ -> lerr None "reduce 类型错误") in
+       let elem = (match ty with TFrac e -> e | _ -> lerr None "reduce type error") in
        let callee = Printf.sprintf "@zfy_frac_reduce_%s" (Hir.suffix_of elem) in
        let (cv, _) = val_of fc cnt and (sv, _) = val_of fc start in
        emitf fc "  call void %s(ptr %s, i64 %s, i64 %s)" callee p cv sv
-     | None -> lerr None "未定义的变量 %s" root)
+     | None -> lerr None "undefined variable %s" root)
   | MPrintStr s ->
     let p = str_value fc s in
     emitf fc "  call void @zfy_print_str(ptr %s)" p
@@ -1082,19 +1413,23 @@ let gen_instr fc (i : instr) : unit =
           emitf fc "  %s = load ptr, ptr %s" sp addr;
           emitf fc "  call void @zfy_seq_free(ptr %s, i8 0)" sp;
           emitf fc "  store ptr null, ptr %s" addr
+        | TStruct s ->
+          (* struct：释放内含堆资源后清零槽（防重复释放） *)
+          emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s addr;
+          emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr
         | _ -> ())
-     | None -> lerr None "未定义的变量 %s" name)
+     | None -> lerr None "undefined variable %s" name)
   | MFreeTemp name ->
     (* 语句末释放临时堆串（寄存器中持有 malloc 指针） *)
     (match Hashtbl.find_opt fc.regs name with
      | Some v -> emitf fc "  call void @zfy_free_str(ptr %s)" v
-     | None -> lerr None "未定义的临时 %s" name)
+     | None -> lerr None "undefined temp %s" name)
   | MFreeSeqTemp (name, is_str) ->
     (* 语句末释放临时 seq（切片结果等） *)
     (match Hashtbl.find_opt fc.regs name with
      | Some v ->
        emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" v (if is_str then 1 else 0)
-     | None -> lerr None "未定义的临时 %s" name)
+     | None -> lerr None "undefined temp %s" name)
   | MSeqAlloc (name, elem, len, is_list) ->
     (* 分配数组/列表：数组 len=容量=长度；列表空起步、初始容量 8（不够自动扩长） *)
     let (slotp, _) = ptr_of fc (operand_of_name name (TList (TInt 64))) in
@@ -1194,6 +1529,152 @@ let gen_instr fc (i : instr) : unit =
     emitf fc "  %s = call ptr @zfy_seq_slice(ptr %s, i64 %s, i64 %s, i64 %s, i8 %d)"
       r sv av bv stv (if is_str then 1 else 0);
     Hashtbl.replace fc.regs d r
+  | MStructNew (d, ty, fields) ->
+    (* struct 构造：聚合槽清零后逐字段写入（槽已清零，无需释放旧值；
+       缺省字段保持零值位模式） *)
+    let addr = fresh_r fc in
+    emitf_entry fc "  %s = alloca %s" addr (ll_ty ty);
+    Hashtbl.replace fc.allocas d (addr, ty);
+    emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr;
+    List.iter
+      (fun (idx, v) ->
+        let fp = gen_gep fc addr (ll_ty ty) idx in
+        gen_field_store ~free_old:false fc fp v)
+      fields
+  | MFieldGet (d, root, rootty, idxs, fty) ->
+    (* 字段读取：GEP 链直达最终字段。标量/string/seq 字段 load 值（借用，
+       赋值时才深拷贝）；嵌套 struct 字段深拷贝到目标槽（值语义）。
+       根为指针（自动解引用 r.x）时基址 = load 出的指针值，首层按 struct 步进 *)
+    let (rp, base_ty) =
+      match rootty with
+      | TStruct _ -> (fst (ptr_of fc root), rootty)
+      | TPtr (TStruct s) -> (fst (val_of fc root), TStruct s)
+      | _ -> lerr None "invalid root type for field access"
+    in
+    let fp = gen_field_path fc rp base_ty idxs in
+    (match fty with
+     | TStruct s ->
+       let addr = fresh_r fc in
+       emitf_entry fc "  %s = alloca %s" addr (ll_ty fty);
+       emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty fty) addr;
+       Hashtbl.replace fc.allocas d (addr, fty);
+       emitf fc "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" s addr fp
+     | TString | TArray _ | TList _ ->
+       let r = fresh_r fc in
+       emitf fc "  %s = load ptr, ptr %s" r fp;
+       Hashtbl.replace fc.regs d r
+     | _ ->
+       let r = fresh_r fc in
+       emitf fc "  %s = load %s, ptr %s" r (ll_ty fty) fp;
+       Hashtbl.replace fc.regs d r)
+  | MFieldStore (root, rootty, idxs, v) ->
+    (* 字段写入：GEP 链直达字段，深拷贝新值 + 释放旧值（指针根自动解引用） *)
+    let (rp, base_ty) =
+      match rootty with
+      | TStruct _ -> (fst (ptr_of fc root), rootty)
+      | TPtr (TStruct s) -> (fst (val_of fc root), TStruct s)
+      | _ -> lerr None "invalid root type for field access"
+    in
+    let fp = gen_field_path fc rp base_ty idxs in
+    gen_field_store ~free_old:true fc fp v
+  | MEmptySeq (d, ty) ->
+    (* 数组/列表字段缺省分配：定长数组按声明长度分配全零槽；
+       列表空起步（长度 0、容量 8，随 push 扩容） *)
+    let (elem, len, cap) =
+      match ty with
+      | TArray (et, n) -> (et, Int64.of_int n, Int64.of_int n)
+      | TList et -> (et, 0L, 8L)
+      | _ -> lerr None "MEmptySeq type is not an array/list"
+    in
+    let r = fresh_r fc in
+    emitf fc "  %s = call ptr @zfy_seq_new(i64 %Ld, i64 %Ld, i32 %d)" r len cap
+      (elem_width elem);
+    Hashtbl.replace fc.regs d r
+  | MAddrOf (d, slot) ->
+    (* 取地址：dst = 变量槽地址（全局 @g.x 与局部 %v.x 都登记在 allocas） *)
+    (match Hashtbl.find_opt fc.allocas slot with
+     | Some (addr, _) -> Hashtbl.replace fc.regs d addr
+     | None -> lerr None "address-of target is undefined: %s" slot)
+  | MLoadK (d, src, ty) ->
+    (* 解引用读：src 求值为指针，load 目标类型 *)
+    let (pv, _) = val_of fc src in
+    let r = fresh_r fc in
+    emitf fc "  %s = load %s, ptr %s" r (ll_ty ty) pv;
+    Hashtbl.replace fc.regs d r
+  | MStoreK (addr, ty, v) ->
+    (* 解引用写：addr 求值为指针，store 值（仅标量/指针目标） *)
+    let (pv, _) = val_of fc addr in
+    let (vv, vt) = val_of fc v in
+    let tt = ll_ty ty in
+    if vt <> tt then lerr None "dereference-assignment type mismatch %s vs %s" tt vt;
+    emitf fc "  store %s %s, ptr %s" tt vv pv
+  | MFieldAddr (d, root, rootty, idxs, _) ->
+    (* 字段地址：根为 struct 槽（基址=槽地址）或指针值（基址=load 出的指针） *)
+    let (rp, base_ty) =
+      match rootty with
+      | TStruct _ -> (fst (ptr_of fc root), rootty)
+      | TPtr (TStruct s) -> (fst (val_of fc root), TStruct s)
+      | _ -> lerr None "invalid root type for field address"
+    in
+    let fp = gen_field_path fc rp base_ty idxs in
+    Hashtbl.replace fc.regs d fp
+  | MElemAddr (d, base, idx, elem) ->
+    (* 元素地址（裸指针，无越界检查）：&a[i] 或 &p[i]。
+       基为数组/列表槽（值=seq 指针，再取 data 字段）或指针值（直接指向元素） *)
+    let (bp, _) = val_of fc base in
+    let (iv, _) = val_of fc idx in
+    let dp =
+      match base.oty with
+      | TArray _ | TList _ ->
+        (* bp = seq 结构指针（槽值），load 取 data 字段（第 0 字段） *)
+        let dp = fresh_r fc in
+        emitf fc "  %s = load ptr, ptr %s" dp bp;
+        dp
+      | TPtr _ -> bp
+      | _ -> lerr None "invalid root type for element address"
+    in
+    let off = fresh_r fc in
+    emitf fc "  %s = mul i64 %s, %d" off iv (elem_width elem);
+    let ep = fresh_r fc in
+    emitf fc "  %s = getelementptr inbounds i8, ptr %s, i64 %s" ep dp off;
+    Hashtbl.replace fc.regs d ep
+  | MIndirectCall (d, f, args, ret) ->
+    (* 函数指针间接调用：call <ret> ptr %f(<args>)（实参标量语义借传） *)
+    let (fv, _) = val_of fc f in
+    let targs =
+      List.map
+        (fun (o : operand) ->
+          if is_agg o.oty then
+            let (p, _) = ptr_of fc o in
+            ("ptr", p)
+          else
+            let (v, t) = val_of fc o in
+            (t, v))
+        args
+    in
+    let args_str =
+      String.concat ", " (List.map (fun (t, v) -> t ^ " " ^ v) targs)
+    in
+    (match d with
+     | Some d' ->
+       let r = fresh_r fc in
+       emitf fc "  %s = call %s %s(%s)" r (ll_ty ret) fv args_str;
+       Hashtbl.replace fc.regs d' r
+     | None -> emitf fc "  call void %s(%s)" fv args_str)
+  | MFunAddr (d, name) ->
+    (* 函数入口地址：寄存器表直接持有 LLVM 符号文本（@名） *)
+    Hashtbl.replace fc.regs d ("@" ^ name)
+  | MFreeStructTemp (name, ty) ->
+    (* 语句末释放临时 struct 槽持有的资源（槽本身在栈上，无需释放） *)
+    (match Hashtbl.find_opt fc.allocas name with
+     | Some (addr, _) ->
+       let s =
+         match ty with
+         | TStruct s -> s
+         | _ -> lerr None "freed temp type is not a struct"
+       in
+       emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s addr
+     | None -> lerr None "undefined temp %s" name)
 
 (* ---------- 终结符 ---------- *)
 
@@ -1206,7 +1687,8 @@ let zero_value g (t : zty) : string =
   | TBool -> "false"
   | TChar -> "0"
   | TString -> "null"
-  | _ -> lerr None "该类型不能作为返回默认值"
+  | TPtr _ | TFunSig _ -> "null"
+  | _ -> lerr None "type cannot be a return default value"
 
 let gen_term fc (t : term) =
   match t with
@@ -1252,21 +1734,18 @@ let gen_fn g (f : mfn) : string =
       fret = f.mret; nl = 0 }
   in
   let ret_ll = if is_agg f.mret then "void" else ll_ty f.mret in
-  let sret_part =
-    if is_agg f.mret then Printf.sprintf "ptr sret(%s) %%out, " (ll_ty f.mret)
-    else ""
-  in
   let params_ll =
     String.concat ", "
-      (List.map
-         (fun (n, t) ->
-           if is_agg t then Printf.sprintf "ptr %%%s" n
-           else Printf.sprintf "%s %%%s" (ll_ty t) n)
-         f.mparams)
+      ((if is_agg f.mret then [ Printf.sprintf "ptr sret(%s) %%out" (ll_ty f.mret) ] else [])
+       @ List.map
+           (fun (n, t) ->
+             if is_agg t then Printf.sprintf "ptr %%%s" n
+             else Printf.sprintf "%s %%%s" (ll_ty t) n)
+           f.mparams)
   in
   let fname = if f.mname = "main" then "@zfy.main" else "@" ^ f.mname in
   Buffer.add_string buf
-    (Printf.sprintf "define %s %s(%s%s) {\n" ret_ll fname sret_part params_ll);
+    (Printf.sprintf "define %s %s(%s) {\n" ret_ll fname params_ll);
   (* 参数落槽（所有权传参约定：string/数组/列表实参的指针值即资源本体，
      直接接管进本地槽，不再克隆——调用方对非 move 实参已先行克隆） *)
   List.iter
@@ -1275,10 +1754,19 @@ let gen_fn g (f : mfn) : string =
       emitf fc "  %s = alloca %s" addr (ll_ty t);
       Hashtbl.replace fc.allocas n (addr, t);
       if is_agg t then begin
-        (* frac：借传槽地址，值拷贝（memcpy 语义） *)
-        let r = fresh_r fc in
-        emitf fc "  %s = load %s, ptr %%%s" r (ll_ty t) n;
-        emitf fc "  store %s %s, ptr %s" (ll_ty t) r addr
+        match t with
+        | TStruct s ->
+          (* struct：借传槽地址，深拷贝接管（值语义；先清零防释放未初始化垃圾） *)
+          emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty t) addr;
+          emitf fc "  call void @zfy_struct_assign_%s(ptr %s, ptr %%%s)" s addr n
+        | TErr _ ->
+          (* 错误值：借传槽地址，memcpy 值拷贝（msg strdup 泄漏约定，无 RAII） *)
+          gen_memcpy fc addr (Printf.sprintf "%%%s" n) (size_of fc.g t)
+        | _ ->
+          (* frac：借传槽地址，值拷贝（memcpy 语义，无堆资源） *)
+          let r = fresh_r fc in
+          emitf fc "  %s = load %s, ptr %%%s" r (ll_ty t) n;
+          emitf fc "  store %s %s, ptr %s" (ll_ty t) r addr
       end
       else if t = TString then
         (* 所有权接管：直接持有调用方移交的堆串 *)
@@ -1308,15 +1796,109 @@ let gen_fn g (f : mfn) : string =
 
 (* ---------- 模块生成 ---------- *)
 
+(* struct LLVM 类型定义：直接按字段类型列表定义——LLVM 自然布局
+   （成员按自然对齐放置，总大小补齐到最大成员对齐）与 hir 手算 C 布局
+   一致；packed 用 <{ }>（紧排无填充），与手算 packed 布局一致。
+   故字段 GEP 的元素序号即字段序号（勿再插入显式 padding 元素——
+   那会使 GEP 字段序号与 LLVM 元素序号错位，见 w-006 段错误）。 *)
+let gen_struct_type_def (_ : gctx) (sd : sdef) : string =
+  let body =
+    String.concat ", " (List.map (fun (_, fty) -> ll_ty fty) sd.sfields)
+  in
+  if sd.spacked then
+    Printf.sprintf "%s = type <{ %s }>\n" (struct_ty_name sd.sname) body
+  else
+    Printf.sprintf "%s = type { %s }\n" (struct_ty_name sd.sname) body
+
+(* 生成 @zfy_struct_free_<名>(ptr)：逐字段释放堆资源
+   （string/seq/嵌套 struct 递归；运行时 free 函数均 NULL 安全） *)
+let gen_struct_free_fn (sd : sdef) : string =
+  let b = Buffer.create 128 in
+  let emit : 'a. ('a, unit, string, unit) format4 -> 'a =
+    fun fmt -> Printf.ksprintf (fun s -> Buffer.add_string b (s ^ "\n")) fmt
+  in
+  let sn = struct_ty_name sd.sname in
+  emit "define void @zfy_struct_free_%s(ptr %%p) {" sd.sname;
+  List.iteri
+    (fun i (_, fty) ->
+      match fty with
+      | TString ->
+        let fp = Printf.sprintf "%%f%d" i and v = Printf.sprintf "%%v%d" i in
+        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+        emit "  %s = load ptr, ptr %s" v fp;
+        emit "  call void @zfy_free_str(ptr %s)" v
+      | TArray _ | TList _ ->
+        let is_str =
+          (match fty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
+        let fp = Printf.sprintf "%%f%d" i and v = Printf.sprintf "%%v%d" i in
+        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+        emit "  %s = load ptr, ptr %s" v fp;
+        emit "  call void @zfy_seq_free(ptr %s, i8 %d)" v is_str
+      | TStruct s2 ->
+        let fp = Printf.sprintf "%%f%d" i in
+        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+        emit "  call void @zfy_struct_free_%s(ptr %s)" s2 fp
+      | _ -> ())
+    sd.sfields;
+  Buffer.add_string b "  ret void\n}\n";
+  Buffer.contents b
+
+(* 生成 @zfy_struct_assign_<名>(ptr dst, ptr src)：逐字段深拷贝
+   （string strdup / seq clone / 嵌套 struct 递归 assign），先释放 dst 旧资源。
+   运行时 free/strdup/clone 均 NULL 安全，无需判空分支 *)
+let gen_struct_assign_fn (sd : sdef) : string =
+  let b = Buffer.create 256 in
+  let emit : 'a. ('a, unit, string, unit) format4 -> 'a =
+    fun fmt -> Printf.ksprintf (fun s -> Buffer.add_string b (s ^ "\n")) fmt
+  in
+  let sn = struct_ty_name sd.sname in
+  emit "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {" sd.sname;
+  List.iteri
+    (fun i (_, fty) ->
+      let dp = Printf.sprintf "%%d%d" i and sp = Printf.sprintf "%%s%d" i in
+      emit "  %s = getelementptr inbounds %s, ptr %%dst, i32 0, i32 %d" dp sn i;
+      emit "  %s = getelementptr inbounds %s, ptr %%src, i32 0, i32 %d" sp sn i;
+      match fty with
+      | TString ->
+        let old = Printf.sprintf "%%o%d" i in
+        let nv = Printf.sprintf "%%n%d" i in
+        let cp = Printf.sprintf "%%c%d" i in
+        emit "  %s = load ptr, ptr %s" old dp;
+        emit "  call void @zfy_free_str(ptr %s)" old;
+        emit "  %s = load ptr, ptr %s" nv sp;
+        emit "  %s = call ptr @zfy_strdup(ptr %s)" cp nv;
+        emit "  store ptr %s, ptr %s" cp dp
+      | TArray _ | TList _ ->
+        let is_str =
+          (match fty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
+        let old = Printf.sprintf "%%o%d" i in
+        let nv = Printf.sprintf "%%n%d" i in
+        let cp = Printf.sprintf "%%c%d" i in
+        emit "  %s = load ptr, ptr %s" old dp;
+        emit "  call void @zfy_seq_free(ptr %s, i8 %d)" old is_str;
+        emit "  %s = load ptr, ptr %s" nv sp;
+        emit "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" cp nv is_str;
+        emit "  store ptr %s, ptr %s" cp dp
+      | TStruct s2 ->
+        emit "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" s2 dp sp
+      | _ ->
+        let v = Printf.sprintf "%%v%d" i in
+        emit "  %s = load %s, ptr %s" v (ll_ty fty) sp;
+        emit "  store %s %s, ptr %s" (ll_ty fty) v dp)
+    sd.sfields;
+  Buffer.add_string b "  ret void\n}\n";
+  Buffer.contents b
+
 let gen_program (m : mir) : string =
   let g =
-    { mbuf = Buffer.create 512; nstr = 0; globals = Hashtbl.create 16 }
+    { mbuf = Buffer.create 512; nstr = 0; globals = Hashtbl.create 16;
+      structs = m.mstructs }
   in
   (* frac 类型定义：{ 分子, 分母 }（预生成全部后缀，未使用的定义合法） *)
   let frac_defs =
     [ "i8", "i8"; "i16", "i16"; "i32", "i32"; "i64", "i64"; "i128", "i128";
       "u8", "i8"; "u16", "i16"; "u32", "i32"; "u64", "i64"; "u128", "i128";
-      "f32", "float"; "f64", "double" ]
+      "f32", "float"; "f64", "double"; "f128", "x86_fp80" ]
   in
   List.iter
     (fun (suf, ll) ->
@@ -1325,6 +1907,28 @@ let gen_program (m : mir) : string =
     frac_defs;
   (* 数组/列表与类型定义 *)
   Buffer.add_string g.mbuf "%zfy.seq = type { ptr, ptr, i64 }\n";
+  (* 错误值类型定义：{ i32 code; ptr msg; <8 字节 value 容器> }（全部 24 字节，
+     与 C 端 zfy_err 布局一致；预生成全部后缀，未使用的定义合法） *)
+  let err_defs =
+    [ "i8", "i64"; "i16", "i64"; "i32", "i64"; "i64", "i64";
+      "u8", "i64"; "u16", "i64"; "u32", "i64"; "u64", "i64";
+      "f16", "double"; "f32", "double"; "f64", "double";
+      "bool", "i64"; "char", "i64"; "str", "ptr"; "ptr", "ptr" ]
+  in
+  List.iter
+    (fun (suf, vll) ->
+      Buffer.add_string g.mbuf
+        (Printf.sprintf "%%err.%s = type { i32, ptr, %s }\n" suf vll))
+    err_defs;
+  (* struct 类型定义与深拷贝/释放辅助函数（嵌套引用同模块前向合法） *)
+  List.iter
+    (fun sd -> Buffer.add_string g.mbuf (gen_struct_type_def g sd))
+    m.mstructs;
+  List.iter
+    (fun sd ->
+      Buffer.add_string g.mbuf (gen_struct_free_fn sd);
+      Buffer.add_string g.mbuf (gen_struct_assign_fn sd))
+    m.mstructs;
   (* 运行时声明 *)
   Buffer.add_string g.mbuf "declare i64 @strlen(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
@@ -1367,11 +1971,18 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_seq_set_str(ptr, i64, ptr, i8)\n";
   Buffer.add_string g.mbuf "declare void @zfy_seq_get(ptr, i64, ptr, i32, i8)\n";
   Buffer.add_string g.mbuf "declare void @zfy_bounds_fail()\n";
-  (* 异常机制：setjmp/longjmp 异常帧（try 区域外零开销） *)
-  Buffer.add_string g.mbuf "declare i32 @zfy_try_setup(ptr) returns_twice\n";
-  Buffer.add_string g.mbuf "declare void @zfy_try_leave()\n";
-  Buffer.add_string g.mbuf "declare ptr @zfy_try_msg()\n";
-  Buffer.add_string g.mbuf "declare void @zfy_throw(ptr)\n";
+  (* ZEM 错误模型运行时：panic / 错误值构造（sret 写 TErr 聚合） /
+     错误码查找 / T! 输入；sret 参数为首个 ptr（布局由调用方槽决定） *)
+  Buffer.add_string g.mbuf "declare void @zfy_panic(i32, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_set_panic_handler(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_stoi_err(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_stod_err(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_err_find(ptr, ptr, i8, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_err_i64(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_err_f64(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_err_str(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_err_bool(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_err_char(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_seq_free(ptr, i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_seq_clone(ptr, i8)\n";
   (* 字符串操作运行时函数 *)
@@ -1388,7 +1999,7 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare ptr @zfy_seq_slice(ptr, i64, i64, i64, i8)\n";
   (* frac 运行时函数声明（12 后缀 × add/sub/mul/div + 比较 + reduce/print） *)
   let sufs = [ "i8"; "i16"; "i32"; "i64"; "i128"; "u8"; "u16"; "u32"; "u64";
-               "u128"; "f32"; "f64" ] in
+               "u128"; "f32"; "f64"; "f128" ] in
   let ops = [ "add"; "sub"; "mul"; "div"; "eq"; "ne"; "lt"; "gt"; "le"; "ge" ] in
   List.iter
     (fun suf ->
@@ -1419,6 +2030,48 @@ let gen_program (m : mir) : string =
     "declare void @zfy_seq_aug_range(ptr, i64, i64, i64, i32, ptr, i32, i32, i32)\n";
   (* 函数 *)
   let fbuf = Buffer.create 4096 in
+  Hashtbl.reset user_fns;
+  List.iter (fun (f : mfn) -> Hashtbl.replace user_fns f.mname ()) m.mfns;
+  (* extern "C" 函数声明：收集 MCall/MCallOwn 中非本模块定义、非内建运行时
+     的 callee，按实参/返回类型生成 declare（去重，同名首见签名生效） *)
+  let is_rt_name (n : string) =
+    Hashtbl.mem user_fns n || n = "main" || n = "strlen"
+    || String.length n >= 4 && String.sub n 0 4 = "zfy_"
+    || String.length n >= 4 && String.sub n 0 4 = "zfy."
+    || n = "str_len" || n = "zfy.prec"
+  in
+  let decls : (string, string * string) Hashtbl.t = Hashtbl.create 8 in
+  let add_decl name (args : operand list) ret =
+    if not (is_rt_name name) && not (Hashtbl.mem decls name) then begin
+      let atys =
+        List.map
+          (fun (o : operand) ->
+            if is_agg o.oty then "ptr" else ll_ty o.oty)
+          args
+      in
+      let rty = if is_agg ret then "ptr" else ll_ty ret in
+      Hashtbl.replace decls name (rty, String.concat ", " atys)
+    end
+  in
+  List.iter
+    (fun (f : mfn) ->
+      List.iter
+        (fun (b : block) ->
+          List.iter
+            (fun i ->
+              match i with
+              | MCall (_, name, args, ret) -> add_decl name args ret
+              | MCallOwn (_, name, args, ret, _) ->
+                add_decl name (List.map fst args) ret
+              | _ -> ())
+            b.body)
+        f.mblocks)
+    m.mfns;
+  Hashtbl.iter
+    (fun name (rty, atys) ->
+      Buffer.add_string g.mbuf
+        (Printf.sprintf "declare %s @%s(%s)\n" rty name atys))
+    decls;
   let main_ret = ref None in
   List.iter
     (fun (f : mfn) ->
@@ -1435,6 +2088,6 @@ let gen_program (m : mir) : string =
        (Printf.sprintf
           "define i32 @main() {\n  call void @zfy.globals()\n  %%r = call i64 @zfy.main()\n  %%t = trunc i64 %%r to i32\n  ret i32 %%t\n}\n")
    | Some rt ->
-     lerr None "main 的返回类型只能是 void 或 i64，得到 %s" (Hir.pp_zty rt)
+     lerr None "main's return type must be void or i64, got %s" (Hir.pp_zty rt)
    | None -> ());
   Buffer.contents g.mbuf ^ Buffer.contents fbuf

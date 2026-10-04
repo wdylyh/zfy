@@ -24,12 +24,7 @@ foreach ($e in $examples) {
     $fail++
   } else {
     $code = $p.ExitCode
-    if ($name -eq "input_fail_test") {
-      # fail-fast 测试：预期 exit 1 且 stderr 有 runtime error
-      $err = Get-Content "d:\zfy\examples\$name.err" -Raw
-      if ($code -eq 1 -and $err -match "runtime error") { Write-Host "PASS $name (expected fail-fast)" }
-      else { Write-Host "FAIL(exit=$code) $name"; $fail++ }
-    } elseif ($null -eq $code -or $code -ne 0) {
+    if ($null -eq $code -or $code -ne 0) {
       Write-Host "FAIL(exit=$code) $name"
       $fail++
     } else {

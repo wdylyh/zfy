@@ -8,31 +8,31 @@ void main()
     output("")
 
     // ---- 声明必带初值；数组未初始化槽位为零值 ----
-    long int m = 42
+    i64 m = 42
     output("[", m, "]", end='\n')   // 期望 [42]
-    int array n[4] = 1,2
-    m = cast(n[2], long int)             // 未初始化槽位零值 -> 0（跨宽度读也需显式 cast）
+    i32 n[4] = 1,2
+    m = cast(n[2], i64)             // 未初始化槽位零值 -> 0（跨宽度读也需显式 cast）
     output("[", m, "]", end='\n')   // 期望 [0]
-    long int m2 = m + 1
+    i64 m2 = m + 1
     output("[", m2, "]", end='\n')  // 期望 [1]
-    long int m3 = m
+    i64 m3 = m
     output("[", m3, "]", end='\n')  // 期望 [0]
-    m = cast(n[0], long int)             // 恢复为 1
+    m = cast(n[0], i64)             // 恢复为 1
     output("[", m, "]", end='\n')   // 期望 [1]
 
     // ---- cast 显式转换（宽化/窄化/浮点都必须写 cast） ----
-    int a = 100
-    long int b = cast(a, long int)
-    double d = cast(a, double)
+    i32 a = 100
+    i64 b = cast(a, i64)
+    f64 d = cast(a, f64)
     output(b, d, sep=",", end='\n')        // 期望 100,100.000000
-    float f = cast(d, float)
-    output(cast(f, double), end='\n')         // 期望 100.000000（经 double 打印）
-    double dd = 3.99
-    output(cast(dd, int), end='\n')        // 期望 3（向零截断）
-    double dn = -3.99
-    output(cast(dn, int), end='\n')        // 期望 -3（向零截断）
-    long int big = 300
-    output(cast(big, int), end='\n')       // 期望 300（窄化显式）
+    f32 f = cast(d, f32)
+    output(cast(f, f64), end='\n')         // 期望 100.000000（经 f64 打印）
+    f64 dd = 3.99
+    output(cast(dd, i32), end='\n')        // 期望 3（向零截断）
+    f64 dn = -3.99
+    output(cast(dn, i32), end='\n')        // 期望 -3（向零截断）
+    i64 big = 300
+    output(cast(big, i32), end='\n')       // 期望 300（窄化显式）
 
     // ---- RAII：return 路径的释放与所有权转移 ----
     output(pick(true), end='\n')    // 期望 from-var（提前 return，所有权转移）

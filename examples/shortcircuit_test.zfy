@@ -1,9 +1,9 @@
 // and/or 短路求值测试：右边不应被求值
 void main()
-    int array arr[5]
-    for int i = 0, i < 5, i++
+    i32 arr[5]
+    for i32 i = 0, i < 5, i++
         arr[i] = i * 10
-    int idx = 7
+    i32 idx = 7
     // 不短路的话 arr[7] 越界崩溃；短路后右边不求值
     bool a = idx < 5 and arr[idx] > 0
     output("a=", a, end='\n')

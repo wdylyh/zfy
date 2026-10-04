@@ -1,0 +1,135 @@
+// n1 传统多词类型别名 + n2 顶层普通变量声明 冒烟测试
+// 别名映射：short=i8 short int=i16 int=i32 long=i128
+//           ushort=u8 ushort int=u16 uint=u32 ulong=u128
+//           half=f16 float=f32 double=f64 quad=f128（char/bool/string 两种写法相同）
+// 注：long int/long long/ulong int/ulong long 已废止（long 后跟类型词报"类型重复"）
+// 注：frac 仅支持 i8..i128 / u8..u128 / f32 / f64（f16/f128 frac 不支持）
+
+// n2：顶层非 const 全局变量（标量/数组/列表/字符串，带或不带初值）
+int g = 10
+long gbignum
+short garr[3] = 1, 2, 3
+double glst[] = 1.5, 2.5
+string gs = "global"
+uint gu
+
+struct Data
+    short int v = 0
+    uint w = 0
+    double x = 0.0
+
+int sum(short x, i64 y)
+    return cast(x, int) + cast(y, int)
+
+void main()
+    // ① 有符号别名等价性：别名与宽度名同值同宽
+    int a = 7
+    i32 a2 = 7
+    short b = 127
+    i8 b2 = 127
+    short int c = 300
+    i16 c2 = 300
+    i64 d = 4000000000
+    i64 d2 = 4000000000
+    long e = 1234567890123456789
+    i128 e2 = 1234567890123456789
+    output(a == a2, b == b2, c == c2, d == d2, e == e2, sep=',')
+
+    // ② 无符号别名等价性
+    ushort f = 255
+    u8 f2 = 255
+    ushort int g2 = 65535
+    u16 f3 = 65535
+    uint h = 3000000000
+    u32 h2 = 3000000000
+    u64 i = 4000000000
+    u64 i2 = 4000000000
+    ulong j = 1234567890123456789
+    u128 j2 = 1234567890123456789
+    output(f == f2, g2 == f3, h == h2, i == i2, j == j2, sep=',')
+
+    // ③ 浮点别名等价性（half/quad 标量可用；frac 不支持 f16/f128）
+    float k = 1.5
+    f32 k2 = 1.5
+    double l = 2.25
+    f64 l2 = 2.25
+    quad m = 1.5
+    f128 m2 = 1.5
+    half n = 1.0
+    f16 n2 = 1.0
+    output(k == k2, l == l2, m == m2, n == n2, sep=',')
+
+    // ④ frac + 别名组合（约分/不约分；quad 与 f128 等价且都合法）
+    i32 frac r = 6/48
+    output(r, end=' ')                       // 期望 1/8（自动约分）
+    output("")
+    double const frac unred ur = 1.2/4.8
+    output(ur, end=' ')                      // 期望 1.2/4.8（不约分）
+    output("")
+    double const frac rd = 1.2/4.8
+    output(rd)                               // 期望 0.25（约分 1/4）
+    quad const frac unred qb = 1.2/4.8
+    output(qb, end=' ')                      // quad=f128 frac，期望 1.2/4.8
+    output("")
+    f128 const frac qr = 2.4/4.8
+    output(qr)                               // 期望 0.5（约分 1/2）
+
+    // ⑤ 数组/列表用别名
+    short sa[3] = 1, 2, 3
+    sa[1] = 100
+    output(sa[0], sa[1], sa[2], sep=',')     // 期望 1,100,3
+    uint lst[] = 10, 20, 30
+    push(lst, 40)
+    output(lst[0], lst[1], lst[2], lst[3], sep=',')   // 期望 10,20,30,40
+    output(length(lst))                      // 期望 4
+    ulong la[2] = 5, 6
+    output(la[0] + la[1])                    // 期望 11
+
+    // ⑥ struct 字段用别名
+    Data dt = Data(v=1000, w=42, x=1.25)
+    output(dt.v, dt.w, dt.x, sep=',')        // 期望 1000,42,1.250000
+
+    // ⑦ 参数/返回类型用别名
+    output(sum(10, 20))                      // 期望 30
+    ushort x = 100
+    i64 y = 22
+    output(sum(x, y))                        // 期望 122（sum 内 cast 到 int 相加）
+
+    // ⑧ cast 用别名（语句重绑定 + 表达式）
+    double pi = 3.75
+    cast(pi, int)
+    output(pi)                               // 期望 3
+    long big = cast(300, long)
+    output(big)                              // 期望 300
+    uint u = cast(65, uint)
+    output(u)                                // 期望 65
+
+    // ⑨ for 头部用别名
+    for int i = 0, i < 3, i++
+        output(i, end=' ')                   // 期望 0 1 2
+    output("")
+    for ushort int k = 0, k < 2, k++
+        output(k, end=' ')                   // 期望 0 1
+    output("")
+
+    // ⑩ 全局变量：读 / 写 / 增广 / 传参
+    output(g)                                // 期望 10
+    g = 20
+    g += 5
+    output(g)                                // 期望 25
+    output(garr[0], garr[1], garr[2], sep=',')        // 期望 1,2,3
+    garr[2] = 30
+    output(garr[2])                          // 期望 30
+    output(glst[0], glst[1], sep=',')        // 期望 1.500000,2.500000
+    output(length(glst))                     // 期望 2
+    output(gs, end='|')                      // 期望 global|
+    gs = "changed"
+    output(gs)                               // 期望 changed
+    output(gu)                               // 期望 0（零值填充）
+    output(gbignum)                          // 期望 0
+    output(sum(5, cast(g, i64)))             // 全局传参：期望 30
+
+    // ⑪ 全局数组深拷贝语义：局部拷贝修改不影响全局
+    short gcopy[3] = garr
+    gcopy[0] = 99
+    output(garr[0], gcopy[0], sep=',')       // 期望 1,99

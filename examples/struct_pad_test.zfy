@@ -1,0 +1,101 @@
+// struct 字段布局回归（w-006）：4 字节字段后跟 8 字节对齐字段曾因
+// LLVM 类型显式 padding 元素与 GEP 字段序号错位而段错误。
+// 覆盖：前置 padding（i32;string;i32 / i8;f64 / i16;i32;string）、
+// packed 变体、嵌套 struct 前置 4 字节字段、裸声明/读写/整体赋值/传参
+struct Rec
+    i32 id
+    string name
+    i32 v = 5
+
+struct Pad8
+    i8 tag
+    f64 score = 1.5
+
+struct Trio
+    i16 w
+    i32 n
+    string s
+
+struct packed Small
+    i8 tag
+    f64 x
+
+struct Inner
+    i32 key
+    string msg = "im"
+
+struct Outer
+    i32 head
+    Inner body
+    string tail = "end"
+
+void show(Rec r)
+    output(r.id, r.name, r.v)
+
+i64 main()
+    // ① w-006 场景：裸声明 + string 字段读写（此前 segfault）
+    Rec a
+    output(a.id)
+    output(a.name)
+    output(a.v)
+    a.id = 7
+    a.name = "abc"
+    a.v += 3
+    output(a.id, a.name, a.v)
+
+    // ② 位置构造（缺省字段走默认值）+ 整体赋值深拷贝
+    Rec b = Rec(1, "one")
+    Rec c = b
+    c.id = 2
+    c.name = "two"
+    c.v = 9
+    output(b.id, b.name, b.v)
+    output(c.id, c.name, c.v)
+
+    // ③ 传参值语义：函数内拿到的是副本
+    show(b)
+    b.id = 99
+    show(b)
+
+    // ④ i8;f64：7 字节前置 padding
+    Pad8 p
+    output(p.tag)
+    output(p.score)
+    p.tag = 3
+    p.score = 2.25
+    output(p.tag, p.score)
+
+    // ⑤ i16;i32;string：两级前置 padding
+    Trio t
+    output(t.w, t.n, t.s)
+    t.w = 300
+    t.n = 400000
+    t.s = "trio"
+    output(t.w, t.n, t.s)
+
+    // ⑥ packed：紧排（tag@0，x@1），尺寸 9 对齐 1
+    Small h = Small(1, 2.5)
+    output(h.tag)
+    output(h.x)
+    output(sizeof(Small), alignof(Small))
+    h.tag = 5
+    h.x = -1.5
+    output(h.tag, h.x)
+
+    // ⑦ 嵌套：head(i32) 后跟含 padding 的 Inner + string 尾字段
+    Outer o
+    output(o.head)
+    output(o.body.key)
+    output(o.body.msg)
+    output(o.tail)
+    o.head = 11
+    o.body.key = 22
+    o.body.msg = "deep"
+    o.tail = "tail!"
+    output(o.head, o.body.key, o.body.msg, o.tail)
+
+    // ⑧ 外层整体赋值：嵌套 struct 深拷贝互不影响
+    Outer o2 = o
+    o2.body.key = 33
+    output(o.body.key, o2.body.key)
+    return 0

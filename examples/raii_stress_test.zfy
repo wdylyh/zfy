@@ -5,15 +5,15 @@ string dup4(string s)
 
 void main()
     // ---- for 头使用已有变量：递减方向不是错误 ----
-    long int i = 5
+    i64 i = 5
     for i, i > 0, i--
         output(i, end=' ')
     output("")
 
     // ---- 10000 轮：每轮分配 string 数组并释放，break/continue 提前退出作用域 ----
-    long int rounds = 0
+    i64 rounds = 0
     for i, i < 10000, i++
-        string array names[8] = "aa","bb"
+        string names[8] = "aa","bb"
         if i == 2
             continue
         if i == 999

@@ -1,7 +1,20 @@
+// ZEM 错误模型冒烟测试（原 try/catch/throw 演示改写）
+// 覆盖：fail 构造错误值、?? 默认值解包、?? 解包块（err 取 code/msg）、
+//       面值自动包装成功值、ErrCode 标准错误码
 void main()
-    try
-        output("in try")
-        throw "x"
-    catch e
-        output(e)
+    // ---- fail + ?? 默认值解包 ----
+    i64! r = fail(ErrCode.NOT_FOUND, "x")
+    i64 v = r ?? -1
+    output(v)                        // 期望 -1
+
+    // ---- 面值自动包装：成功值 ----
+    i64! ok = 42
+    output(ok ?? 0)                  // 期望 42
+
+    // ---- ?? 解包块：err 结构化错误（块外不可用） ----
+    i64 y = r ??
+        output("failed: ", err.msg)  // 期望 failed: x
+        output("code=", err.code)    // 期望 code=3（NOT_FOUND）
+        -2
+    output(y)                        // 期望 -2
     output("done")

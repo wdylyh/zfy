@@ -1,0 +1,79 @@
+struct Student
+    i32 id
+    string name
+    i32 score = 60
+
+i32 const MAX_STUDENTS = 5
+
+i32! parse_score(string s)
+    i32 v = cast(s, i32)?
+    if v < 0 or v > 100
+        return fail(ErrCode.CUSTOM, "分数超出范围")
+    return v
+
+i64 main()
+    i32    ids[5]
+    string names_arr[5]
+    i32    scores[5]
+    i32 count = 0
+
+    string names[] = "Alice", "Bob", "Cara", "Dan", "Eve"
+    i32 raw[5] = 88, 95, 72, 60, 100
+
+    i32 i = 0
+    while i < MAX_STUDENTS
+        ids[i] = i
+        names_arr[i] = names[i]
+        scores[i] = raw[i]
+        count++
+        i++
+
+    output("共录入", count, "名学生", sep=' ')
+
+    output("及格率(%)：", 3 * 100 / 4)
+
+    i32 total = 0
+    i32 j = 0
+    while j < count
+        i32 d = parse_score("85") ?? 0
+        total += d
+        j++
+
+    i32 bonus = parse_score("999") ?? 0
+    output("默认失败值：", bonus)
+
+    string line = "Alice,Bob,Cara"
+    string parts[] = split(line, ',')
+    output("拆分后段数：", length(parts))
+    output("第二段：", parts[1])
+
+    i32 pos = find("hello world", 'o') ?? -1
+    output("字符 o 首次出现位置：", pos)
+
+    i32 best = 0
+    i32 k = 0
+    while k < count
+        if scores[k] > best
+            best = scores[k]
+        k++
+
+    i32* bp = &best
+    output("最高分：", bp*)
+    unsafe
+        i32* shifted = bp + 0
+        output("指针解引用：", shifted*)
+
+    Student s1 = Student(id=1, name="Zoe", score=77)
+    output("单个 struct：", s1.id, s1.name, s1.score)
+
+    Student s2 = s1
+    s2.score = 1
+    output("原件/副本：", s1.score, s2.score)
+
+    output("---- 成绩单 ----")
+    i32 m = 0
+    while m < count
+        output(names_arr[m], scores[m], sep='\t')
+        m++
+
+    return 0

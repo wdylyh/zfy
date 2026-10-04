@@ -4,15 +4,15 @@
 //       replace(s,起,止,"串")/+ 拼接/整体赋值（RAII 先释放旧串）
 void main()
     string n = "Hello World"
-    string list m
+    string m[]
     output(length(n))               // 期望 11
     output(n[4])                    // 期望 o
     output(n[4,10])                 // 期望 o World（两端含）
     output(n[4,10:2])               // 期望 oWrd（步长 2，冒号）
-    output(find(n, 'l'))            // 期望 2（第 1 次出现）
-    output(find(n, 'l', count=2))   // 期望 3（第 2 次出现）
-    output(find(n, 'l', count=3))   // 期望 9（第 3 次出现）
-    output(find(n, 'z'))            // 期望 -1（未找到返回 -1）
+    output(find(n, 'l') ?? -1)            // 期望 2（第 1 次出现）
+    output(find(n, 'l', count=2) ?? -1)   // 期望 3（第 2 次出现）
+    output(find(n, 'l', count=3) ?? -1)   // 期望 9（第 3 次出现）
+    output(find(n, 'z') ?? -1)            // 期望 -1（未找到产错误值，?? 解包 -1）
     output(trim(n, 'l'))            // 期望 Heo Word（删除所有 'l'）
     m = split(n, 'l')               // 切分为 string 列表："Hello World" 有 3 个 'l'，
                                     // 连续分隔符产生空段 -> "He","","o Wor","d"

@@ -6,40 +6,63 @@ exception ParseError of pos * string
 
 let err p msg = raise (ParseError (p, msg))
 
-type parser = { mutable toks : (token * pos) list }
+type parser =
+  { mutable toks : (token * pos) list;
+    mutable tynames : string list;  (* 已知类型名：内建 + 本文件 struct/type 别名 *)
+    mutable errs : (pos * string) list }  (* 已收集待恢复的错误（多错误报告） *)
 
-let make toks = { toks = toks }
+let make toks = { toks = toks; tynames = type_names; errs = [] }
 
 let pos_of (t, p) = p
-let peek p = match p.toks with [] -> (Eof, { line = 0; col = 0 }) | x :: _ -> x
-let peek2 p = match p.toks with _ :: x :: _ -> x | _ -> (Eof, { line = 0; col = 0 })
-let next p = match p.toks with [] -> (Eof, { line = 0; col = 0 }) | x :: r -> p.toks <- r; x
+let eof_pos = { file = ""; line = 0; col = 0 }
+let peek p = match p.toks with [] -> (Eof, eof_pos) | x :: _ -> x
+let peek2 p = match p.toks with _ :: x :: _ -> x | _ -> (Eof, eof_pos)
+let next p = match p.toks with [] -> (Eof, eof_pos) | x :: r -> p.toks <- r; x
+
+(* 记录错误（供语句级恢复后统一报告） *)
+let record_err p pos msg = p.errs <- (pos, msg) :: p.errs
+
+(* 语句级恢复：丢弃 token 直到语句边界（Newline/Dedent/Eof），至少消耗一个 *)
+let rec sync_stmt p =
+  match next p with
+  | (Newline, _) | (Dedent, _) | (Eof, _) -> ()
+  | _ -> sync_stmt p
+
+(* 顶层项级恢复：丢弃 token 直到下一个顶层项开头（Newline 后不缩进） *)
+let rec sync_top p =
+  match next p with
+  | (Eof, _) -> ()
+  | (Newline, _) ->
+    (match peek p with
+     | (Indent, _) -> sync_top p   (* 仍在出错项的块内，继续跳 *)
+     | _ -> ())
+  | _ -> sync_top p
 
 (* 跳过空行（Newline）；分号在语句位置非法（只允许出现在 for 头部） *)
 let rec skip_trivia p =
   match peek p with
   | (Newline, _) -> ignore (next p); skip_trivia p
   | (Semicolon, sp) ->
-    err sp "分号不允许出现在语句末尾（只允许在 for 头部使用）"
+    err sp "semicolon is only allowed in for headers"
   | _ -> ()
 
 let expect p t what =
   let (tk, tp) = peek p in
   if tk = t then ignore (next p)
   else
-    err tp (Printf.sprintf "期望 %s（%s），得到 %s" what (pp_token t) (pp_token tk))
+    err tp (Printf.sprintf "expected %s (%s), got %s" what (pp_token t) (pp_token tk))
 
 let expect_ident p what =
   let (tk, tp) = peek p in
   match tk with
   | Ident s -> ignore (next p); s
-  | _ -> err tp (Printf.sprintf "期望 %s（标识符），得到 %s" what (pp_token tk))
+  | _ -> err tp (Printf.sprintf "expected %s (identifier), got %s" what (pp_token tk))
 
 let expect_kw p k what =
   let (tk, tp) = peek p in
   match tk with
   | Keyword k' when k' = k -> ignore (next p)
-  | _ -> err tp (Printf.sprintf "期望 %s（%s），得到 %s" what (pp_keyword k) (pp_token tk))
+  | _ -> err tp (Printf.sprintf "expected %s (%s), got %s" what (pp_keyword k) (pp_token tk))
 
 let is_kw p k =
   match peek p with (Keyword k', _) -> k' = k | _ -> false
@@ -49,103 +72,129 @@ let end_of_stmt p = skip_trivia p
 
 (* ---------- 类型 ---------- *)
 
-(* 类型词序列长度（0 = 不是类型开头）。数值类型为关键字多词序列，
-   bool/char/string 为 Ident（void 不作为声明类型起始）。
-   uint 作为后缀（int uint / long long uint / short int uint ...）+1 长度 *)
-let ty_kws_len (toks : (token * pos) list) : int =
-  let uint_suf n = function
-    | (Keyword KUint, _) :: _ -> n + 1
-    | _ -> n
-  in
+(* 类型别名关键词（多词序列的组成词） *)
+let is_alias_kw = function
+  | KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad -> true
+  | _ -> false
+
+(* 传统多词类型别名 → 内部宽度名（new.md：与传统宽度名并存，两者皆合法）。
+   贪婪匹配最长合法序列；返回 (归一化名, 消耗词数)。
+   long=i128、ulong=u128（用户拍板：long int/long long/ulong int/ulong long
+   已废止——long 后跟另一类型词由 check_no_dup_ty 报"类型重复"）：
+   short=i8 short int=i16 int=i32 long=i128
+   ushort=u8 ushort int=u16 uint=u32 ulong=u128
+   half=f16 float=f32 double=f64 quad=f128 *)
+let alias_ty (toks : (token * pos) list) : (string * int) option =
   match toks with
-  | (Ident s, _) :: _ when List.mem s type_names && s <> "void" -> 1
-  | (Ident "void", _) :: _ -> 1   (* void 仅用于函数返回类型 *)
-  | (Keyword (KHalf | KFloat | KDouble), _) :: rest -> uint_suf 1 rest
-  | (Keyword KInt, _) :: rest -> uint_suf 1 rest
-  | (Keyword KShort, _) :: rest ->
-    (match rest with
-     | (Keyword (KShort | KInt), _) :: rest2 -> uint_suf 2 rest2
-     | _ -> 0)
-  | (Keyword KLong, _) :: rest ->
-    (match rest with
-     | (Keyword (KInt | KLong | KDouble), _) :: rest2 -> uint_suf 2 rest2
-     | _ -> 0)
+  | (Keyword KShort, _) :: (Keyword KInt, _) :: _ -> Some ("i16", 2)
+  | (Keyword KShort, _) :: _ -> Some ("i8", 1)
+  | (Keyword KLong, _) :: _ -> Some ("i128", 1)
+  | (Keyword KUshort, _) :: (Keyword KInt, _) :: _ -> Some ("u16", 2)
+  | (Keyword KUshort, _) :: _ -> Some ("u8", 1)
+  | (Keyword KUlong, _) :: _ -> Some ("u128", 1)
+  | (Keyword KInt, _) :: _ -> Some ("i32", 1)
+  | (Keyword KUint, _) :: _ -> Some ("u32", 1)
+  | (Keyword KHalf, _) :: _ -> Some ("f16", 1)
+  | (Keyword KFloat, _) :: _ -> Some ("f32", 1)
+  | (Keyword KDouble, _) :: _ -> Some ("f64", 1)
+  | (Keyword KQuad, _) :: _ -> Some ("f128", 1)
+  | _ -> None
+
+(* 类型词长度（0 = 不是类型开头）。类型为：
+   - 单词 Ident：内建宽度类型或用户 struct 名（后者由 typeck 校验）
+   - 多词 Keyword 序列：short int 等传统别名（贪婪最长匹配） *)
+let ty_kws_len (toks : (token * pos) list) : int =
+  match toks with
+  | (Ident _, _) :: _ -> 1
+  | (Keyword k, _) :: _ when is_alias_kw k ->
+    (match alias_ty toks with
+     | Some (_, n) -> n
+     | None -> 1)   (* 防御：当前全部别名词均有映射，不可达 *)
   | _ -> 0
 
-(* 多词数值类型：short short / short int / int / long int / long long /
-   half / float / double / long double；整数词序列后可跟 uint 后缀
-   （int uint / long long uint / short int uint ...）表示无符号。
-   解析后规范化为内部宽度名（i8..i128 / u8..u128 / f16..f128），
-   单词类型 bool/char/string/void 保持原名。 *)
-let rec parse_ty p =
+(* 类型词后紧跟另一类型词：重复/混写报错（如 int int、i32 int） *)
+let check_no_dup_ty p =
+  match peek p with
+  | (Keyword k, tp) when is_alias_kw k ->
+    err tp "duplicate base type: a declaration has exactly one base type (alias and width names cannot be mixed)"
+  | (Ident s, tp) when List.mem s type_names ->
+    err tp "duplicate base type: a declaration has exactly one base type (alias and width names cannot be mixed)"
+  | _ -> ()
+
+(* 类型：单词 Ident（bool/char/string/void + i8..f128 宽度类型 + struct 名）
+   或多词传统别名（short int 等，归一化为宽度名）+
+   指针后缀 T*（可叠加，T** 由 typeck 限制）；函数类型 T(参数类型列表)
+   仅在 type 别名处允许（~allow_fun） *)
+let rec parse_ty ?(allow_fun = false) p =
   let (tk, tp) = peek p in
+  let rec suffixes base =
+    match peek p with
+    | (Star, _) ->
+      ignore (next p);
+      suffixes (TPtr (base, tp))
+    | (Bang, _) ->
+      ignore (next p);
+      suffixes (TErr (base, tp))
+    | (LParen, lp) when allow_fun ->
+      ignore (next p);
+      let ptys =
+        let rec go acc =
+          match peek p with
+          | (RParen, _) -> ignore (next p); List.rev acc
+          | _ ->
+            let t = parse_ty p in
+            (match peek p with
+             | (Comma, _) -> ignore (next p); go (t :: acc)
+             | (RParen, _) -> ignore (next p); List.rev (t :: acc)
+             | (_, tp') -> err tp' "expected ',' or ')' to end the parameter type list")
+        in
+        go []
+      in
+      suffixes (TFun (base, ptys, lp))
+    | _ -> base
+  in
   match tk with
   | Ident s ->
     ignore (next p);
-    if not (List.mem s type_names) then
-      err tp (Printf.sprintf "未定义的类型：%s（数值类型：short short / short int / int / long int / long long / ... uint 后缀 / half / float / double / long double）" s);
-    TNamed (s, tp)
-  | Keyword (KShort | KLong | KInt | KUint | KHalf | KFloat | KDouble) as k ->
-    let (nm, tp') = parse_numeric_ty p (k, tp) in
-    TNamed (nm, tp')
+    check_no_dup_ty p;
+    suffixes (TNamed (s, tp))
+  | Keyword k when is_alias_kw k ->
+    (* 传统类型别名：归一化为内部宽度名（short int→i16 等，零后端改动） *)
+    (match alias_ty p.toks with
+     | Some (name, n) ->
+       for _ = 1 to n do ignore (next p) done;
+       check_no_dup_ty p;
+       suffixes (TNamed (name, tp))
+     | None -> err tp "expected a type")
+  | Keyword (KArray | KList) ->
+    err tp "'array'/'list' keywords removed: arrays are written T a[N], lists T a[]"
   | Star ->
-    err tp "'*'（指针类型）语法已删除"
+    err tp "'*' must follow a type to form a pointer (syntax T*, e.g. i32* p)"
   | LBracket ->
-    err tp "'[]T' / '[T;N]'（切片/数组类型）语法已删除"
-  | _ -> err tp (Printf.sprintf "期望类型，得到 %s" (pp_token tk))
-
-(* 解析数值类型词序列，返回内部宽度名与起始位置。
-   整数：宽度词序列（short short / short int / int / long int / long long）
-   后可跟 uint 后缀（int uint / long long uint ...）表示无符号；
-   浮点（half / float / double / long double）不支持 uint 后缀 *)
-and parse_numeric_ty p ((tk0, tp0) : token * pos) : string * pos =
-  let single = function
-    | Keyword KHalf -> Some "f16"
-    | Keyword KFloat -> Some "f32"
-    | Keyword KDouble -> Some "f64"
-    | _ -> None
-  in
-  (* uint 后缀：iN -> uN；浮点词序列后跟 uint 报错 *)
-  let uint_suffix (nm : string) : string =
-    match peek p with
-    | (Keyword KUint, _) ->
-      ignore (next p);
-      if nm.[0] = 'f' then err tp0 "浮点类型不支持 uint 修饰";
-      "u" ^ String.sub nm 1 (String.length nm - 1)
-    | _ -> nm
-  in
-  match tk0 with
-  | Keyword (KHalf | KFloat | KDouble) ->
-    ignore (next p);
-    (uint_suffix (Option.get (single tk0)), tp0)
-  | Keyword KInt ->
-    ignore (next p);
-    (uint_suffix "i32", tp0)
-  | Keyword KShort ->
-    ignore (next p);
-    let nm =
-      (match peek p with
-       | (Keyword KShort, _) -> ignore (next p); "i8"
-       | (Keyword KInt, _) -> ignore (next p); "i16"
-       | (_, sp) -> err sp "short 后应为 short（i8）或 int（i16）")
-    in
-    (uint_suffix nm, tp0)
-  | Keyword KLong ->
-    ignore (next p);
-    let nm =
-      (match peek p with
-       | (Keyword KInt, _) -> ignore (next p); "i64"
-       | (Keyword KLong, _) -> ignore (next p); "i128"
-       | (Keyword KDouble, _) -> ignore (next p); "f128"
-       | (_, sp) -> err sp "long 后应为 int（i64）/ long（i128）/ double（f128）")
-    in
-    (uint_suffix nm, tp0)
-  | _ -> err tp0 "期望数值类型"
+    err tp "'[]T' / '[T;N]' (slice/array type) syntax removed"
+  | _ -> err tp (Printf.sprintf "expected a type, got %s" (pp_token tk))
 
 (* ---------- 表达式 ---------- *)
-(* 优先级（低->高）：or < and < not < 比较 < 加减 < 乘除模 < 一元负号 < 后缀 *)
+(* 优先级（低->高）：?? < or < and < not < 比较 < 加减 < 乘除模 < 一元负号 < 后缀 *)
 
-let rec parse_expr p = parse_or p
+let rec parse_expr p = parse_unwrap p
+
+(* ?? 解包：a ?? b（值形式）或 a ?? + 缩进块（块形式，块内可用 err） *)
+and parse_unwrap p =
+  let l = parse_or p in
+  match peek p with
+  | (QuestionQuestion, tp) ->
+    ignore (next p);
+    (match peek p with
+     | (Newline, _) ->
+       (* 块形式：换行后跟缩进块 *)
+       ignore (next p);
+       let blk = parse_block p in
+       EUnwrap (l, EBlock (blk, tp), tp)
+     | _ ->
+       let r = parse_or p in
+       EUnwrap (l, r, tp))
+  | _ -> l
 
 and parse_or p =
   let l = parse_and p in
@@ -243,6 +292,7 @@ and parse_mul p =
 and parse_unary p =
   match peek p with
   | (Minus, tp) -> ignore (next p); EUn (Neg, parse_unary p, tp)
+  | (Amp, tp) -> ignore (next p); EAddrOf (parse_unary p, tp)
   | _ -> parse_postfix p
 
 and parse_postfix p =
@@ -277,15 +327,31 @@ and parse_postfix_rest p e =
      | (RBracket, _) ->
        ignore (next p);
        parse_postfix_rest p (EIndex (e, e1, tp))
-     | (_, tp') -> err tp' "期望 ',' 或 ']'")
+     | (_, tp') -> err tp' "expected ',' or ']'")
   | Dot ->
     (* 命名空间访问：t.item（仅用于 use 导入的文件命名空间） *)
     (match e with
      | EVar (base, _) when (match peek2 p with (Ident _, _) -> true | _ -> false) ->
        ignore (next p);
-       let item = expect_ident p "命名空间成员" in
+       let item = expect_ident p "namespace member" in
        parse_postfix_rest p (EVar (base ^ "." ^ item, tp))
-     | _ -> err tp "点语法已移除：'.' 仅用于 use 导入的命名空间访问（如 t.item）")
+     | _ -> err tp "dot syntax removed: '.' is only for use-namespace access (e.g. t.item)")
+  | Question ->
+    (* 后缀错误传播 a?（ZEM 错误模型） *)
+    ignore (next p);
+    parse_postfix_rest p (EPropagate (e, tp))
+  | Star ->
+    (* 后缀解引用 p*：与乘法 a * b 的歧义按 * 后一个 token 判定——
+       收尾符/运算符（= ) ] 换行 + - * / 等）→ 解引用；
+       表达式开始（标识符/字面量/括号）→ 乘法（留给 parse_mul） *)
+    (match fst (peek2 p) with
+     | Assign | PlusAssign | MinusAssign | StarAssign | SlashAssign
+     | PercentAssign | RParen | Comma | RBracket | Newline | Dedent | Eof
+     | Colon | Semicolon | Plus | Minus | Star | Slash | Percent
+     | Eq | Ne | Lt | Gt | Le | Ge | Dot | PlusPlus | MinusMinus ->
+       ignore (next p);
+       parse_postfix_rest p (EDeref (e, tp))
+     | _ -> e)
   | _ -> e
 
 and parse_expr_list p =
@@ -294,20 +360,28 @@ and parse_expr_list p =
     match peek p with
     | (RParen, _) -> ignore (next p); List.rev acc
     | (Semicolon, tp') ->
-      err tp' "函数调用参数不允许 ';' 分隔，请一律使用 ','"
+      err tp' "';' is not allowed between call arguments; use ','"
+    | (Keyword KMove, _) ->
+      (* 显式 move 实参：f(move p)——所有权移交（change.md 1.6） *)
+      ignore (next p);
+      let e = parse_expr p in
+      (match peek p with
+       | (Comma, _) -> ignore (next p); go (CMove e :: acc)
+       | (RParen, _) -> ignore (next p); List.rev (CMove e :: acc)
+       | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
     | (Ident nm, _) when (match peek2 p with (Assign, _) -> true | _ -> false) ->
       ignore (next p); ignore (next p);
       let e = parse_expr p in
       (match peek p with
        | (Comma, _) -> ignore (next p); go (CNamed (nm, e) :: acc)
        | (RParen, _) -> ignore (next p); List.rev (CNamed (nm, e) :: acc)
-       | (_, tp') -> err tp' "期望 ',' 或 ')' 结束参数列表")
+       | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
     | _ ->
       let e = parse_expr p in
       (match peek p with
        | (Comma, _) -> ignore (next p); go (CPos e :: acc)
        | (RParen, _) -> ignore (next p); List.rev (CPos e :: acc)
-       | (_, tp') -> err tp' "期望 ',' 或 ')' 结束参数列表")
+       | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
   in
   go []
 
@@ -320,6 +394,36 @@ and parse_primary p =
   | CharLit c -> ignore (next p); EChar (c, tp)
   | Keyword KTrue -> ignore (next p); EBool (true, tp)
   | Keyword KFalse -> ignore (next p); EBool (false, tp)
+  | Keyword KNull -> ignore (next p); ENull tp
+  | Keyword KErr ->
+    (* err：解包块内的错误信息变量（typeck 在 ?? 块作用域注入；外部报未定义） *)
+    ignore (next p);
+    parse_postfix_rest p (EVar ("err", tp))
+  | Keyword KFail ->
+    (* fail(code, msg)：构造 T! 错误值（元素类型由上下文推断） *)
+    ignore (next p);
+    expect p LParen "(";
+    let c = parse_expr p in
+    expect p Comma ",";
+    let m = parse_expr p in
+    expect p RParen ")";
+    EFail (c, m, tp)
+  | Keyword KPanic ->
+    (* panic(msg) 或 panic(code, msg)：不可恢复终止 *)
+    ignore (next p);
+    expect p LParen "(";
+    (match peek p with
+     | (RParen, _) -> err tp "panic requires a message argument: panic(msg) or panic(code, msg)"
+     | _ ->
+       let e1 = parse_expr p in
+       (match peek p with
+        | (RParen, _) -> ignore (next p); EPanic (None, e1, tp)
+        | (Comma, _) ->
+          ignore (next p);
+          let e2 = parse_expr p in
+          expect p RParen ")";
+          EPanic (Some e1, e2, tp)
+        | (_, tp') -> err tp' "expected ',' or ')' to end the panic arguments"))
   | Keyword KCast ->
     (* cast(表达式, 目标类型)：唯一的显式数值转换语法 *)
     ignore (next p);
@@ -337,7 +441,7 @@ and parse_primary p =
     let e = parse_expr p in
     expect p RParen ")";
     e
-  | _ -> err tp (Printf.sprintf "期望表达式，得到 %s" (pp_token tk))
+  | _ -> err tp (Printf.sprintf "expected an expression, got %s" (pp_token tk))
 
 (* ---------- 块与语句 ---------- *)
 
@@ -351,8 +455,14 @@ and parse_block p =
       skip_trivia p;
       match peek p with
       | (Dedent, _) -> ignore (next p); List.rev acc
-      | (Eof, tp') -> err tp' "意外的文件结尾（块未闭合）"
-      | _ -> let s = parse_stmt p in go (s :: acc)
+      | (Eof, tp') -> err tp' "unexpected end of input (unclosed block)"
+      | _ ->
+        (* 语句级错误恢复：记录后跳到下一条语句继续（多错误收集） *)
+        (try let s = parse_stmt p in go (s :: acc)
+         with ParseError (ep, em) ->
+           record_err p ep em;
+           sync_stmt p;
+           go acc)
     in
     go []
   end
@@ -379,7 +489,7 @@ and parse_seq_inits p =
     go []
   | _ -> []  (* 无初始化：全部填零值 *)
 
-(* 解析 const/frac/unreduced 修饰（可任意顺序，位于类型后名字前） *)
+(* 解析 const/frac/unred 修饰（可任意顺序，位于类型后名字前） *)
 and parse_modifiers p =
   let is_const = ref false and is_frac = ref false and is_unred = ref false in
   let rec go () =
@@ -395,46 +505,37 @@ and parse_modifiers p =
   go ();
   (!is_const, !is_frac, !is_unred)
 
-(* 声明语法（variable 关键字已删除）：
-   标量：<类型> (const)? (frac)? 名字 = 值
-   数组：<类型> (const)? array 名字 [长度] (= 值1,值2,...)?
-   列表：<类型> (const)? list 名字 (= 值1,值2,...)? *)
+(* 声明语法：
+   标量：<类型> (const)? (frac)? 名字 [= 初值]
+   数组：<类型> (const)? 名字[长度] (= 值1,值2,...)?
+   列表：<类型> (const)? 名字[] (= 值1,值2,...)?（中括号必须为空） *)
 and parse_decl p tp =
   let ty = parse_ty p in
   parse_decl_ty p tp ty
 
 and parse_decl_ty p tp ty =
   let (is_const, is_frac, is_unred) = parse_modifiers p in
+  let name = expect_ident p "variable name" in
   (match peek p with
-   | (Keyword KArray, lp) ->
+   | (LBracket, lp) ->
+     (* 数组 / 列表：名字后跟 [长度]（数组）或 []（列表） *)
      ignore (next p);
-     (* const 可位于 array 关键字之后、变量名之前：i64 array const carr[3] *)
-     let (is_const, is_unred) =
-       match peek p with
-       | (Keyword KConst, _) -> ignore (next p); (true, is_unred)
-       | _ -> (is_const, is_unred)
-     in
-     let name = expect_ident p "数组名" in
-     expect p LBracket "[";
-     let len = parse_expr p in
-     expect p RBracket "]";
-     let inits = parse_seq_inits p in
-     end_of_stmt p;
-     SSeqDecl (is_const, name, ty, Some len, false, inits, lp)
-   | (Keyword KList, lp) ->
-     ignore (next p);
-     let (is_const, is_unred) =
-       match peek p with
-       | (Keyword KConst, _) -> ignore (next p); (true, is_unred)
-       | _ -> (is_const, is_unred)
-     in
-     let name = expect_ident p "列表名" in
-     let inits = parse_seq_inits p in
-     end_of_stmt p;
-     SSeqDecl (is_const, name, ty, None, true, inits, lp)
+     (match peek p with
+      | (RBracket, _) ->
+        ignore (next p);
+        if is_frac then err lp "lists do not support the frac modifier";
+        let inits = parse_seq_inits p in
+        end_of_stmt p;
+        SSeqDecl (is_const, name, ty, None, true, inits, lp)
+      | _ ->
+        if is_frac then err lp "arrays do not support the frac modifier";
+        let len = parse_expr p in
+        expect p RBracket "]";
+        let inits = parse_seq_inits p in
+        end_of_stmt p;
+        SSeqDecl (is_const, name, ty, Some len, false, inits, lp))
    | _ ->
      (* 标量：初值可省略（省略时填零值）；const 必须带初值 *)
-     let name = expect_ident p "变量名" in
      let init =
        (match p.toks with
         | (Assign, _) :: _ ->
@@ -443,26 +544,43 @@ and parse_decl_ty p tp ty =
         | _ -> None)
      in
      (match is_const, init with
-      | true, None -> err tp "const 变量必须带初值"
+      | true, None -> err tp "const requires an initializer"
       | _ -> ());
      end_of_stmt p;
      SDecl (is_const, is_frac, is_unred, name, ty, init, tp))
 
-(* 判断当前是否为声明语句开头：类型词序列 + 名字/const/frac/unreduced/array/list *)
+(* 判断当前是否为声明语句开头：类型词 + 名字/const/frac/unred。
+   类型位后跟 *（指针声明 T* p 与乘法 x * y 形状相同）：仅当类型位是
+   已知类型名（内建/本文件 struct/type 别名）才视为指针声明 *)
 and looks_like_decl p =
   match ty_kws_len p.toks with
   | 0 -> false
   | n ->
     let rec drop k l = if k <= 0 then l else match l with _ :: r -> drop (k - 1) r | [] -> [] in
-    (match drop n p.toks with
+    let rec skip_stars l = match l with (Star, _) :: r -> skip_stars r | _ -> l in
+    let rec skip_bangs l = match l with (Bang, _) :: r -> skip_bangs r | _ -> l in
+    let after_ty = drop n p.toks in
+    let tyname_ok =
+      match drop (n - 1) p.toks with
+      | (Ident s, _) :: _ -> List.mem s p.tynames
+      | (Keyword _, _) :: _ -> true   (* 多词别名（short int 等）：必为类型 *)
+      | _ -> false
+    in
+    (match after_ty with
+     | (Star, _) :: _ | (Bang, _) :: _ ->
+       tyname_ok &&
+       (match skip_bangs (skip_stars after_ty) with
+        | (Ident _, _) :: _ -> true
+        | (Keyword (KConst | KFrac | KUnreduced), _) :: _ -> true
+        | _ -> false)
      | (Ident _, _) :: _ -> true
-     | (Keyword (KConst | KFrac | KUnreduced | KArray | KList), _) :: _ -> true
+     | (Keyword (KConst | KFrac | KUnreduced), _) :: _ -> true
      | _ -> false)
-(* for 头部声明（const/frac/unreduced 允许，无 variable） *)
+(* for 头部声明（const/frac/unred 允许，无 variable） *)
 and parse_for_decl p tp =
   let ty = parse_ty p in
   let (is_const, _is_frac, _is_unred) = parse_modifiers p in
-  let name = expect_ident p "变量名" in
+  let name = expect_ident p "variable name" in
   let init =
     (match p.toks with
      | (Assign, _) :: _ ->
@@ -471,32 +589,37 @@ and parse_for_decl p tp =
      | _ -> None)
   in
   (match is_const, init with
-   | true, None -> err tp "const 变量必须带初值"
+   | true, None -> err tp "const requires an initializer"
    | _ -> ());
   FIDecl (is_const, name, ty, init, tp)
 
 (* 判断是否为"裸声明"形状错误（类型名开头但后续不构成合法声明） *)
 and check_bare_decl p =
+  (* 类型词后紧跟另一类型词：重复/混写（int int、i32 int）单独提示 *)
+  let second_ty =
+    match peek2 p with
+    | (Keyword k, _) -> is_alias_kw k
+    | (Ident s, _) -> List.mem s type_names
+    | _ -> false
+  in
   match p.toks with
+  | (_, tp) :: _ when second_ty ->
+    err tp "duplicate base type: a declaration has exactly one base type (alias and width names cannot be mixed)"
   | (Ident s, tp) :: _ when List.mem s type_names && s <> "void" ->
     err tp (Printf.sprintf
-              "声明语法：类型 (const)? (frac)? 名字 [= 初值]（如 %s x = 1 / %s x / %s const k = 2 / %s array n[8]）"
-              s s s s)
-  | toks when ty_kws_len toks > 0 ->
-    let (tk, tp) = List.nth toks 0 in
+              "declaration syntax: TYPE (const)? (frac)? NAME [= init] (e.g. %s x = 1 / %s x / %s const k = 2 / %s arr[8] = 1,2 / %s lst[])"
+              s s s s s)
+  | (Keyword (KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad), tp) :: _ ->
     err tp (Printf.sprintf
-              "声明语法：类型 (const)? (frac)? 名字 [= 初值]（如 %s x = 1 / %s x / %s const k = 2 / %s array n[8]）"
-              (pp_token tk) (pp_token tk) (pp_token tk) (pp_token tk))
+              "declaration syntax: TYPE (const)? (frac)? NAME [= init] (e.g. int x = 1 / short k / long const frac r = 1/2 / double arr[8] = 1,2 / uint lst[])")
   | _ -> ()
 
 and parse_stmt p =
   let (tk, tp) = peek p in
   match tk with
   | Ident _ when looks_like_decl p -> parse_decl p tp
-  | Keyword (KShort | KLong | KInt | KUint | KHalf | KFloat | KDouble)
-    when looks_like_decl p -> parse_decl p tp
-  | Ident _ -> check_bare_decl p; parse_expr_stmt p
-  | Keyword (KShort | KLong | KInt | KUint | KHalf | KFloat | KDouble) ->
+  | Keyword k when is_alias_kw k && looks_like_decl p -> parse_decl p tp
+  | Keyword k when is_alias_kw k ->
     check_bare_decl p; parse_expr_stmt p
   | Keyword KReturn ->
     ignore (next p);
@@ -527,23 +650,11 @@ and parse_stmt p =
     parse_input p tp
   | Keyword KBreak -> ignore (next p); end_of_stmt p; SBreak tp
   | Keyword KContinue -> ignore (next p); end_of_stmt p; SContinue tp
-  | Keyword KThrow ->
+  | Keyword KUnsafe ->
+    (* unsafe 块：允许指针算术（块内语句平铺，语义与普通块一致） *)
     ignore (next p);
-    let e = parse_expr p in
-    end_of_stmt p;
-    SThrow (e, tp)
-  | Keyword KTry ->
-    ignore (next p);
-    let try_b = parse_block p in
-    skip_trivia p;
-    expect p (Keyword KCatch) "catch";
-    let binding =
-      match peek p with
-      | (Ident nm, _) -> ignore (next p); Some nm
-      | _ -> None
-    in
-    let catch_b = parse_block p in
-    STry (try_b, (binding, catch_b), tp)
+    let b = parse_block p in
+    SUnsafe (b, tp)
   | Keyword KReduce ->
     ignore (next p);
     expect p LParen "(";
@@ -603,11 +714,11 @@ and parse_output p tp =
   (* 命名参数阶段：记录表达式，之后只允许另一个命名参数或 ')' *)
   let rec go_named nm v =
     if nm = "sep" then begin
-      if !sep <> None then err tp "output 的 sep 参数重复";
+      if !sep <> None then err tp "duplicate sep parameter in output";
       sep := Some v
     end
     else begin
-      if !end_ <> None then err tp "output 的 end 参数重复";
+      if !end_ <> None then err tp "duplicate end parameter in output";
       end_ := Some v
     end;
     match peek p with
@@ -619,8 +730,8 @@ and parse_output p tp =
          ignore (next p); ignore (next p);
          let v' = parse_expr p in
          go_named (if kw = KSep then "sep" else "end") v'
-       | (_, tp') -> err tp' "output 的命名参数（sep/end）必须放在最后")
-    | (_, tp') -> err tp' "期望 ',' 或 ')' 结束 output 参数列表"
+       | (_, tp') -> err tp' "named output parameters (sep/end) must come last")
+    | (_, tp') -> err tp' "expected ',' or ')' to end the output argument list"
   in
   (* 普通参数阶段 *)
   let rec go_args () =
@@ -637,7 +748,7 @@ and parse_output p tp =
       (match peek p with
        | (Comma, _) -> ignore (next p); go_args ()
        | (RParen, _) -> ignore (next p)
-       | (_, tp') -> err tp' "期望 ',' 或 ')' 结束 output 参数列表")
+       | (_, tp') -> err tp' "expected ',' or ')' to end the output argument list")
   in
   go_args ();
   end_of_stmt p;
@@ -659,17 +770,17 @@ and parse_input p tp =
       delim := Some e;
       (match peek p with
        | (RParen, _) -> ignore (next p)
-       | (_, tp') -> err tp' "input 的 delim 必须是最后一个参数")
+       | (_, tp') -> err tp' "input's delim parameter must come last")
     | _ ->
       let t =
         if looks_like_decl p then begin
           let ty = parse_ty p in
           let (_c, _f, _u) = parse_modifiers p in
-          let name = expect_ident p "变量名" in
+          let name = expect_ident p "variable name" in
           InNew (name, ty, tp)
         end
         else begin
-          let name = expect_ident p "变量名" in
+          let name = expect_ident p "variable name" in
           InUse (name, tp)
         end
       in
@@ -677,7 +788,7 @@ and parse_input p tp =
       (match peek p with
        | (Comma, _) -> ignore (next p); go ()
        | (RParen, _) -> ignore (next p)
-       | (_, tp') -> err tp' "期望 ',' 或 ')' 结束 input 目标列表")
+       | (_, tp') -> err tp' "expected ',' or ')' to end the input target list")
   in
   go ();
   end_of_stmt p;
@@ -763,51 +874,99 @@ and parse_if p tp =
 
 (* ---------- 顶层项 ---------- *)
 
-(* 顶层项是函数定义还是声明：类型词后（可跳过 const/frac/unreduced 修饰，
-   但出现 array/list 关键字则为声明）跟标识符，标识符后是 '(' 为函数定义 *)
-let top_is_fn (toks : (token * pos) list) : bool =
+(* 顶层项是函数定义还是声明：类型词后（可跳过 * 指针后缀与
+   const/frac/unred 修饰）跟标识符，标识符后是 '(' 为函数定义
+   （i32 f(...) / i32* f(...)），是 '[' 为数组/列表声明 *)
+let top_is_fn p =
+  let toks = p.toks in
   let n = ty_kws_len toks in
   if n = 0 then false
   else begin
     let rec drop k l = if k <= 0 then l else match l with _ :: r -> drop (k - 1) r | [] -> [] in
+    let rec skip_stars l = match l with (Star, _) :: r -> skip_stars r | _ -> l in
+    let rec skip_bangs l = match l with (Bang, _) :: r -> skip_bangs r | _ -> l in
     let rec skip_mods l =
       match l with
       | (Keyword (KConst | KFrac | KUnreduced), _) :: r -> skip_mods r
       | _ -> l
     in
-    match skip_mods (drop n toks) with
-    | (Keyword (KArray | KList), _) :: _ -> false
-    | (Ident _, _) :: (LParen, _) :: _ -> true
-    | _ -> false
+    let tyname_ok =
+      match drop (n - 1) toks with
+      | (Ident s, _) :: _ -> List.mem s p.tynames
+      | (Keyword _, _) :: _ -> true   (* 多词别名（short int 等）：必为类型 *)
+      | _ -> false
+    in
+    tyname_ok &&
+    (match skip_mods (skip_bangs (skip_stars (drop n toks))) with
+     | (Ident _, _) :: (LParen, _) :: _ -> true
+     | _ -> false)
   end
 
 (* 函数参数：
    标量：<类型> (frac)? 名字
-   数组：<类型> array 名字 [长度]（长度为字面量或之前的参数名）
-   列表：<类型> list 名字 *)
+   数组：<类型> 名字[长度]（长度为字面量或之前的参数名）
+   列表：<类型> 名字[]（中括号必须为空） *)
 let parse_param p =
   let (tk0, tp0) = peek p in
   let pt = parse_ty p in
   let (isc, is_frac, is_unred) = parse_modifiers p in
-  if isc then err tp0 "参数不支持 const 修饰";
-  if is_unred then err tp0 "参数不支持 unreduced 修饰";
+  if isc then err tp0 "parameters do not support const";
+  if is_unred then err tp0 "parameters do not support unred";
+  let name = expect_ident p "parameter name" in
   match peek p with
-  | (Keyword KArray, lp) ->
+  | (LBracket, lp) ->
     ignore (next p);
-    if is_frac then err lp "数组参数不支持 frac 修饰";
-    let name = expect_ident p "数组参数名" in
-    expect p LBracket "[";
-    let len = parse_expr p in
-    expect p RBracket "]";
-    { pname = name; pty = pt; pfrac = false; pseq = PArray len; ppos = lp }
-  | (Keyword KList, lp) ->
-    ignore (next p);
-    if is_frac then err lp "列表参数不支持 frac 修饰";
-    let name = expect_ident p "列表参数名" in
-    { pname = name; pty = pt; pfrac = false; pseq = PList; ppos = lp }
+    if is_frac then err lp "array/list parameters do not support the frac modifier";
+    (match peek p with
+     | (RBracket, _) ->
+       ignore (next p);
+       { pname = name; pty = pt; pfrac = false; pseq = PList; ppos = lp }
+     | _ ->
+       let len = parse_expr p in
+       expect p RBracket "]";
+       { pname = name; pty = pt; pfrac = false; pseq = PArray len; ppos = lp })
   | _ ->
-    let name = expect_ident p "参数名" in
     { pname = name; pty = pt; pfrac = is_frac; pseq = PScalar; ppos = tp0 }
+
+(* struct 字段块：每行一个字段；块以 DEDENT 结束 *)
+let rec parse_struct_fields p acc =
+  skip_trivia p;
+  match peek p with
+  | (Indent, _) -> ignore (next p); parse_struct_fields p acc
+  | (Dedent, _) -> ignore (next p); List.rev acc
+  | (Eof, _) -> List.rev acc
+  | (Ident _, ftp)
+  | (Keyword (KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad), ftp) ->
+    (* 字段类型：任意标识符（基础宽度类型或已声明 struct 名，typeck 校验）
+       或多词传统别名（short int 等），可带 * 指针后缀 *)
+    let fty = parse_ty p in
+    let name = expect_ident p "field name" in
+    let fseq =
+      match peek p with
+      | (LBracket, lp) ->
+        ignore (next p);
+        (match peek p with
+         | (RBracket, _) -> ignore (next p); PList
+         | _ ->
+           let len = parse_expr p in
+           expect p RBracket "]";
+           PArray len)
+      | _ -> PScalar
+    in
+    let fdefault =
+      match peek p with
+      | (Assign, _) -> ignore (next p); Some (parse_expr p)
+      | _ -> None
+    in
+    (match fseq with
+     | PScalar -> ()
+     | _ ->
+       (match fdefault with
+        | Some _ -> err ftp "array/list struct fields cannot have default values"
+        | None -> ()));
+    end_of_stmt p;
+    parse_struct_fields p ({ fname = name; fty; fseq; fdefault; fpos = ftp } :: acc)
+  | (_, tp) -> err tp "struct field syntax: TYPE NAME [= default]"
 
 let rec parse_item p =
   skip_trivia p;
@@ -832,7 +991,7 @@ let rec parse_item p =
         expect p Slash "/";
         for _ = 1 to n do Buffer.add_string buf "../" done
       end;
-      let first = expect_ident p "文件名" in
+      let first = expect_ident p "file name" in
       Buffer.add_string buf first;
       (* 文件名中的 .zfy 后缀：. 后跟标识符 *)
       let rec ext () =
@@ -840,7 +999,7 @@ let rec parse_item p =
         | (Dot, _) ->
           ignore (next p);
           Buffer.add_char buf '.';
-          Buffer.add_string buf (expect_ident p "扩展名");
+          Buffer.add_string buf (expect_ident p "extension");
           ext ()
         | _ -> ()
       in
@@ -848,27 +1007,86 @@ let rec parse_item p =
     in
     path_parts ();
     if not (Filename.check_suffix (Buffer.contents buf) ".zfy") then
-      err tp "use 的文件名必须带 .zfy 后缀";
+      err tp "use file name must end with .zfy";
     let import =
       if is_kw p KImport then begin
         ignore (next p);
-        Some (expect_ident p "模块名")
+        Some (expect_ident p "module name")
       end else None
     in
     let alias =
       if is_kw p KAs then begin
         ignore (next p);
-        Some (expect_ident p "别名")
+        Some (expect_ident p "alias")
       end else None
     in
     end_of_stmt p;
     IUse { path = Buffer.contents buf; import; alias; pos = tp }
-  | Ident _ | Keyword (KShort | KLong | KInt | KUint | KHalf | KFloat | KDouble | KFrac | KConst | KUnreduced) ->
-    if top_is_fn p.toks then begin
+  | Keyword KStruct ->
+    (* struct 声明：struct [packed] 名字 缩进块（字段：类型 名字 [= 默认值]，
+       或 类型 名字[N] / 类型 名字[]） *)
+    ignore (next p);
+    let packed =
+      match peek p with
+      | (Keyword KPacked, _) -> ignore (next p); true
+      | _ -> false
+    in
+    let name = expect_ident p "struct name" in
+    let fields = parse_struct_fields p [] in
+    p.tynames <- name :: p.tynames;
+    IStruct { name; packed; fields; pos = tp }
+  | Keyword KExtern ->
+    (* extern "C"：缩进块内每行一个 C 函数声明（类型 (frac)? 名字(参数)），
+       解析为多个 IExtern 函数（块结构不保留） *)
+    ignore (next p);
+    (match peek p with
+     | (StrLit "C", _) -> ignore (next p)
+     | (StrLit s, sp) ->
+       err sp (Printf.sprintf "extern supports only \"C\", got \"%s\"" s)
+     | (_, sp) -> err sp "expected \"C\" after extern");
+    skip_trivia p;
+    let rec go acc =
+      match peek p with
+      | (Indent, _) -> ignore (next p); go acc
+      | (Dedent, _) -> ignore (next p); List.rev acc
+      | (Eof, _) -> List.rev acc
+      | _ ->
+        let rt = parse_ty p in
+        let (_c, rf, _u) = parse_modifiers p in
+        let name = expect_ident p "extern function name" in
+        expect p LParen "(";
+        let params =
+          let rec go2 acc2 =
+            match peek p with
+            | (RParen, _) -> ignore (next p); List.rev acc2
+            | _ ->
+              let pd = parse_param p in
+              (match peek p with
+               | (Comma, _) -> ignore (next p); go2 (pd :: acc2)
+               | (RParen, _) -> ignore (next p); List.rev (pd :: acc2)
+               | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
+          in
+          go2 []
+        in
+        end_of_stmt p;
+        go ({ ename = name; eparams = params; eret = rt; erfrac = rf; epos = tp } :: acc)
+    in
+    IExtern { funcs = go []; pos = tp }
+  | Keyword KType ->
+    (* type 别名：type 名 = 类型（类型可含 * 指针后缀与函数类型） *)
+    ignore (next p);
+    let name = expect_ident p "type alias" in
+    expect p Assign "=";
+    let t = parse_ty ~allow_fun:true p in
+    end_of_stmt p;
+    p.tynames <- name :: p.tynames;
+    ITypeAlias { name; ty = t; pos = tp }
+  | Ident _ | Keyword (KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad | KFrac | KConst | KUnreduced) ->
+    if top_is_fn p then begin
       (* 函数定义：类型 (frac)? 名字(参数) 块 *)
       let ty0 = parse_ty p in
       let (_c, rf, _u) = parse_modifiers p in
-      let name = expect_ident p "函数名" in
+      let name = expect_ident p "function name" in
       expect p LParen "(";
       let params =
         let rec go acc =
@@ -879,7 +1097,7 @@ let rec parse_item p =
             (match peek p with
              | (Comma, _) -> ignore (next p); go (pd :: acc)
              | (RParen, _) -> ignore (next p); List.rev (pd :: acc)
-             | (_, tp') -> err tp' "期望 ',' 或 ')' 结束参数列表")
+             | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
         in
         go []
       in
@@ -887,17 +1105,23 @@ let rec parse_item p =
       IFn { name; params; ret = Some ty0; rfrac = rf; body; pos = tp }
     end
     else begin
-      (* 顶层声明：const/frac/unreduced 标量、数组、列表均可 *)
+      (* 顶层声明：const/frac/unred 标量、数组、列表均可 *)
       let d = parse_decl p tp in
       IDecl (d, tp)
     end
-  | _ -> err tp (Printf.sprintf "期望顶层项（函数定义/use/声明），得到 %s" (pp_token tk))
+  | _ -> err tp (Printf.sprintf "expected a top-level item (function/use/declaration), got %s" (pp_token tk))
 
 let parse_program p =
   let rec go acc =
     skip_trivia p;
     match peek p with
     | (Eof, _) -> List.rev acc
-    | _ -> go (parse_item p :: acc)
+    | _ ->
+      (* 顶层项级错误恢复：记录后跳到下一顶层项继续（多错误收集） *)
+      (try go (parse_item p :: acc)
+       with ParseError (ep, em) ->
+         record_err p ep em;
+         sync_top p;
+         go acc)
   in
   go []

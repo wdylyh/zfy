@@ -84,30 +84,30 @@ let dispatch argv =
   | [| _; "llvm"; path |] -> cmd_llvm path
   | [| _; "build"; path |] -> cmd_build path
   | _ ->
-    Printf.eprintf "用法: zfyc <tokens|ast|hir|mir|llvm|build> <file.zfy>\n";
+    Printf.eprintf "zfy:error[E5006] in 0 of (cli) because (usage: zfyc <tokens|ast|hir|mir|llvm|build> <file.zfy>)\n";
     exit 2
 
 let () =
   try dispatch Sys.argv with
   | Lexer.LexError (p, m) ->
-    Printf.eprintf "词法错误 %s: %s\n" (pp_pos p) m;
+    Printf.eprintf "lex error %s: %s\n" (pp_pos p) m;
     exit 1
   | Parser.ParseError (p, m) ->
-    Printf.eprintf "语法错误 %s: %s\n" (pp_pos p) m;
+    Printf.eprintf "syntax error %s: %s\n" (pp_pos p) m;
     exit 1
   | Typeck.TypeError (p, m) ->
-    Printf.eprintf "类型错误 %s: %s\n" (pp_pos p) m;
+    Printf.eprintf "type error %s: %s\n" (pp_pos p) m;
     exit 1
   | Mir.MirError (p, m) ->
-    Printf.eprintf "MIR 降码错误 %s: %s\n" (pp_pos p) m;
+    Printf.eprintf "MIR lowering error %s: %s\n" (pp_pos p) m;
     exit 1
   | Llvmgen.LlvmError (p, m) ->
     (match p with
-     | Some p -> Printf.eprintf "代码生成错误 %s: %s\n" (pp_pos p) m
-     | None -> Printf.eprintf "代码生成错误: %s\n" m);
+     | Some p -> Printf.eprintf "codegen error %s: %s\n" (pp_pos p) m
+     | None -> Printf.eprintf "codegen error: %s\n" m);
     exit 1
   | Driver.CompileError (p, m) ->
     (match p with
-     | Some p -> Printf.eprintf "编译错误 %s: %s\n" (pp_pos p) m
-     | None -> Printf.eprintf "编译错误: %s\n" m);
+     | Some p -> Printf.eprintf "compile error %s: %s\n" (pp_pos p) m
+     | None -> Printf.eprintf "compile error: %s\n" m);
     exit 1

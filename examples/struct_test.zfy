@@ -1,0 +1,87 @@
+// struct 功能测试：声明/构造/字段读写/嵌套/深拷贝/传参/sizeof/alignof
+struct Point
+    f32 x = 0.0
+    f32 y = 0.0
+
+struct Player
+    Point pos
+    i32 hp = 100
+    string name
+
+struct Buf
+    i32 data[4]
+    f64 vals[]
+
+struct packed Header
+    u8 tag
+    i32 value
+
+struct pair64
+    i64 a
+    i64 b
+
+void bump(Point p)
+    p.x += 100.0
+    output(p.x)
+
+Point addp(Point a, Point b)
+    return Point(a.x + b.x, a.y + b.y)
+
+i64 main()
+    // 位置构造 / 命名构造 / 缺省字段 / 全默认裸声明
+    Point p = Point(1.0, 2.0)
+    Point q = Point(x=3.5, y=4.5)
+    Point r = Point(5.0)
+    Point s
+    output(p.x, p.y, q.x, q.y)
+    output(r.x, r.y, s.x, s.y)
+
+    // 字段写 / 字段增广
+    p.x = 10.0
+    p.y += 5.0
+    output(p.x, p.y)
+
+    // 嵌套 struct：命名构造 + 字段链读写/增广
+    Player pl = Player(pos=Point(1.0, 2.0), name="Tom")
+    output(pl.hp, pl.name, pl.pos.x, pl.pos.y)
+    pl.pos.x += 2.0
+    pl.hp -= 55
+    output(pl.pos.x, pl.hp)
+
+    // 全默认嵌套声明：hp=100，name=""，pos 全零
+    Player pl2
+    output(pl2.hp, pl2.pos.x, pl2.name)
+
+    // string 字段独立（读字段为借用，赋值时深拷贝）
+    string t = pl.name
+    t = t + "!"
+    output(pl.name, t)
+
+    // 整体赋值深拷贝：改副本不影响原件
+    Player copy = pl
+    copy.hp = 1
+    copy.pos.x = 99.0
+    output(pl.hp, copy.hp, pl.pos.x, copy.pos.x)
+
+    // 字段写 string：旧值释放 + 新值深拷贝，互不影响
+    pl.name = "Jerry"
+    output(pl.name, copy.name)
+
+    // 数组/列表字段：缺省为空 seq（零值），读取与 length
+    Buf b = Buf()
+    output(b.data[0], b.data[3], length(b.vals))
+
+    // 传参值语义：函数内修改的是副本，不影响调用方
+    bump(p)
+    output(p.x)
+
+    // 返回 struct（值语义）
+    Point mid = addp(p, q)
+    output(mid.x, mid.y)
+
+    // sizeof/alignof 编译期内建：packed 紧凑布局 vs C 自然布局
+    output(sizeof(Header), alignof(Header))
+    output(sizeof(pair64), alignof(pair64))
+    Header h = Header(7, 1234)
+    output(h.tag, h.value)
+    return 0

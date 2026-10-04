@@ -1,0 +1,5 @@
+// 顶层 struct，默认 C 自然布局
+struct Student
+    i32 id
+    string name
+    i32 score = 60          // 默认值：未赋值时为 60

@@ -4,6 +4,368 @@ open Ast
 
 exception CompileError of pos option * string
 
+(* ---------- 错误报告（n3：多错误收集 + new.md 格式输出） ---------- *)
+
+type zerr = { code : string; zpos : pos; zmsg : string }
+
+(* 子串查找（朴素匹配；标准库无字符串 contains） *)
+let has_sub (m : string) (sub : string) : bool =
+  let n = String.length m and k = String.length sub in
+  let rec go i =
+    if i + k > n then false
+    else if String.sub m i k = sub then true
+    else go (i + 1)
+  in
+  if k = 0 then true else go 0
+
+(* 错误码查表（一一对应 errors.md）：条目 (子串列表, 码)——错误消息命中
+   全部子串即取该码，按表序先命中先得（特异条目在前）。未命中回退
+   fallback 兜底码（未细分错误，不应触发）。 *)
+let code_of_tbl fallback (tbl : (string list * string) list) (m : string) : string =
+  let rec go = function
+    | (subs, c) :: r ->
+      if List.for_all (fun s -> has_sub m s) subs then c else go r
+    | [] -> fallback
+  in
+  go tbl
+
+(* 阶段 → 文案查表：同阶段同文案同码；跨阶段同文案不同码（如
+   "unsupported assignment target"：typeck E3035 / mir E4008）故分表。 *)
+let code_of = function
+  | `Lex ->
+    code_of_tbl "E1000" [
+      ["unterminated string literal"], "E1001";
+      ["dangling escape character"], "E1002";
+      ["unknown escape sequence"], "E1003";
+      ["raw newline in string literal"], "E1004";
+      ["unterminated character literal"], "E1005";
+      ["character literal must end with"], "E1008";
+      ["numeric literal has no digits"], "E1009";
+      ["invalid float literal"], "E1010";
+      ["hex literal overflows"], "E1011";
+      ["binary literal overflows"], "E1012";
+      ["integer literal overflows"], "E1013";
+      ["unterminated block comment"], "E1014";
+      ["inconsistent indentation"], "E1015";
+      ["illegal character"], "E1016";
+    ]
+  | `Parse -> fun m ->
+    (* expect_ident 的 what 任意（变量名/函数名/...），用形态特征识别 *)
+    if has_sub m " (identifier), got " then "E2006"
+    else
+      code_of_tbl "E2007" [
+        ["expected an expression, got "], "E2001";
+        ["expected a type, got "], "E2008";
+        ["expected a top-level item"], "E2005";
+        ["declaration syntax: "], "E2003";
+        ["duplicate base type: "], "E2010";
+        ["const requires an initializer"], "E2012";
+        ["lists do not support the frac modifier"], "E2013";
+        ["arrays do not support the frac modifier"], "E2014";
+        ["array/list parameters do not support the frac modifier"], "E2015";
+        ["'array'/'list' keywords removed"], "E2018";
+        ["'*' must follow a type"], "E2019";
+        ["'[]T' / '[T;N]'"], "E2020";
+        ["dot syntax removed"], "E2017";
+        ["panic requires a message argument"], "E2021";
+        ["duplicate sep parameter in output"], "E2022";
+        ["duplicate end parameter in output"], "E2023";
+        ["struct field syntax: "], "E2024";
+        ["use file name must end with .zfy"], "E2025";
+        ["extern supports only "], "E2031";
+        ["expected \"C\" after extern"], "E2031";
+        ["semicolon is only allowed in for headers"], "E2027";
+        ["parameters do not support const"], "E2028";
+        ["parameters do not support unred"], "E2029";
+        ["array/list struct fields cannot have default values"], "E2030";
+        ["expected ',' or ')' to end the parameter type list"], "E2032";
+        ["expected ',' or ']"], "E2033";
+        ["';' is not allowed between call arguments"], "E2034";
+        ["expected ',' or ')' to end the argument list"], "E2035";
+        ["expected ',' or ')' to end the panic arguments"], "E2036";
+        ["unexpected end of input"], "E2037";
+        ["named output parameters (sep/end) must come last"], "E2038";
+        ["expected ',' or ')' to end the output argument list"], "E2039";
+        ["input's delim parameter must come last"], "E2040";
+        ["expected ',' or ')' to end the input target list"], "E2041";
+      ] m
+  | `Type ->
+    code_of_tbl "E3000" [
+      ["(extern conflicts with an existing function)"], "E3106";
+      ["duplicate function definition: "], "E3105";
+      ["dot access is only for structs"], "E3088";
+      ["has no field "], "E3087";
+      ["has duplicate field "], "E3100";
+      [" field type cannot be itself"], "E3098";
+      ["has circular nesting"], "E3154";
+      ["conflicts with an existing type/function"], "E3103";
+      ["extern function name "], "E3107";
+      ["struct name "], "E3095";
+      ["function name "], "E3104";
+      ["is already a function and cannot also be a struct name"], "E3096";
+      ["struct field array length must be a compile-time literal"], "E3097";
+      ["T! cannot be a struct field"], "E3099";
+      ["duplicate struct definition: "], "E3094";
+      ["struct field augmented assignment supports only"], "E3028";
+      ["does not support field assignment "], "E3029";
+      ["dereferenced augmented assignment supports only"], "E3024";
+      ["augmented/inc/dec target must be a pointer dereference"], "E3025";
+      ["augmented/inc/dec target must be a variable or array/list element"], "E3026";
+      ["augmented assignment target does not support indexing"], "E3022";
+      ["augmented assignment target does not support slicing"], "E3023";
+      ["string slices do not support augmented assignment"], "E3018";
+      ["frac slices do not support augmented assignment"], "E3019";
+      ["f16/f128 slices do not support augmented assignment"], "E3020";
+      ["pointers do not support augmented assignment/inc/dec"], "E3021";
+      ["string concatenation requires both sides to be string"], "E3045";
+      ["cannot assign to field of constant "], "E3027";
+      ["cannot modify elements of constant "], "E3015";
+      ["cannot assign to constant "], "E3014";
+      ["cannot input into constant "], "E3151";
+      ["cannot reduce constant "], "E3122";
+      ["cannot remove from constant "], "E3153";
+      ["has been moved and cannot be written"], "E3016";
+      ["has been moved and cannot be removed from"], "E3152";
+      ["has been moved and cannot be used"], "E3013";
+      ["has already been moved"], "E3038";
+      ["undefined error code: ErrCode."], "E3135";
+      ["undefined variable: "], "E3011";
+      ["undefined function: "], "E3101";
+      ["undefined type: "], "E3001";
+      ["circular type inference constraint"], "E3004";
+      ["type mismatch: expected "], "E3005";
+      ["unsupported cast: "], "E3008";
+      ["cannot omit an initializer"], "E3009";
+      ["cannot convert to string"], "E3007";
+      ["frac does not support modulo"], "E3117";
+      ["mismatched frac element types"], "E3114";
+      ["cannot be mixed with "], "E3115";
+      ["cannot initialize "], "E3118";
+      ["frac parameter does not support element type"], "E3120";
+      ["frac return type does not support element type"], "E3121";
+      ["frac does not support element type"], "E3113";
+      ["bool can only be initialized with"], "E3146";
+      ["array lengths differ"], "E3144";
+      ["pointer arithmetic is only allowed inside an unsafe block"], "E3047";
+      ["cannot add two pointers"], "E3048";
+      ["cannot add an integer to a pointer"], "E3049";
+      ["cannot subtract a pointer from an integer"], "E3052";
+      ["pointer comparison requires both sides to be pointers or null"], "E3053";
+      ["unsupported pointer operation: "], "E3054";
+      ["comparison requires numeric types"], "E3055";
+      ["arithmetic requires numeric types"], "E3056";
+      ["unary minus requires a numeric type"], "E3057";
+      ["panic_handler signature"], "E3059";
+      ["panic_handler expects"], "E3058";
+      ["push target must be a list, got "], "E3061";
+      ["push takes two arguments"], "E3062";
+      ["sizeof/alignof does not support type "], "E3063";
+      ["expects a type name argument"], "E3064";
+      [" pointer expects "], "E3065";
+      ["function pointer calls do not support move arguments"], "E3066";
+      ["function pointer calls do not support named argument "], "E3067";
+      ["function calls do not support named argument "], "E3068";
+      ["unsupported callee expression"], "E3069";
+      ["does not support index access"], "E3070";
+      ["slicing is only for string/array/list"], "E3071";
+      ["'&' can only take the address of"], "E3072";
+      ["cannot take the address of a void value"], "E3073";
+      ["dereference requires a pointer type"], "E3074";
+      ["block expressions are not supported here"], "E3149";
+      ["left side of ?? must be a fallible value"], "E3136";
+      ["??-block form (a ?? indented block) is only allowed"], "E3138";
+      ["??-block declaration type must be the element type"], "E3137";
+      ["??-block assignment target must be a variable"], "E3139";
+      ["? propagation requires the enclosing function to return T! (current: void)"], "E3141";
+      ["? propagation requires the enclosing function to return"], "E3142";
+      ["? left side must be a fallible value"], "E3140";
+      ["cannot move constant "], "E3036";
+      ["cannot move global variable "], "E3037";
+      ["move supports only string/array/list arguments"], "E3039";
+      ["move can only apply to a local variable"], "E3150";
+      ["does not support field access "], "E3089";
+      ["struct constructor does not support move arguments"], "E3091";
+      ([" fields, got "; " positional arguments"], "E3092");
+      ["initialized twice"], "E3093";
+      ["an integer type is required"], "E3075";
+      ["is not yet supported as an array/list element"], "E3126";
+      (["builtin "; " does not support move arguments"], "E3145");
+      ["expects a string for its "], "E3076";
+      ["does not accept type "], "E3077";
+      ["length expects string/array/list"], "E3078";
+      ["'s count must be > 0"], "E3079";
+      ["prec does not support type "], "E3080";
+      ["prec's length parameter must be"], "E3081";
+      ["malformed argument list for builtin "], "E3082";
+      ["a char is required ("], "E3083";
+      ["input target must be string/integer/float/bool/char"], "E3084";
+      ["output does not support argument type: "], "E3085";
+      ["input's delim must be char or string"], "E3086";
+      ["strings do not support index assignment"], "E3017";
+      ["dereference assignment supports only scalar/pointer types"], "E3031";
+      ["does not support index assignment"], "E3032";
+      ["index-assignment target must be an array/list variable"], "E3033";
+      ["assignment target must be a pointer dereference"], "E3034";
+      ["unsupported assignment target"], "E3035";
+      ["frac arrays/lists are not yet supported"], "E3119";
+      ["T! cannot be an array/list element"], "E3127";
+      ["array length must be an integer"], "E3128";
+      ["array length must be a compile-time constant"], "E3129";
+      ["lists take no length"], "E3130";
+      ["arrays require a length"], "E3131";
+      [" initial values exceed array length "], "E3132";
+      ["frac/unred does not support ??-block initialization"], "E3125";
+      ["remove only works on arrays/lists"], "E3147";
+      ["remove's first argument must be an array/list variable"], "E3147";
+      ["array parameter length must be a literal"], "E3133";
+      ["reduce's first argument must be a frac-typed local variable"], "E3124";
+      ["reduce requires a frac-typed variable"], "E3123";
+      ["top-level const does not support frac/unred"], "E3040";
+      ["duplicate top-level constant: "], "E3041";
+      ["top-level const currently supports only integer types"], "E3042";
+      ["duplicate top-level variable: "], "E3043";
+      ["but may not return a value"], "E3111";
+      ["extern parameters do not support arrays/lists"], "E3108";
+      ["extern parameters do not support T!"], "E3109";
+      ["extern functions do not support a T! return type"], "E3110";
+      ["missing main()"], "E3148";
+      ["fallible value used directly as a plain value"], "E3010";
+      ([" expects "; " arguments, got "], "E3102");
+    ]
+  | `Mir ->
+    code_of_tbl "E4000" [
+      ["push target must be a list variable"], "E4001";
+      ["unsupported frac operation"], "E4004";
+      ["unsupported field-access target"], "E4005";
+      ["unsupported address-of target"], "E4006";
+      ["element address-of target must be a variable"], "E4007";
+      ["unsupported assignment target"], "E4008";
+      ["reduce target must be a frac-typed local variable"], "E4009";
+      ["break outside a loop"], "E4010";
+      ["continue outside a loop"], "E4011";
+    ]
+  | `Llvm ->
+    code_of_tbl "E4000" [
+      ["main's return type must be void or i64"], "E4012";
+      ["unsupported float width f"], "E4013";
+      ["error value element type does not support 128-bit width"], "E4002";
+      ["invalid error value element type"], "E4003";
+      ["unresolved type variable"], "E4014";
+      ["cannot determine type size"], "E4015";
+      ["undefined struct "], "E4015";
+      ["unsupported array/list element type"], "E4016";
+      ["pointer constant must be null"], "E4017";
+      ["must be used as a pointer"], "E4018";
+      ["undefined local variable "], "E4019";
+      ["undefined variable "], "E4019";
+      ["type cannot be stored as an array/list element"], "E4020";
+      ["expected aggregate local: "], "E4021";
+      ["aggregate type does not support arithmetic"], "E4022";
+      ["unsupported pointer operation"], "E4023";
+      ["float type does not support modulo"], "E4024";
+      ["bool type does not support this operation"], "E4025";
+      ["aggregate type does not support unary operations"], "E4026";
+      ["type cannot convert to string"], "E4027";
+      ["aggregate type does not support cast"], "E4028";
+      ["unsupported conversion "], "E4029";
+      ["output does not support this argument type"], "E4030";
+      ["input does not support this error-value element type"], "E4031";
+      ["input does not support this target type"], "E4031";
+      ["invalid prec length parameter type"], "E4032";
+      ["aggregate return value must be captured"], "E4033";
+      ["non-void return value must be used"], "E4034";
+      ["field access target is not a struct"], "E4035";
+      ["invalid root type for field access"], "E4035";
+      ["has no field index "], "E4036";
+      ["does not match value type "], "E4037";
+      ["invalid move target slot type "], "E4038";
+      ["fail's code must be i32"], "E4039";
+      ["MErrOk type error"], "E4040";
+      ["MErrValue type error"], "E4040";
+      ["panic's code must be i32"], "E4041";
+      ["norm type error"], "E4042";
+      ["reduce type error"], "E4042";
+      ["unsupported augmented-assignment operation on slices"], "E4043";
+      ["unsupported element type for slice augmented assignment"], "E4043";
+      ["undefined temp "], "E4044";
+      ["MEmptySeq type is not an array/list"], "E4045";
+      ["address-of target is undefined: "], "E4046";
+      ["dereference-assignment type mismatch"], "E4047";
+      ["invalid root type for field address"], "E4048";
+      ["invalid root type for element address"], "E4048";
+      ["freed temp type is not a struct"], "E4049";
+      ["type cannot be a return default value"], "E4050";
+    ]
+  | `Driver ->
+    code_of_tbl "E5000" [
+      ["use: file not found: "], "E5001";
+      ["import conflict: "], "E5002";
+      ["nested modules are not allowed"], "E5003";
+      ["cannot read source file: "], "E5005";
+    ]
+
+let read_lines file =
+  let ic = open_in_bin file in
+  let n = in_channel_length ic in
+  let s = really_input_string ic n in
+  close_in ic;
+  Array.of_list (String.split_on_char '\n' s)
+
+let trim_cr (s : string) =
+  if String.length s > 0 && s.[String.length s - 1] = '\r'
+  then String.sub s 0 (String.length s - 1) else s
+
+(* 估算错误处 token 显示宽度：标识符/数字取连续单词字符，字符串字面量
+   取到闭合引号，其他（运算符/标点）为 1 —— 多字符 token 用等长 ^^^^ *)
+let caret_width lines line col =
+  let l = line - 1 in
+  if l < 0 || l >= Array.length lines then 1
+  else
+    let s = trim_cr lines.(l) in
+    let c = col - 1 in
+    if c < 0 || c >= String.length s then 1
+    else
+      let is_word ch =
+        (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') || ch = '_'
+      in
+      let ch = s.[c] in
+      if ch = '"' then
+        let rec go i =
+          if i >= String.length s then String.length s - c
+          else if s.[i] = '\\' then go (i + 2)
+          else if s.[i] = '"' then i - c + 1
+          else go (i + 1)
+        in
+        max 1 (go (c + 1))
+      else if is_word ch then begin
+        let j = ref c in
+        while !j < String.length s && is_word s.[!j] do incr j done;
+        !j - c
+      end
+      else 1
+
+(* 按 new.md 格式输出一个错误块：
+   zfy:error[EXXX] in <line> of <文件名> because (原因)
+   <错误行及上下各 2 行，共 5 行>
+        ^ *)
+let report_err errs =
+  List.iter
+    (fun (e : zerr) ->
+      Printf.eprintf "zfy:error[%s] in %d of %s because (%s)\n"
+        e.code e.zpos.line e.zpos.file e.zmsg;
+      (try
+         let lines = read_lines e.zpos.file in
+         let n = Array.length lines in
+         for l = max 1 (e.zpos.line - 2) to min n (e.zpos.line + 2) do
+           Printf.eprintf "%s\n" (trim_cr lines.(l - 1))
+         done;
+         let w = caret_width lines e.zpos.line e.zpos.col in
+         Printf.eprintf "%s%s\n"
+           (String.make (max 0 (e.zpos.col - 1)) ' ') (String.make w '^')
+       with _ -> ()))
+    errs
+
 let read_file path =
   let ic = open_in_bin path in
   let n = in_channel_length ic in
@@ -19,13 +381,14 @@ let read_file path =
  *  - import 模块名：只导入该模块的函数（仍以 ns.模块名.fn 命名）
  *  - 导入文件体内的同名函数调用随映射改名；按归一化路径去重防环 *)
 
-let expand_uses (main : program) (main_dir : string) : program =
+let expand_uses (main : program) (main_dir : string)
+    (perrs : (pos * string) list ref) : program =
   let names : (string, unit) Hashtbl.t = Hashtbl.create 16 in
   let loaded : (string, unit) Hashtbl.t = Hashtbl.create 8 in
   let out : item list ref = ref [] in
   let reg name p =
     if Hashtbl.mem names name then
-      raise (CompileError (Some p, Printf.sprintf "导入冲突：%s 已存在" name));
+      raise (CompileError (Some p, Printf.sprintf "import conflict: %s already exists" name));
     Hashtbl.replace names name ()
   in
   (* 改写函数体：m 为 本文件裸函数名 -> 全局名 映射 *)
@@ -36,6 +399,7 @@ let expand_uses (main : program) (main_dir : string) : program =
         List.map
           (function
             | CPos e -> CPos (rw_expr m e)
+            | CMove e -> CMove (rw_expr m e)
             | CNamed (s, e) -> CNamed (s, rw_expr m e))
           args
       in
@@ -102,14 +466,14 @@ let expand_uses (main : program) (main_dir : string) : program =
         List.iter
           (function
             | IFn f -> own := (f.name, ns ^ mname ^ "." ^ f.name) :: !own
-            | IMod _ | IUse _ -> ())
+            | IMod _ | IUse _ | IDecl _ | IStruct _ | IExtern _ | ITypeAlias _ -> ())
           its2
       in
       List.iter
         (function
           | IFn f -> own := (f.name, ns ^ f.name) :: !own
           | IMod (m, its2, _) -> go_mod m its2
-          | IUse _ -> ())
+          | IUse _ | IDecl _ | IStruct _ | IExtern _ | ITypeAlias _ -> ())
         its
     in
     collect items;
@@ -124,8 +488,8 @@ let expand_uses (main : program) (main_dir : string) : program =
         (function
           | IFn f -> emit_fn (ns_mod ^ f.name) f.pos f.params f.ret f.body
           | IMod (_, _, p) ->
-            raise (CompileError (Some p, "模块不允许嵌套"))
-          | IDecl _ | IUse _ -> ())
+            raise (CompileError (Some p, "nested modules are not allowed"))
+          | IDecl _ | IUse _ | IStruct _ | IExtern _ | ITypeAlias _ -> ())
         its2
     in
     List.iter
@@ -152,7 +516,16 @@ let expand_uses (main : program) (main_dir : string) : program =
            | None ->
              (match List.assoc_opt f.name m with
               | Some n -> emit_fn n f.pos f.params f.ret f.body
-              | None -> emit_fn (ns ^ f.name) f.pos f.params f.ret f.body)))
+              | None -> emit_fn (ns ^ f.name) f.pos f.params f.ret f.body))
+        | IStruct it ->
+          (* struct 原样并入（类型名无命名空间；重名由 typeck 统一报错） *)
+          out := IStruct it :: !out
+        | IExtern it ->
+          (* extern "C" 原样并入（符号链接期解析；重名由 typeck 报错） *)
+          out := IExtern it :: !out
+        | ITypeAlias it ->
+          (* type 别名原样并入（重名由 typeck 报错） *)
+          out := ITypeAlias it :: !out)
       items
   in
   let rec load_use base_dir (upath, uimport, ualias, upos) =
@@ -161,13 +534,24 @@ let expand_uses (main : program) (main_dir : string) : program =
       else upath
     in
     if not (Sys.file_exists path) then
-      raise (CompileError (Some upos, Printf.sprintf "use：找不到文件 %s" upath));
+      raise (CompileError (Some upos, Printf.sprintf "use: file not found: %s" upath));
     let norm = String.lowercase_ascii (Filename.concat (Sys.getcwd ()) path) in
     if not (Hashtbl.mem loaded norm) then begin
       Hashtbl.replace loaded norm ();
-      let src = read_file path in
-      let toks = Lexer.tokenize src in
-      let sub = Parser.parse_program (Parser.make toks) in
+      (* 子文件词法/语法错误：记录后跳过该文件（多错误收集） *)
+      match
+        (try
+           let src = read_file path in
+           let sub_p = Parser.make (Lexer.tokenize ~file:path src) in
+           let sub = Parser.parse_program sub_p in
+           List.iter (fun x -> perrs := x :: !perrs) sub_p.Parser.errs;
+           Some sub
+         with
+         | Lexer.LexError (p, m) -> perrs := (p, m) :: !perrs; None
+         | Parser.ParseError (p, m) -> perrs := (p, m) :: !perrs; None)
+      with
+      | None -> ()
+      | Some sub ->
       let base =
         match ualias with
         | Some a -> a ^ "."
@@ -189,18 +573,77 @@ let expand_uses (main : program) (main_dir : string) : program =
   List.iter
     (function
       | IUse _ -> ()
-      | (IFn _ | IMod _ | IDecl _) as it -> out := it :: !out)
+      | (IFn _ | IMod _ | IDecl _ | IStruct _ | IExtern _ | ITypeAlias _) as it ->
+        out := it :: !out)
     main;
   List.rev !out
 
-let run_pipeline path : string =
-  let src = read_file path in
-  let toks = Lexer.tokenize src in
-  let prog = Parser.parse_program (Parser.make toks) in
-  let prog = expand_uses prog (Filename.dirname path) in
-  let hir = Typeck.check_program prog in
-  let m = Mir.lower hir in
-  Llvmgen.gen_program m
+(* 收集式管线：词法 → 语法 → use 展开 → 类型 → MIR → LLVM。
+   各阶段错误收集进 errs（多错误一次报告），阶段间提前终止：
+   词法有错不进语法，语法/use 有错不进类型检查，类型有错不进降码。 *)
+let run_checked path : (string, zerr list) result =
+  let errs = ref [] in
+  let add k p m =
+    (* file 为空的 pos（如 main 缺失的合成位置）归属主文件 *)
+    let p = if p.file = "" then { p with file = path } else p in
+    (* 尾插：保持收集顺序（parse → use → typeck），输出即此顺序 *)
+    errs := !errs @ [ { code = code_of k m; zpos = p; zmsg = m } ]
+  in
+  let driver_add k po m =
+    match po with
+    | Some p -> add k p m
+    | None -> add k { file = path; line = 0; col = 0 } m
+  in
+  let result =
+    try
+      let src = read_file path in
+      let toks =
+        try Lexer.tokenize ~file:path src
+        with Lexer.LexError (p, m) -> add `Lex p m; []
+      in
+      if !errs <> [] then None
+      else
+        let pp = Parser.make toks in
+        let prog =
+          try Ok (Parser.parse_program pp)
+          with Parser.ParseError (p, m) -> add `Parse p m; Error ()
+        in
+        match prog with
+        | Error () -> None
+        | Ok prog ->
+          (* 主文件 parse 恢复收集的错误先入列（头插列表反转成源码顺序） *)
+          List.iter (fun (p, m) -> add `Parse p m) (List.rev pp.Parser.errs);
+          let perrs = ref [] in
+          let prog =
+            try Ok (expand_uses prog (Filename.dirname path) perrs)
+            with CompileError (po, m) -> driver_add `Driver po m; Error ()
+          in
+          match prog with
+          | Error () -> None
+          | Ok prog ->
+            (* 子文件词法/语法错误（use 展开）；已恢复的 AST 继续做类型
+               检查（报出更多错误，不在此终止） *)
+            List.iter (fun (p, m) -> add `Parse p m) (List.rev !perrs);
+            let hir = Typeck.check_program prog in
+            List.iter (fun (p, m) -> add `Type p m)
+              (List.rev !(Typeck.collected));
+            if !errs <> [] then None
+            else Some (Llvmgen.gen_program (Mir.lower hir))
+    with
+    | Typeck.TypeError (p, m) ->
+      (* main 缺失等 check_program 尾部错误：先收集中途已收集项再补本条 *)
+      List.iter (fun (q, mm) -> add `Type q mm) (List.rev !(Typeck.collected));
+      add `Type p m;
+      None
+    | Mir.MirError (p, m) -> add `Mir p m; None
+    | Llvmgen.LlvmError (po, m) -> driver_add `Llvm po m; None
+    | CompileError (po, m) -> driver_add `Driver po m; None
+    | Sys_error m ->
+      driver_add `Driver None ("cannot read source file: " ^ m); None
+  in
+  match result with
+  | Some ll when !errs = [] -> Ok ll
+  | _ -> Error !errs
 
 let find_clang () =
   match Sys.getenv_opt "ZFY_CLANG" with
@@ -226,7 +669,11 @@ let find_runtime () =
 
 (* 编译到可执行文件，返回可执行文件路径 *)
 let compile path : string =
-  let ll = run_pipeline path in
+  let ll =
+    match run_checked path with
+    | Ok ll -> ll
+    | Error errs -> report_err errs; exit 1
+  in
   let base = Filename.remove_extension path in
   let ll_path = base ^ ".ll" in
   let oc = open_out ll_path in
@@ -253,7 +700,7 @@ let compile path : string =
   in
   let code = Sys.command cmd in
   if code <> 0 then begin
-    Printf.eprintf "链接失败（clang 退出码 %d）\n" code;
+    Printf.eprintf "zfy:error[E5004] in 0 of %s because (link failed (clang exit code %d))\n" path code;
     exit 1
   end;
   exe

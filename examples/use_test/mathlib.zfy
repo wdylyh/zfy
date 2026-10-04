@@ -1,10 +1,10 @@
 // 被导入的库
-int add(int a, int b)
+i32 add(i32 a, i32 b)
     return a + b
 
-int twice(int x)
+i32 twice(i32 x)
     return x * 2
 
 // 库内互相调用（应随映射改名 m.twice）
-int quad(int x)
+i32 quad(i32 x)
     return twice(x) * 2

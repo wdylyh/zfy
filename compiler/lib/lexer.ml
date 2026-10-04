@@ -7,6 +7,7 @@ let err pos msg = raise (LexError (pos, msg))
 
 type lexer = {
   src : string;
+  file : string;                (* 源文件路径（错误报告用） *)
   mutable i : int;              (* 字节游标 *)
   mutable line : int;
   mutable col : int;
@@ -15,8 +16,8 @@ type lexer = {
   mutable at_line_start : bool; (* 当前是否处于行首缩进判定点 *)
 }
 
-let make src =
-  { src; i = 0; line = 1; col = 1; indents = [ 0 ];
+let make src file =
+  { src; file; i = 0; line = 1; col = 1; indents = [ 0 ];
     paren_depth = 0; at_line_start = true }
 
 let peek l k =
@@ -40,20 +41,22 @@ let is_ident_start c =
   (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_'
 let is_ident_char c = is_ident_start c || is_digit c
 
-let pos l = { line = l.line; col = l.col }
+let pos l = { file = l.file; line = l.line; col = l.col }
 
 let punct2 =
   [ "==", Eq; "!=", Ne; "<=", Le; ">=", Ge;
     "+=", PlusAssign; "-=", MinusAssign; "*=", StarAssign; "/=", SlashAssign;
     "++", PlusPlus; "--", MinusMinus;
     "%=", PercentAssign;
-    "=>", FatArrow; "->", ThinArrow ]
+    "=>", FatArrow; "->", ThinArrow;
+    "??", QuestionQuestion ]
 
 let punct1 =
   [ '(', LParen; ')', RParen; '[', LBracket; ']', RBracket; '{', LBrace;
     '}', RBrace; ',', Comma; ';', Semicolon; ':', Colon; '=', Assign;
-    '+', Plus; '-', Minus; '*', Star; '/', Slash; '%', Percent; '<', Lt;
-    '>', Gt; '.', Dot ]
+    '+', Plus; '-', Minus; '*', Star; '&', Amp; '/', Slash; '%', Percent;
+    '<', Lt; '>', Gt; '.', Dot;
+    '?', Question; '!', Bang ]
 
 (* ---------- 子扫描器 ---------- *)
 
@@ -64,14 +67,14 @@ let scan_string l =
   let buf = Buffer.create 16 in
   let rec go () =
     if l.i >= String.length l.src then
-      err pos0 "未闭合的字符串字面量"
+      err pos0 "unterminated string literal"
     else
       match l.src.[l.i] with
       | '"' -> advance l 1
       | '\\' ->
         let p = pos l in
         advance l 1;
-        if l.i >= String.length l.src then err p "悬空的转义符";
+        if l.i >= String.length l.src then err p "dangling escape character";
         (match l.src.[l.i] with
          | 'n' -> Buffer.add_char buf '\n'; advance l 1
          | 't' -> Buffer.add_char buf '\t'; advance l 1
@@ -84,9 +87,9 @@ let scan_string l =
          | '\\' -> Buffer.add_char buf '\\'; advance l 1
          | '"' -> Buffer.add_char buf '"'; advance l 1
          | '\'' -> Buffer.add_char buf '\''; advance l 1
-         | c -> err p (Printf.sprintf "未知转义符 \\%c" c));
+         | c -> err p (Printf.sprintf "unknown escape sequence \\%c" c));
         go ()
-      | '\n' -> err (pos l) "字符串字面量中不允许裸换行"
+      | '\n' -> err (pos l) "raw newline in string literal"
       | c -> Buffer.add_char buf c; advance l 1; go ()
   in
   go ();
@@ -95,22 +98,22 @@ let scan_string l =
 (* 前置条件：游标在 '\'' 上 *)
 let scan_char l p0 =
   advance l 1;
-  if l.i >= String.length l.src then err p0 "未闭合的字符字面量";
+  if l.i >= String.length l.src then err p0 "unterminated character literal";
   let c =
     match l.src.[l.i] with
     | '\\' ->
       advance l 1;
-      if l.i >= String.length l.src then err p0 "悬空的转义符";
+      if l.i >= String.length l.src then err p0 "dangling escape character";
       (match l.src.[l.i] with
        | 'n' -> '\n' | 't' -> '\t' | 'r' -> '\r' | '0' -> '\000'
        | 'a' -> '\007' | 'b' -> '\b' | 'f' -> '\012' | 'v' -> '\011'
        | '\\' -> '\\' | '\'' -> '\'' | '"' -> '"'
-       | c -> err (pos l) (Printf.sprintf "未知转义符 \\%c" c))
+       | c -> err (pos l) (Printf.sprintf "unknown escape sequence \\%c" c))
     | c -> c
   in
   advance l 1;
   if l.i >= String.length l.src || l.src.[l.i] <> '\'' then
-    err p0 "字符字面量必须以 ' 结尾";
+    err p0 "character literal must end with '";
   advance l 1;
   c
 
@@ -134,7 +137,7 @@ let scan_number l =
   while l.i < String.length l.src && valid l.src.[l.i] do
     Buffer.add_char buf l.src.[l.i]; advance l 1; all_digits := true
   done;
-  if not !all_digits then err p0 "数字字面量缺少有效数位";
+  if not !all_digits then err p0 "numeric literal has no digits";
   let text = Buffer.contents buf in
   (* 检测浮点：小数点或指数（仅十进制） *)
   let is_float =
@@ -160,20 +163,20 @@ let scan_number l =
       done
     end;
     (try FloatLit (float_of_string (Buffer.contents buf))
-     with _ -> err p0 "非法的浮点字面量")
+     with _ -> err p0 "invalid float literal")
   end
   else begin
     match !base with
     | 16 ->
       (try IntLit (Int64.of_string ("0x" ^ text))
-       with _ -> err p0 "十六进制字面量溢出 i64")
+       with _ -> err p0 "hex literal overflows i64")
     | 2 ->
       (try IntLit (Int64.of_string ("0b" ^ text))
-       with _ -> err p0 "二进制字面量溢出 i64")
+       with _ -> err p0 "binary literal overflows i64")
     | _ ->
       (match Int64.of_string_opt text with
        | Some n -> IntLit n
-       | None -> err p0 "整数字面量溢出 i64")
+       | None -> err p0 "integer literal overflows i64")
   end
 
 (* ---------- 注释与空白 ---------- *)
@@ -193,7 +196,7 @@ let rec skip_line_noise l =
     | '/' when peek l 1 = '*' ->
       let p0 = pos l in
       let rec go depth =
-        if l.i >= String.length l.src then err p0 "未闭合的块注释"
+        if l.i >= String.length l.src then err p0 "unterminated block comment"
         else if l.src.[l.i] = '/' && peek l 1 = '*' then begin
           advance l 2; go (depth + 1)
         end
@@ -214,8 +217,8 @@ let rec skip_line_noise l =
 
 let keyword_lookup s = List.assoc_opt s Tokens.keyword_table
 
-let tokenize src =
-  let l = make src in
+let tokenize ?(file = "") src =
+  let l = make src file in
   let acc = ref [] in
   let push tok p = acc := (tok, p) :: !acc in
   let rec loop () =
@@ -264,7 +267,7 @@ let tokenize src =
                | top'' :: _ when top'' = indent -> ()
                | top'' :: _ when top'' < indent ->
                  err (pos l)
-                   (Printf.sprintf "缩进不一致：期望 %d，得到 %d" top'' indent)
+                   (Printf.sprintf "inconsistent indentation: expected %d, got %d" top'' indent)
                | _ -> ());
               if List.hd l.indents <> indent then pop ()
             | _ -> ()
@@ -338,13 +341,8 @@ let tokenize src =
                 push t p
               | None ->
                 let c = l.src.[l.i] in
-                if c = '&' then
-                  err (pos l) "'&'（引用）语法已删除"
-                else if c = '?' then
-                  err (pos l) "'?'（错误传播）语法已删除"
-                else
-                  err (pos l)
-                    (Printf.sprintf "非法字符 '%c' (0x%02X)" c (Char.code c))));
+                err (pos l)
+                  (Printf.sprintf "illegal character '%c' (0x%02X)" c (Char.code c))));
           loop ()
     end
   in

@@ -23,7 +23,7 @@ type term =
 
 type instr =
   | MCopy of string * operand * zty              (* 槽位写入（聚合为 memcpy/克隆） *)
-  | MMoveSeq of string * operand * zty           (* 所有权转移：释放目标旧值后直接接管临时指针（免克隆）；string/数组/列表 *)
+  | MMoveSeq of string * operand * zty           (* 所有权转移：释放目标旧值后直接接管临时（免克隆）；string/数组/列表=指针接管，struct=槽 memcpy *)
   | MClear of string * zty                       (* move 后清空变量槽（store null，防 RAII 双释放） *)
   | MBinop of string * binop * operand * operand
   | MUnop of string * unop * operand
@@ -33,11 +33,23 @@ type instr =
     (* 用户函数调用（所有权传参）：每个 string/数组/列表实参带 move 标志——
        true 直接移交（免克隆），false 由调用方克隆（保持值语义）；
        最后一项为 move 的变量实参（调用后需清槽）；frac 始终借传 *)
-  | MThrow of operand                            (* throw：抛出 string 消息 *)
-  | MTryFrame of string                          (* try 帧缓冲（入口 alloca） *)
-  | MTrySetup of string * string                 (* setjmp：结果（非 0=异常路径）, 帧 *)
-  | MTryLeave                                    (* 正常离开 try：弹出异常帧 *)
-  | MTryMsg of string * zty                      (* catch 取异常消息（所有权移交目标槽） *)
+  | MErrNew of string * zty * operand * operand
+    (* fail(code, msg)：目标槽（TErr 聚合 alloca）, TErr 类型, code（i32）, msg
+       （string，运行时 strdup 永不释放）；value 字段不初始化（code≠0 不读） *)
+  | MErrOk of string * zty * operand
+    (* 成功包装（T → TErr T）：目标槽（TErr 聚合 alloca）, TErr 类型, 元素值
+       （标量/string/指针，string 深拷贝）；code=0, msg=null *)
+  | MErrIsOk of string * operand * zty
+    (* 判定成功：目标寄存器（i1）, TErr 槽操作数, TErr 类型 *)
+  | MErrValue of string * operand * zty
+    (* 取成功值：目标寄存器（元素类型）, TErr 槽操作数, TErr 类型 *)
+  | MErrFillErr of string * operand * zty
+    (* TErr 值 → Err struct 槽（拷 code/msg 两字段）：目标槽, TErr 槽操作数, TErr 类型 *)
+  | MErrFillOut of operand * zty
+    (* a? 失败路径：错误值 memcpy 到本函数 sret 返回槽 %out（块终结由 TRet None
+       生成 ret void；仅 TErr 返回类型的函数） *)
+  | MPanic of operand option * operand
+    (* panic(code?, msg)：调用 zfy_panic 不可恢复终止（不返回）；后继为死块 *)
   | MAlloca of string * zty                      (* 变量槽（入口块统一分配�?*)
   | MFracNew of string * zty * operand * operand (* 分数字面量：�? frac 类型, 分子, 分母 *)
   | MNorm of string * zty                        (* frac 槽约分：调用 zfy_frac_norm_<suf> *)
@@ -58,7 +70,33 @@ type instr =
   | MSeqGet of string * operand * operand * zty  (* 读元素到临时：目�? 数组, 下标, 元素类型 *)
   | MSeqLen of string * operand                  (* length(x)：目标临�? 数组/列表 *)
   | MSeqSlice of string * operand * operand * operand * operand * bool
-    (* base[a,b:step]：目标临�?seq 指针), �? 起点, 终点, 步长, 元素是否 string *)
+    (* base[a,b:step]：目标临时(seq 指针), 基, 起点, 终点, 步长, 元素是否 string *)
+  | MStructNew of string * zty * (int * operand) list
+    (* struct 构造：目标槽（聚合 alloca）, struct 类型, (字段序号, 值) 列表 *)
+  | MFieldGet of string * operand * zty * int list * zty
+    (* 字段读取：目标, 根槽, 根 struct 类型, 字段序号链, 字段类型；
+       标量/string/seq 字段为 load（借用语义），嵌套 struct 字段深拷贝到目标槽 *)
+  | MFieldStore of operand * zty * int list * operand
+    (* 字段写入：根槽, 根 struct 类型, 字段序号链, 新值（深拷贝新值+释放旧值） *)
+  | MEmptySeq of string * zty
+    (* 数组/列表字段缺省分配：目标临时, 完整 seq 类型
+       （TArray (t,n) → 定长 n 全零；TList t → 空列表、初始容量 8） *)
+  | MFreeStructTemp of string * zty
+    (* 语句末释放临时 struct 槽持有的资源 *)
+  | MAddrOf of string * string
+    (* 取地址：dst 寄存器 = 变量槽地址（槽名含全局 @g.x） *)
+  | MLoadK of string * operand * zty
+    (* 解引用读：dst = load <ty>, ptr <op>（op 为指针值） *)
+  | MStoreK of operand * zty * operand
+    (* 解引用写：store <值>, ptr <地址>（地址, 目标类型, 值；仅标量/指针目标） *)
+  | MFieldAddr of string * operand * zty * int list * zty
+    (* 字段地址：dst = GEP 链地址（root 操作数, 根类型(可为 TPtr), 字段链, 字段类型） *)
+  | MElemAddr of string * operand * operand * zty
+    (* 元素地址（裸指针，无越界检查）：dst = getelementptr（base ptr, 下标, 元素类型） *)
+  | MIndirectCall of string option * operand * operand list * zty
+    (* 函数指针间接调用：dst, 被调指针值, 实参（标量语义借传）, 返回类型 *)
+  | MFunAddr of string * string
+    (* 函数入口地址：dst 寄存器持有 LLVM 符号文本（@名），作函数指针值 *)
 
 type block = { bid : int; mutable body : instr list; mutable term : term option }
 
@@ -70,7 +108,13 @@ type mfn = {
   mblocks : block list;
 }
 
-type mir = { mfns : mfn list }
+type mir = { mfns : mfn list; mstructs : sdef list }
+
+(* 临时资源的释放类别（语句末统一释放） *)
+type free_kind =
+  | FStr                          (* 寄存器堆串（regs）：zfy_free_str *)
+  | FSeq of bool                  (* 寄存器 seq（regs）：zfy_seq_free（元素是否 string） *)
+  | FStruct of zty                (* 槽 struct（allocas）：zfy_struct_free_<名> *)
 
 (* ---------- 降码上下�?---------- *)
 
@@ -81,10 +125,7 @@ type lctx = {
   mutable cur : block;
   mutable loops : (int * int * int) list;  (* (break 目标, continue 目标, 循环体作用域深度) *)
   mutable scopes : (string * zty) list ref list;  (* RAII 作用域栈：每层收集需释放变量 *)
-  mutable stmt_temps : (string * bool * bool) list;  (* 当前语句拥有的临时：(名, 是否 seq, seq 元素是否 string) *)
-  mutable loop_ids : int list;             (* 循环体标识栈（move 分析用：当前处于哪些循环体内） *)
-  occ_tbl : (string, int) Hashtbl.t;       (* 全函数变量出现次数（move 分析用） *)
-  fresh_tbl : (string, int) Hashtbl.t;     (* 变量名 -> 声明时所在循环体标识 *)
+  mutable stmt_temps : (string * free_kind) list;  (* 当前语句拥有的临时：(名, 释放类别) *)
 }
 
 let new_block l =
@@ -99,17 +140,13 @@ let set_term l t = if l.cur.term = None then l.cur.term <- Some t
 
 let fresh l = l.nt <- l.nt + 1; Printf.sprintf "%%t%d" l.nt
 
-(* 循环体标识（move 分析：判定变量是否为循环体内每轮重新声明的"新鲜"变量） *)
-let loop_counter = ref 0
-let fresh_loop_id () = incr loop_counter; !loop_counter
-
 let op k t = { o = k; oty = t }
 
-(* 需 RAII 释放的变量类型：string（堆串）、数组/列表（seq 资源）。
+(* 需 RAII 释放的变量类型：string（堆串）、数组/列表（seq 资源）、struct（内含堆资源）。
    全局变量槽（'@' 前缀）不属于函数作用域，永不释放 *)
 let owned_ty (name : string) (t : zty) =
   match t with
-  | TString | TArray _ | TList _ -> name.[0] <> '@'
+  | TString | TArray _ | TList _ | TStruct _ -> name.[0] <> '@'
   | _ -> false
 
 (* 在当前作用域登记需 RAII 释放的变量（后声明先释放） *)
@@ -120,19 +157,26 @@ let declare_owned l name ty =
     | [] -> ()
 
 (* 登记本语句产生的临时（语句末统一释放） *)
-let add_temp l name is_seq is_str =
-  l.stmt_temps <- (name, is_seq, is_str) :: l.stmt_temps
+let add_temp l name kind =
+  l.stmt_temps <- (name, kind) :: l.stmt_temps
 
-(* 临时 move 优化：若 v 是本语句产生的 owned 临时（string/seq，语句末才释放、
-   此后不再被引用），则将所有权直接转移给目标变量——释放目标旧值后
-   store 临时指针，免去整体克隆。临时从 stmt_temps 移除（不再释放）。
-   返回是否发生了 move（发生时调用方不再 emit MCopy）。 *)
+(* 临时 move 优化：若 v 是本语句产生的 owned 临时（string/seq/struct 槽，
+   语句末才释放、此后不再被引用），则将所有权直接转移给目标变量——
+   string/seq 为指针接管，struct 为释放目标旧值后槽 memcpy。临时从
+   stmt_temps 移除（不再释放）。返回是否发生了 move（发生时调用方不再 emit MCopy）。 *)
 let move_owned_temp l (name : string) (v : operand) (ty : zty) : bool =
+  let kind_matches kind =
+    match kind, ty with
+    | FStr, TString -> true
+    | FSeq _, (TArray _ | TList _) -> true
+    | FStruct _, TStruct _ -> true
+    | _ -> false
+  in
   match v.o, ty with
-  | OLocal d, (TString | TArray _ | TList _) ->
+  | OLocal d, (TString | TArray _ | TList _ | TStruct _) ->
     let rec go acc = function
       | [] -> false
-      | (n, is_seq, is_str) :: rest when n = d ->
+      | (n, kind) :: rest when n = d && kind_matches kind ->
         l.stmt_temps <- List.rev_append acc rest;
         emit l (MMoveSeq (name, v, ty));
         true
@@ -141,11 +185,10 @@ let move_owned_temp l (name : string) (v : operand) (ty : zty) : bool =
     go [] l.stmt_temps
   | _ -> false
 
-(* 用户调用实参的可移动性：string/数组/列表实参若满足
-   ① 是本语句临时（split/切片/调用结果等），或
-   ② 是全函数仅出现一次的局部变量，且不在循环内（或在最内层循环体内声明，
-      每轮迭代重新初始化）
-   则可 move（免克隆，所有权移交被调函数）。返回 (move?, 变量清槽项) *)
+(* 调用实参的可移动性：string/数组/列表实参若为本语句产生的临时
+   （split/切片/调用结果等，语句末才释放、此后不再被引用）则可 move
+   （免克隆，所有权移交被调函数）。返回 (move?, 变量清槽项)。
+   （t6 起：全函数单次出现变量的自动 move 已删除——一律显式 move。） *)
 let arg_moveable l (v : operand) : bool * (string * zty) option =
   let owned = match v.oty with TString | TArray _ | TList _ -> true | _ -> false in
   if not owned then (false, None)
@@ -155,20 +198,12 @@ let arg_moveable l (v : operand) : bool * (string * zty) option =
       (* 本语句临时（%临时名）：直接移交 *)
       let rec go acc = function
         | [] -> (false, None)
-        | (n, _, _) :: rest when n = d ->
+        | (n, _) :: rest when n = d ->
           l.stmt_temps <- List.rev_append acc rest;
           (true, None)
         | x :: rest -> go (x :: acc) rest
       in
       go [] l.stmt_temps
-    | OLocal n when n.[0] <> '@' ->
-      let occ = match Hashtbl.find_opt l.occ_tbl n with Some c -> c | None -> 0 in
-      let loop_fresh =
-        match l.loop_ids with
-        | [] -> true
-        | top :: _ -> Hashtbl.find_opt l.fresh_tbl n = Some top
-      in
-      if occ = 1 && loop_fresh then (true, Some (n, v.oty)) else (false, None)
     | _ -> (false, None)
 
 (* 语句结束：释放本语句拥有的临时（若当前块已终结则放弃——控制流边界�?   return 路径的所有权随返回转移，由调用方先行清空�?*)
@@ -177,8 +212,11 @@ let finish_stmt_temps l =
   l.stmt_temps <- [];
   if l.cur.term = None then
     List.iter
-      (fun (n, is_seq, is_str) ->
-        if is_seq then emit l (MFreeSeqTemp (n, is_str)) else emit l (MFreeTemp n))
+      (fun (n, kind) ->
+        match kind with
+        | FStr -> emit l (MFreeTemp n)
+        | FSeq is_str -> emit l (MFreeSeqTemp (n, is_str))
+        | FStruct t -> emit l (MFreeStructTemp (n, t)))
       ts
 
 (* RAII：从作用域栈顶释放到深度 depth（不含），内层作用域先释放�?   层内后声明先释放；skip 中的变量名不释放（如�?return 转移的返回值） *)
@@ -203,7 +241,7 @@ let frac_rt_name (bop : binop) (elem : zty) : string =
     | BAdd -> "add" | BSub -> "sub" | BMul -> "mul" | BDiv -> "div"
     | BEq -> "eq" | BNe -> "ne" | BLt -> "lt" | BGt -> "gt" | BLe -> "le"
     | BGe -> "ge"
-    | _ -> merr { line = 0; col = 0 } "frac 不支持该运算"
+    | _ -> merr { file = ""; line = 0; col = 0 } "unsupported frac operation"
   in
   Printf.sprintf "zfy_frac_%s_%s" opname (Hir.suffix_of elem)
 
@@ -270,24 +308,51 @@ let rec lexpr l (e : texpr) : operand =
     let d = fresh l in
     emit l (MUnop (d, u, oa));
     op (OLocal d) e.ety
+  | ECastK (a, t) when a.ety = TString ->
+    (* string → 数值 cast：错误值路径（失败产 TErr 值，code=CAST）；
+       zfy_stoi_err / zfy_stod_err 以 sret 写 TErr 聚合 *)
+    let oa = lexpr l a in
+    let fn = match t with TFloat _ -> "zfy_stod_err" | _ -> "zfy_stoi_err" in
+    let d = fresh l in
+    emit l (MCall (Some d, fn, [ oa ], e.ety));
+    op (OLocal d) e.ety
   | ECastK (a, t) ->
     let oa = lexpr l a in
     let d = fresh l in
     emit l (MCast (d, oa, t));
     op (OLocal d) e.ety
-  | ECallK (f, args) ->
+  | ECallK (f, args, moves) ->
     (* 用户函数：所有权传参。先求值全部实参，再逐个判定可移动性
-       （临时 / 单次出现变量直接移交，其余由调用方克隆保持值语义） *)
+       （本语句临时直接移交；显式 move 实参（f(move x)）移交并清槽，
+       其余由调用方克隆保持值语义）。
+       moves 与实参等长标记显式 move；typeck 内建/runtime 辅助调用
+       构造空表时按缺省 false（无显式 move）处理 *)
     let oargs = List.map (lexpr l) args in
-    let decisions = List.map (arg_moveable l) oargs in
+    let decisions =
+      List.mapi
+        (fun i o ->
+          match List.nth_opt moves i with
+          | Some true ->
+            (* 显式 move：typeck 已保证局部 owned 变量（string/数组/列表） *)
+            (match o.o, o.oty with
+             | OLocal n, (TString | TArray _ | TList _) when n.[0] <> '@' ->
+               (true, Some (n, o.oty))
+             | _ -> (false, None))
+          | _ -> arg_moveable l o)
+        oargs
+    in
     let pairs = List.combine oargs decisions in
     let call_args = List.map (fun (o, (mv, _)) -> (o, mv)) pairs in
     let clears = List.filter_map (fun (_, (_, c)) -> c) pairs in
     let d = if e.ety = TVoid then None else Some (fresh l) in
     emit l (MCallOwn (d, f, call_args, e.ety, clears));
-    (* 拥有堆串的调用结果登记为语句临时（语句末释放�?*)
+    (* 拥有堆资源的调用结果登记为语句临时（语句末释放；struct 可被 move 接管） *)
     (match d with
-     | Some d' when e.ety = TString -> add_temp l d' false false
+     | Some d' when e.ety = TString -> add_temp l d' FStr
+     | Some d' ->
+       (match e.ety with
+        | TStruct _ -> add_temp l d' (FStruct e.ety)
+        | _ -> ())
      | _ -> ());
     (match d with
      | Some d' -> op (OLocal d') e.ety
@@ -311,7 +376,7 @@ let rec lexpr l (e : texpr) : operand =
     let is_str = (match e.ety with TList TString -> true | _ -> false) in
     let d = fresh l in
     emit l (MSeqSlice (d, ob, oa, ob', ost, is_str));
-    add_temp l d true is_str;  (* 临时 seq：语句末释放 *)
+    add_temp l d (FSeq is_str);  (* 临时 seq：语句末释放 *)
     op (OLocal d) e.ety
   | ESplitK (a, c) ->
     (* split(s, x)：调用运行时切分，返回新分配的 string 列表 seq。
@@ -323,7 +388,7 @@ let rec lexpr l (e : texpr) : operand =
        emit l (MCall (Some d, "zfy_str_split", [ oa; oc ], TList TString))
      | _ ->
        emit l (MCall (Some d, "zfy_str_split_str", [ oa; oc ], TList TString)));
-    add_temp l d true true;
+    add_temp l d (FSeq true);
     op (OLocal d) (TList TString)
   | EPushK (base, v) ->
     (* push(列表, 值)：下标 = 当前长度，写入时自动扩长 *)
@@ -335,7 +400,162 @@ let rec lexpr l (e : texpr) : operand =
        let ov = lexpr l v in
        emit l (MSeqSet (name, elem, op (OLocal dl) (TInt 64), ov, true));
        op (OInt 0L) TVoid
-     | _ -> merr e.epos "push 的目标必须是列表变量")
+     | _ -> merr e.epos "push target must be a list variable")
+  | EStructNewK (_, fields) ->
+    (* struct 构造：逐字段求值后写入聚合目标槽（llvmgen 负责 alloca 与
+       深拷贝语义）。目标登记为语句临时：语句末释放，或整体赋值时 move 接管 *)
+    let d = fresh l in
+    let vals = List.mapi (fun i f -> (i, lexpr l f)) fields in
+    emit l (MStructNew (d, e.ety, vals));
+    add_temp l d (FStruct e.ety);
+    op (OLocal d) e.ety
+  | EFieldK (base, idx) ->
+    (* 字段读取：字段链展平为 (根槽, 序号链)，一次 GEP 直达最终字段。
+       标量/string/seq 字段 load 值（借用语义，赋值时才深拷贝）；
+       嵌套 struct 字段深拷贝到临时槽（值语义） *)
+    let rec flatten acc b =
+      match b.e with
+      | EFieldK (b', i) -> flatten (i :: acc) b'
+      | EVarK n -> Some (n, acc, b.ety)
+      | _ -> None
+    in
+    (match flatten [ idx ] base with
+     | Some (root, idxs, rootty) ->
+       let d = fresh l in
+       emit l (MFieldGet (d, op (OLocal root) rootty, rootty, idxs, e.ety));
+       (match e.ety with
+        | TStruct _ -> add_temp l d (FStruct e.ety)  (* 深拷贝副本：语句末释放 *)
+        | _ -> ());
+       op (OLocal d) e.ety
+     | None -> merr e.epos "unsupported field-access target")
+  | ENullK ->
+    (* null：0 值（llvmgen 对指针类型的 OInt 0 落为 null 常量） *)
+    op (OInt 0L) e.ety
+  | EAddrOfK a ->
+    (* 取地址：&x。按目标形态分派：
+       变量 → 槽地址（MAddrOf，全局槽同样适用）；
+       字段链 → GEP 链地址（MFieldAddr，根可为 TStruct 或 TPtr(TStruct)）；
+       数组/列表元素 → 裸元素地址（MElemAddr，无越界检查）；
+       解引用 → 取地址与解引用相互抵消，即 p 本身（直接化简） *)
+    (match a.e with
+     | EVarK n ->
+       let d = fresh l in
+       emit l (MAddrOf (d, n));
+       op (OLocal d) e.ety
+     | EDerefK p -> lexpr l p
+     | EFieldK _ ->
+       let rec flatten acc b =
+         match b.e with
+         | EFieldK (b', i) -> flatten (i :: acc) b'
+         | EVarK n -> Some (n, acc, b.ety)
+         | _ -> None
+       in
+       (match flatten [] a with
+        | Some (root, idxs, rootty) ->
+          let d = fresh l in
+          emit l (MFieldAddr (d, op (OLocal root) rootty, rootty, idxs, a.ety));
+          op (OLocal d) e.ety
+        | None -> merr e.epos "unsupported address-of target")
+     | ESeqGetK (b, i) ->
+       (match b.e with
+        | EVarK _ ->
+          let ob = lexpr l b and oi = lexpr l i in
+          let d = fresh l in
+          emit l (MElemAddr (d, ob, oi, a.ety));
+          op (OLocal d) e.ety
+        | _ -> merr e.epos "element address-of target must be a variable")
+     | _ -> merr e.epos "unsupported address-of target")
+  | EDerefK p ->
+    (* 解引用读：p 为指针值，load 目标类型（聚合类型已在 typeck 拒绝） *)
+    let pv = lexpr l p in
+    let d = fresh l in
+    emit l (MLoadK (d, pv, e.ety));
+    op (OLocal d) e.ety
+  | EIndirectCallK (f, args) ->
+    (* 函数指针间接调用：实参标量语义借传（不做 move 分析） *)
+    let of_ = lexpr l f in
+    let oargs = List.map (lexpr l) args in
+    let d = if e.ety = TVoid then None else Some (fresh l) in
+    emit l (MIndirectCall (d, of_, oargs, e.ety));
+    (match d with
+     | Some d' -> op (OLocal d') e.ety
+     | None -> op (OInt 0L) TVoid)
+  | EFunPtrK f ->
+    (* 函数名引用：dst 寄存器持有函数符号（llvmgen 落为 @名） *)
+    let d = fresh l in
+    emit l (MFunAddr (d, f));
+    op (OLocal d) e.ety
+  | EEmptySeqK ->
+    (* 数组/列表字段缺省分配：新分配 seq（定长/空列表），登记为语句临时 *)
+    let d = fresh l in
+    let elem =
+      match e.ety with TList t | TArray (t, _) -> t | _ -> assert false
+    in
+    emit l (MEmptySeq (d, e.ety));
+    add_temp l d (FSeq (elem = TString));
+    op (OLocal d) e.ety
+  | EFailK (code, msg) ->
+    (* fail(code, msg)：构造错误值临时槽（value 字段不初始化） *)
+    let oc = lexpr l code and om = lexpr l msg in
+    let d = fresh l in
+    emit l (MErrNew (d, e.ety, oc, om));
+    op (OLocal d) e.ety
+  | EPanicK (code, msg) ->
+    (* panic：调用运行时后不返回；后继代码落入死块（死代码消除删除） *)
+    let oc = Option.map (lexpr l) code in
+    let om = lexpr l msg in
+    emit l (MPanic (oc, om));
+    set_term l TUnreachable;
+    l.cur <- new_block l;
+    op (OInt 0L) TVoid
+  | EUnwrapK (a, b) ->
+    (* a ?? b：短路——a 成功取 value，失败才求值 b；结果写元素类型临时槽 *)
+    let va = lexpr l a in
+    let rslot = fresh l in
+    emit l (MAlloca (rslot, e.ety));
+    let okr = fresh l in
+    emit l (MErrIsOk (okr, va, a.ety));
+    let bok = new_block l and berr = new_block l and bend = new_block l in
+    set_term l (TCondBr (op (OLocal okr) TBool, bok.bid, berr.bid));
+    l.cur <- bok;
+    let dv = fresh l in
+    emit l (MErrValue (dv, va, a.ety));
+    emit l (MCopy (rslot, op (OLocal dv) e.ety, e.ety));
+    set_term l (TBr bend.bid);
+    l.cur <- berr;
+    let vb = lexpr l b in
+    emit l (MCopy (rslot, vb, e.ety));
+    set_term l (TBr bend.bid);
+    l.cur <- bend;
+    op (OLocal rslot) e.ety
+  | EPropagateK a ->
+    (* a?：失败即从函数传播返回错误（先 RAII 释放全部局部资源，
+       再把错误值拷入返回槽）；成功取 value 继续 *)
+    let va = lexpr l a in
+    let okr = fresh l in
+    emit l (MErrIsOk (okr, va, a.ety));
+    let bfail = new_block l and bok = new_block l in
+    set_term l (TCondBr (op (OLocal okr) TBool, bok.bid, bfail.bid));
+    l.cur <- bfail;
+    emit_frees_from l 0;
+    emit l (MErrFillOut (va, a.ety));
+    set_term l (TRet None);
+    l.cur <- bok;
+    let dv = fresh l in
+    emit l (MErrValue (dv, va, a.ety));
+    op (OLocal dv) e.ety
+  | EErrOkK v ->
+    (* T 值自动包装为 TErr T（赋值/传参/返回处的 coerce） *)
+    let ov = lexpr l v in
+    let d = fresh l in
+    emit l (MErrOk (d, e.ety, ov));
+    op (OLocal d) e.ety
+  | EFindK (s, c, k) ->
+    (* find(s, c, k)：运行时查找，产 TErr i64（sret） *)
+    let os = lexpr l s and oc = lexpr l c and ok = lexpr l k in
+    let d = fresh l in
+    emit l (MCall (Some d, "zfy_err_find", [ os; oc; ok ], e.ety));
+    op (OLocal d) e.ety
 
 (* ---------- 语句降码 ---------- *)
 
@@ -350,12 +570,10 @@ and lstmt l (s : tstmt) : unit =
 and lstmt_inner l (s : tstmt) : unit =
   match s.s with
   | SDeclK (_, name, ty, init, nn) ->
-    (* 标量声明：变量永远有值，必有初值；非 unreduced frac 存入后约分。
+    (* 标量声明：变量永远有值，必有初值；非 unred frac 存入后约分。
        初值是本语句的 seq 临时（如 split 结果）时直接 move 所有权免克隆 *)
     declare_owned l name ty;
     let v = lexpr l init in
-    if l.loop_ids <> [] then
-      Hashtbl.replace l.fresh_tbl name (List.hd l.loop_ids);
     let moved =
       match ty with TString | TArray _ | TList _ -> move_owned_temp l name v ty | _ -> false
     in
@@ -382,8 +600,6 @@ and lstmt_inner l (s : tstmt) : unit =
     let tgt = if is_list then TList elem else TArray (elem, Int64.to_int len) in
     declare_owned l name tgt;
     let v = lexpr l src in
-    if l.loop_ids <> [] then
-      Hashtbl.replace l.fresh_tbl name (List.hd l.loop_ids);
     if not (move_owned_temp l name v tgt) then
       emit l (MCopy (name, v, tgt))
   | SAssignK (lhs, rhs, nn) ->
@@ -400,7 +616,7 @@ and lstmt_inner l (s : tstmt) : unit =
          emit l (MCopy (name, v, lhs.ety));
          if nn then emit l (MNorm (name, lhs.ety))
        end
-     | _ -> merr lhs.epos "不支持的赋值目标")
+     | _ -> merr lhs.epos "unsupported assignment target")
   | SAugIndexK (name, elem, idx, bop, v, grow) ->
     (* a[i] op= v：下标只求值一次（load + op + store 同一槽位�?*)
     let oi = lexpr l idx in
@@ -427,6 +643,36 @@ and lstmt_inner l (s : tstmt) : unit =
     (* a[x,y:st] op= v：运行时逐元素原地运算 *)
     emit l (MAugSlice (name, elem, lexpr l a, lexpr l b, lexpr l st, bop,
                        lexpr l v))
+  | SFieldSetK (root, idxs, rootty, v) ->
+    (* 字段写入：GEP 直达字段，深拷贝新值 + 释放旧值（llvmgen 按字段类型分派） *)
+    emit l (MFieldStore (op (OLocal root) rootty, rootty, idxs, lexpr l v))
+  | SAugFieldK (root, idxs, rootty, bop, v) ->
+    (* 字段增广：load 字段 + op + 写回（字段只求值一次；字段类型 = 右值类型） *)
+    let fty = v.ety in
+    let old = fresh l in
+    emit l (MFieldGet (old, op (OLocal root) rootty, rootty, idxs, fty));
+    let ov = lexpr l v in
+    let r = fresh l in
+    emit l (MBinop (r, bop, op (OLocal old) fty, ov));
+    emit l (MFieldStore (op (OLocal root) rootty, rootty, idxs,
+                         op (OLocal r) fty))
+  | SDerefSetK (p, v) ->
+    (* 指针解引用写入 p* = v：地址先求值，store 值（仅标量/指针目标） *)
+    let pv = lexpr l p in
+    let vv = lexpr l v in
+    emit l (MStoreK (pv, v.ety, vv))
+  | SAugDerefK (p, bop, v) ->
+    (* 指针解引用复合赋值 p* op= v：load 旧值 + op + store（p 只求值一次） *)
+    let pv = lexpr l p in
+    let old = fresh l in
+    emit l (MLoadK (old, pv, v.ety));
+    let ov = lexpr l v in
+    let r = fresh l in
+    emit l (MBinop (r, bop, op (OLocal old) v.ety, ov));
+    emit l (MStoreK (pv, v.ety, op (OLocal r) v.ety))
+  | SUnsafeK b ->
+    (* unsafe 块：门禁在 typeck 已检查，降码时透明展开 *)
+    lblock l b
   | SExprK e -> ignore (lexpr l e)
   | SReturnK e ->
     (* 先求返回值，再释放全部局部资源（RAII）；
@@ -467,12 +713,10 @@ and lstmt_inner l (s : tstmt) : unit =
     l.scopes <- ref [] :: l.scopes;
     let body_depth = List.length (List.tl l.scopes) in
     l.loops <- (bend.bid, bcond.bid, body_depth) :: l.loops;
-    l.loop_ids <- fresh_loop_id () :: l.loop_ids;
     l.cur <- bbody;
     lblock l body;
     emit_frees_from l body_depth;
     set_term l (TBr bcond.bid);
-    l.loop_ids <- List.tl l.loop_ids;
     l.loops <- List.tl l.loops;
     l.scopes <- List.tl l.scopes;
     l.cur <- bend
@@ -490,7 +734,6 @@ and lstmt_inner l (s : tstmt) : unit =
     (* 循环上下文：break -> bend；continue -> bupd（continue/break 前
        需先释放 body 层，bupd/bend 都在 body 作用域之外） *)
     l.loops <- (bend.bid, bupd.bid, body_depth) :: l.loops;
-    l.loop_ids <- fresh_loop_id () :: l.loop_ids;
     l.cur <- bbody;
     lblock l body;
     emit_frees_from l body_depth;
@@ -498,7 +741,6 @@ and lstmt_inner l (s : tstmt) : unit =
     l.cur <- bupd;
     List.iter (lstmt l) updates;
     set_term l (TBr bcond.bid);
-    l.loop_ids <- List.tl l.loop_ids;
     l.loops <- List.tl l.loops;
     l.scopes <- List.tl l.scopes;
     l.cur <- bend
@@ -535,7 +777,7 @@ and lstmt_inner l (s : tstmt) : unit =
        emit l (MCast (s64, vs, TInt 64));
        emit l (MReduce (root, x.ety, op (OLocal c64) (TInt 64),
                         op (OLocal s64) (TInt 64)))
-     | _ -> merr x.epos "reduce 的对象必须是 frac 类型的局部变量")
+     | _ -> merr x.epos "reduce target must be a frac-typed local variable")
   | SBreakK ->
     (match l.loops with
      | (bk, _, body_depth) :: _ ->
@@ -543,111 +785,44 @@ and lstmt_inner l (s : tstmt) : unit =
        emit_frees_from l body_depth;
        set_term l (TBr bk);
        l.cur <- new_block l            (* 后续死代码放入孤立块 *)
-     | [] -> merr s.spos "break 只能出现在循环内")
+     | [] -> merr s.spos "break outside a loop")
   | SContinueK ->
     (match l.loops with
      | (_, ck, body_depth) :: _ ->
        emit_frees_from l body_depth;
        set_term l (TBr ck);
        l.cur <- new_block l
-     | [] -> merr s.spos "continue 只能出现在循环内")
-  | SThrowK e ->
-    (* throw：运行时 strdup 消息后长跳到最近异常帧；无帧则报错退出 *)
-    let v = lexpr l e in
-    emit l (MThrow v)
-  | STryK (tb, binding, cb) ->
-    (* try/catch：setjmp 双返回。0=try 路径（正常离开时弹帧），
-       非 0=异常路径（先释放 try 作用域资源，再取消息、执行 catch 块） *)
-    let frame = fresh l in
-    emit l (MTryFrame frame);
-    let res = fresh l in
-    emit l (MTrySetup (res, frame));
-    let btry = new_block l and bcatch = new_block l and bend = new_block l in
-    set_term l (TCondBr (op (OLocal res) TBool, bcatch.bid, btry.bid));
-    (* try 路径：独立 RAII 作用域 *)
-    l.scopes <- ref [] :: l.scopes;
-    let try_scope = List.hd l.scopes in
-    let outer = List.length (List.tl l.scopes) in
-    l.cur <- btry;
-    lblock l tb;
-    emit_frees_from l outer;
-    emit l MTryLeave;
+     | [] -> merr s.spos "continue outside a loop")
+  | SUnwrapBlockK (is_decl, slot, elem, a, errslot, blk) ->
+    (* a ?? 缩进块：a 成功 → value 写入目标槽；失败 → code/msg 拷入 err 槽，
+       执行块（块内可用 err，块末表达式已由 typeck 改写为对目标槽的赋值），
+       两路在结尾汇合 *)
+    if is_decl then begin
+      declare_owned l slot elem
+    end;
+    let va = lexpr l a in
+    let okr = fresh l in
+    emit l (MErrIsOk (okr, va, a.ety));
+    let bok = new_block l and berr = new_block l and bend = new_block l in
+    set_term l (TCondBr (op (OLocal okr) TBool, bok.bid, berr.bid));
+    (* 成功路径：取 value 写入目标槽 *)
+    l.cur <- bok;
+    let dv = fresh l in
+    emit l (MErrValue (dv, va, a.ety));
+    emit l (MCopy (slot, op (OLocal dv) elem, elem));
     set_term l (TBr bend.bid);
-    l.scopes <- List.tl l.scopes;
-    (* 异常路径：先释放 try 作用域变量（异常时未走正常释放路径），
-       再绑定异常消息并执行 catch 块 *)
-    l.cur <- bcatch;
-    List.iter (fun (n, t) -> emit l (MFreeVar (n, t))) (List.rev !try_scope);
+    (* 失败路径：填 err 槽后执行块（独立 RAII 作用域） *)
+    l.cur <- berr;
+    emit l (MErrFillErr (errslot, va, a.ety));
     l.scopes <- ref [] :: l.scopes;
-    let couter = List.length (List.tl l.scopes) in
-    (match binding with
-     | Some nm ->
-       declare_owned l nm TString;
-       emit l (MTryMsg (nm, TString))
-     | None -> ());
-    lblock l cb;
-    emit_frees_from l couter;
+    let outer = List.length (List.tl l.scopes) in
+    lblock l blk;
+    emit_frees_from l outer;
     set_term l (TBr bend.bid);
     l.scopes <- List.tl l.scopes;
     l.cur <- bend
 
 (* ---------- 函数降码 ---------- *)
-
-(* ---------- 出现次数统计（move 分析） ---------- *)
-
-let add_occ (occ : (string, int) Hashtbl.t) (n : string) =
-  let c = match Hashtbl.find_opt occ n with Some c -> c | None -> 0 in
-  Hashtbl.replace occ n (c + 1)
-
-let rec count_uses_expr occ (e : texpr) =
-  match e.e with
-  | EVarK n -> add_occ occ n
-  | EBinK (_, a, b) -> count_uses_expr occ a; count_uses_expr occ b
-  | EUnK (_, a) -> count_uses_expr occ a
-  | ECallK (_, args) -> List.iter (count_uses_expr occ) args
-  | ECastK (a, _) -> count_uses_expr occ a
-  | EFracNewK (a, b) -> count_uses_expr occ a; count_uses_expr occ b
-  | ESeqGetK (a, b) -> count_uses_expr occ a; count_uses_expr occ b
-  | ESeqLenK a -> count_uses_expr occ a
-  | ESeqSliceK (a, b, c, d) -> List.iter (count_uses_expr occ) [ a; b; c; d ]
-  | ESplitK (a, b) -> count_uses_expr occ a; count_uses_expr occ b
-  | EPushK (a, b) -> count_uses_expr occ a; count_uses_expr occ b
-  | EIntK _ | EFloatK _ | EStrK _ | ECharK _ | EBoolK _ -> ()
-
-let rec count_uses_stmt occ (s : tstmt) =
-  match s.s with
-  | SDeclK (_, _, _, init, _) -> count_uses_expr occ init
-  | SSeqDeclK (_, _, _, _, _, inits) -> List.iter (count_uses_expr occ) inits
-  | SSeqCopyK (_, _, _, _, src, _) -> count_uses_expr occ src
-  | SAssignK (lhs, rhs, _) -> count_uses_expr occ lhs; count_uses_expr occ rhs
-  | SAugIndexK (n, _, idx, _, v, _) ->
-    add_occ occ n; count_uses_expr occ idx; count_uses_expr occ v
-  | SAugVarK (n, _, _, v, _) -> add_occ occ n; count_uses_expr occ v
-  | SAugSliceK (n, _, a, b, st, _, v) ->
-    add_occ occ n; List.iter (count_uses_expr occ) [ a; b; st; v ]
-  | SSeqSetK (n, _, idx, v, _) ->
-    add_occ occ n; count_uses_expr occ idx; count_uses_expr occ v
-  | SExprK e -> count_uses_expr occ e
-  | SReturnK (Some e) -> count_uses_expr occ e
-  | SReturnK None -> ()
-  | SIfK (c, a, b) ->
-    count_uses_expr occ c; count_uses_stmts occ a; count_uses_stmts occ b
-  | SWhileK (c, b) -> count_uses_expr occ c; count_uses_stmts occ b
-  | SForK (inits, c, ups, b) ->
-    List.iter (count_uses_stmt occ) inits; count_uses_expr occ c;
-    List.iter (count_uses_stmt occ) ups; count_uses_stmts occ b
-  | SOutputK (args, sep, end_) -> List.iter (count_uses_expr occ) (sep :: end_ :: args)
-  | SInputK (targets, delim) ->
-    List.iter (fun (t : tin_target) -> if not t.tnew then add_occ occ t.tname) targets;
-    (match delim with Some d -> count_uses_expr occ d | None -> ())
-  | SReduceK (x, c, st) ->
-    count_uses_expr occ x; count_uses_expr occ c; count_uses_expr occ st
-  | SRemoveK (n, _, idx, _) -> add_occ occ n; count_uses_expr occ idx
-  | SThrowK e -> count_uses_expr occ e
-  | STryK (tb, _, cb) -> count_uses_stmts occ tb; count_uses_stmts occ cb
-  | SBreakK | SContinueK -> ()
-
-and count_uses_stmts occ stmts = List.iter (count_uses_stmt occ) stmts
 
 let rec collect_lets acc (stmts : tblock) =
   List.iter
@@ -671,12 +846,14 @@ let rec collect_lets acc (stmts : tblock) =
           (fun (t : tin_target) -> if t.tnew then acc := (t.tname, t.tty) :: !acc)
           targets
       | SIfK (_, a, b) -> collect_lets acc a; collect_lets acc b
-      | STryK (tb2, binding, cb2) ->
-        (match binding with
-         | Some n -> acc := (n, TString) :: !acc
-         | None -> ());
-        collect_lets acc tb2; collect_lets acc cb2
+      | SUnwrapBlockK (is_decl, slot, elem, _, errslot, blk) ->
+        (* 解包块：目标槽（声明时）与 err 槽（Err struct）都需要入口 alloca；
+           err 槽不登记 RAII（msg 有意泄漏，且槽可复用） *)
+        if is_decl && slot.[0] <> '@' then acc := (slot, elem) :: !acc;
+        acc := (errslot, TStruct "Err") :: !acc;
+        collect_lets acc blk
       | SWhileK (_, b) -> collect_lets acc b
+      | SUnsafeK b -> collect_lets acc b
       | SForK (inits, _, _, b) ->
         List.iter
           (fun (s : tstmt) ->
@@ -705,11 +882,8 @@ let rec collect_lets acc (stmts : tblock) =
 let lower_fn (h : hir) (f : tfn) : mfn =
   let l =
     { blocks = Hashtbl.create 8; nb = 0; nt = 0; cur = Obj.magic 0;
-      loops = []; scopes = []; stmt_temps = []; loop_ids = [];
-      occ_tbl = Hashtbl.create 16; fresh_tbl = Hashtbl.create 16 }
+      loops = []; scopes = []; stmt_temps = [] }
   in
-  (* 全函数出现次数（move 分析：单次出现的变量可安全 move） *)
-  count_uses_stmts l.occ_tbl f.fbody;
   let entry = new_block l in
   l.cur <- entry;
   (* 全局变量槽先于一切局部槽（'@' 前缀，llvmgen 落为模块级 global） *)
@@ -819,9 +993,14 @@ let uses_of (i : instr) : string list =
   | MCall (_, _, args, _) -> List.concat_map operand_names args
   | MCallOwn (_, _, args, _, _) ->
     List.concat_map (fun (o, _) -> operand_names o) args
-  | MThrow o -> operand_names o
-  | MTryFrame _ | MTryLeave | MTryMsg _ -> []
-  | MTrySetup _ -> []
+  | MErrNew (_, _, c, m) -> operand_names c @ operand_names m
+  | MErrOk (_, _, v) -> operand_names v
+  | MErrIsOk (_, slot, _) -> operand_names slot
+  | MErrValue (_, slot, _) -> operand_names slot
+  | MErrFillErr (_, v, _) -> operand_names v
+  | MErrFillOut (v, _) -> operand_names v
+  | MPanic (c, m) ->
+    (match c with Some o -> operand_names o | None -> []) @ operand_names m
   | MAlloca _ -> []
   | MFracNew (_, _, a, b) -> operand_names a @ operand_names b
   | MNorm _ -> []
@@ -841,10 +1020,29 @@ let uses_of (i : instr) : string list =
   | MSeqLen (_, base) -> operand_names base
   | MSeqSlice (_, src, a, b, st, _) ->
     operand_names src @ operand_names a @ operand_names b @ operand_names st
+  | MStructNew (_, _, fs) -> List.concat_map (fun (_, o) -> operand_names o) fs
+  | MFieldGet (_, root, _, _, _) -> operand_names root
+  | MFieldStore (root, _, _, v) -> operand_names root @ operand_names v
+  | MEmptySeq _ -> []
+  | MFreeStructTemp _ -> []
+  | MAddrOf (_, slot) -> [ slot ]
+  | MLoadK (_, a, _) -> operand_names a
+  | MStoreK (a, _, v) -> operand_names a @ operand_names v
+  | MFieldAddr (_, root, _, _, _) -> operand_names root
+  | MElemAddr (_, base, idx, _) -> operand_names base @ operand_names idx
+  | MIndirectCall (_, f, args, _) ->
+    operand_names f @ List.concat_map operand_names args
+  | MFunAddr _ -> []
 
 let pure_dst (i : instr) : string option =
   match i with
   | MBinop (d, _, _, _) | MUnop (d, _, _) | MCast (d, _, _) ->
+    if String.length d > 0 && d.[0] = '%' then Some d else None
+  (* 指针取地址/读/字段地址/元素地址/函数地址均为纯求值（间接调用有副作用除外）；
+     错误值判定/取值同理（只读槽） *)
+  | MAddrOf (d, _) | MLoadK (d, _, _) | MFieldAddr (d, _, _, _, _)
+  | MElemAddr (d, _, _, _) | MFunAddr (d, _)
+  | MErrIsOk (d, _, _) | MErrValue (d, _, _) ->
     if String.length d > 0 && d.[0] = '%' then Some d else None
   | _ -> None
 
@@ -904,5 +1102,5 @@ let lower (h : hir) : mir =
   let mfns =
     List.map (fun (f : tfn) -> cleanup_fn (fold_fn (lower_fn h f))) (gfn :: h.hfns)
   in
-  { mfns }
+  { mfns; mstructs = h.hstructs }
 

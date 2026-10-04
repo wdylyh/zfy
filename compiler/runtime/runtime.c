@@ -19,120 +19,114 @@
 #include <string.h>
 #include <math.h>
 #include <errno.h>
-#include <setjmp.h>
 
-/* ---------- 异常机制（try/catch/throw）：自实现寄存器级 setjmp/longjmp ----------
- * 不使用 CRT 的 setjmp/longjmp：x64 Windows 的 msvcrt longjmp 走 RtlUnwindEx
- * SEH 展开，而编译器生成的函数无 unwind 信息，展开会崩溃（0xC0000409）。
- * 这里直接保存/恢复 callee-saved 寄存器 + 栈指针 + 控制字 + xmm6-15，
- * 纯寄存器恢复、不展开栈帧——RAII 清理由编译器生成的 catch 路径负责。
- *
- * zfy_try_setup：安装异常帧并保存上下文（returns_twice，LLVM 侧按调用约定处理）
- * zfy_throw：有 handler 则记录消息并跳回 try 点；无 handler 则报错退出
- * zfy_try_msg：catch 路径取走消息（并弹帧）；zfy_try_leave：try 正常完成后弹帧 */
-typedef struct zfy_handler {
-    unsigned long long env[10];  /* rbx rbp rsi rdi r12 r13 r14 r15 rsp rip */
-    unsigned int mxcsr, fpucsr;
-    unsigned long long xmm[10][2]; /* xmm6..xmm15 */
-    char *msg;
-    struct zfy_handler *prev;
-} zfy_handler;
-
-static zfy_handler *zfy_handler_top = NULL;
-
-__attribute__((returns_twice)) int zfy_try_setup(zfy_handler *h) {
-    h->msg = NULL;
-    h->prev = zfy_handler_top;
-    zfy_handler_top = h;
-    int ret;
-    __asm__ volatile
-        ("movq %%rbx,   0(%1)\n\t"
-         "movq %%rbp,   8(%1)\n\t"
-         "movq %%rsi,  16(%1)\n\t"
-         "movq %%rdi,  24(%1)\n\t"
-         "movq %%r12,  32(%1)\n\t"
-         "movq %%r13,  40(%1)\n\t"
-         "movq %%r14,  48(%1)\n\t"
-         "movq %%r15,  56(%1)\n\t"
-         "movq %%rsp,  64(%1)\n\t"
-         "leaq  1f(%%rip), %%rax\n\t"
-         "movq %%rax,  72(%1)\n\t"
-         "stmxcsr 80(%1)\n\t"
-         "fnstcw  84(%1)\n\t"
-         "movdqu %%xmm6,  88(%1)\n\t"
-         "movdqu %%xmm7, 104(%1)\n\t"
-         "movdqu %%xmm8, 120(%1)\n\t"
-         "movdqu %%xmm9, 136(%1)\n\t"
-         "movdqu %%xmm10, 152(%1)\n\t"
-         "movdqu %%xmm11, 168(%1)\n\t"
-         "movdqu %%xmm12, 184(%1)\n\t"
-         "movdqu %%xmm13, 200(%1)\n\t"
-         "movdqu %%xmm14, 216(%1)\n\t"
-         "movdqu %%xmm15, 232(%1)\n\t"
-         "xorl %%eax, %%eax\n"
-         "1:\n"
-        : "=a"(ret)
-        : "S"(h->env)   /* 固定 rsi：避免与输出 rax 冲突；块内只读，安全 */
-        : "memory");
-    if (getenv("ZFY_DBG")) fprintf(stderr, "[dbg] try_setup ret=%d msg=%s h=%p\n", ret, h->msg ? h->msg : "(null)", (void*)h);
-    return ret;
-}
-
-/* 恢复上下文：h 为异常帧（Windows x64：arg1=rcx，arg2=edx）。仅裸跳转，无栈展开 */
-__attribute__((naked, noreturn)) void zfy_longjmp(zfy_handler *h, int val) {
-    __asm__ volatile
-        ("movq   0(%rcx), %rbx\n\t"
-         "movq   8(%rcx), %rbp\n\t"
-         "movq  16(%rcx), %rsi\n\t"
-         "movq  24(%rcx), %rdi\n\t"
-         "movq  32(%rcx), %r12\n\t"
-         "movq  40(%rcx), %r13\n\t"
-         "movq  48(%rcx), %r14\n\t"
-         "movq  56(%rcx), %r15\n\t"
-         "movq  64(%rcx), %rsp\n\t"
-         "ldmxcsr 80(%rcx)\n\t"
-         "fldcw  84(%rcx)\n\t"
-         "movdqu  88(%rcx), %xmm6\n\t"
-         "movdqu 104(%rcx), %xmm7\n\t"
-         "movdqu 120(%rcx), %xmm8\n\t"
-         "movdqu 136(%rcx), %xmm9\n\t"
-         "movdqu 152(%rcx), %xmm10\n\t"
-         "movdqu 168(%rcx), %xmm11\n\t"
-         "movdqu 184(%rcx), %xmm12\n\t"
-         "movdqu 200(%rcx), %xmm13\n\t"
-         "movdqu 216(%rcx), %xmm14\n\t"
-         "movdqu 232(%rcx), %xmm15\n\t"
-         "movl %edx, %eax\n\t"
-         "jmp *72(%rcx)");
-}
-
-void zfy_try_leave(void) {
-    zfy_handler_top = zfy_handler_top->prev;
-}
-
-char *zfy_try_msg(void) {
-    zfy_handler *h = zfy_handler_top;
-    char *m = h->msg;
-    zfy_handler_top = h->prev;
-    if (getenv("ZFY_DBG")) fprintf(stderr, "[dbg] try_msg m=%s\n", m ? m : "(null)");
-    return m; /* malloc 串，catch 绑定槽负责释放 */
-}
-
-void zfy_throw(char *msg) {
-    zfy_handler *h = zfy_handler_top;
-    if (!h) {
-        fprintf(stderr, "runtime error: %s\n", msg);
-        exit(1);
-    }
-    size_t n = strlen(msg) + 1;
-    char *m = (char *)malloc(n);
-    if (m) memcpy(m, msg, n); /* 分配失败则消息为 NULL，catch 侧容忍 */
-    h->msg = m;
-    zfy_longjmp(h, 1);
-}
+/* ---------- 致命错误（除零/越界/内存不足等）：打印后直接退出 ---------- */
 
 static void zfy_die(const char *msg) {
-    zfy_throw((char *)msg);
+    fflush(stdout);
+    fprintf(stderr, "runtime error: %s\n", msg);
+    exit(1);
+}
+
+/* ---------- ZEM 错误模型运行时 ----------
+ * 错误值 zfy_err = { int32_t code; char* msg; value 容器 }，LLVM 侧布局
+ * %err.<T> = { i32, ptr, i64/double/ptr }，二者偏移一致（24 字节）。
+ * 约定：code=0 表示成功（value 有效，msg=NULL）；code≠0 时 value 未定义。
+ * msg 一律 strdup，永不释放（有意的最小泄漏，免生命周期管理）。
+ * 自定义错误码 ≥ 100 由源码直接写字面量；0-99 为标准码：
+ * OK=0 DIV_ZERO=1 OOB=2 NOT_FOUND=3 IO=4 CAST=5 INPUT=6 */
+enum {
+    ZFY_EOK = 0, ZFY_EDIV_ZERO = 1, ZFY_EOOB = 2, ZFY_ENOT_FOUND = 3,
+    ZFY_EIO = 4, ZFY_ECAST = 5, ZFY_EINPUT = 6
+};
+
+typedef struct zfy_err {
+    int32_t code;
+    char *msg;
+    union {
+        long long i;
+        double d;
+        void *p;
+    } value;
+} zfy_err;
+
+/* panic 用户处理器（panic_handler(f) 注册；签名 (i32, string) -> void） */
+static void (*zfy_panic_handler)(int32_t, char *) = NULL;
+
+void zfy_set_panic_handler(void (*h)(int32_t, char *)) {
+    zfy_panic_handler = h;
+}
+
+char *zfy_strdup(const char *s); /* 前向声明（zfy_strdup 定义在后） */
+
+/* panic：不可恢复。有 handler 先调用（用户可自定义输出），随后退出进程。
+   handler 是 zfy 函数，string 参数按所有权约定接管——调用方须克隆（同
+   普通函数传参的值语义）；panic 随后 exit，克隆无人释放（最小泄漏，无碍） */
+void zfy_panic(int32_t code, char *msg) {
+    fflush(stdout);
+    if (zfy_panic_handler) {
+        zfy_panic_handler(code, zfy_strdup(msg ? msg : ""));
+    } else if (code == 0) {
+        fprintf(stderr, "panic: %s\n", msg ? msg : "");
+    } else {
+        fprintf(stderr, "panic: %s (code %d)\n", msg ? msg : "", code);
+    }
+    exit(101);
+}
+
+/* 错误值快捷填充 */
+static void err_set(zfy_err *out, int32_t code, const char *msg) {
+    out->code = code;
+    out->msg = zfy_strdup(msg);
+    out->value.i = 0;
+}
+
+static void err_ok_i(zfy_err *out, long long v) {
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value.i = v;
+}
+
+/* string -> 整数（错误值版：解析失败产 CAST 错误，取前缀数字，C++ stoi 语义） */
+void zfy_stoi_err(zfy_err *out, const char *s) {
+    char *end;
+    long long v = strtoll(s, &end, 10);
+    if (end == s) {
+        err_set(out, ZFY_ECAST, "cast：无法把 string 解析为整数");
+    } else {
+        err_ok_i(out, v);
+    }
+}
+
+/* string -> 浮点（错误值版） */
+void zfy_stod_err(zfy_err *out, const char *s) {
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s) {
+        err_set(out, ZFY_ECAST, "cast：无法把 string 解析为浮点数");
+    } else {
+        out->code = ZFY_EOK;
+        out->msg = NULL;
+        out->value.d = v;
+    }
+}
+
+/* find(s, c, k)：第 k 次出现的下标；未找到产 NOT_FOUND 错误 */
+void zfy_err_find(zfy_err *out, const char *s, char c, long long k) {
+    if (k < 1) {
+        err_set(out, ZFY_ENOT_FOUND, "find: count 必须 > 0");
+        return;
+    }
+    for (long long i = 0, seen = 0; s[i]; i++) {
+        if (s[i] == c) {
+            seen++;
+            if (seen == k) {
+                err_ok_i(out, i);
+                return;
+            }
+        }
+    }
+    err_set(out, ZFY_ENOT_FOUND, "find: 未找到字符");
 }
 
 /* 程序加载时调大 stdout 缓冲（默认 4KB）：大量逐行输出时减少系统调用。
@@ -548,6 +542,7 @@ DEF_FRAC_INT(u128, unsigned __int128, unsigned __int128, unsigned __int128)
 
 DEF_FRAC_FLT(f32, float)
 DEF_FRAC_FLT(f64, double)
+DEF_FRAC_FLT(f128, long double)
 
 /* ---------- output 运行时支持 ---------- */
 
@@ -831,6 +826,101 @@ void zfy_input_char(void *val, const char *delim) {
     }
     *(char *)val = seg[0];
     free(seg);
+}
+
+/* ---------- ZEM：T! 目标 input（失败写错误值而非退出） ----------
+ * EOF 或解析失败 → code=INPUT、msg=原因、value 保持 0；成功 → code=0 */
+
+void zfy_input_err_i64(zfy_err *out, const char *delim) {
+    int no_input = 0;
+    char *seg = input_segment(delim, (long long)strlen(delim), &no_input);
+    long long v;
+    if (no_input) {
+        free(seg);
+        err_set(out, ZFY_EINPUT, "input: EOF（无输入可读）");
+        return;
+    }
+    if (!try_i64(seg, &v)) {
+        free(seg);
+        err_set(out, ZFY_EINPUT, "input: 无法把输入解析为整数");
+        return;
+    }
+    free(seg);
+    err_ok_i(out, v);
+}
+
+void zfy_input_err_f64(zfy_err *out, const char *delim) {
+    int no_input = 0;
+    char *seg = input_segment(delim, (long long)strlen(delim), &no_input);
+    double v;
+    if (no_input) {
+        free(seg);
+        err_set(out, ZFY_EINPUT, "input: EOF（无输入可读）");
+        return;
+    }
+    if (!try_f64(seg, &v)) {
+        free(seg);
+        err_set(out, ZFY_EINPUT, "input: 无法把输入解析为小数");
+        return;
+    }
+    free(seg);
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value.d = v;
+}
+
+void zfy_input_err_str(zfy_err *out, const char *delim) {
+    int no_input = 0;
+    char *seg = input_segment(delim, (long long)strlen(delim), &no_input);
+    if (no_input) {
+        free(seg);
+        err_set(out, ZFY_EINPUT, "input: EOF（无输入可读）");
+        return;
+    }
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value.p = seg;               /* 缓冲区所有权移交错误值（?? 解包后归变量） */
+}
+
+void zfy_input_err_bool(zfy_err *out, const char *delim) {
+    int no_input = 0;
+    char *seg = input_segment(delim, (long long)strlen(delim), &no_input);
+    if (no_input) {
+        free(seg);
+        err_set(out, ZFY_EINPUT, "input: EOF（无输入可读）");
+        return;
+    }
+    if (strcmp(seg, "true") == 0) {
+        free(seg);
+        err_ok_i(out, 1);
+        return;
+    }
+    if (strcmp(seg, "false") == 0) {
+        free(seg);
+        err_ok_i(out, 0);
+        return;
+    }
+    long long v;
+    if (!try_i64(seg, &v)) {
+        free(seg);
+        err_set(out, ZFY_EINPUT, "input: 无法把输入解析为布尔值");
+        return;
+    }
+    free(seg);
+    err_ok_i(out, v != 0);
+}
+
+void zfy_input_err_char(zfy_err *out, const char *delim) {
+    int no_input = 0;
+    char *seg = input_segment(delim, (long long)strlen(delim), &no_input);
+    if (no_input || seg[0] == '\0') {
+        free(seg);
+        err_set(out, ZFY_EINPUT, "input: EOF（无输入可读）");
+        return;
+    }
+    char c = seg[0];
+    free(seg);
+    err_ok_i(out, (long long)c);
 }
 
 /* ---------- 数组/列表运行时支持（按元素宽度存储） ---------- */

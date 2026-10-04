@@ -1,16 +1,16 @@
-// uint 后缀语法：int uint / long long uint / short int uint 等（宽度词在前，uint 在后）
+// uint 后缀语法：u32 / u128 / u16 等（宽度词在前，uint 在后）
 void main()
-    int uint a = 3000000000
-    long long uint b = 1234567890123456789
-    short short uint c = 255
-    short int uint d = 65535
-    long int uint e = 4000000000
+    u32 a = 3000000000
+    u128 b = 1234567890123456789
+    u8 c = 255
+    u16 d = 65535
+    u64 e = 4000000000
     output(a, sep='|')
     output(b, sep='|')
     output(c, sep='|')
     output(d, sep='|')
     output(e, sep='|')
-    int uint array au[3] = 1, 2, 3
+    u32 au[3] = 1, 2, 3
     au[2] = 4000000000
     output(au[0], au[1], au[2], sep=',')
-    output(cast(a, long int uint) + cast(au[2], long int uint))
+    output(cast(a, u64) + cast(au[2], u64))

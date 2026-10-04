@@ -1,0 +1,14 @@
+# 构建产物
+compiler/_build/
+*.cmi
+*.cmx
+*.o
+*.exe
+
+# 生成物
+*.ll
+
+# 临时/误创建文件
+echo
+_fracdemo2_tmp.*
+_longmap_tmp.*

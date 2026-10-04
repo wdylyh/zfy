@@ -1,69 +1,50 @@
-// try/catch/throw 异常 + 所有权传参（A1 move）测试
-// 覆盖：throw string、catch 绑定消息、catch 不绑定、
-//       运行期错误（下标越界/input 失败）可捕获、
-//       try 作用域 RAII 变量在进入 catch 前释放、
-//       用户函数传 string/数组（值语义：调用方克隆）、单次出现 move 免克隆
+// ZEM 错误模型测试（原 try/catch/throw + 所有权传参演示改写）
+// 覆盖：fail 构造、? 传播链（返回类型显式 T!）、?? 默认值/块解包、
+//       err 结构化错误（code/msg）、panic_handler 注册、
+//       用户函数传 string/数组（值语义：调用方克隆）
+i32! parse_i32(string s)
+    if length(s) == 0
+        return fail(ErrCode.CUSTOM, "empty string")
+    i32 n = cast(s, i32)?
+    return n
+
+i32! parse_double(string s)
+    i32 n = parse_i32(s)?
+    return n * 2
+
 string pick(string s)
     return s
 
-void show(int array a[2])
+void show(i32 a[2])
     output(a[0], a[1], sep=",")
 
+void on_panic(i32 code, string msg)
+    output("[handler] code=", code, " msg=", msg)
+
 void main()
-    // ---- throw / catch 绑定 ----
-    try
-        string inner = "inside"
-        throw "boom: " + inner
-        output("not reached")
-    catch e
-        output(e)               // 期望 boom: inside
+    // ---- ? 传播链：失败逐层向上，顶层 ?? 兜底 ----
+    i32 a = parse_double("21") ?? -1
+    output(a)                        // 期望 42
+    i32 b = parse_double("") ?? -1
+    output(b)                        // 期望 -1（CUSTOM 空串错误传播到顶层）
 
-    // ---- catch 不绑定 ----
-    try
-        throw "plain"
-    catch
-        output("caught plain")  // 期望 caught plain
+    // ---- ?? 块解包 + err 结构化错误 ----
+    i32 c = parse_double("abc") ??
+        output("cast failed: code=", err.code)   // 期望 cast failed: code=5（CAST）
+        -1
+    output(c)                        // 期望 -1
 
-    // ---- 正常路径不进 catch ----
-    int ok = 0
-    try
-        ok = 1
-    catch e2
-        ok = 2
-    output(ok)                  // 期望 1
-
-    // ---- 运行期错误可捕获：下标越界 ----
-    try
-        int array a[3]
-        a[0] = 7
-        output(a[9])            // 越界 -> 运行时抛出
-        output("not reached 2")
-    catch e3
-        output("bounds caught") // 期望 bounds caught
-
-    // ---- 嵌套 try：内层不处理则传给外层 ----
-    try
-        try
-            throw "deep"
-        catch e4
-            output(e4)          // 期望 deep
-        throw "outer"
-    catch e5
-        output(e5)              // 期望 outer
+    // ---- panic_handler 注册（本例不触发 panic）----
+    panic_handler(on_panic)
+    output("handler registered")
 
     // ---- 所有权传参：值语义（调用方克隆，源变量仍可用） ----
     string s = "hello"
-    string r = pick(s)          // s 非 move -> 克隆传参
-    output(r, s, sep="|")       // 期望 hello|hello
-    r = pick(r)                 // r 只出现一次传参后未再用？r 被重新赋值，保守克隆
-    output(r)                   // 期望 hello
-
-    // ---- move：临时（调用结果）直接移交，免克隆 ----
-    string t = pick("temp str")
-    output(t)                   // 期望 temp str
+    string r = pick(s)               // s 非 move -> 克隆传参
+    output(r, s, sep="|")            // 期望 hello|hello
 
     // ---- 数组传参仍为值语义 ----
-    int array arr[2] = 1,2
-    show(arr)                   // 期望 1,2
+    i32 arr[2] = 1,2
+    show(arr)                        // 期望 1,2
     arr[0] = 9
-    show(arr)                   // 期望 9,2（show 拿到的是克隆）
+    show(arr)                        // 期望 9,2（show 拿到的是克隆）
