@@ -1,0 +1,13 @@
+// new2.md #3: unsafe block doubles as @unchecked — no bounds check inside
+i32 a[3] = 10, 20, 30
+
+void main()
+    i32 s = 0
+    unsafe
+        for i32 i = 0, i < 3, i++
+            s += a[i]
+    output(s)
+    unsafe
+        a[0] = 99
+        s += a[0]
+    output(s)

@@ -603,29 +603,40 @@ let elem_signed (e : zty) : int =
   match e with TInt _ -> 1 | _ -> 0
 
 (* 内联元素地址：边界检查（icmp ult 同时覆盖负下标：负数无符号比较必失败）
-   + GEP 到元素字节地址。失败路径调用 zfy_bounds_fail（不返回）后 unreachable。
+   + GEP 到元素字节地址。checked=false（unsafe 块内）跳过检查直接寻址。
+   失败路径调用 zfy_bounds_fail（不返回）后 unreachable。
    返回 (元素地址, join 标签)：调用方在快速块内完成 load/store 后须
    `br label %join` 收尾；join 块只有一个前驱（快速块），无需 phi。 *)
-let inline_elem_addr fc (seqp : string) (iv : string) (elem : zty) : string * string =
-  let lenp = fresh_r fc in
-  emitf fc "  %s = getelementptr inbounds %%zfy.seq, ptr %s, i32 0, i32 2" lenp seqp;
-  let len = fresh_r fc in
-  emitf fc "  %s = load i64, ptr %s" len lenp;
-  let ok = fresh_r fc in
-  emitf fc "  %s = icmp ult i64 %s, %s" ok iv len;
-  let lb = fresh_lbl fc and fb = fresh_lbl fc and jb = fresh_lbl fc in
-  emitf fc "  br i1 %s, label %%%s, label %%%s" ok lb fb;
-  emitf fc "%s:" fb;
-  emitf fc "  call void @zfy_bounds_fail()";
-  emitf fc "  unreachable";
-  emitf fc "%s:" lb;
-  let dp = fresh_r fc in
-  emitf fc "  %s = load ptr, ptr %s" dp seqp;
-  let off = fresh_r fc in
-  emitf fc "  %s = mul i64 %s, %d" off iv (elem_width elem);
-  let ep = fresh_r fc in
-  emitf fc "  %s = getelementptr inbounds i8, ptr %s, i64 %s" ep dp off;
-  (ep, jb)
+let inline_elem_addr fc (seqp : string) (iv : string) (elem : zty) ~(checked : bool) : string * string =
+  let dp0 = fresh_r fc in
+  emitf fc "  %s = load ptr, ptr %s" dp0 seqp;
+  if not checked then begin
+    (* unsafe：跳过边界检查，直接 GEP 元素地址 *)
+    let off = fresh_r fc in
+    emitf fc "  %s = mul i64 %s, %d" off iv (elem_width elem);
+    let ep = fresh_r fc in
+    emitf fc "  %s = getelementptr inbounds i8, ptr %s, i64 %s" ep dp0 off;
+    (ep, fresh_lbl fc)   (* join 标签由调用方 br 收尾（无phi，同检查路径） *)
+  end
+  else begin
+    let lenp = fresh_r fc in
+    emitf fc "  %s = getelementptr inbounds %%zfy.seq, ptr %s, i32 0, i32 2" lenp seqp;
+    let len = fresh_r fc in
+    emitf fc "  %s = load i64, ptr %s" len lenp;
+    let ok = fresh_r fc in
+    emitf fc "  %s = icmp ult i64 %s, %s" ok iv len;
+    let lb = fresh_lbl fc and fb = fresh_lbl fc and jb = fresh_lbl fc in
+    emitf fc "  br i1 %s, label %%%s, label %%%s" ok lb fb;
+    emitf fc "%s:" fb;
+    emitf fc "  call void @zfy_bounds_fail()";
+    emitf fc "  unreachable";
+    emitf fc "%s:" lb;
+    let off = fresh_r fc in
+    emitf fc "  %s = mul i64 %s, %d" off iv (elem_width elem);
+    let ep = fresh_r fc in
+    emitf fc "  %s = getelementptr inbounds i8, ptr %s, i64 %s" ep dp0 off;
+    (ep, jb)
+  end
 
 (* 按类型输出一个值 *)
 let gen_print_val fc (o : operand) =
@@ -1441,7 +1452,7 @@ let gen_instr fc (i : instr) : unit =
     emitf fc "  %s = call ptr @zfy_seq_new(i64 %Ld, i64 %Ld, i32 %d)"
       r cnt cap (elem_width elem);
     emitf fc "  store ptr %s, ptr %s" r slotp
-  | MSeqSet (name, elem, idx, v, grow) ->
+  | MSeqSet (name, elem, idx, v, grow, unchecked) ->
     (* 元素写入：按元素宽度存储；string 元素深拷贝（数组独占堆串）。
        非 string 且不扩长时走内联路径（边界检查 + 直接 store），
        消除逐元素函数调用与 i128 中转槽；其余走运行时函数。 *)
@@ -1463,7 +1474,7 @@ let gen_instr fc (i : instr) : unit =
          "  call void @zfy_seq_set_w(ptr %s, i64 %s, ptr %s, i32 %d, i8 %d)"
          seqp iv slot (elem_width elem) 1
      | _, false ->
-       let (ep, jb) = inline_elem_addr fc seqp iv elem in
+       let (ep, jb) = inline_elem_addr fc seqp iv elem ~checked:(not unchecked) in
        let bits = bits_of fc v in
        let w = elem_width elem * 8 in
        (if w < 128 then begin
@@ -1474,7 +1485,7 @@ let gen_instr fc (i : instr) : unit =
           emitf fc "  store i128 %s, ptr %s, align 1" bits ep);
        emitf fc "  br label %%%s" jb;
        emitf fc "%s:" jb)
-  | MSeqGet (d, base, idx, elem) ->
+  | MSeqGet (d, base, idx, elem, unchecked) ->
     (* 非 string 元素走内联路径：边界检查 + 直接 load 元素位模式，
        再按元素类型还原（窄整数截断/位转换）；string 仍走运行时。 *)
     (match elem with
@@ -1492,7 +1503,7 @@ let gen_instr fc (i : instr) : unit =
      | _ ->
        let (seqp, _) = val_of fc base in
        let (iv, _) = val_of fc idx in
-       let (ep, jb) = inline_elem_addr fc seqp iv elem in
+       let (ep, jb) = inline_elem_addr fc seqp iv elem ~checked:(not unchecked) in
        let raw = fresh_r fc in
        let w = elem_width elem * 8 in
        emitf fc "  %s = load i%d, ptr %s, align 1" raw w ep;

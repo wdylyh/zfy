@@ -20,12 +20,15 @@
 #include <math.h>
 #include <errno.h>
 
-/* ---------- 致命错误（除零/越界/内存不足等）：打印后直接退出 ---------- */
+/* ---------- 致命错误（除零/越界/内存不足等）：统一走 panic 通道 ----------
+   与 panic 语句共用 zfy_panic：有注册 handler 先回调（code=0），否则打印
+   后 exit(101)。new2.md #3：panic 通道可注册 handler、默认 abort、不可
+   被 ?/?? 捕获。 */
+
+void zfy_panic(int32_t code, char *msg); /* 前向声明（定义在 ZEM 段后） */
 
 static void zfy_die(const char *msg) {
-    fflush(stdout);
-    fprintf(stderr, "runtime error: %s\n", msg);
-    exit(1);
+    zfy_panic(0, (char *)msg);
 }
 
 /* ---------- ZEM 错误模型运行时 ----------

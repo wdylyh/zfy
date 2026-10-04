@@ -65,9 +65,9 @@ type instr =
   | MFreeSeqTemp of string * bool                (* 语句末释放临�?seq（bool=元素是否 string�?*)
   | MSeqAlloc of string * zty * int64 * bool
     (* 数组/列表分配：槽, 元素类型, 长度(列表�?0→编译器自选初始容�?, 是否列表 *)
-  | MSeqSet of string * zty * operand * operand * bool
+  | MSeqSet of string * zty * operand * operand * bool * bool
     (* arr[i]=v：槽, 元素类型(决定写入宽度), 下标, �? 可扩�?*)
-  | MSeqGet of string * operand * operand * zty  (* 读元素到临时：目�? 数组, 下标, 元素类型 *)
+  | MSeqGet of string * operand * operand * zty * bool  (* 读元素到临时：目标, 数组, 下标, 元素类型, unchecked(关闭越界检查) *)
   | MSeqLen of string * operand                  (* length(x)：目标临�? 数组/列表 *)
   | MSeqSlice of string * operand * operand * operand * operand * bool
     (* base[a,b:step]：目标临时(seq 指针), 基, 起点, 终点, 步长, 元素是否 string *)
@@ -126,6 +126,7 @@ type lctx = {
   mutable loops : (int * int * int) list;  (* (break 目标, continue 目标, 循环体作用域深度) *)
   mutable scopes : (string * zty) list ref list;  (* RAII 作用域栈：每层收集需释放变量 *)
   mutable stmt_temps : (string * free_kind) list;  (* 当前语句拥有的临时：(名, 释放类别) *)
+  mutable unchecked : bool;  (* unsafe 块内：下标读写关闭越界检查（new2.md #3/@unchecked） *)
 }
 
 let new_block l =
@@ -362,7 +363,7 @@ let rec lexpr l (e : texpr) : operand =
     let ob = lexpr l b and oi = lexpr l i in
     let elem = e.ety in
     let d = fresh l in
-    emit l (MSeqGet (d, ob, oi, elem));
+    emit l (MSeqGet (d, ob, oi, elem, l.unchecked));
     op (OLocal d) elem
   | ESeqLenK b ->
     (* length(x)：数�?列表长度（string �?length �?typeck 已转�?strlen 调用�?*)
@@ -398,7 +399,7 @@ let rec lexpr l (e : texpr) : operand =
        let dl = fresh l in
        emit l (MSeqLen (dl, op (OLocal name) base.ety));
        let ov = lexpr l v in
-       emit l (MSeqSet (name, elem, op (OLocal dl) (TInt 64), ov, true));
+       emit l (MSeqSet (name, elem, op (OLocal dl) (TInt 64), ov, true, l.unchecked));
        op (OInt 0L) TVoid
      | _ -> merr e.epos "push target must be a list variable")
   | EStructNewK (_, fields) ->
@@ -591,7 +592,7 @@ and lstmt_inner l (s : tstmt) : unit =
       (fun i t ->
         let v = lexpr l t in
         emit l (MSeqSet (name, elem, op (OInt (Int64.of_int i)) (TInt 64),
-                         v, is_list)))
+                         v, is_list, false)))
       inits
   | SSeqCopyK (_, name, elem, len, src, is_list) ->
     (* 数组/列表整体初值：目标槽位无需预分配（初值直接覆盖，
@@ -621,11 +622,11 @@ and lstmt_inner l (s : tstmt) : unit =
     (* a[i] op= v：下标只求值一次（load + op + store 同一槽位�?*)
     let oi = lexpr l idx in
     let old = fresh l in
-    emit l (MSeqGet (old, op (OLocal name) (TList elem), oi, elem));
+    emit l (MSeqGet (old, op (OLocal name) (TList elem), oi, elem, l.unchecked));
     let ov = lexpr l v in
     let r = fresh l in
     emit l (MBinop (r, bop, op (OLocal old) elem, ov));
-    emit l (MSeqSet (name, elem, oi, op (OLocal r) elem, grow))
+    emit l (MSeqSet (name, elem, oi, op (OLocal r) elem, grow, l.unchecked))
   | SAugVarK (name, ty, bop, v, nn) ->
     (* x op= v：load + op + store 同一槽位 *)
     let ov = lexpr l v in
@@ -635,7 +636,7 @@ and lstmt_inner l (s : tstmt) : unit =
     if nn then emit l (MNorm (name, ty))
   | SSeqSetK (name, elem, idx, v, grow) ->
     (* 元素写入：元素类型决定写入宽度；grow 允许列表扩长 *)
-    emit l (MSeqSet (name, elem, lexpr l idx, lexpr l v, grow))
+    emit l (MSeqSet (name, elem, lexpr l idx, lexpr l v, grow, l.unchecked))
   | SRemoveK (name, elem, idx, is_list) ->
     (* remove(数组/列表, i)：数组槽位填零值；列表删除并左移，长度-1 *)
     emit l (MSeqRemove (name, elem, lexpr l idx, is_list))
@@ -671,8 +672,11 @@ and lstmt_inner l (s : tstmt) : unit =
     emit l (MBinop (r, bop, op (OLocal old) v.ety, ov));
     emit l (MStoreK (pv, v.ety, op (OLocal r) v.ety))
   | SUnsafeK b ->
-    (* unsafe 块：门禁在 typeck 已检查，降码时透明展开 *)
-    lblock l b
+    (* unsafe 块：门禁在 typeck 已检查；块内关闭下标越界检查（@unchecked） *)
+    let saved = l.unchecked in
+    l.unchecked <- true;
+    lblock l b;
+    l.unchecked <- saved
   | SExprK e -> ignore (lexpr l e)
   | SReturnK e ->
     (* 先求返回值，再释放全部局部资源（RAII）；
@@ -882,7 +886,7 @@ let rec collect_lets acc (stmts : tblock) =
 let lower_fn (h : hir) (f : tfn) : mfn =
   let l =
     { blocks = Hashtbl.create 8; nb = 0; nt = 0; cur = Obj.magic 0;
-      loops = []; scopes = []; stmt_temps = [] }
+      loops = []; scopes = []; stmt_temps = []; unchecked = false }
   in
   let entry = new_block l in
   l.cur <- entry;
@@ -1012,11 +1016,11 @@ let uses_of (i : instr) : string list =
   | MPrintVal o -> operand_names o
   | MInput (_, _, d) -> operand_names d
   | MSeqAlloc _ -> []
-  | MSeqSet (_, _, idx, v, _) -> operand_names idx @ operand_names v
+  | MSeqSet (_, _, idx, v, _, _) -> operand_names idx @ operand_names v
   | MFreeVar _ -> []
   | MFreeTemp _ -> []
   | MFreeSeqTemp _ -> []
-  | MSeqGet (_, base, idx, _) -> operand_names base @ operand_names idx
+  | MSeqGet (_, base, idx, _, _) -> operand_names base @ operand_names idx
   | MSeqLen (_, base) -> operand_names base
   | MSeqSlice (_, src, a, b, st, _) ->
     operand_names src @ operand_names a @ operand_names b @ operand_names st
