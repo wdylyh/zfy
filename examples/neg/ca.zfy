@@ -1,0 +1,3 @@
+mod cb;
+pub i32 fa()
+    return 1

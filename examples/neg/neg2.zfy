@@ -1,0 +1,9 @@
+// negative: unresolved use path -> E5008
+mod math
+    pub i32 add(i32 a, i32 b)
+        return a + b
+
+use math::nope
+
+void main()
+    output(math::add(1, 2))

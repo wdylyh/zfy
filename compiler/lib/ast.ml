@@ -112,17 +112,30 @@ type sfield =
 type item =
   | IUse of { path : string; import : string option; alias : string option;
               pos : pos }
-    (* use 文件名.zfy [import 模块名] [as 别名]：别名绑定给文件（命名空间） *)
+    (* use 文件名.zfy [import 模块名] [as 别名]：别名绑定给文件（命名空间，
+       legacy——新代码用 IUseP 的 a::b::item 路径语法） *)
+  | IUseP of { binds : (string * string list * pos) list; pos : pos }
+    (* use 路径语法（模块系统）：名字绑定，不搬运 AST。
+       use a::b::item;      binds=[("item", ["a";"b";"item"])]
+       use a::b::item as x; binds=[("x", ["a";"b";"item"])]
+       use a::b::{x, y as z}; binds=[("x", [...;"x"]); ("z", [...;"y"])]
+       use a::b as m;       binds=[("m", ["a";"b"])]（绑定模块） *)
   | IFn of { name : string; params : param list; ret : ty option; rfrac : bool;
              body : block; pos : pos }
     (* rfrac：返回类型带 frac 修饰（返回 TFrac） *)
   | IStruct of { name : string; packed : bool; fields : sfield list; pos : pos }
   | IMod of string * item list * pos
+    (* 内联模块 mod name（缩进块体，可嵌套）；resolve 展开为扁平名 *)
+  | IModFile of string * pos
+    (* 文件模块 mod name;：body 在 name.zfy 或 name/mod.zfy（相对父模块
+       文件目录），由 resolve 加载展开；空 item list 语义由此区分 *)
   | IExtern of { funcs : extern_fn list; pos : pos }
     (* extern "C" 块：多个 C 函数声明（签名直通 LLVM，调用不门禁） *)
   | ITypeAlias of { name : string; ty : ty; pos : pos }
     (* type 别名：type 名 = 类型（可含函数类型） *)
   | IDecl of stmt * pos
     (* 顶层声明：仅允许 const 标量（编译期常量，使用处内联，不生成运行时槽） *)
+  | IPub of item * pos
+    (* pub 修饰：仅模块内顶层合法（root 顶层 pub 被 resolve 忽略） *)
 
 type program = item list

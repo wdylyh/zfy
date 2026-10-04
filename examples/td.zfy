@@ -1,0 +1,8 @@
+mod math
+    pub i32 add(i32 a, i32 b)
+        return a + b
+
+use math::{add}
+
+void main()
+    output(add(1, 2))

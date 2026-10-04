@@ -302,6 +302,11 @@ let code_of = function
       ["import conflict: "], "E5002";
       ["nested modules are not allowed"], "E5003";
       ["cannot read source file: "], "E5005";
+      ["circular module dependency: "], "E5006";
+      ["is not visible"], "E5007";
+      ["unresolved path: "], "E5008";
+      ["module file not found: "], "E5008";
+      ["name conflict: "], "E5009";
     ]
 
 let read_lines file =
@@ -459,21 +464,36 @@ let expand_uses (main : program) (main_dir : string)
     | s -> s
   in
   (* 把一个文件的函数并入全局：ns 前缀；import 为 None 导入全部，Some m 只导入模块 m *)
-  let add_items ns (items : item list) (import : string option) =
+  let add_items ns (items0 : item list) (import : string option) =
+    (* legacy 子文件容错：剥 pub；新语法项（IUseP/IModFile）报错（应走
+       模块系统）；legacy 子文件内联 IMod 走原 ns.m.fn 逻辑 *)
+    let rec strip its =
+      List.map
+        (function
+          | IPub (x, _) -> x
+          | IUseP { pos; _ } | IModFile (_, pos) ->
+            raise (CompileError (Some pos, "module system syntax (use a::b / mod name;) is not allowed in a legacy use file"))
+          | IMod (n, its2, p) -> IMod (n, strip its2, p)
+          | x -> x)
+        its
+    in
+    let items = strip items0 in
     let own : (string * string) list ref = ref [] in
     let collect its =
       let rec go_mod mname its2 =
         List.iter
           (function
             | IFn f -> own := (f.name, ns ^ mname ^ "." ^ f.name) :: !own
-            | IMod _ | IUse _ | IDecl _ | IStruct _ | IExtern _ | ITypeAlias _ -> ())
+            | IMod _ | IUse _ | IUseP _ | IModFile _ | IPub _ | IDecl _
+            | IStruct _ | IExtern _ | ITypeAlias _ -> ())
           its2
       in
       List.iter
         (function
           | IFn f -> own := (f.name, ns ^ f.name) :: !own
           | IMod (m, its2, _) -> go_mod m its2
-          | IUse _ | IDecl _ | IStruct _ | IExtern _ | ITypeAlias _ -> ())
+          | IUse _ | IUseP _ | IModFile _ | IPub _ | IDecl _ | IStruct _
+          | IExtern _ | ITypeAlias _ -> ())
         its
     in
     collect items;
@@ -489,7 +509,8 @@ let expand_uses (main : program) (main_dir : string)
           | IFn f -> emit_fn (ns_mod ^ f.name) f.pos f.params f.ret f.body
           | IMod (_, _, p) ->
             raise (CompileError (Some p, "nested modules are not allowed"))
-          | IDecl _ | IUse _ | IStruct _ | IExtern _ | ITypeAlias _ -> ())
+          | IDecl _ | IUse _ | IUseP _ | IModFile _ | IPub _ | IStruct _
+          | IExtern _ | ITypeAlias _ -> ())
         its2
     in
     List.iter
@@ -572,7 +593,7 @@ let expand_uses (main : program) (main_dir : string)
   (* 主文件其余项原样保留（剔除 IUse） *)
   List.iter
     (function
-      | IUse _ -> ()
+      | IUse _ | IUseP _ | IModFile _ | IPub _ -> ()
       | (IFn _ | IMod _ | IDecl _ | IStruct _ | IExtern _ | ITypeAlias _) as it ->
         out := it :: !out)
     main;
@@ -614,13 +635,35 @@ let run_checked path : (string, zerr list) result =
           (* 主文件 parse 恢复收集的错误先入列（头插列表反转成源码顺序） *)
           List.iter (fun (p, m) -> add `Parse p m) (List.rev pp.Parser.errs);
           let perrs = ref [] in
+          (* 模块解析 pass（new2.md 第4条）：内联/文件 mod、pub、use 路径
+             语法；旧 use file.zfy 保留原样交 expand_uses *)
+          let rerrs = ref [] in
           let prog =
-            try Ok (expand_uses prog (Filename.dirname path) perrs)
-            with CompileError (po, m) -> driver_add `Driver po m; Error ()
+            match Resolve.resolve prog (Filename.dirname path) rerrs with
+            | Some p -> Ok p
+            | None -> Error ()
           in
           match prog with
-          | Error () -> None
+          | Error () ->
+            List.iter
+              (fun (k, p, m) ->
+                 let kk =
+                   match k with
+                   | Resolve.RLex -> `Lex
+                   | Resolve.RParse -> `Parse
+                   | Resolve.RDriver -> `Driver
+                 in
+                 add kk p m)
+              (List.rev !rerrs);
+            None
           | Ok prog ->
+            let prog =
+              try Ok (expand_uses prog (Filename.dirname path) perrs)
+              with CompileError (po, m) -> driver_add `Driver po m; Error ()
+            in
+            match prog with
+            | Error () -> None
+            | Ok prog ->
             (* 子文件词法/语法错误（use 展开）；已恢复的 AST 继续做类型
                检查（报出更多错误，不在此终止） *)
             List.iter (fun (p, m) -> add `Parse p m) (List.rev !perrs);

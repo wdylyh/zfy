@@ -12,6 +12,7 @@ $libSources = @(
   "lib/lexer.ml",
   "lib/ast.ml",
   "lib/parser.ml",
+  "lib/resolve.ml",
   "lib/hir.ml",
   "lib/typeck.ml",
   "lib/mir.ml",

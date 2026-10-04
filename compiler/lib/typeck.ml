@@ -1912,7 +1912,8 @@ let check_program (prog : program) : hir =
              | _ -> ());
             Hashtbl.replace g.fns f.ename { params = ptys; ret = rty })
           funcs
-      | IUse _ | IMod _ | IDecl _ | IStruct _ | ITypeAlias _ -> ())
+      | IUse _ | IUseP _ | IMod _ | IModFile _ | IPub _ | IDecl _
+      | IStruct _ | ITypeAlias _ -> ())
     prog;
   (* 第二遍：函数体检查 *)
   let env =

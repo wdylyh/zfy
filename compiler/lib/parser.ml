@@ -17,6 +17,7 @@ let pos_of (t, p) = p
 let eof_pos = { file = ""; line = 0; col = 0 }
 let peek p = match p.toks with [] -> (Eof, eof_pos) | x :: _ -> x
 let peek2 p = match p.toks with _ :: x :: _ -> x | _ -> (Eof, eof_pos)
+let peek3 p = match p.toks with _ :: _ :: x :: _ -> x | _ -> (Eof, eof_pos)
 let next p = match p.toks with [] -> (Eof, eof_pos) | x :: r -> p.toks <- r; x
 
 (* 记录错误（供语句级恢复后统一报告） *)
@@ -69,6 +70,38 @@ let is_kw p k =
 
 (* 消耗当前行剩余的换行，保证语句边界干净 *)
 let end_of_stmt p = skip_trivia p
+
+(* ---------- 模块路径（::） ---------- *)
+
+(* token 列表是否以 Ident (:: Ident)+ 开头（模块路径形状，如 m::Point） *)
+let is_qpath_start (toks : (token * pos) list) : bool =
+  match toks with
+  | (Ident _, _) :: (Colon, _) :: (Colon, _) :: _ -> true
+  | _ -> false
+
+(* 从 token 列表扫描 Ident (:: Ident)* 段，返回 (段名列表, 剩余 tokens)。
+   调用前须 is_qpath_start 成立 *)
+let scan_qpath (toks : (token * pos) list) : string list * (token * pos) list =
+  let rec go acc l =
+    match l with
+    | (Ident s, _) :: (Colon, _) :: (Colon, _) :: (Ident _, _) :: r ->
+      go (s :: acc) r
+    | (Ident s, _) :: r -> (List.rev (s :: acc), r)
+    | _ -> (List.rev acc, l)
+  in
+  match toks with
+  | (Ident s, _) :: r -> go [ s ] r
+  | _ -> assert false
+
+(* 表达式/类型位置：消耗 Ident 后的 :: 后缀（相邻两个 Colon），拼接为
+   "a::b::c" 形式的名字（resolve 阶段解析改写） *)
+let rec qpath_extend p s =
+  match fst (peek p), fst (peek2 p) with
+  | Colon, Colon ->
+    ignore (next p); ignore (next p);
+    let seg = expect_ident p "path segment" in
+    qpath_extend p (s ^ "::" ^ seg)
+  | _ -> s
 
 (* ---------- 类型 ---------- *)
 
@@ -156,6 +189,7 @@ let rec parse_ty ?(allow_fun = false) p =
   match tk with
   | Ident s ->
     ignore (next p);
+    let s = qpath_extend p s in    (* 模块路径类型 m::Point *)
     check_no_dup_ty p;
     suffixes (TNamed (s, tp))
   | Keyword k when is_alias_kw k ->
@@ -435,6 +469,7 @@ and parse_primary p =
     ECast (e, t, tp)
   | Ident s ->
     ignore (next p);
+    let s = qpath_extend p s in    (* 模块路径引用 m::f / m::Point(...) *)
     parse_postfix_rest p (EVar (s, tp))
   | LParen ->
     ignore (next p);
@@ -551,8 +586,25 @@ and parse_decl_ty p tp ty =
 
 (* 判断当前是否为声明语句开头：类型词 + 名字/const/frac/unred。
    类型位后跟 *（指针声明 T* p 与乘法 x * y 形状相同）：仅当类型位是
-   已知类型名（内建/本文件 struct/type 别名）才视为指针声明 *)
+   已知类型名（内建/本文件 struct/type 别名）才视为指针声明。
+   模块路径类型 m::Point p：qpath 后（跳过 */!/修饰）跟标识符（非调用
+   形状）即声明；数组/列表声明 m::Point arr[8] 与下标表达式 m::arr[0]
+   无法句法区分，取表达式（用 type 别名绕过） *)
 and looks_like_decl p =
+  if is_qpath_start p.toks then begin
+    let (_segs, rest) = scan_qpath p.toks in
+    let rec skip l =
+      match l with
+      | (Star, _) :: r | (Bang, _) :: r -> skip r
+      | (Keyword (KConst | KFrac | KUnreduced), _) :: r -> skip r
+      | _ -> l
+    in
+    match skip rest with
+    | (Ident _, _) :: (LParen, _) :: _ -> false
+    | (Ident _, _) :: _ -> true
+    | _ -> false
+  end
+  else
   match ty_kws_len p.toks with
   | 0 -> false
   | n ->
@@ -876,8 +928,22 @@ and parse_if p tp =
 
 (* 顶层项是函数定义还是声明：类型词后（可跳过 * 指针后缀与
    const/frac/unred 修饰）跟标识符，标识符后是 '(' 为函数定义
-   （i32 f(...) / i32* f(...)），是 '[' 为数组/列表声明 *)
+   （i32 f(...) / i32* f(...)），是 '[' 为数组/列表声明。
+   模块路径返回类型 m::Point f(...)：qpath + 修饰 + 名字 + '(' *)
 let top_is_fn p =
+  if is_qpath_start p.toks then begin
+    let (_segs, rest) = scan_qpath p.toks in
+    let rec skip l =
+      match l with
+      | (Star, _) :: r | (Bang, _) :: r -> skip r
+      | (Keyword (KConst | KFrac | KUnreduced), _) :: r -> skip r
+      | _ -> l
+    in
+    match skip rest with
+    | (Ident _, _) :: (LParen, _) :: _ -> true
+    | _ -> false
+  end
+  else
   let toks = p.toks in
   let n = ty_kws_len toks in
   if n = 0 then false
@@ -968,60 +1034,179 @@ let rec parse_struct_fields p acc =
     parse_struct_fields p ({ fname = name; fty; fseq; fdefault; fpos = ftp } :: acc)
   | (_, tp) -> err tp "struct field syntax: TYPE NAME [= default]"
 
-let rec parse_item p =
+(* 模块体：缩进块内每行一个顶层项（fn/struct/mod/use/...；可嵌套 mod） *)
+and parse_item_block p =
+  skip_trivia p;
+  match peek p with
+  | (Indent, _) ->
+    ignore (next p);
+    let rec go acc =
+      skip_trivia p;
+      match peek p with
+      | (Dedent, _) -> ignore (next p); List.rev acc
+      | (Eof, tp') -> err tp' "unexpected end of input (unclosed module body)"
+      | _ ->
+        (try go (parse_item p :: acc)
+         with ParseError (ep, em) ->
+           record_err p ep em;
+           sync_top p;
+           go acc)
+    in
+    go []
+  | (_, tp') -> err tp' "expected an indented module body (mod name + newline + indent)"
+
+(* 旧 use 文件语法尾部：校验 .zfy 后缀与 import/as 修饰 *)
+and finish_legacy_use p tp buf =
+  if not (Filename.check_suffix (Buffer.contents buf) ".zfy") then
+    err tp "use file name must end with .zfy";
+  let import =
+    if is_kw p KImport then begin
+      ignore (next p);
+      Some (expect_ident p "module name")
+    end else None
+  in
+  let alias =
+    if is_kw p KAs then begin
+      ignore (next p);
+      Some (expect_ident p "alias")
+    end else None
+  in
+  end_of_stmt p;
+  IUse { path = Buffer.contents buf; import; alias; pos = tp }
+
+and parse_item p =
   skip_trivia p;
   let (tk, tp) = peek p in
   match tk with
-  | Keyword KUse ->
-    (* use 文件名.zfy [import 模块名] [as 别名]
-       路径：无 / 从当前目录找；./ 当前目录；../ 上一级 *)
+  | Keyword KPub ->
+    (* pub 修饰：仅模块内顶层合法（root 顶层 pub 由 resolve 忽略并告警容忍） *)
     ignore (next p);
-    (* 解析文件路径：('.' | '.' '.')? '/'? ident ('.' ident)*，拼接为字符串 *)
-    let buf = Buffer.create 16 in
-    let rec path_parts () =
-      (* 前导 ./ 或 ../ *)
-      let rec dots n =
-        match peek p with
-        | (Dot, _) when n < 2 -> ignore (next p); dots (n + 1)
-        | _ -> n
-      in
-      let n = dots 0 in
-      if n > 0 then begin
-        (* ./ 与 ../ 需要 / 跟进 *)
-        expect p Slash "/";
-        for _ = 1 to n do Buffer.add_string buf "../" done
-      end;
-      let first = expect_ident p "file name" in
-      Buffer.add_string buf first;
-      (* 文件名中的 .zfy 后缀：. 后跟标识符 *)
-      let rec ext () =
-        match peek p with
-        | (Dot, _) ->
-          ignore (next p);
-          Buffer.add_char buf '.';
-          Buffer.add_string buf (expect_ident p "extension");
-          ext ()
-        | _ -> ()
-      in
-      ext ()
-    in
-    path_parts ();
-    if not (Filename.check_suffix (Buffer.contents buf) ".zfy") then
-      err tp "use file name must end with .zfy";
-    let import =
-      if is_kw p KImport then begin
-        ignore (next p);
-        Some (expect_ident p "module name")
-      end else None
-    in
-    let alias =
-      if is_kw p KAs then begin
-        ignore (next p);
-        Some (expect_ident p "alias")
-      end else None
-    in
-    end_of_stmt p;
-    IUse { path = Buffer.contents buf; import; alias; pos = tp }
+    IPub (parse_item p, tp)
+  | Keyword KMod ->
+    (* mod name;  → 文件模块（body 在 name.zfy / name/mod.zfy，resolve 加载）
+       mod name（换行缩进块）→ 内联模块，块内为顶层项，可嵌套 *)
+    ignore (next p);
+    let name = expect_ident p "module name" in
+    (match peek p with
+     | (Semicolon, _) ->
+       (* mod name;：文件模块，显式分号收尾 *)
+       ignore (next p);
+       end_of_stmt p;
+       IModFile (name, tp)
+     | _ ->
+       let rec skip_nl () =
+         match peek p with
+         | (Newline, _) -> ignore (next p); skip_nl ()
+         | _ -> ()
+       in
+       skip_nl ();
+       (match peek p with
+        | (Indent, _) ->
+          let items = parse_item_block p in
+          IMod (name, items, tp)
+        | _ ->
+          (* 文件模块：语句随换行结束 *)
+          IModFile (name, tp)))
+  | Keyword KUse ->
+    (* use 目标两态：
+       - 新路径语法 use a::b::item [as x] / use a::b::{x, y as z} / use a::b [as m]
+         （Ident 后跟相邻两个 Colon）
+       - 旧文件语法 use 文件名.zfy [import 模块名] [as 别名]（legacy），
+         支持 ./ ../ 前缀（相对路径） *)
+    ignore (next p);
+    (match fst (peek p) with
+     | Dot ->
+       (* ---- 旧文件语法（legacy）：./ ../ 前缀 ---- *)
+       let buf = Buffer.create 16 in
+       let rec dots n =
+         match peek p with
+         | (Dot, _) when n < 2 -> ignore (next p); dots (n + 1)
+         | _ -> n
+       in
+       let n = dots 0 in
+       expect p Slash "/";
+       for _ = 1 to n do Buffer.add_string buf "../" done;
+       Buffer.add_string buf (expect_ident p "file name");
+       let rec ext () =
+         match peek p with
+         | (Dot, _) ->
+           ignore (next p);
+           Buffer.add_char buf '.';
+           Buffer.add_string buf (expect_ident p "extension");
+           ext ()
+         | _ -> ()
+       in
+       ext ();
+       finish_legacy_use p tp buf
+     | _ ->
+       let first = expect_ident p "use target" in
+       (match fst (peek p) with
+        | Colon ->
+          (* ---- 新路径语法 ---- *)
+          let rec go_segs acc =
+            match fst (peek p), fst (peek2 p) with
+            | Colon, Colon ->
+              (match fst (peek3 p) with
+               | Ident _ ->
+                 ignore (next p); ignore (next p);
+                 go_segs (expect_ident p "path segment" :: acc)
+               | LBrace -> List.rev acc   (* a::b::{x}：停在 '{' 前的 '::' *)
+               | _ ->
+                 err (snd (peek3 p))
+                   "expected a path segment or '{' after '::'")
+            | _ -> List.rev acc
+          in
+          let segs = first :: go_segs [] in
+          (match peek p with
+           | (Colon, _) ->
+             (* 分组 use a::b::{x, y as z}；go_segs 停在 '::' 前 *)
+             ignore (next p); ignore (next p);
+             expect p LBrace "'{'";
+             let rec go_binds acc =
+               let (orig, opos) =
+                 match peek p with
+                 | (Ident s, sp) -> ignore (next p); (s, sp)
+                 | (_, tp') -> err tp' "expected a use binding (identifier)"
+               in
+               let local =
+                 if is_kw p KAs then begin
+                   ignore (next p); expect_ident p "alias"
+                 end else orig
+               in
+               let acc = (local, segs @ [ orig ], opos) :: acc in
+               match peek p with
+               | (Comma, _) -> ignore (next p); go_binds acc
+               | (RBrace, _) -> ignore (next p); List.rev acc
+               | (_, tp') -> err tp' "expected ',' or '}' to end the use group"
+             in
+             let binds = go_binds [] in
+             end_of_stmt p;
+             IUseP { binds; pos = tp }
+           | _ ->
+             (* 单路径 use a::b::item [as x]；无 as 时绑定最后一段名 *)
+             let local =
+               if is_kw p KAs then begin
+                 ignore (next p); expect_ident p "alias"
+               end else List.nth segs (List.length segs - 1)
+             in
+             end_of_stmt p;
+             IUseP { binds = [ (local, segs, tp) ]; pos = tp })
+        | _ ->
+          (* ---- 旧文件语法（legacy）：首段文件名 + .zfy ---- *)
+          let buf = Buffer.create 16 in
+          Buffer.add_string buf first;
+          let rec ext () =
+            match peek p with
+            | (Dot, _) ->
+              ignore (next p);
+              Buffer.add_char buf '.';
+              Buffer.add_string buf (expect_ident p "extension");
+              ext ()
+            | _ -> ()
+          in
+          ext ();
+          finish_legacy_use p tp buf))
+
   | Keyword KStruct ->
     (* struct 声明：struct [packed] 名字 缩进块（字段：类型 名字 [= 默认值]，
        或 类型 名字[N] / 类型 名字[]） *)
