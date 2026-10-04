@@ -1,0 +1,24 @@
+// 9c 底层 const：i32 const* 指向 const 的指针——解引用读合法，写报错
+extern "C"
+    void* malloc(u64 n)
+    void free(void* p)
+
+// 参数位：指向 const 的指针（函数承诺不通过 p 写入）
+i32 peek(i32 const* p)
+    return p*
+
+i64 main()
+    i32 a = 42
+    i32 b = 7
+    // 读：解引用读合法
+    i32 const* cp = &a
+    output(cp*)
+    cp = &b                 // 指针本身可重绑（非 T* const）
+    output(cp*)
+    // 传参：i32 const* 实参
+    output(peek(&a))
+    // cast 得到的普通指针仍可写（const 性不随值传播）
+    i32* mutable_p = cast(cp, i32*)
+    mutable_p* = 100
+    output(b)
+    return 0

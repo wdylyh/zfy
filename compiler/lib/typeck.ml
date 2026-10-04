@@ -91,7 +91,8 @@ type genv = { fns : (string, fn_sig) Hashtbl.t;
               structs : (string, sdefk) Hashtbl.t;
               aliases : (string, zty) Hashtbl.t }   (* type 别名 *)
 
-type local = { lconst : bool; lty : zty; lslot : string; lunred : bool }
+type local = { lconst : bool; lty : zty; lslot : string; lunred : bool;
+               lconstp : bool }   (* 指向 const 的指针（T const*，9c）：解引用写报错 *)
 type env = {
   g : genv;
   mutable scopes : (string, local) Hashtbl.t list;
@@ -154,6 +155,7 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
            | Some _ -> TStruct s
            | None -> terr pp "undefined type: %s" s)))
   | TPtr (t', pp) -> TPtr (conv_ty g pp t')
+  | TPtrC (t', pp) -> TPtr (conv_ty g pp t')   (* const 性在槽级跟踪（lconstp） *)
   | TErr (t', pp) -> TErr (conv_ty g pp t')
   | TFun (ret, ptys, pp) ->
     (* 函数类型统一表示为指针：TPtr (TFunSig ...)（与函数名引用/函数指针
@@ -1142,7 +1144,8 @@ let rec check_decl env p isconst is_frac is_unred name ty init =
     | _, _ -> check_expr env init)
   in
   let tinit = coerce p tinit want in
-  declare env name { lconst = isconst; lty = want; lslot = ""; lunred = is_unred };
+  declare env name { lconst = isconst; lty = want; lslot = ""; lunred = is_unred;
+                     lconstp = (match ty with TPtrC _ -> true | _ -> false) };
   (* const 整数变量记录编译期值（数组长度用；非 const 不算常量） *)
   let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
   if isconst then
@@ -1162,6 +1165,16 @@ and assign_var env p name =
       terr p "cannot assign to constant %s (declared const)" name;
     l.lslot
   | None -> terr p "undefined variable: %s" name
+
+(* 9c：解引用写目标若为指向 const 的指针变量（T const*）则报错 *)
+and check_constp env (pe : expr) p =
+  match pe with
+  | EVar (name, _) ->
+    (match lookup_var env name with
+     | Some l when l.lconstp ->
+       terr p "cannot write through pointer-to-const %s (declared T const*)" name
+     | _ -> ())
+  | _ -> ()
 
 (* 复合赋值 / 自增自减（左值地址只求值一次）：
    - 数组/列表元素：SAugIndexK（下标只求值一次）
@@ -1192,6 +1205,8 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
         | TPtr t ->
           (* 指针下标复合赋值（自动解引用，无越界检查）：p[i] op= v，
              地址 p+i 只求值一次；强制 unsafe 块（new2.md #8） *)
+          if l.lconstp then
+            terr ap "cannot write through pointer-to-const %s (declared T const*)" arr;
           if not env.in_unsafe then
             terr ap "pointer subscript p[i] is only allowed inside an unsafe block";
           let ti = to_i64 (check_expr env idx) in
@@ -1283,6 +1298,7 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
         | None -> terr p' "undefined variable: %s" name))
   | EDeref (pe, dp) ->
     (* p* op= v / p*++ / p*--：解引用复合赋值（仅数值标量/指针目标） *)
+    check_constp env pe dp;
     let tp = check_expr env pe in
     (match resolve tp.ety with
      | TPtr t ->
@@ -1315,7 +1331,7 @@ and check_unwrap env p (a : expr) (blk : block) target =
          terr p "??-block declaration type must be the element type T (without '!')"
        | _ -> ());
       unify p elem want;
-      declare env name { lconst = isconst; lty = want; lslot = ""; lunred = false };
+      declare env name { lconst = isconst; lty = want; lslot = ""; lunred = false; lconstp = false };
       let s = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
       (s, want)
     | `Assign name ->
@@ -1328,7 +1344,7 @@ and check_unwrap env p (a : expr) (blk : block) target =
     | `Discard -> ("", elem)
   in
   push_scope env;
-  declare env "err" { lconst = true; lty = TStruct "Err"; lslot = ""; lunred = false };
+  declare env "err" { lconst = true; lty = TStruct "Err"; lslot = ""; lunred = false; lconstp = false };
   let errslot = (match lookup_var env "err" with Some l -> l.lslot | None -> assert false) in
   let tblk = check_block env blk in
   pop_scope env;
@@ -1397,7 +1413,7 @@ and check_seq_decl env p isconst name e len is_list inits =
      let ti = check_expr env ie in
      let copy_list () =
        declare env name
-         { lconst = isconst; lty = TList e; lslot = ""; lunred = false };
+         { lconst = isconst; lty = TList e; lslot = ""; lunred = false; lconstp = false };
        let slot =
          (match lookup_var env name with
           | Some l -> l.lslot
@@ -1418,7 +1434,7 @@ and check_seq_decl env p isconst name e len is_list inits =
             inits
         in
         declare env name
-          { lconst = isconst; lty = TList e; lslot = ""; lunred = false };
+          { lconst = isconst; lty = TList e; lslot = ""; lunred = false; lconstp = false };
         let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
         SSeqDeclK (isconst, slot, e, 0L, true, tinits))
   (* 数组整体初值：T array b[N] = 源（源为同元素类型数组/列表 → 深拷贝） *)
@@ -1428,7 +1444,7 @@ and check_seq_decl env p isconst name e len is_list inits =
       | TArray (e2, n2) when resolve e2 = resolve e && n2 = Int64.to_int vlen ->
         declare env name
           { lconst = isconst; lty = TArray (e, Int64.to_int vlen);
-            lslot = ""; lunred = false };
+            lslot = ""; lunred = false; lconstp = false };
         let slot =
           (match lookup_var env name with
            | Some l -> l.lslot
@@ -1438,7 +1454,7 @@ and check_seq_decl env p isconst name e len is_list inits =
       | TList e2 when resolve e2 = resolve e ->
         declare env name
           { lconst = isconst; lty = TList e;
-            lslot = ""; lunred = false };
+            lslot = ""; lunred = false; lconstp = false };
         let slot =
           (match lookup_var env name with
            | Some l -> l.lslot
@@ -1456,7 +1472,7 @@ and check_seq_decl env p isconst name e len is_list inits =
         declare env name
           { lconst = isconst;
             lty = TArray (e, Int64.to_int vlen);
-            lslot = ""; lunred = false };
+            lslot = ""; lunred = false; lconstp = false };
         let slot =
           (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
         SSeqDeclK (isconst, slot, e, vlen, is_list, tinits))
@@ -1471,7 +1487,7 @@ and check_seq_decl env p isconst name e len is_list inits =
      declare env name
        { lconst = isconst;
          lty = if is_list then TList e else TArray (e, Int64.to_int vlen);
-         lslot = ""; lunred = false };
+         lslot = ""; lunred = false; lconstp = false };
      let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
      SSeqDeclK (isconst, slot, e, vlen, is_list, tinits))
 
@@ -1514,6 +1530,8 @@ and check_stmt env (st : stmt) : tstmt =
            | TPtr t ->
              (* 指针下标写入（自动解引用，无越界检查）：p[i] = v 等同于
                 先按元素步进地址（p+i）再解引用写入；强制 unsafe（new2.md #8） *)
+             if l.lconstp then
+               terr ap "cannot write through pointer-to-const %s (declared T const*)" arr;
              if not env.in_unsafe then
                terr ip "pointer subscript p[i] is only allowed inside an unsafe block";
              (match resolve t with
@@ -1532,6 +1550,7 @@ and check_stmt env (st : stmt) : tstmt =
        terr ip "index-assignment target must be an array/list variable, e.g. n[3] = value"
      | EDeref (pe, dp), _ ->
        (* p* = v：解引用写入（仅标量/指针目标；聚合类型暂不支持） *)
+       check_constp env pe dp;
        let tp = check_expr env pe in
        (match resolve tp.ety with
         | TPtr t ->
@@ -1600,7 +1619,7 @@ and check_stmt env (st : stmt) : tstmt =
         | None -> terr np "undefined variable: %s" name
         | Some _ ->
           let te = check_expr env e in
-          declare env name { lconst = false; lty = te.ety; lslot = ""; lunred = false };
+          declare env name { lconst = false; lty = te.ety; lslot = ""; lunred = false; lconstp = false };
           let slot =
             (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
           mk (SDeclK (false, slot, te.ety, te, false)))
@@ -1691,7 +1710,7 @@ and check_stmt env (st : stmt) : tstmt =
           | InNew (name, ty, p') ->
             let t = conv_ty env.g p' ty in
             check_input_ty p' t;
-            declare env name { lconst = false; lty = t; lslot = ""; lunred = false };
+            declare env name { lconst = false; lty = t; lslot = ""; lunred = false; lconstp = false };
             let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
             { tname = slot; tnew = true; tty = t }
           | InUse (name, p') ->
@@ -2086,7 +2105,8 @@ let check_program (prog : program) : hir =
                 List.map2
                   (fun (pd : param) pty ->
                     declare env pd.pname
-                      { lconst = false; lty = pty; lslot = ""; lunred = false };
+                      { lconst = false; lty = pty; lslot = ""; lunred = false;
+                        lconstp = (match pd.pty with TPtrC _ -> true | _ -> false) };
                     let slot = (match lookup_var env pd.pname with
                                 | Some l -> l.lslot | None -> assert false) in
                     (false, slot, pty))

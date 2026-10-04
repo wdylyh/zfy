@@ -47,6 +47,7 @@ zfy 是一门编译到 LLVM IR 的静态类型语言（OCaml 编译器 `zyfc`，
 - 单独写 `long` / `ulong` 不是类型（报错并提示合法组合）。
 - 其他标量：`bool` `char` `string` `void`（void 仅作返回类型）。
 - 指针类型：`T*`（如 `i32*`、`Point*`、`void*`）；指针本身的可变修饰 `T* const`。
+- 指向 const 的指针：`T const*`（如 `i32 const* p`，9c）——解引用读合法、指针可重绑，解引用写（`p* = v`、`p* op=`、`p[i] = v`）报 E3156；const 性为槽级跟踪（cast/传参后不传播）。
 - 错误类型：`T!`（ZEM，见第 11 节），限 ≤64 位标量 / string / 指针；128 位不支持。
 - 用户类型：`struct` 名与 `type` 别名（见第 6/7 节）。
 - 函数类型仅能通过 `type` 别名书写（如 `type Callback = i32(i32, i32)`）。

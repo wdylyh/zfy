@@ -392,6 +392,7 @@ let resolve (main : program) (main_dir : string)
       match t with
       | TNamed (n, p) -> TNamed (resolve_name m n p, p)
       | TPtr (t2, p) -> TPtr (rw_ty m t2, p)
+      | TPtrC (t2, p) -> TPtrC (rw_ty m t2, p)
       | TErr (t2, p) -> TErr (rw_ty m t2, p)
       | TFun (r, ps, p) -> TFun (rw_ty m r, List.map (rw_ty m) ps, p)
     in

@@ -6,6 +6,7 @@ open Tokens
 type ty =
   | TNamed of string * pos
   | TPtr of ty * pos                  (* T*：指向 T 的指针 *)
+  | TPtrC of ty * pos                 (* T const*：指向 const T 的指针（解引用写报错） *)
   | TErr of ty * pos                  (* T!：可失败值（错误模型 ZEM） *)
   | TFun of ty * ty list * pos        (* 返回类型, 参数类型列表（仅 type 别名） *)
 

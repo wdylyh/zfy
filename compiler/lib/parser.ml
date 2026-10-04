@@ -165,6 +165,11 @@ let rec parse_ty ?(allow_fun = false) p =
     | (Star, _) ->
       ignore (next p);
       suffixes (TPtr (base, tp))
+    (* T const*：指向 const 的指针（new2.md 9c）；const 后跟其它 token 时
+       留给声明修饰符处理（如 T const 常量变量） *)
+    | (Keyword KConst, cp) when fst (peek2 p) = Star ->
+      ignore (next p); ignore (next p);
+      suffixes (TPtrC (base, cp))
     | (Bang, _) ->
       ignore (next p);
       suffixes (TErr (base, tp))
