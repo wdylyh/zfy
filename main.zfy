@@ -1,79 +1,74 @@
-struct Student
-    i32 id
-    string name
-    i32 score = 60
+// 单文件综合演示：zfy 语言特性
 
-i32 const MAX_STUDENTS = 5
+i32 const MAXN = 8
 
-i32! parse_score(string s)
-    i32 v = cast(s, i32)?
-    if v < 0 or v > 100
-        return fail(ErrCode.CUSTOM, "分数超出范围")
-    return v
+type IntPtr = i32*
 
-i64 main()
-    i32    ids[5]
-    string names_arr[5]
-    i32    scores[5]
-    i32 count = 0
+struct Point
+    f64 x = 0.0
+    f64 y = 0.0
 
-    string names[] = "Alice", "Bob", "Cara", "Dan", "Eve"
-    i32 raw[5] = 88, 95, 72, 60, 100
+struct Box<T>
+    T v
 
-    i32 i = 0
-    while i < MAX_STUDENTS
-        ids[i] = i
-        names_arr[i] = names[i]
-        scores[i] = raw[i]
-        count++
-        i++
+<T> T min_of(T a, T b)
+    if a < b
+        return a
+    return b
 
-    output("共录入", count, "名学生", sep=' ')
+i32! safe_div(i32 a, i32 b)
+    if b == 0
+        return fail(ErrCode.DIV_ZERO, "division by zero")
+    return a / b
 
-    output("及格率(%)：", 3 * 100 / 4)
+void add_to(i32 ref acc, i32 n)
+    acc += n
 
-    i32 total = 0
-    i32 j = 0
-    while j < count
-        i32 d = parse_score("85") ?? 0
-        total += d
-        j++
+void main()
+    i32 n = 10
+    i64 big = n
+    output("n =", n, "big =", big)
 
-    i32 bonus = parse_score("999") ?? 0
-    output("默认失败值：", bonus)
+    i32 arr[MAXN] = 1, 2, 3
+    f64 xs[] = 1.5, 2.5, 3.5
+    push(xs, 4.5)
+    output("len(arr) =", length(arr), "len(xs) =", length(xs))
+    output("xs[0] =", xs[0], "xs[3] =", xs[3])
 
-    string line = "Alice,Bob,Cara"
-    string parts[] = split(line, ',')
-    output("拆分后段数：", length(parts))
-    output("第二段：", parts[1])
+    i32 sum = 0
+    for i32 i = 0, i < length(arr), i++
+        sum += arr[i]
+    output("sum(arr) =", sum)
 
-    i32 pos = find("hello world", 'o') ?? -1
-    output("字符 o 首次出现位置：", pos)
+    Point p = Point(x=1.0, y=2.0)
+    p.y += 3.0
+    output("p =", p.x, p.y)
 
-    i32 best = 0
-    i32 k = 0
-    while k < count
-        if scores[k] > best
-            best = scores[k]
-        k++
+    Box<i32> bi = Box(7)
+    Box<f64> bf = Box(2.5)
+    output("Box i32 =", bi.v, "Box f64 =", bf.v)
+    output("min =", min_of(3, 9), min_of(2.5, 1.5))
 
-    i32* bp = &best
-    output("最高分：", bp*)
+    i32 d1 = safe_div(10, 2) ?? -1
+    output("10/2 =", d1)
+
+    i32 d2 = safe_div(10, 0) ??
+        output("caught:", err.code, err.msg)
+        -1
+    output("10/0 =", d2)
+
+    i32 total = 100
+    add_to(ref total, 23)
+    output("total =", total)
+
+    i32 v = 42
+    IntPtr ptr = &v
     unsafe
-        i32* shifted = bp + 0
-        output("指针解引用：", shifted*)
+        ptr^ = 99
+        output("via ptr =", ptr^)
+    output("v =", v)
 
-    Student s1 = Student(id=1, name="Zoe", score=77)
-    output("单个 struct：", s1.id, s1.name, s1.score)
-
-    Student s2 = s1
-    s2.score = 1
-    output("原件/副本：", s1.score, s2.score)
-
-    output("---- 成绩单 ----")
-    i32 m = 0
-    while m < count
-        output(names_arr[m], scores[m], sep='\t')
-        m++
-
-    return 0
+    string s = "  hello zfy  "
+    string t = trim(s, ' ')
+    output("trimmed = [" + t + "]")
+    output("find 'z' =", find(t, 'z') ?? -1)

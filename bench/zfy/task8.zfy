@@ -1,0 +1,21 @@
+// T8: 泛型函数 + 泛型 struct（单态化实例 300k + 150k 次）
+struct Box<T>
+    T v = 0
+
+<T> T pick(T a, T b)
+    if a < b
+        return a
+    return b
+
+i64 main()
+    i64 acc = 0
+    f64 accf = 0.0
+    for i32 i = 0, i < 300000, i++
+        Box<i32> b = Box(i)
+        acc += b.v
+        acc += pick(i % 7, 3)
+    for i32 j = 0, j < 150000, j++
+        Box<f64> c = Box(cast(j, f64) * 0.5)
+        accf += c.v
+    output("T8 acc=", acc, " accf=", accf)
+    return 0

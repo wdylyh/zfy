@@ -1,0 +1,24 @@
+// T9: 聚合传参（move 免克隆路径 + 值语义深拷贝路径）
+// s1: xs 最后使用 → 自动 move，函数内求和
+// s2: 循环 30 次传 xs（之后仍使用 → 每次深拷贝）
+i64 sum_consume(i64 a[])
+    i64 s = 0
+    for i64 k = 0, k < length(a), k++
+        s += a[k]
+    return s
+
+i64 main()
+    i64 n = 1000000
+    i64 xs[]
+    for i64 i = 0, i < n, i++
+        push(xs, i)
+    i64 s1 = sum_consume(xs)
+    output("T9 s1=", s1)
+    i64 ys[]
+    for i64 i = 0, i < n, i++
+        push(ys, i)
+    i64 s2 = 0
+    for i32 r = 0, r < 30, r++
+        s2 += sum_consume(copy ys)
+    output("T9 s2=", s2, " keep=", length(ys))
+    return 0
