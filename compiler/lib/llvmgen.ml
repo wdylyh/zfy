@@ -924,11 +924,20 @@ let gen_call_own fc dst name (args : (operand * bool) list) (ret_ty : zty)
 
 (* ---------- struct 字段访问辅助 ---------- *)
 
-(* 按字段序号链逐级 GEP（LLVM 布局与 hir 手算 C 布局一致） *)
+(* 按字段序号链逐级 GEP（LLVM 布局与 hir 手算 C 布局一致）；
+   中间层为 TPtr(TStruct) 时先 load 解引用再继续（链式指针字段 p.next.x） *)
 let rec gen_field_path fc (p : string) (ty : zty) (idxs : int list) : string =
   match idxs with
   | [] -> p
   | i :: rest ->
+    let (p, ty) =
+      match ty with
+      | TPtr t' ->
+        let ld = fresh_r fc in
+        emitf fc "  %s = load ptr, ptr %s" ld p;
+        (ld, t')
+      | _ -> (p, ty)
+    in
     let s =
       match ty with
       | TStruct s -> s

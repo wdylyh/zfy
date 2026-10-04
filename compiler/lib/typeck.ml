@@ -1842,14 +1842,27 @@ let check_program (prog : program) : hir =
   List.iter
     (function IFn { name; pos; _ } -> Hashtbl.replace fn_names name pos | _ -> ())
     prog;
-  (* 第一遍 A：按声明序登记 struct（先声明后使用：字段类型只能引用
-     已声明的 struct；函数签名引用 struct 同样要求已声明） *)
+  (* 第一遍 A0：预登记所有 struct 名（空字段占位），使指针形态的字段
+     （Node* next / B* b）可自引用与前向引用——conv_ty 只需名字存在；
+     非指针自引用仍由下方 E3098 检查拦截（无限大小） *)
+  let seen_structs : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+  List.iter
+    (function
+      | IStruct { name; pos; _ } ->
+        if Hashtbl.mem seen_structs name then
+          terr pos "duplicate struct definition: %s" name
+        else begin
+          Hashtbl.add seen_structs name ();
+          Hashtbl.replace g.structs name { spacked = false; sfields = [] }
+        end
+      | _ -> ())
+    prog;
+  (* 第一遍 A：按声明序登记 struct（字段类型只展开已声明 struct 的字段；
+     函数签名引用 struct 同样要求已声明） *)
   let struct_pos : (string, pos) Hashtbl.t = Hashtbl.create 8 in
   List.iter
     (function
       | IStruct { name; packed; fields; pos } ->
-        if Hashtbl.mem g.structs name then
-          terr pos "duplicate struct definition: %s" name;
         if List.mem name builtin_names then
           terr pos "struct name %s conflicts with a builtin, rename it" name;
         if Hashtbl.mem fn_names name then
