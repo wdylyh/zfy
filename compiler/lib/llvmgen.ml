@@ -744,20 +744,10 @@ let gen_input fc name (ty : zty) delim =
 
 (* ---------- 内建函数 ---------- *)
 
+(* 9d：i128 判定（extern "C" 的 __int128 ABI 适配用） *)
+let is_i128 = function TInt 128 | TUint 128 -> true | _ -> false
+
 let gen_call fc dst name (args : operand list) (ret_ty : zty) =
-  let arg_values () =
-    List.map
-      (fun (o : operand) ->
-        if is_agg o.oty then begin
-          (* 聚合参数按指针传递 *)
-          let (p, _) = ptr_of fc o in
-          ("ptr", p)
-        end
-        else
-          let (v, t) = val_of fc o in
-          (t, v))
-      args
-  in
   match name, args with
   | "str_len", [ a ] ->
     let (v, _) = val_of fc a in
@@ -819,7 +809,28 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
        emitf fc "  %s = call ptr @zfy_prec_str(ptr %s, i64 %s)" d sp n64)
   | _ ->
     let callee = if name = "main" then "@zfy.main" else "@" ^ name in
-    let targs = arg_values () in
+    let is_ext = Hashtbl.mem Typeck.extern_fns name in
+    let targs =
+      List.map
+        (fun (o : operand) ->
+          if is_agg o.oty then begin
+            (* 聚合参数按指针传递 *)
+            let (p, _) = ptr_of fc o in
+            ("ptr", p)
+          end
+          else if is_ext && is_i128 o.oty then begin
+            (* 9d：extern i128 参数按引用传（clang win32 __int128 ABI） *)
+            let a = fresh_r fc in
+            emitf_entry fc "  %s = alloca i128" a;
+            let (v, _) = val_of fc o in
+            emitf fc "  store i128 %s, ptr %s" v a;
+            ("ptr", a)
+          end
+          else
+            let (v, t) = val_of fc o in
+            (t, v))
+        args
+    in
     let args_str =
       String.concat ""
         (List.map (fun (t, v) -> Printf.sprintf ", %s %s" t v) targs)
@@ -840,6 +851,11 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
       in
       match ret_ty, dst with
       | TVoid, _ -> emitf fc "  call void %s(%s)" callee args_str
+      | rt, Some d when is_ext && is_i128 rt ->
+        (* 9d：extern i128 返回值按 <2 x i64> 接收后 bitcast（clang win32 ABI） *)
+        let r = fresh_r fc in
+        emitf fc "  %s = call <2 x i64> %s(%s)" r callee args_str;
+        emitf fc "  %s = bitcast <2 x i64> %s to i128" d r
       | rt, Some d ->
         emitf fc "  %s = call %s %s(%s)" d (ll_ty rt) callee args_str
       | _ -> lerr None "non-void return value must be used"
@@ -2063,13 +2079,20 @@ let gen_program (m : mir) : string =
   let decls : (string, string * string) Hashtbl.t = Hashtbl.create 8 in
   let add_decl name (args : operand list) ret =
     if not (is_rt_name name) && not (Hashtbl.mem decls name) then begin
+      let is_ext = Hashtbl.mem Typeck.extern_fns name in
       let atys =
         List.map
           (fun (o : operand) ->
-            if is_agg o.oty then "ptr" else ll_ty o.oty)
+            if is_agg o.oty then "ptr"
+            else if is_ext && is_i128 o.oty then "ptr"   (* 9d：按引用传 *)
+            else ll_ty o.oty)
           args
       in
-      let rty = if is_agg ret then "ptr" else ll_ty ret in
+      let rty =
+        if is_agg ret then "ptr"
+        else if is_ext && is_i128 ret then "<2 x i64>"   (* 9d：sret 等价形式 *)
+        else ll_ty ret
+      in
       Hashtbl.replace decls name (rty, String.concat ", " atys)
     end
   in

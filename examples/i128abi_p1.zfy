@@ -1,0 +1,9 @@
+// param only
+extern "C"
+    i64 abi_i128_lo(i128 v)
+
+i64 main()
+    i128 big = 1234567890123456789
+    output(abi_i128_lo(big))
+    return 0
+

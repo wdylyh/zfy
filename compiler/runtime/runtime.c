@@ -254,6 +254,16 @@ char *zfy_tostr_i128(__int128 v) {
     return zfy_u128_to_str((unsigned __int128)v);
 }
 
+/* 9d ABI 自检：extern "C" i128 参数（按值声明，MinGW 下后端自动按引用传递）
+   与 i128 返回值（sret）的双向验证 */
+int64_t abi_i128_lo(__int128 v) {
+    return (int64_t)(v & (((__int128)1 << 64) - 1));
+}
+
+__int128 abi_i128_scale(__int128 v, int64_t k) {
+    return v * (__int128)k;
+}
+
 char *zfy_tostr_u128(unsigned __int128 v) {
     return zfy_u128_to_str(v);
 }

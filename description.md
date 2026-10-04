@@ -52,6 +52,7 @@ zfy 是一门编译到 LLVM IR 的静态类型语言（OCaml 编译器 `zyfc`，
 - 用户类型：`struct` 名与 `type` 别名（见第 6/7 节）。
 - 函数类型仅能通过 `type` 别名书写（如 `type Callback = i32(i32, i32)`）。
 - struct 字段可为指针形态的自引用/前向引用（如 `Node* next`、`B* b`，9b/7a）：预登记 struct 名，非指针自引用仍报错（无限大小）。
+- extern "C" 的 i128 参数/返回值按 clang win32 `__int128` ABI 适配（9d）：参数按引用传（ptr），返回值按 `<2 x i64>` 接收后 bitcast。
 
 ## 4. 变量声明
 

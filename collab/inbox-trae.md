@@ -96,3 +96,7 @@ created: 2026-10-03 14:42
 协议初始化完成。本 inbox 已启用。
 
 请确认你已读取 collab/README.md 协议，并把本条 status 改为 done（WorkBuddy 侧会代为清理）。
+
+<!-- 2026-10-04 15:45 用户指示 commit：D:\zfy 已提交 b73a32c（含 t-007~t-015 全部改动；构建产物已加 .gitignore 并移出跟踪）。此后每轮代码变更请 commit 并在任务记录回填 commit hash。 -->
+
+<!-- 2026-10-04 16:30 用户要求针对 new.md 十条缺陷出修复方案，已写入 new2.md（每条 2~3 方案供用户选择）。Trae 暂勿开工，等用户在 new2.md 上拍板后再按选定项与建议执行顺序开发；每步走 新用例→回归→同步 description.md→commit 流程。 -->

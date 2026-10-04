@@ -1,0 +1,13 @@
+// 9d extern i128 ABI 自检：i128 参数按值声明（MinGW 后端按引用传递）+ i128 返回值（sret）
+extern "C"
+    i64 abi_i128_lo(i128 v)
+    i128 abi_i128_scale(i128 v, i64 k)
+
+i64 main()
+    i128 big = 1234567890123456789
+    // i128 参数传入 C 函数：取低 64 位
+    output(abi_i128_lo(big))
+    // i128 返回值接收：big * 1000
+    i128 scaled = abi_i128_scale(big, 1000)
+    output(scaled)
+    return 0

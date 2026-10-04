@@ -12,6 +12,10 @@ let terr p fmt =
    driver 在检查结束后统一读取报告；非空时不进入后续阶段 *)
 let collected : (pos * string) list ref = ref []
 
+(* 9d：extern "C" 函数名名单（i128 参数按引用传、返回值按 <2 x i64> 接收，
+   与 clang win32 的 __int128 ABI 一致） *)
+let extern_fns : (string, unit) Hashtbl.t = Hashtbl.create 8
+
 (* ---------- TVar 求解 ---------- *)
 
 let subs : (int, zty) Hashtbl.t = Hashtbl.create 16
@@ -2010,7 +2014,9 @@ let check_program (prog : program) : hir =
             (match rty with
              | TErr _ -> terr f.epos "extern functions do not support a T! return type (the error model is for zfy functions only)"
              | _ -> ());
-            Hashtbl.replace g.fns f.ename { params = ptys; ret = rty })
+            Hashtbl.replace g.fns f.ename { params = ptys; ret = rty };
+            (* 9d：登记 extern 名单——llvmgen 对 i128 参数/返回值做 ABI 适配 *)
+            Hashtbl.replace extern_fns f.ename ())
           funcs
       | IUse _ | IUseP _ | IMod _ | IModFile _ | IPub _ | IDecl _
       | IStruct _ | ITypeAlias _ -> ())
