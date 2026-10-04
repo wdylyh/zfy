@@ -44,11 +44,12 @@ i64 main()
     rp.y += 2
     output(r.x, r.y)
 
-    // 自动解引用：p[i] 下标 与 &arr[i] 元素地址
+    // 自动解引用：p[i] 下标 与 &arr[i] 元素地址（p[i] 强制 unsafe，new2.md #8）
     i32 arr[4] = 1, 2, 3, 4
     i32* ap = &arr[0]
-    output(ap[0], ap[2])
-    ap[1] = 22
+    unsafe
+        output(ap[0], ap[2])
+        ap[1] = 22
     output(arr[1])
     i32* mid = &arr[2]
     output(mid*)
@@ -75,8 +76,9 @@ i64 main()
     // extern "C"：malloc/free + 指针间 cast
     void* raw = malloc(16)
     i32* nums = cast(raw, i32*)
-    nums[0] = 123
-    nums[1] = 456
-    output(nums[0], nums[1])
+    unsafe
+        nums[0] = 123
+        nums[1] = 456
+        output(nums[0], nums[1])
     free(raw)
     return 0

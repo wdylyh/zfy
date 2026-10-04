@@ -602,8 +602,10 @@ and check_expr env (e : expr) : texpr =
        (* s[i] 读字符：越界运行时报错，结果直接是 char *)
        mk (ECallK ("zfy_str_char", [ tb; ti ], [])) TChar
      | TPtr t ->
-       (* 指针下标（自动解引用，无越界检查，不需 unsafe）：p[i] 等同于先
-          按元素步进地址再解引用（降码复用指针加法与解引用读） *)
+       (* 指针下标（自动解引用，无越界检查）：p[i] 等同于先按元素步进
+          地址再解引用；绕过类型系统，强制 unsafe 块（new2.md #8） *)
+       if not env.in_unsafe then
+         terr p' "pointer subscript p[i] is only allowed inside an unsafe block";
        let addr = mk (EBinK (BAdd, tb, ti)) (TPtr t) in
        mk (EDerefK addr) t
      | t -> terr p' "type %s does not support index access" (pp_zty t))
@@ -1127,7 +1129,9 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           SAugIndexK (l.lslot, e, ti, bop, trhs, grow)
         | TPtr t ->
           (* 指针下标复合赋值（自动解引用，无越界检查）：p[i] op= v，
-             地址 p+i 只求值一次（load + op + store 同一地址） *)
+             地址 p+i 只求值一次；强制 unsafe 块（new2.md #8） *)
+          if not env.in_unsafe then
+            terr ap "pointer subscript p[i] is only allowed inside an unsafe block";
           let ti = to_i64 (check_expr env idx) in
           let tp = { e = EVarK l.lslot; ety = l.lty; epos = ap } in
           let addr = { e = EBinK (BAdd, tp, ti); ety = l.lty; epos = ip } in
@@ -1447,7 +1451,9 @@ and check_stmt env (st : stmt) : tstmt =
              terr ip "strings do not support index assignment (use replace for ranges)"
            | TPtr t ->
              (* 指针下标写入（自动解引用，无越界检查）：p[i] = v 等同于
-                先按元素步进地址（p+i）再解引用写入 *)
+                先按元素步进地址（p+i）再解引用写入；强制 unsafe（new2.md #8） *)
+             if not env.in_unsafe then
+               terr ip "pointer subscript p[i] is only allowed inside an unsafe block";
              (match resolve t with
               | TInt _ | TUint _ | TFloat _ | TBool | TChar | TPtr _ ->
                 let ti = to_i64 (check_expr env idx) in
