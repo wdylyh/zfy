@@ -1,0 +1,35 @@
+// new2.md #1：值语义 move/ref/copy 与自动 move（最后使用即 move）
+// 1) 自动 move 传参：b 之后不再使用 → 所有权移交（免深拷贝）
+// 2) 自动 move 赋值：xs 之后不再使用 → 数组指针转移
+// 3) ref 传引用参数：函数内经引用读写调用方变量
+// 4) copy 显式深拷贝：d 之后仍使用，copy 为显式值语义声明
+
+string take(string s)
+    return s
+
+void bump(i32 ref x)
+    x = x + 1
+    x++
+
+void show(string s)
+    output(s, end='\n')
+
+i64 main()
+    string a = "hello"
+    string b = "world"
+    string c = take(b)          // b 最后使用：自动 move
+    output(a, c, sep=' ', end='\n')
+
+    i32 xs[3] = 1, 2, 3
+    i32 ys[3]
+    ys = xs                     // xs 最后使用：自动 move 赋值
+    output(ys[2], end='\n')
+
+    i32 v = 10
+    bump(ref v)                 // 传引用：v 被函数内改为 12
+    output(v, end='\n')
+
+    string d = "abc"
+    show(copy d)                // 显式 copy：d 之后仍使用，深拷贝
+    output(d, end='\n')
+    return 0

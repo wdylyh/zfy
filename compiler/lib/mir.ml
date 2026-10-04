@@ -603,19 +603,30 @@ and lstmt_inner l (s : tstmt) : unit =
     let v = lexpr l src in
     if not (move_owned_temp l name v tgt) then
       emit l (MCopy (name, v, tgt))
-  | SAssignK (lhs, rhs, nn) ->
+  | SAssignK (lhs, rhs, nn, mov) ->
     let v = lexpr l rhs in
     (match lhs.e with
      | EVarK name ->
-       (* 聚合整体赋值：值为本语句临时（切片/split/调用结果等）时 move 免克隆 *)
-       let moved =
-         match lhs.ety with
-         | TString | TArray _ | TList _ -> move_owned_temp l name v lhs.ety
-         | _ -> false
-       in
-       if not moved then begin
-         emit l (MCopy (name, v, lhs.ety));
-         if nn then emit l (MNorm (name, lhs.ety))
+       if mov then begin
+         (* move 赋值（new2.md #1：自动 move/显式 move）：源为变量槽时
+            所有权直接转移（释放目标旧值 + 接管指针），随后清空源槽防双释放 *)
+         (match lhs.ety, v.o with
+          | (TString | TArray _ | TList _), OLocal src ->
+            emit l (MMoveSeq (name, v, lhs.ety));
+            emit l (MClear (src, lhs.ety))
+          | _ -> merr lhs.epos "move assignment requires an aggregate variable source")
+       end
+       else begin
+         (* 聚合整体赋值：值为本语句临时（切片/split/调用结果等）时 move 免克隆 *)
+         let moved =
+           match lhs.ety with
+           | TString | TArray _ | TList _ -> move_owned_temp l name v lhs.ety
+           | _ -> false
+         in
+         if not moved then begin
+           emit l (MCopy (name, v, lhs.ety));
+           if nn then emit l (MNorm (name, lhs.ety))
+         end
        end
      | _ -> merr lhs.epos "unsupported assignment target")
   | SAugIndexK (name, elem, idx, bop, v, grow) ->

@@ -136,6 +136,20 @@ let code_of = function
       ["type mismatch: expected "], "E3005";
       ["narrowing conversion from "], "E3155";
       ["cannot write through pointer-to-const "], "E3156";
+      ["explicit copy conflicts with automatic move"], "E3157";
+      ["is passed by ref, but the parameter is not declared ref"], "E3158";
+      ["is ref, pass the argument with ref"], "E3159";
+      ["cannot pass constant "], "E3160";
+      ["has been moved and cannot be passed by ref"], "E3038";
+      ["ref can only apply to a variable"], "E3161";
+      ["ref parameters support scalar/string types only"], "E3162";
+      ["extern parameters do not support ref"], "E3163";
+      ["ref is only allowed on function parameters"], "E3164";
+      ["ref parameters do not support the frac modifier"], "E3165";
+      ["function pointer calls do not support ref arguments"], "E3166";
+      ["does not support ref arguments"], "E3167";
+      ["ref parameters support scalar/string types only (got "], "E3162";
+      ["move assignment requires an aggregate variable source"], "E3168";
       ["unsupported cast: "], "E3008";
       ["cannot omit an initializer"], "E3009";
       ["cannot convert to string"], "E3007";
@@ -407,6 +421,8 @@ let expand_uses (main : program) (main_dir : string)
           (function
             | CPos e -> CPos (rw_expr m e)
             | CMove e -> CMove (rw_expr m e)
+            | CCopy e -> CCopy (rw_expr m e)
+            | CRef e -> CRef (rw_expr m e)
             | CNamed (s, e) -> CNamed (s, rw_expr m e))
           args
       in

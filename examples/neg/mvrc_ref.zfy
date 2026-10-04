@@ -1,0 +1,8 @@
+// 负例：ref 实参传给非 ref 参数
+void f(i32 x)
+    output(x, end='\n')
+
+i64 main()
+    i32 v = 1
+    f(ref v)
+    return 0

@@ -88,11 +88,16 @@ and for_update =
 and block = stmt list
 
 (* 调用实参：位置参数在前，命名参数在后（如 find 的 count=、output 的 sep=）；
-   CMove 为显式 move 实参（f(move p)：所有权移交，p 之后不可再用） *)
+   CMove 为显式 move 实参（f(move p)：所有权移交，p 之后不可再用）；
+   CCopy 为显式深拷贝实参（f(copy p)：与默认值语义相同，显式声明意图，
+   与自动 move 判定互斥）；CRef 为传引用实参（f(ref y)：y 须为可定位变量，
+   对应参数须声明为 ref——函数内经指针读写调用方变量） *)
 and call_arg =
   | CPos of expr
   | CNamed of string * expr
   | CMove of expr
+  | CCopy of expr
+  | CRef of expr
 
 (* 参数种类：标量 / 定长数组（长度为表达式：字面量或之前参数名）/ 列表 *)
 type pseq_kind =
@@ -100,7 +105,10 @@ type pseq_kind =
   | PArray of expr
   | PList
 
-type param = { pname : string; pty : ty; pfrac : bool; pseq : pseq_kind; ppos : pos }
+type param = { pname : string; pty : ty; pfrac : bool; pseq : pseq_kind;
+               pref : bool; ppos : pos }
+  (* pref：ref 参数（new2.md #1）——`i32 ref x`，调用方 f(ref y) 传地址，
+     函数体内自动解引用读写（仅标量/string，extern/函数指针不支持） *)
 
 (* extern "C" 块内的单个 C 函数声明 *)
 type extern_fn =

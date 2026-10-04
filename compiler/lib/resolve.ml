@@ -407,6 +407,8 @@ let resolve (main : program) (main_dir : string)
                  (function
                    | CPos x -> CPos (rw_expr m x)
                    | CMove x -> CMove (rw_expr m x)
+                   | CCopy x -> CCopy (rw_expr m x)
+                   | CRef x -> CRef (rw_expr m x)
                    | CNamed (s, x) -> CNamed (s, rw_expr m x))
                  args,
                p)
@@ -420,6 +422,8 @@ let resolve (main : program) (main_dir : string)
                       (function
                         | CPos x -> CPos (rw_expr m x)
                         | CMove x -> CMove (rw_expr m x)
+                        | CCopy x -> CCopy (rw_expr m x)
+                        | CRef x -> CRef (rw_expr m x)
                         | CNamed (s, x) -> CNamed (s, rw_expr m x))
                       args,
                     p)

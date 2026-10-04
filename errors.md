@@ -317,6 +317,18 @@
 | E3154 | struct A 内含 B、B 内含 A（循环嵌套） | struct %s has circular nesting (infinite size) |
 | E3155 | 窄化转换未加显式 cast（new2.md #5：宽化自动，窄化显式） | narrowing conversion from %s to %s requires an explicit cast |
 | E3156 | 通过指向 const 的指针（T const*）解引用写（new2.md 9c） | cannot write through pointer-to-const %s (declared T const*) |
+| E3157 | `f(copy b)` 且 b 为最后使用（new2.md #1：与自动 move 冲突） | explicit copy conflicts with automatic move: %s is not used after this point, the value is moved automatically (remove 'copy') |
+| E3158 | `f(ref v)` 但参数未声明 ref（new2.md #1） | argument %d of %s is passed by ref, but the parameter is not declared ref |
+| E3159 | 参数为 ref 但实参未加 ref（new2.md #1） | parameter %d of %s is ref, pass the argument with ref (f(ref x)) |
+| E3160 | `f(ref c)`（c 为 const） | cannot pass constant %s by ref |
+| E3161 | `f(ref (a+b))`（ref 实参非变量） | ref can only apply to a variable (pass-by-reference needs an addressable variable) |
+| E3162 | `i32[3] ref a` / `struct S ref s` / `i32 frac ref x`（ref 参数类型不符） | ref parameters support scalar/string types only |
+| E3163 | extern "C" 参数带 ref | extern parameters do not support ref |
+| E3164 | 变量声明带 ref（`i32 ref x = 1`） | ref is only allowed on function parameters |
+| E3165 | `i32 frac ref x`（参数同时带 frac 与 ref） | ref parameters do not support the frac modifier |
+| E3166 | 函数指针调用带 ref 实参 | function pointer calls do not support ref arguments |
+| E3167 | struct 构造/内建函数带 ref 实参 | %s does not support ref arguments（struct 构造为固定文案） |
+| E3168 | move 赋值源非聚合变量槽（内部错误兜底） | move assignment requires an aggregate variable source |
 
 > 跳号（类型段）：E3002/E3003 并入 E3001、E3006 并入 E3005、E3012 并入 E3011、E3030 并入 E3011、E3044 并入 E3043、E3046 并入 E3045、E3050/E3051 并入 E3047、E3060 并入 E3101、E3090 并入 E3001、E3112 删除（归 E4012）、E3116 并入 E3115、E3134 并入 E3133、E3143 删除（TErr 元素非法归 E4002）。
 

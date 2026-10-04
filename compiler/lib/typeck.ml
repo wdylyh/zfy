@@ -86,7 +86,9 @@ let widen_target (a : zty) (b : zty) : zty =
 
 (* ---------- 环境 ---------- *)
 
-type fn_sig = { params : zty list; ret : zty }
+type fn_sig = { params : zty list; prefs : bool list; ret : zty }
+  (* prefs：各参数是否为 ref（传引用，new2.md #1）——ref 参数的 params 元素
+     已降为 TPtr（调用方 f(ref y) 传地址，函数体内自动解引用） *)
 
 (* struct 声明信息（字段 default 为 AST 表达式，构造时检查） *)
 type sdefk = { spacked : bool; sfields : (string * zty * expr option) list }
@@ -106,6 +108,8 @@ type env = {
   const_vals : (string, int64) Hashtbl.t;    (* const 整数变量的编译期值（按槽名） *)
   mutable in_unsafe : bool;                  (* 是否在 unsafe 块内（指针算术门禁） *)
   mutable moved : (string, unit) Hashtbl.t;  (* 已被显式 move 的变量槽（使用报错；写回解除） *)
+  mutable uses : (string * pos) list;        (* 当前函数体内全部 EVar 出现位置
+                                                （自动 move 后向判定用，new2.md #1） *)
 }
 
 (* 内建函数表（与 hir.ml builtin_fns 同步） *)
@@ -522,7 +526,7 @@ and check_expr env (e : expr) : texpr =
           (match args with
            | [ CPos (EVar (fname, fp)) ] ->
              (match Hashtbl.find_opt env.g.fns fname with
-              | Some { params = [ TInt 32; TString ]; ret = TVoid } ->
+              | Some { params = [ TInt 32; TString ]; prefs = _; ret = TVoid } ->
                 mk (ECallK ("zfy_set_panic_handler",
                             [ { e = EFunPtrK fname;
                                ety = TPtr (TFunSig ([ TInt 32; TString ], TVoid));
@@ -579,7 +583,9 @@ and check_expr env (e : expr) : texpr =
                    (fun (ca : call_arg) pt ->
                      match ca with
                      | CPos e -> coerce p' (check_expr env e) pt
+                     | CCopy e -> coerce p' (check_expr env e) pt
                      | CMove _ -> terr p' "function pointer calls do not support move arguments"
+                     | CRef _ -> terr p' "function pointer calls do not support ref arguments"
                      | CNamed (n, _) -> terr p' "function pointer calls do not support named argument %s=" n)
                    args ptys
                in
@@ -603,47 +609,25 @@ and check_expr env (e : expr) : texpr =
                             (fun (ca : call_arg) pt ->
                               match ca with
                               | CPos e -> coerce p' (check_expr env e) pt
+                              | CCopy e -> coerce p' (check_expr env e) pt
                               | CMove _ -> terr p' "function pointer calls do not support move arguments"
+                              | CRef _ -> terr p' "function pointer calls do not support ref arguments"
                               | CNamed (n, _) -> terr p' "function pointer calls do not support named argument %s=" n)
                             args ptys
                         in
                         mk (EIndirectCallK (tcallee, targs)) ret
                       | _ ->
-                        (* 普通/未知函数调用：要求全部位置参数；实参可带显式 move *)
-                        let moves = ref [] in
-                        let targs =
-                          List.map
-                            (function
-                              | CPos e -> moves := false :: !moves; check_expr env e
-                              | CMove e -> moves := true :: !moves; check_move_arg env e
-                              | CNamed (n, _) -> terr p' "function calls do not support named argument %s=" n)
-                            args
-                        in
-                        check_call env p' name targs (List.rev !moves))
+                        (* 普通/未知函数调用：走统一实参分派（自动 move/copy/ref） *)
+                        let (targs, modes) = check_args_modes env args in
+                        check_call env p' name targs modes)
                    | None ->
-                     (* 普通函数调用：要求全部位置参数；实参可带显式 move（f(move p)） *)
-                     let moves = ref [] in
-                     let targs =
-                       List.map
-                         (function
-                           | CPos e -> moves := false :: !moves; check_expr env e
-                           | CMove e -> moves := true :: !moves; check_move_arg env e
-                           | CNamed (n, _) -> terr p' "function calls do not support named argument %s=" n)
-                         args
-                     in
-                     check_call env p' name targs (List.rev !moves))
+                     (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
+                     let (targs, modes) = check_args_modes env args in
+                     check_call env p' name targs modes)
                 | None ->
-                 (* 普通函数调用：要求全部位置参数；实参可带显式 move（f(move p)） *)
-                 let moves = ref [] in
-                 let targs =
-                   List.map
-                     (function
-                       | CPos e -> moves := false :: !moves; check_expr env e
-                       | CMove e -> moves := true :: !moves; check_move_arg env e
-                       | CNamed (n, _) -> terr p' "function calls do not support named argument %s=" n)
-                     args
-                 in
-                 check_call env p' name targs (List.rev !moves)))))
+                 (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
+                 let (targs, modes) = check_args_modes env args in
+                 check_call env p' name targs modes))))
      | _ -> terr p' "unsupported callee expression")
   | EIndex (base, idx, p') ->
     let tb = check_expr env base in
@@ -795,10 +779,10 @@ and check_expr env (e : expr) : texpr =
        terr p' "? propagation requires the enclosing function to return %s! (current: %s)" (pp_zty elem) (pp_zty rt));
     mk (EPropagateK ta) elem
 
-and check_call env p name targs moves =
+and check_call env p name targs modes =
   let sig_ =
     match List.assoc_opt name builtin_fns_aux with
-    | Some (ptys, ret) -> { params = ptys; ret }
+    | Some (ptys, ret) -> { params = ptys; prefs = List.map (fun _ -> false) ptys; ret }
     | None ->
       (match Hashtbl.find_opt env.g.fns name with
        | Some s -> s
@@ -807,8 +791,18 @@ and check_call env p name targs moves =
   if List.length sig_.params <> List.length targs then
     terr p "function %s expects %d arguments, got %d"
       name (List.length sig_.params) (List.length targs);
+  (* ref 参数/实参匹配（new2.md #1）：ref 参数必须 f(ref x)，反之亦然 *)
+  List.iteri
+    (fun i m ->
+      let pref = try List.nth sig_.prefs i with _ -> false in
+      if m = 2 && not pref then
+        terr p "argument %d of %s is passed by ref, but the parameter is not declared ref" (i + 1) name
+      else if pref && m <> 2 then
+        terr p "parameter %d of %s is ref, pass the argument with ref (f(ref x))" (i + 1) name)
+    modes;
   let targs =
     List.map2 (fun ta pt -> coerce p ta pt) targs sig_.params in
+  let moves = List.map (fun m -> m = 1) modes in
   { e = ECallK (name, targs, moves); ety = sig_.ret; epos = p }
 
 (* 显式 move 实参（f(move p)，change.md 1.6）：仅局部 owned 变量
@@ -836,6 +830,281 @@ and check_move_arg env (e : expr) : texpr =
             name (pp_zty t))
      | None -> check_expr env e)
   | _ -> terr (pos_of_expr e) "move can only apply to a local variable"
+
+(* ---------- move/ref/copy 三选一与自动 move（new2.md #1） ---------- *)
+
+(* 位置先后比较（同一函数体内，行/列序） *)
+and pos_after (a : pos) (b : pos) =
+  a.file = b.file && (a.line > b.line || (a.line = b.line && a.col > b.col))
+
+(* 收集 AST 内全部 EVar 出现（名字, 位置）——含 callee/写目标/in_target，
+   保守估计：任何出现都算"之后仍在使用" *)
+and uses_of_expr (acc : (string * pos) list) (e : expr) : (string * pos) list =
+  match e with
+  | EVar (n, p) -> (n, p) :: acc
+  | EInt _ | EFloat _ | EStr _ | EChar _ | EBool _ | ENull _ -> acc
+  | EBin (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+  | EUn (_, a, _) -> uses_of_expr acc a
+  | ECall (callee, args, _) ->
+    let acc = uses_of_expr acc callee in
+    List.fold_left
+      (fun acc (ca : call_arg) ->
+        match ca with
+        | CPos e | CMove e | CCopy e | CRef e -> uses_of_expr acc e
+        | CNamed (_, e) -> uses_of_expr acc e)
+      acc args
+  | EIndex (b, i, _) -> uses_of_expr (uses_of_expr acc b) i
+  | ESlice (b, a, c, s, _) ->
+    let acc = uses_of_expr (uses_of_expr (uses_of_expr acc b) a) c in
+    (match s with Some s -> uses_of_expr acc s | None -> acc)
+  | ECast (a, _, _) -> uses_of_expr acc a
+  | EStructNew (_, args, _) ->
+    List.fold_left
+      (fun acc (ca : call_arg) ->
+        match ca with
+        | CPos e | CMove e | CCopy e | CRef e -> uses_of_expr acc e
+        | CNamed (_, e) -> uses_of_expr acc e)
+      acc args
+  | EField (b, _, _) -> uses_of_expr acc b
+  | EBlock (blk, _) -> List.fold_left uses_of_stmt acc blk
+  | EAddrOf (a, _) -> uses_of_expr acc a
+  | EDeref (a, _) -> uses_of_expr acc a
+  | EFail (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+  | EPanic (a, b, _) ->
+    let acc = (match a with Some a -> uses_of_expr acc a | None -> acc) in
+    uses_of_expr acc b
+  | EUnwrap (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+  | EPropagate (a, _) -> uses_of_expr acc a
+
+and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
+  match s with
+  | SDecl (_, _, _, _, _, init, _) ->
+    (match init with Some e -> uses_of_expr acc e | None -> acc)
+  | SSeqDecl (_, _, _, len, _, inits, _) ->
+    let acc = (match len with Some e -> uses_of_expr acc e | None -> acc) in
+    List.fold_left uses_of_expr acc inits
+  | SAssign (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+  | SAug (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+  | SInc (a, _) | SDec (a, _) -> uses_of_expr acc a
+  | SExpr e -> uses_of_expr acc e
+  | SReturn (e, _) -> (match e with Some e -> uses_of_expr acc e | None -> acc)
+  | SIf (c, a, b, _) ->
+    let acc = uses_of_expr acc c in
+    let acc = List.fold_left uses_of_stmt acc a in
+    (match b with Some b -> List.fold_left uses_of_stmt acc b | None -> acc)
+  | SWhile (c, b, _) -> List.fold_left uses_of_stmt (uses_of_expr acc c) b
+  | SFor (inits, c, ups, b, _) ->
+    let acc =
+      List.fold_left
+        (fun acc (fi : for_init) ->
+          match fi with
+          | FIDecl (_, _, _, e, _) ->
+            (match e with Some e -> uses_of_expr acc e | None -> acc)
+          | FIExpr (e, _) -> uses_of_expr acc e)
+        acc inits
+    in
+    let acc = uses_of_expr acc c in
+    let acc =
+      List.fold_left
+        (fun acc (fu : for_update) ->
+          match fu with
+          | FUAssign (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+          | FUOp (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+          | FUInc (a, _) | FUDec (a, _) -> uses_of_expr acc a)
+        acc ups
+    in
+    List.fold_left uses_of_stmt acc b
+  | SOutput (es, sep, endl, _) ->
+    let acc = List.fold_left uses_of_expr acc es in
+    let acc = (match sep with Some e -> uses_of_expr acc e | None -> acc) in
+    (match endl with Some e -> uses_of_expr acc e | None -> acc)
+  | SInput (tgts, delim, _) ->
+    let acc =
+      List.fold_left
+        (fun acc (t : in_target) ->
+          match t with InNew _ -> acc | InUse (_, p) -> (p.line, p.col) |> fun _ -> acc)
+        acc tgts
+    in
+    (* InUse 目标也是使用（读写） *)
+    let acc =
+      List.fold_left
+        (fun acc (t : in_target) ->
+          match t with InUse (n, p) -> (n, p) :: acc | InNew _ -> acc)
+        acc tgts
+    in
+    (match delim with Some e -> uses_of_expr acc e | None -> acc)
+  | SReduce (a, b, c, _) -> uses_of_expr (uses_of_expr (uses_of_expr acc a) b) c
+  | SRemove (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+  | SBreak _ | SContinue _ -> acc
+  | SUnsafe (blk, _) -> List.fold_left uses_of_stmt acc blk
+
+(* 变量 n 在位置 p 之后是否不再出现（最后使用判定，保守） *)
+and last_use env n (p : pos) =
+  not (List.exists (fun (m, q) -> m = n && pos_after q p) env.uses)
+
+(* 自动 move 候选：聚合类型（string/数组/列表）局部非 const 变量、
+   未被 move 过、且此后不再出现 *)
+and auto_moveable env n (p : pos) =
+  match lookup_var env n with
+  | Some l ->
+    (not l.lconst) && l.lslot.[0] <> '@'
+    && (match resolve l.lty with
+        | TString | TArray _ | TList _ -> true | _ -> false)
+    && not (Hashtbl.mem env.moved l.lslot)
+    && last_use env n p
+  | None -> false
+
+(* 显式 copy 实参：f(copy p)——与默认值语义相同（深拷贝）。
+   若编译器能确定此处为最后使用（应自动 move），与显式 copy 冲突 → 报错 *)
+and check_copy_arg env (e : expr) : texpr =
+  (match e with
+   | EVar (n, p) ->
+     (match lookup_var env n with
+      | Some l when (not l.lconst) && l.lslot.[0] <> '@'
+                    && (match resolve l.lty with
+                        | TString | TArray _ | TList _ -> true | _ -> false) ->
+        if last_use env n p then
+          terr p "explicit copy conflicts with automatic move: %s is not used after this point, the value is moved automatically (remove 'copy')" n
+      | _ -> ())
+   | _ -> ());
+  check_expr env e
+
+(* 显式 ref 实参：f(ref y)——传引用（对应参数须声明 ref）。
+   y 须为可定位的局部变量；const/已 move 变量不可传 ref *)
+and check_ref_arg env (e : expr) : texpr =
+  match e with
+  | EVar (n, p) ->
+    (match lookup_var env n with
+     | Some l ->
+       if l.lconst then terr p "cannot pass constant %s by ref" n;
+       if Hashtbl.mem env.moved l.lslot then
+         terr p "variable %s has been moved and cannot be passed by ref" n;
+       check_expr env (EAddrOf (e, p))
+     | None -> check_expr env (EAddrOf (e, p)))
+  | _ ->
+    terr (pos_of_expr e) "ref can only apply to a variable (pass-by-reference needs an addressable variable)"
+
+(* 实参列表 → (类型化实参, 模式列表)：0=值 1=move（含自动 move） 2=ref 3=copy *)
+and check_args_modes env (args : call_arg list) : texpr list * int list =
+  List.split
+    (List.map
+    (function
+      | CPos e ->
+        (match e with
+         | EVar (n, p) when auto_moveable env n p ->
+           (* 自动 move（new2.md #1：最后使用即 move）——免拷贝移交 *)
+           (check_move_arg env e, 1)
+         | _ -> (check_expr env e, 0))
+      | CMove e -> (check_move_arg env e, 1)
+      | CCopy e -> (check_copy_arg env e, 3)
+      | CRef e -> (check_ref_arg env e, 2)
+      | CNamed (n, e) ->
+        terr (pos_of_expr e) "function calls do not support named argument %s=" n)
+    args)
+
+(* ref 参数体内改写（new2.md #1）：ref 参数在体内自动解引用——
+   读 x → (x)^、写 x = v → (x)^ = v、x op= / x++ 同理；
+   取地址 &x → &((x)^)（typeck 化简为指针本身）。
+   ECall 的 callee 位置不改写（必为函数名/字段路径） *)
+and deref_refs (refs : string list) (body : block) : block =
+  let in_refs n = List.mem n refs in
+  let rec re (e : expr) : expr =
+    match e with
+    | EVar (n, p) when in_refs n -> EDeref (EVar (n, p), p)
+    | EVar _ -> e
+    | EInt _ | EFloat _ | EStr _ | EChar _ | EBool _ | ENull _ -> e
+    | EBin (o, a, b, p) -> EBin (o, re a, re b, p)
+    | EUn (o, a, p) -> EUn (o, re a, p)
+    | ECall (callee, args, p) ->
+      ECall (callee,
+             List.map
+               (function
+                 | CPos a -> CPos (re a)
+                 | CMove a -> CMove (re a)
+                 | CCopy a -> CCopy (re a)
+                 | CRef a -> CRef a   (* ref 实参取原变量地址，不改写 *)
+                 | CNamed (n2, a) -> CNamed (n2, re a))
+               args, p)
+    | EIndex (b, i, p) -> EIndex (re b, re i, p)
+    | ESlice (b, a, c, s, p) ->
+      ESlice (re b, re a, re c, (match s with Some s -> Some (re s) | None -> None), p)
+    | ECast (a, t, p) -> ECast (re a, t, p)
+    | EStructNew (n2, args, p) ->
+      EStructNew (n2,
+                  List.map
+                    (function
+                      | CPos a -> CPos (re a)
+                      | CMove a -> CMove (re a)
+                      | CCopy a -> CCopy (re a)
+                      | CRef a -> CRef a
+                      | CNamed (n3, a) -> CNamed (n3, re a))
+                    args, p)
+    | EField (b, s, p) -> EField (re b, s, p)
+    | EBlock (blk, p) -> EBlock (List.map rs blk, p)
+    | EAddrOf (a, p) -> EAddrOf (re a, p)
+    | EDeref (a, p) -> EDeref (re a, p)
+    | EFail (a, b, p) -> EFail (re a, re b, p)
+    | EPanic (a, b, p) -> EPanic ((match a with Some a -> Some (re a) | None -> None), re b, p)
+    | EUnwrap (a, b, p) ->
+      EUnwrap (re a, (match b with EBlock (blk, bp) -> EBlock (List.map rs blk, bp) | b2 -> b2), p)
+    | EPropagate (a, p) -> EPropagate (re a, p)
+  (* 赋值类左值：EVar ∈ refs → EDeref（解引用写） *)
+  and lhs (e : expr) : expr =
+    match e with
+    | EVar (n, p) when in_refs n -> EDeref (EVar (n, p), p)
+    | e2 -> re e2
+  and rs (s : stmt) : stmt =
+    match s with
+    | SAssign (l, r, p) -> SAssign (lhs l, re r, p)
+    | SAug (o, l, r, p) -> SAug (o, lhs l, re r, p)
+    | SInc (l, p) -> SInc (lhs l, p)
+    | SDec (l, p) -> SDec (lhs l, p)
+    | SDecl (c, f, u, n, t, init, p) -> SDecl (c, f, u, n, t, (match init with Some e -> Some (re e) | None -> None), p)
+    | SSeqDecl (c, n, t, len, isl, inits, p) ->
+      SSeqDecl (c, n, t, (match len with Some e -> Some (re e) | None -> None), isl,
+                List.map re inits, p)
+    | SExpr e -> SExpr (re e)
+    | SReturn (e, p) -> SReturn ((match e with Some e -> Some (re e) | None -> None), p)
+    | SIf (c, a, b, p) ->
+      SIf (re c, List.map rs a,
+           (match b with Some b -> Some (List.map rs b) | None -> None), p)
+    | SWhile (c, b, p) -> SWhile (re c, List.map rs b, p)
+    | SFor (inits, c, ups, b, p) ->
+      SFor (List.map
+              (function
+                | FIDecl (ic, n2, t, e, fp) ->
+                  FIDecl (ic, n2, t, (match e with Some e -> Some (re e) | None -> None), fp)
+                | FIExpr (e, fp) -> FIExpr (re e, fp))
+              inits,
+            re c,
+            List.map
+              (function
+                | FUAssign (l, r, fp) -> FUAssign (lhs l, re r, fp)
+                | FUOp (o, l, r, fp) -> FUOp (o, lhs l, re r, fp)
+                | FUInc (l, fp) -> FUInc (lhs l, fp)
+                | FUDec (l, fp) -> FUDec (lhs l, fp))
+              ups,
+            List.map rs b, p)
+    | SOutput (es, sep, endl, p) ->
+      SOutput (List.map re es,
+               (match sep with Some e -> Some (re e) | None -> None),
+               (match endl with Some e -> Some (re e) | None -> None), p)
+    | SInput (tgts, delim, p) ->
+      (* ref 参数暂不支持作 input 目标（in_target 无法表达解引用写） *)
+      List.iter
+        (fun (t : in_target) ->
+          match t with
+          | InUse (n, ip) when in_refs n ->
+            raise (TypeError (ip, "input does not support ref parameters (for now)"))
+          | _ -> ())
+        tgts;
+      SInput (tgts, (match delim with Some e -> Some (re e) | None -> None), p)
+    | SReduce (a, b, c, p) -> SReduce (re a, re b, re c, p)
+    | SRemove (a, b, p) -> SRemove (re a, re b, p)
+    | SUnsafe (blk, p) -> SUnsafe (List.map rs blk, p)
+    | SBreak _ | SContinue _ -> s
+  in
+  List.map rs body
 
 (* 字段链读取：base 为根 struct 表达式（可为指针，自动解引用），逐段展开 *)
 and field_chain env p (base : texpr) (segs : string list) : texpr =
@@ -874,6 +1143,8 @@ and check_struct_new env p name (args : call_arg list) : texpr =
       List.filter_map
         (function
           | CPos e -> Some e
+          | CCopy e -> Some e
+          | CRef _ -> terr p "struct constructor does not support ref arguments"
           | CMove _ -> terr p "struct constructor does not support move arguments"
           | _ -> None)
         args in
@@ -973,6 +1244,8 @@ and check_builtin env p name (args : call_arg list) =
     List.filter_map
       (function
         | CPos e -> Some e
+        | CCopy e -> Some e
+        | CRef _ -> terr p "builtin %s does not support ref arguments" name
         | CMove _ -> terr p "builtin %s does not support move arguments" name
         | _ -> None)
       args in
@@ -1269,7 +1542,7 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
             { e = ECallK ("zfy_str_concat", [ tself; trhs ], []);
               ety = TString; epos = p' }
           in
-          SAssignK (tself, cat, false)
+          SAssignK (tself, cat, false, false)
         | _ ->
           let lty = l.lty in
           let trhs = check_expr env rhs in
@@ -1358,7 +1631,7 @@ and check_unwrap env p (a : expr) (blk : block) target =
     | _, { s = SExprK v; spos = vp } :: rest_rev ->
       let v = coerce vp v tgt_ty in
       List.rev
-        ({ s = SAssignK ({ e = EVarK slot; ety = v.ety; epos = vp }, v, false);
+        ({ s = SAssignK ({ e = EVarK slot; ety = v.ety; epos = vp }, v, false, false);
            spos = vp } :: rest_rev)
     | _, _ -> tblk   (* 块以 return/break/continue/panic 等结束：目标不写 *)
   in
@@ -1598,16 +1871,29 @@ and check_stmt env (st : stmt) : tstmt =
           Hashtbl.remove env.moved l.lslot;  (* 重新赋值：move 状态解除 *)
           let slot = l.lslot in
           let lty = l.lty in
-          let trhs = check_expr env rhs' in
-          let needs_norm =
-            (match resolve lty with TFrac _ -> not l.lunred | _ -> false) in
-          (match resolve trhs.ety, resolve lty with
-           | TList e2, TArray (e, _) when resolve e2 = resolve e ->
-             (* 数组/列表切片（TList 元素类型）赋给数组变量：运行时同为 seq，深拷贝 *)
-             mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, false))
-           | _, _ ->
-             let trhs = coerce p' trhs lty in
-             mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, needs_norm)))
+          (match rhs' with
+           | EVar (n2, p2) when n2 <> name && auto_moveable env n2 p2 ->
+             (* 自动 move 赋值（new2.md #1）：源变量此后不再出现——
+                所有权转移免克隆（deep copy → move），源槽置空防双释放 *)
+             let trhs0 = check_expr env rhs' in
+             ignore (coerce p' trhs0 lty);
+             let src_slot =
+               (match lookup_var env n2 with
+                | Some s -> s.lslot | None -> assert false) in
+             Hashtbl.replace env.moved src_slot ();
+             mk (SAssignK ({ e = EVarK slot; ety = lty; epos = p' },
+                           { e = EVarK src_slot; ety = lty; epos = p2 }, false, true))
+           | _ ->
+             let trhs = check_expr env rhs' in
+             let needs_norm =
+               (match resolve lty with TFrac _ -> not l.lunred | _ -> false) in
+             (match resolve trhs.ety, resolve lty with
+              | TList e2, TArray (e, _) when resolve e2 = resolve e ->
+                (* 数组/列表切片（TList 元素类型）赋给数组变量：运行时同为 seq，深拷贝 *)
+                mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, false, false))
+              | _, _ ->
+                let trhs = coerce p' trhs lty in
+                mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, needs_norm, false))))
         | None ->
           (* 名字含 '.'：struct 字段链写入（p.x = v / p.pos.x = v / r.x = v 指针自动解引用） *)
           (match split_field_path name with
@@ -1999,9 +2285,21 @@ let check_program (prog : program) : hir =
             (fun (pd : param) ->
               let t = conv_param g pos !prev pd in
               prev := pd.pname :: !prev;
-              t)
+              if pd.pref then begin
+                (* ref 参数（new2.md #1）：签名侧降为指针（调用方传地址），
+                   仅标量/string；函数体内由 deref_refs 自动解引用 *)
+                if pd.pseq <> Ast.PScalar then
+                  terr pd.ppos "ref parameters support scalar/string types only";
+                (match resolve t with
+                 | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString -> ()
+                 | _ ->
+                   terr pd.ppos "ref parameters support scalar/string types only (got %s)"
+                     (pp_zty t));
+                TPtr t
+              end else t)
             params
         in
+        let prefs = List.map (fun (pd : param) -> pd.pref) params in
         let rty =
           match ret with
           | None -> TVoid
@@ -2013,7 +2311,7 @@ let check_program (prog : program) : hir =
               TFrac base
             end else base
         in
-        Hashtbl.replace g.fns name { params = ptys; ret = rty }
+        Hashtbl.replace g.fns name { params = ptys; prefs; ret = rty }
       | IExtern { funcs; pos = _ } ->
         (* extern "C"：登记签名（调用直通 LLVM 符号，与 C 链接一致） *)
         List.iter
@@ -2027,6 +2325,8 @@ let check_program (prog : program) : hir =
                 (fun (pd : param) ->
                   if pd.pseq <> Ast.PScalar then
                     terr pd.ppos "extern parameters do not support arrays/lists";
+                  if pd.pref then
+                    terr pd.ppos "extern parameters do not support ref";
                   let t = conv_ty g pd.ppos pd.pty in
                   (match t with
                    | TErr _ -> terr pd.ppos "extern parameters do not support T!"
@@ -2038,7 +2338,8 @@ let check_program (prog : program) : hir =
             (match rty with
              | TErr _ -> terr f.epos "extern functions do not support a T! return type (the error model is for zfy functions only)"
              | _ -> ());
-            Hashtbl.replace g.fns f.ename { params = ptys; ret = rty };
+            Hashtbl.replace g.fns f.ename
+              { params = ptys; prefs = List.map (fun _ -> false) ptys; ret = rty };
             (* 9d：登记 extern 名单——llvmgen 对 i128 参数/返回值做 ABI 适配 *)
             Hashtbl.replace extern_fns f.ename ())
           funcs
@@ -2049,7 +2350,7 @@ let check_program (prog : program) : hir =
   let env =
     { g; scopes = []; fncur_ret = TVoid; slotn = 0;
       fnvars = Hashtbl.create 8; const_vals = Hashtbl.create 16;
-      in_unsafe = false; moved = Hashtbl.create 8 }
+      in_unsafe = false; moved = Hashtbl.create 8; uses = [] }
   in
   (* 全局作用域：顶层声明（const 内联；非 const 为全局可变变量） *)
   push_scope env;
@@ -2142,7 +2443,13 @@ let check_program (prog : program) : hir =
                     (false, slot, pty))
                   params sig_.params
               in
-              let tbody = check_block env body in
+              let refnames =
+                List.filter_map (fun (pd : param) -> if pd.pref then Some pd.pname else None) params in
+              let body' =
+                if refnames = [] then body else deref_refs refnames body in
+              (* 自动 move 判定数据：函数体内全部变量出现位置（new2.md #1） *)
+              env.uses <- List.rev (List.fold_left uses_of_stmt [] body');
+              let tbody = check_block env body' in
               pop_scope env;
               (* 返回类型非 void 时，要求有 return 或尾表达式 *)
               if (match sig_.ret with TVoid -> false | _ -> true) then begin
@@ -2218,7 +2525,7 @@ let check_program (prog : program) : hir =
         SSeqDeclK (c, n, subst_ty t, len, isl, List.map fix_texpr inits)
       | SSeqCopyK (c, n, t, len, src, isl) ->
         SSeqCopyK (c, n, subst_ty t, len, fix_texpr src, isl)
-      | SAssignK (a, b, nn) -> SAssignK (fix_texpr a, fix_texpr b, nn)
+      | SAssignK (a, b, nn, mv) -> SAssignK (fix_texpr a, fix_texpr b, nn, mv)
       | SAugIndexK (n, t, i, op, v, g) ->
         SAugIndexK (n, subst_ty t, fix_texpr i, op, fix_texpr v, g)
       | SAugVarK (n, t, op, v, nn) ->

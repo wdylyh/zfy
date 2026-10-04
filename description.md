@@ -9,7 +9,7 @@ zfy 是一门编译到 LLVM IR 的静态类型语言（OCaml 编译器 `zyfc`，
 - **缩进块**：块用缩进划分，不用 `{}`；语句按行分隔，语句末不允许分号（分号仅限 for 头部）。
 - **无 `fn` 关键字**：函数声明直接以返回类型开头，如 `i64 main()`。
 - **声明初值可省略**：标量/数组/列表/struct 声明均可省略初值（填类型零值）；`const` 必须带初值。
-- **值语义 + 显式 move**：赋值/传参/返回一律深拷贝；想免拷贝用 `f(move p)` 转移所有权。
+- **值语义 + 自动 move/ref/copy**（new2.md #1）：赋值/传参默认深拷贝；源变量为最后使用时**自动 move**（免拷贝，之后使用报错）；`f(move p)` 显式移交、`f(copy p)` 显式深拷贝（与自动 move 冲突时报错）、`f(ref y)` 传引用（对应参数 `T ref x`，函数内自动解引用读写调用方变量）。
 - **错误值模型（ZEM）**：可失败操作产生 `T!` 错误值，不使用异常；仅 `panic` 不可恢复。
 - 编译错误消息为英文，带错误码（见第 14 节）；注释为 `//` 到行尾。
 
@@ -23,7 +23,7 @@ zfy 是一门编译到 LLVM IR 的静态类型语言（OCaml 编译器 `zyfc`，
   if else while for return true false break continue
   const frac unreduced reduce and or not output input
   cast remove use import as sep end delim
-  fail panic err struct packed move null unsafe extern type
+  fail panic err struct packed move copy ref null unsafe extern type
   short long ushort ulong int uint half float double quad
   ```
 
@@ -135,9 +135,14 @@ zfy 是一门编译到 LLVM IR 的静态类型语言（OCaml 编译器 `zyfc`，
 ## 10. 函数与 move
 
 - 定义：`<返回类型> [frac] 名字(参数, ...)` 缩进块；返回类型必写（无返回值写 `void`）。
-- 参数：`<类型> 名字`，支持 const/frac/unreduced 修饰（unreduced 参数不支持）；数组参数 `i32 a[5]`（长度可为字面量或之前的参数名，调用时校验）、列表参数 `i32 xs[]`、frac 参数/返回均支持。
+- 参数：`<类型> [ref] 名字`，支持 const/frac/unreduced 修饰（unreduced 参数不支持）；数组参数 `i32 a[5]`（长度可为字面量或之前的参数名，调用时校验）、列表参数 `i32 xs[]`、frac 参数/返回均支持。
 - 返回类型可带 `!`（`i32!`）表示可失败（见第 11 节）；frac 函数写作 `int frac f(int x)`（frac 是类型后缀）。
-- **显式 move**：`f(move p)` 把实参所有权移交（仅 string/数组/列表的局部非 const 变量，不可 move 全局/常量/标量/数组元素/字段）；move 后变量不可再用（报错），重新赋值后恢复；重复 move 报错。内建函数与 struct 构造不支持 move 实参。
+- **move/ref/copy 三选一**（new2.md #1）：
+  - **自动 move**：传参/赋值时若源变量（string/数组/列表的局部非 const 变量）在此之后**不再出现**，编译器自动 move（所有权移交免深拷贝）；之后再使用报错，重新赋值恢复。全局/const/标量不自动 move（照旧深拷贝）。
+  - **显式 move**：`f(move p)` 强制移交；`move` 与最后使用判定不冲突。
+  - **显式 copy**：`f(copy p)` 显式声明深拷贝（行为同默认）；若 p 为最后使用（编译器判定应自动 move）则报 E3157。
+  - **ref 传引用参数**：参数声明 `i32 ref x`（仅标量/string，frac/数组/列表/struct/extern/函数指针不支持），调用方 `f(ref y)` 传地址（y 为可定位变量，const/已 move 不可），函数体内 `x` 自动解引用读写调用方变量（`&x` 取得底层指针）；实参与 ref 参数必须一一匹配（否则 E3158/E3159）。
+- move 后变量不可再用（报错），重新赋值后恢复；重复 move 报错。内建函数与 struct 构造不支持 move/ref 实参。
 - 本语句产生的临时（split/切片/调用结果）自动移交，无需 move。
 - 字符串返回走 RAII：提前 `return` 转移所有权；字面量返回自动 strdup 副本。
 
@@ -192,6 +197,6 @@ zfy 是一门编译到 LLVM IR 的静态类型语言（OCaml 编译器 `zyfc`，
 
 **编译错误报告**
 - 格式：`zfy:error[EXNNN] in <行> of <文件> because (<英文文案>)`，随后打印错误行及上下各 2 行共 5 行，等长 `^` 列对齐指向出错 token。
-- 错误码规则：`E` + 体系位（1 词法 / 2 语法 / 3 类型语义 / 4 代码生成 / 5 驱动配置）+ 3 位序号，如 E3084。全部 245 码见 `errors.md`（词法 14 / 语法 36 / 类型语义 139 / 代码生成 50 / 驱动 6，另有 E1000/E3000/E4000/E5000 兜底）。
+- 错误码规则：`E` + 体系位（1 词法 / 2 语法 / 3 类型语义 / 4 代码生成 / 5 驱动配置）+ 3 位序号，如 E3084。全部 258 码见 `errors.md`（词法 14 / 语法 36 / 类型语义 139 / 代码生成 50 / 驱动 6，另有 E1000/E3000/E4000/E5000 兜底）。
 - **多错误恢复**：词法单错即停；语法按语句/顶层项恢复继续；类型按语句/函数/顶层项恢复；输出顺序 = 主文件语法 → use 子文件 → 类型（源码行序）；有错误 exit 1（CLI 用法错误 exit 2）。
 - 运行期致命错误（`zfy_die` 38 类：越界/除零/内存不足等）与 `panic` 不入编译错误码体系；统一走 panic 通道（`zfy_panic`），exit 101。

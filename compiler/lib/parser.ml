@@ -409,6 +409,22 @@ and parse_expr_list p =
        | (Comma, _) -> ignore (next p); go (CMove e :: acc)
        | (RParen, _) -> ignore (next p); List.rev (CMove e :: acc)
        | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
+    | (Keyword KCopy, _) ->
+      (* 显式深拷贝实参：f(copy p)——与默认值语义相同，显式声明意图（new2.md #1） *)
+      ignore (next p);
+      let e = parse_expr p in
+      (match peek p with
+       | (Comma, _) -> ignore (next p); go (CCopy e :: acc)
+       | (RParen, _) -> ignore (next p); List.rev (CCopy e :: acc)
+       | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
+    | (Keyword KRef, _) ->
+      (* 传引用实参：f(ref y)——y 须为可定位变量，对应参数须为 ref（new2.md #1） *)
+      ignore (next p);
+      let e = parse_expr p in
+      (match peek p with
+       | (Comma, _) -> ignore (next p); go (CRef e :: acc)
+       | (RParen, _) -> ignore (next p); List.rev (CRef e :: acc)
+       | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
     | (Ident nm, _) when (match peek2 p with (Assign, _) -> true | _ -> false) ->
       ignore (next p); ignore (next p);
       let e = parse_expr p in
@@ -530,9 +546,11 @@ and parse_seq_inits p =
     go []
   | _ -> []  (* 无初始化：全部填零值 *)
 
-(* 解析 const/frac/unred 修饰（可任意顺序，位于类型后名字前） *)
+(* 解析 const/frac/unred/ref 修饰（可任意顺序，位于类型后名字前）；
+   ref 仅函数参数合法（其他位置由调用方报错） *)
 and parse_modifiers p =
-  let is_const = ref false and is_frac = ref false and is_unred = ref false in
+  let is_const = ref false and is_frac = ref false and is_unred = ref false
+  and is_ref = ref false in
   let rec go () =
     match peek p with
     | (Keyword KConst, _) when not !is_const ->
@@ -541,10 +559,12 @@ and parse_modifiers p =
       ignore (next p); is_frac := true; go ()
     | (Keyword KUnreduced, _) when not !is_unred ->
       ignore (next p); is_unred := true; go ()
+    | (Keyword KRef, _) when not !is_ref ->
+      ignore (next p); is_ref := true; go ()
     | _ -> ()
   in
   go ();
-  (!is_const, !is_frac, !is_unred)
+  (!is_const, !is_frac, !is_unred, !is_ref)
 
 (* 声明语法：
    标量：<类型> (const)? (frac)? 名字 [= 初值]
@@ -555,7 +575,8 @@ and parse_decl p tp =
   parse_decl_ty p tp ty
 
 and parse_decl_ty p tp ty =
-  let (is_const, is_frac, is_unred) = parse_modifiers p in
+  let (is_const, is_frac, is_unred, is_ref) = parse_modifiers p in
+  if is_ref then err tp "ref is only allowed on function parameters";
   let name = expect_ident p "variable name" in
   (match peek p with
    | (LBracket, lp) ->
@@ -602,7 +623,7 @@ and looks_like_decl p =
     let rec skip l =
       match l with
       | (Star, _) :: r | (Bang, _) :: r -> skip r
-      | (Keyword (KConst | KFrac | KUnreduced), _) :: r -> skip r
+      | (Keyword (KConst | KFrac | KUnreduced | KRef), _) :: r -> skip r
       | _ -> l
     in
     match skip rest with
@@ -629,15 +650,15 @@ and looks_like_decl p =
        tyname_ok &&
        (match skip_bangs (skip_stars after_ty) with
         | (Ident _, _) :: _ -> true
-        | (Keyword (KConst | KFrac | KUnreduced), _) :: _ -> true
+        | (Keyword (KConst | KFrac | KUnreduced | KRef), _) :: _ -> true
         | _ -> false)
      | (Ident _, _) :: _ -> true
-     | (Keyword (KConst | KFrac | KUnreduced), _) :: _ -> true
+     | (Keyword (KConst | KFrac | KUnreduced | KRef), _) :: _ -> true
      | _ -> false)
 (* for 头部声明（const/frac/unred 允许，无 variable） *)
 and parse_for_decl p tp =
   let ty = parse_ty p in
-  let (is_const, _is_frac, _is_unred) = parse_modifiers p in
+  let (is_const, _is_frac, _is_unred, _is_ref) = parse_modifiers p in
   let name = expect_ident p "variable name" in
   let init =
     (match p.toks with
@@ -833,7 +854,7 @@ and parse_input p tp =
       let t =
         if looks_like_decl p then begin
           let ty = parse_ty p in
-          let (_c, _f, _u) = parse_modifiers p in
+          let (_c, _f, _u, _r) = parse_modifiers p in
           let name = expect_ident p "variable name" in
           InNew (name, ty, tp)
         end
@@ -942,7 +963,7 @@ let top_is_fn p =
     let rec skip l =
       match l with
       | (Star, _) :: r | (Bang, _) :: r -> skip r
-      | (Keyword (KConst | KFrac | KUnreduced), _) :: r -> skip r
+      | (Keyword (KConst | KFrac | KUnreduced | KRef), _) :: r -> skip r
       | _ -> l
     in
     match skip rest with
@@ -959,7 +980,7 @@ let top_is_fn p =
     let rec skip_bangs l = match l with (Bang, _) :: r -> skip_bangs r | _ -> l in
     let rec skip_mods l =
       match l with
-      | (Keyword (KConst | KFrac | KUnreduced), _) :: r -> skip_mods r
+      | (Keyword (KConst | KFrac | KUnreduced | KRef), _) :: r -> skip_mods r
       | _ -> l
     in
     let tyname_ok =
@@ -982,24 +1003,26 @@ let parse_param p =
   let (tk0, tp0) = peek p in
   (* 函数类型允许作参数类型（new2.md 9a）：i32(i32,i32) g *)
   let pt = parse_ty ~allow_fun:true p in
-  let (isc, is_frac, is_unred) = parse_modifiers p in
+  let (isc, is_frac, is_unred, is_ref) = parse_modifiers p in
   if isc then err tp0 "parameters do not support const";
   if is_unred then err tp0 "parameters do not support unred";
+  if is_ref && is_frac then err tp0 "ref parameters do not support the frac modifier";
   let name = expect_ident p "parameter name" in
   match peek p with
   | (LBracket, lp) ->
     ignore (next p);
     if is_frac then err lp "array/list parameters do not support the frac modifier";
+    if is_ref then err lp "ref parameters support scalar/string types only (arrays/lists use move for zero-copy)";
     (match peek p with
      | (RBracket, _) ->
        ignore (next p);
-       { pname = name; pty = pt; pfrac = false; pseq = PList; ppos = lp }
+       { pname = name; pty = pt; pfrac = false; pseq = PList; pref = false; ppos = lp }
      | _ ->
        let len = parse_expr p in
        expect p RBracket "]";
-       { pname = name; pty = pt; pfrac = false; pseq = PArray len; ppos = lp })
+       { pname = name; pty = pt; pfrac = false; pseq = PArray len; pref = false; ppos = lp })
   | _ ->
-    { pname = name; pty = pt; pfrac = is_frac; pseq = PScalar; ppos = tp0 }
+    { pname = name; pty = pt; pfrac = is_frac; pseq = PScalar; pref = is_ref; ppos = tp0 }
 
 (* struct 字段块：每行一个字段；块以 DEDENT 结束 *)
 let rec parse_struct_fields p acc =
@@ -1244,7 +1267,7 @@ and parse_item p =
       | (Eof, _) -> List.rev acc
       | _ ->
         let rt = parse_ty p in
-        let (_c, rf, _u) = parse_modifiers p in
+        let (_c, rf, _u, _r2) = parse_modifiers p in
         let name = expect_ident p "extern function name" in
         expect p LParen "(";
         let params =
@@ -1277,7 +1300,7 @@ and parse_item p =
     if top_is_fn p then begin
       (* 函数定义：类型 (frac)? 名字(参数) 块 *)
       let ty0 = parse_ty p in
-      let (_c, rf, _u) = parse_modifiers p in
+      let (_c, rf, _u, _r3) = parse_modifiers p in
       let name = expect_ident p "function name" in
       expect p LParen "(";
       let params =

@@ -58,14 +58,14 @@ i64 main()
     output(pl.name, t)
 
     // 整体赋值深拷贝：改副本不影响原件
-    Player copy = pl
-    copy.hp = 1
-    copy.pos.x = 99.0
-    output(pl.hp, copy.hp, pl.pos.x, copy.pos.x)
+    Player cp = pl
+    cp.hp = 1
+    cp.pos.x = 99.0
+    output(pl.hp, cp.hp, pl.pos.x, cp.pos.x)
 
     // 字段写 string：旧值释放 + 新值深拷贝，互不影响
     pl.name = "Jerry"
-    output(pl.name, copy.name)
+    output(pl.name, cp.name)
 
     // 数组/列表字段：缺省为空 seq（零值），读取与 length
     Buf b = Buf()

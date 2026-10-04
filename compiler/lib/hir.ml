@@ -77,7 +77,9 @@ and tstmt_kind =
   | SSeqCopyK of bool * string * zty * int64 * texpr * bool
     (* (is_const, 槽, 元素类型, 长度(列表忽略), 源, 是否列表) *)
     (* 数组整体初值：T array b[N] = 源（源为数组/列表，深拷贝） *)
-  | SAssignK of texpr * texpr * bool             (* 标量赋值：(目标, 值, 需自动约分) *)
+  | SAssignK of texpr * texpr * bool * bool
+    (* 标量赋值：(目标, 值, 需自动约分, move)——move=true 时值为同一变量槽
+       （EVarK src），所有权转移免克隆（自动 move/显式 move 赋值，new2.md #1） *)
   | SAugIndexK of string * zty * texpr * binop * texpr * bool
     (* 复合赋值作用于数组/列表元素：a[i] op= v
        (槽名, 元素类型, 下标(只求值一次), 运算, 右值, 可扩长) *)
