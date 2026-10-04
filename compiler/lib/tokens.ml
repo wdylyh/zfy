@@ -45,6 +45,7 @@ type token =
   | PlusPlus | MinusMinus
   | Eq | Ne | Lt | Gt | Le | Ge
   | Question (* ? *) | QuestionQuestion (* ?? *) | Bang (* ! *)
+  | Caret (* ^：解引用后缀 p^（new2.md #10，替代 p* 消歧） *)
   | Dot
   | Newline
   | Indent
@@ -93,6 +94,7 @@ let pp_token = function
   | PlusPlus -> "++" | MinusMinus -> "--"
   | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Le -> "<=" | Ge -> ">="
   | Question -> "?" | QuestionQuestion -> "??" | Bang -> "!"
+  | Caret -> "^"
   | Dot -> "."
   | Newline -> "\\n" | Indent -> "INDENT" | Dedent -> "DEDENT" | Eof -> "EOF"
 

@@ -379,18 +379,19 @@ and parse_postfix_rest p e =
     (* 后缀错误传播 a?（ZEM 错误模型） *)
     ignore (next p);
     parse_postfix_rest p (EPropagate (e, tp))
-  | Star ->
-    (* 后缀解引用 p*：与乘法 a * b 的歧义按 * 后一个 token 判定——
-       收尾符/运算符（= ) ] 换行 + - * / 等）→ 解引用；
-       表达式开始（标识符/字面量/括号）→ 乘法（留给 parse_mul） *)
-    (match fst (peek2 p) with
-     | Assign | PlusAssign | MinusAssign | StarAssign | SlashAssign
-     | PercentAssign | RParen | Comma | RBracket | Newline | Dedent | Eof
-     | Colon | Semicolon | Plus | Minus | Star | Slash | Percent
-     | Eq | Ne | Lt | Gt | Le | Ge | Dot | PlusPlus | MinusMinus ->
-       ignore (next p);
-       parse_postfix_rest p (EDeref (e, tp))
-     | _ -> e)
+  | Caret ->
+    (* 后缀解引用 p^（new2.md #10：替代 p*，消除与乘法的歧义） *)
+    ignore (next p);
+    parse_postfix_rest p (EDeref (e, tp))
+  | Star when (match fst (peek2 p) with
+               (* p* 旧解引用写法已移除：* 后是收尾符/运算符时按解引用意图报错提示；
+                  后随表达式时按乘法处理（p * -b 等正常解析） *)
+               | Assign | PlusAssign | MinusAssign | StarAssign | SlashAssign
+               | PercentAssign | RParen | Comma | RBracket | Newline | Dedent
+               | Eof | Colon | Semicolon | PlusPlus | MinusMinus
+               | Eq | Ne | Lt | Gt | Le | Ge | Dot -> true
+               | _ -> false) ->
+    err tp "pointer dereference syntax is now 'p^' (the 'p*' form was removed to avoid ambiguity with multiplication)"
   | _ -> e
 
 and parse_expr_list p =

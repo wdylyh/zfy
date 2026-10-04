@@ -1,4 +1,4 @@
-// 指针功能测试：T* 声明 / & 取地址 / p* 解引用 / null / 自动解引用（字段与下标）/
+// 指针功能测试：T* 声明 / & 取地址 / p^ 解引用 / null / 自动解引用（字段与下标）/
 // unsafe 指针算术 / extern "C" / type 别名 / 函数指针 / T* const
 extern "C"
     void* malloc(u64 n)
@@ -18,16 +18,16 @@ i64 main()
     // 基础：取地址 / 解引用读 / 解引用写 / 复合赋值
     i32 a = 10
     i32* p = &a
-    output(p*)
-    p* = 20
+    output(p^)
+    p^ = 20
     output(a)
-    p* += 5
+    p^ += 5
     output(a)
 
     // T* const：指针不可重绑，指向值可写
     i32 b = 1
     i32* const q = &a
-    q* = 30
+    q^ = 30
     output(a)
 
     // null 与比较
@@ -52,11 +52,11 @@ i64 main()
         ap[1] = 22
     output(arr[1])
     i32* mid = &arr[2]
-    output(mid*)
+    output(mid^)
 
     // type 别名
     IntPtr ip = &b
-    ip* = 99
+    ip^ = 99
     output(b)
 
     // 函数指针
@@ -66,12 +66,12 @@ i64 main()
     // unsafe 块：指针算术（p+n / p-n / p-q）
     unsafe
         i32* e = ap + 3
-        e* = 44
+        e^ = 44
         output(arr[3])
         i64 span = e - ap
         output(span)
         i32* back = e - 2
-        output(back*)
+        output(back^)
 
     // extern "C"：malloc/free + 指针间 cast
     void* raw = malloc(16)

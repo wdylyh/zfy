@@ -2,6 +2,6 @@
 i64 main()
     i32 a = 42
     i32 const* cp = &a
-    cp* = 10
+    cp^ = 10
     output(a)
     return 0

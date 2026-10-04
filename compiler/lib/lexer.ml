@@ -56,7 +56,7 @@ let punct1 =
     '}', RBrace; ',', Comma; ';', Semicolon; ':', Colon; '=', Assign;
     '+', Plus; '-', Minus; '*', Star; '&', Amp; '/', Slash; '%', Percent;
     '<', Lt; '>', Gt; '.', Dot;
-    '?', Question; '!', Bang ]
+    '?', Question; '!', Bang; '^', Caret ]
 
 (* ---------- 子扫描器 ---------- *)
 
