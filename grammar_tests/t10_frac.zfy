@@ -1,0 +1,33 @@
+// t10: frac 分数与大整数——frac 运算、reduce、i128/u128 大字面量（grammar.md §8/§10）
+f64 frac hl = 1/2
+long const frac third = 1/3
+
+f64 frac addf(f64 frac a, f64 frac b)
+    return a + b
+
+i64 main()
+    // frac 标量运算与自动约分
+    f64 frac a = 1/6
+    f64 frac b = 1/3
+    f64 frac s = a + b
+    // unred 不约分
+    f64 frac unred u = 6/48
+    // 手动约分
+    reduce(u, 1, 6)
+    output(s, u)
+    output(addf(1/4, 1/4))
+    output(hl, third)
+    // 整数除法截断与 % 符号随被除数（§8/§13）
+    i32 q1 = -7 / 2
+    i32 q2 = 7 / -2
+    i32 m1 = -7 % 2
+    output(q1, q2, m1)
+    // 大整数字面量（w-014 #6）：仅 i128/u128 期望上下文合法
+    i128 big = 1267650600228229401496703205375
+    u128 ubig = 340282366920938463463374607431768211455
+    output(big, ubig)
+    // 溢出回绕（§13）：i32 max + 1 → min
+    i32 mx = 2147483647
+    mx += 1
+    output(mx)
+    return 0

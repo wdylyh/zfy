@@ -1,0 +1,45 @@
+// t01: 类型系统——宽度名、传统别名、type 别名、类型后缀、一行多声明器（grammar.md §3/§4）
+type Meter = i64
+type Fun = i32(i32)
+
+i64 main()
+    // 宽度名
+    i8 a = 1
+    u64 b = 2
+    f32 c = 1.5
+    f64 d = 2.5
+    // 传统别名归一化
+    short e = 3
+    int f = 4
+    double g = 3.25
+    ulong h = 5
+    // type 别名
+    Meter m = 100
+    // 类型后缀声明（w-014 #1）
+    i32[] xs = 1, 2, 3
+    i32[3] arr = 7, 8, 9
+    i32[][] nested
+    i32[2][3] grid
+    // 传统声明形式对照
+    i32 arr2[4] = 1, 2
+    i32 list3[]
+    // 一行多声明器（w-012）
+    i32 p, q = 10
+    i32 r = 2, s = r * 3
+    string sa, sb = "hi"
+    i32 m1[3], m2[2] = 7, 8
+    // const/frac/unred 修饰（§4：修饰符在类型后名字前）
+    i32 const k = 42
+    f64 frac fr = 1/2
+    f64 frac unred fu = 6/48
+    long const frac lk = 3/9
+    // bool/char/string
+    bool flag = true
+    char ch = 'A'
+    string str = "zfy"
+    // 泛型实例化类型位置
+    output(a, b, c, d, e, f, g, h)
+    output(m, xs, arr, p, q, r, s, k)
+    output(fr, fu, lk)
+    output(flag, ch, str)
+    return 0

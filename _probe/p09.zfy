@@ -1,0 +1,16 @@
+// struct 作列表元素 + struct 含列表字段
+struct P
+    i32 x = 0
+struct Bag
+    i32 xs[]
+void main()
+    P a = P(x=1)
+    P b = P(x=2)
+    P ps[]
+    push(ps, a)
+    push(ps, b)
+    output(ps[1].x)
+    Bag bag
+    push(bag.xs, 5)
+    output(bag.xs[0])
+    return

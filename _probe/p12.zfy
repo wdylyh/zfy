@@ -1,0 +1,11 @@
+// i128 除法/格式化、char 输出、f64 精度
+void main()
+    i128 a = 100000000000000000000
+    i128 b = 3
+    output(a / b)
+    char c = 'A'
+    output(c)
+    output(65)
+    f64 x = 0.1 + 0.2
+    output(x)
+    return

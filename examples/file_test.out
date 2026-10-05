@@ -1,0 +1,10 @@
+written: 28
+read_file: hello file
+second line
+third
+l1: line1
+count: 1
+exists-yes: true
+exists-no: false
+has-appended: 15
+z-first: hello file

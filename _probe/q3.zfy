@@ -1,0 +1,4 @@
+void main()
+    string s = "abcdef"
+    output(s[1,3])
+    return

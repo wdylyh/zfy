@@ -346,6 +346,9 @@
 | E3183 | `f().x = 1`（字段写目标非 struct 元素槽） | field assignment target must be a struct array/list element (ps[i].x = v) |
 | E3184 | `extern "C" { i32[] f() }`（extern 返回序列） | extern functions do not support array/list return types (zfy seq is not a C type) |
 | E3185 | `for i32 a[] = ...`（for 头部声明数组/列表） | for header declarations do not support arrays/lists |
+| E3186 | `struct S` 含 `File f` 字段 / `File f[]` / `Box<File>` | File cannot be a struct field (move-only handle) / File cannot be an array/list element / File cannot be a type argument |
+| E3187 | `usef(f)`（File 参数未用 move 传） | File parameters are move-only: pass with %s(move x) |
+| E3188 | `open("a.txt", "rw+")` | invalid open mode "%s" (expected "r", "w" or "a") |
 
 > 跳号（类型段）：E3002/E3003 并入 E3001、E3006 并入 E3005、E3012 并入 E3011、E3030 并入 E3011、E3044 并入 E3043、E3046 并入 E3045、E3050/E3051 并入 E3047、E3060 并入 E3101、E3090 并入 E3001、E3112 删除（归 E4012）、E3116 并入 E3115、E3134 并入 E3133、E3143 删除（TErr 元素非法归 E4002）。
 

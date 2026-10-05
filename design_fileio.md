@@ -1,6 +1,6 @@
 # 设计稿：zfy 文件 I/O（定稿待实施）
 
-> 状态：设计已由用户拍板（2026-10-05），**尚未派发**。实施时转 w-0xx 给 Trae。
+> 状态：**已实现**（WorkBuddy 直接实施，2026-10-05）。错误码按 Trae w-014 占用情况调整为 E3186~E3188。
 > 前置依赖：无（第一阶段刻意绕开 w-014 #1"函数返回列表"）。
 
 ## 一、类型语义：File 是 move-only 句柄
@@ -73,14 +73,14 @@ for string line in file        // for-in 语法糖（依赖 for-in 设计，另�
 2. **错误码分配**（按 errors.md 现有分段接续）：
    - `ErrCode.EOF = 7`（接 INPUT=6 之后，CUSTOM=100 之前）——read_line 的 EOF
      与 IO 错误区分（ErrCode.IO=4 保持不变）。
-   - `E3176`：File 位置禁用——作 struct 字段 / 泛型实参（Box<File>）/
+   - `E3186`：File 位置禁用——作 struct 字段 / 泛型实参（Box<File>）/
      容器元素 / copy 实参，一条码四种形态，消息文本区分。
-   - `E3178`：open 的 mode 字面量非法（编译期校验，见第 3 条）。
+   - `E3188`：open 的 mode 字面量非法（编译期校验，见第 3 条）。
    - use-after-close / use-after-move 的运行期 panic **不入 EXXX 码体系**
      （与数组越界同列附录 A），消息统一 "use of closed file" /
      "use of moved file handle"。
 3. **mode 校验 → 双层**：
-   - 编译期：实参为字符串字面量时，校验 ∈ {"r","w","a"}，非法报 E3177
+   - 编译期：实参为字符串字面量时，校验 ∈ {"r","w","a"}，非法报 E3188
      （第二阶段扩为 +"rb","wb","ab"）。
    - 运行期：非字面量实参（变量/拼接结果）在 open 内校验，非法 panic
      （消息 "invalid open mode: %s"）。

@@ -106,7 +106,7 @@ let pp_token = function
 (* 单词类型名（声明处类型位以 Ident 出现的名字）：
    基础类型 bool/char/string/void + 宽度类型 i8..i128 / u8..u128 / f16..f128 *)
 let type_names =
-  [ "bool"; "char"; "string"; "void";
+  [ "bool"; "char"; "string"; "void"; "File";
     "i8"; "i16"; "i32"; "i64"; "i128";
     "u8"; "u16"; "u32"; "u64"; "u128";
     "f16"; "f32"; "f64"; "f128" ]

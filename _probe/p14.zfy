@@ -1,0 +1,6 @@
+// struct 值自引用（应报错而非死循环）
+struct Bad
+    i32 v = 0
+    Bad next
+void main()
+    return

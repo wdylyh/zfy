@@ -1,0 +1,7 @@
+//数值边缘：负数取模/除法截断/溢出回绕
+void main()
+    output(-7 / 2, -7 % 2)
+    i64 big = 9223372036854775807
+    big = big + 1
+    output(big)
+    return

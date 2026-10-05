@@ -4,7 +4,7 @@
 
 ## 1. 词法规则
 
-- 缩进系语言：块用缩进（INDENT/DEDENT），括号内换行被忽略；`;` 仅允许出现在 for 头部。
+- 缩进系语言：块用缩进（INDENT/DEDENT），括号内换行被忽略
 - 注释：`// 行注释`；`/* 块注释（可嵌套）*/`。
 - 标识符：`[A-Za-z_][A-Za-z0-9_]*`。
 - 数字：`123`、`0x1A`、`0b1010`、`1.5`、`1e-3`。
@@ -168,3 +168,29 @@ not       一元（比较高于 not：not y==1 == not(y==1)）
 - **除法截断**：`/` 向零截断（`-7 / 2 = -3`、`7 / -2 = -3`）；`%` 符号随被除数。
 - **整数除零**：硬件异常（不可捕获、非 panic 通道）；frac 除零走 panic 通道。
 - **所有权**：返回数组/列表 = seq 指针移交（与 string 返回一致，RVO）；函数内返回局部列表免克隆。
+
+## 14. 文件 I/O（design_fileio.md 第一阶段）
+
+- **`File` 内建类型**：move-only 句柄（槽 = 堆上 `{FILE* fp; int closed}` 对象指针）。
+  不可作 struct 字段、数组/列表元素、泛型实参（E3186）；不可 const 语义复制。
+- **打开**：`File! fo = open(path, mode)`——mode 字面量限 `"r"`/`"w"`/`"a"`（E3188），
+  变量实参运行期校验；失败产 `ErrCode.IO` 错误值。
+- **典型解包**：`File f = fo ?? panic("...")`（`?? panic(...)` 对任意 T! 合法）。
+- **读**（借传，不消耗句柄）：
+  - `string! s = read_all(f)`（IO 错误产 `ErrCode.IO`）
+  - `string! l = read_line(f)`——读一行不含换行符；文件结束产 `ErrCode.EOF`（=7）
+- **写**（失败 panic，不产 T!）：`write(f, s)` / `writeln(f, s)`（追加 `\n`）；
+  实参自动转 string。
+- **关闭**：`close(f)` 幂等；close 失败 panic。
+- **一步式**：`string! s = read_file(path)`；`i64! n = write_file(path, s)`（覆盖写，
+  成功返回字节数）。
+- **查询**：`bool e = exists(path)`。
+- **所有权规则**：
+  - 声明初始化/赋值 `File g = f` = 所有权转移（源变量失效；同块复用报 E3013，
+    跨块运行期 panic "use of moved file handle"）。
+  - 用户函数的 File 参数**只能 `f(move g)` 传**（E3187）；被调函数退出时自动 close。
+  - **作用域退出自动 close**（RAII）：仍有效的 File 局部变量/参数在函数退出时
+    幂等关闭（复用 emit_frees_from）；close 失败 panic。
+  - 已 close 句柄上的任何操作 → panic "use of closed file"。
+- **运行时约定**：文件按字节透传（Windows 文本模式含 CRLF 转换），不做编码转换；
+  第二阶段规划 `read_lines -> string[]`（依赖函数返回列表，已落地）与 for-in 迭代。

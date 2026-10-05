@@ -1,6 +1,22 @@
 # Inbox → Trae（WorkBuddy 写，Trae 读）
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
+---
+id: w-015
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-05 22:10
+---
+用户任务：按 grammar.md 全量编写 12 份符合性测试代码（D:/zfy/grammar_tests/t01~t12）并编译，产出错误报告 grammar_tests/compile_report.md。两轮编译后 6 通过 / 6 报错；我方写法自误已修正，剩余 6 文件均为真实"文档↔编译器"不一致，待你/用户排期修复（文件与原始报错均已保留）：
+1. 【文档条目错误】replace 签名：grammar.md §11 写 replace(s, char, rep)，实现为 replace(s, 起, 止, 串) 区间替换（t08，E3075）。
+2. 【语法未实现】§9 新 use 路径 use a::b::item / 分组 / as 整体报 E2025，解析器仍按旧文件名 use 处理（t11）。
+3. 【解析器缺口】泛型实例作非泛型函数返回类型 Box<i32> make_box(i32 x) 顶层解析失败 E2005；泛型函数 <T> 形式正常（t05）。
+4. 【文档缺限制】?? 块形式仅限声明/赋值右值，return 位报 E3138（t06，t-009 偏离⑥未进文档）。
+5. 【文档缺限制】顶层 const+frac/unred 报 E3040，§4 示例未注明仅函数内合法（t10）。
+6. 【文档欠明确】output 不支持嵌套列表/定长二维整体打印（t02，E3000 ×2，w-013 需注明仅一维）。
+另：全部成功编译带同一条 benign 警告 overriding the module target triple。t-026 复核我本轮未展开，下轮处理。
+
 
 ---
 id: w-007

@@ -43,10 +43,10 @@ static void zfy_die(const char *msg) {
  * 约定：code=0 表示成功（value 有效，msg=NULL）；code≠0 时 value 未定义。
  * msg 一律 strdup，永不释放（有意的最小泄漏，免生命周期管理）。
  * 自定义错误码 ≥ 100 由源码直接写字面量；0-99 为标准码：
- * OK=0 DIV_ZERO=1 OOB=2 NOT_FOUND=3 IO=4 CAST=5 INPUT=6 */
+ * OK=0 DIV_ZERO=1 OOB=2 NOT_FOUND=3 IO=4 CAST=5 INPUT=6 EOF=7 */
 enum {
     ZFY_EOK = 0, ZFY_EDIV_ZERO = 1, ZFY_EOOB = 2, ZFY_ENOT_FOUND = 3,
-    ZFY_EIO = 4, ZFY_ECAST = 5, ZFY_EINPUT = 6
+    ZFY_EIO = 4, ZFY_ECAST = 5, ZFY_EINPUT = 6, ZFY_EEOF = 7
 };
 
 typedef struct zfy_err {
@@ -172,6 +172,185 @@ void zfy_err_find(zfy_err *out, const char *s, char c, long long k) {
         }
     }
     err_set(out, ZFY_ENOT_FOUND, "find: 未找到字符");
+}
+
+/* ---------- 文件 I/O（design_fileio.md） ----------
+ * File = move-only 句柄：变量槽值是堆上句柄对象指针 { FILE* fp; int closed }。
+ * - open 分配句柄；close 显式关闭（幂等）；autoclose 供作用域退出 RAII 调用。
+ * - 失效（move 后源槽 = NULL）或已关闭句柄上的任何操作 → panic（编译期
+ *   同块复用已由 typeck 拦截，此处为跨块/跨函数兜底）。
+ * - read 产错误值（IO=4 / EOF=7）；write/close 失败 panic（不产 T!）。
+ * - 文件按字节透传（假定 UTF-8），不做编码转换。 */
+
+typedef struct {
+    FILE *fp;
+    int closed;
+} zfy_file_t;
+
+static void zfy_file_check(zfy_file_t *h) {
+    if (!h) zfy_die("use of moved file handle");
+    if (h->closed) zfy_die("use of closed file");
+}
+
+void zfy_file_open_err(zfy_err *out, const char *path, const char *mode) {
+    FILE *fp = fopen(path, mode);
+    if (!fp) {
+        err_set(out, ZFY_EIO, "open: 无法打开文件");
+        return;
+    }
+    zfy_file_t *h = (zfy_file_t *)malloc(sizeof(zfy_file_t));
+    if (!h) zfy_die("内存分配失败");
+    h->fp = fp;
+    h->closed = 0;
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value.p = h;
+}
+
+/* 读整个文件内容为堆串（调用方持有，zfy 侧 RAII 释放）。
+   读到末尾为 EOF 时若已读到数据按成功处理（空文件 = 空串） */
+static char *zfy_file_slurp(FILE *fp, size_t *out_len) {
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) zfy_die("内存分配失败");
+    for (;;) {
+        if (len + 4096 + 1 > cap) {
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) zfy_die("内存分配失败");
+            buf = nb;
+        }
+        size_t n = fread(buf + len, 1, 4096, fp);
+        len += n;
+        if (n < 4096) {
+            if (ferror(fp)) {
+                free(buf);
+                return NULL;
+            }
+            break;
+        }
+    }
+    buf[len] = '\0';
+    *out_len = len;
+    return buf;
+}
+
+void zfy_file_read_all_err(zfy_err *out, zfy_file_t *h) {
+    zfy_file_check(h);
+    size_t len = 0;
+    char *s = zfy_file_slurp(h->fp, &len);
+    if (!s) {
+        err_set(out, ZFY_EIO, "read_all: 读取失败");
+        return;
+    }
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value.p = s;
+}
+
+/* 读一行（不含行尾换行符）；文件结束且无数据 → EOF 错误 */
+void zfy_file_read_line_err(zfy_err *out, zfy_file_t *h) {
+    zfy_file_check(h);
+    size_t cap = 128, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) zfy_die("内存分配失败");
+    int c;
+    while ((c = fgetc(h->fp)) != EOF) {
+        if (c == '\n') break;
+        if (len + 2 > cap) {
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) zfy_die("内存分配失败");
+            buf = nb;
+        }
+        buf[len++] = (char)c;
+    }
+    if (c == EOF && len == 0) {
+        free(buf);
+        err_set(out, ZFY_EEOF, "read_line: 文件结束");
+        return;
+    }
+    if (ferror(h->fp)) {
+        free(buf);
+        err_set(out, ZFY_EIO, "read_line: 读取失败");
+        return;
+    }
+    buf[len] = '\0';
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value.p = buf;
+}
+
+/* write / writeln（nl=1 追加换行）：失败 panic（不产 T!，design_fileio.md） */
+void zfy_file_write(zfy_file_t *h, const char *s, int nl) {
+    zfy_file_check(h);
+    size_t n = strlen(s);
+    if (n > 0 && fwrite(s, 1, n, h->fp) != n)
+        zfy_die("write: 写入失败");
+    if (nl && fputc('\n', h->fp) == EOF)
+        zfy_die("write: 写入失败");
+}
+
+/* 显式 close：幂等（已关闭直接返回）；fclose 失败 panic */
+void zfy_file_close(zfy_file_t *h) {
+    if (!h) zfy_die("use of moved file handle");
+    if (h->closed) return;
+    if (fclose(h->fp) != 0) zfy_die("close: 关闭失败");
+    h->closed = 1;
+}
+
+/* 作用域退出 RAII 自动 close：null（已 move）或已关闭跳过；失败 panic。
+ * close 失败仍置 closed，防双关（进程即将终止，无碍） */
+void zfy_file_autoclose(zfy_file_t *h) {
+    if (!h || h->closed) return;
+    if (fclose(h->fp) != 0) zfy_die("close: 关闭失败");
+    h->closed = 1;
+}
+
+int zfy_file_exists(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    fclose(fp);
+    return 1;
+}
+
+/* 一步式整读：open("r") + 读全部 + close */
+void zfy_file_read_file_err(zfy_err *out, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        err_set(out, ZFY_EIO, "read_file: 无法打开文件");
+        return;
+    }
+    size_t len = 0;
+    char *s = zfy_file_slurp(fp, &len);
+    if (fclose(fp) != 0 || !s) {
+        free(s);
+        err_set(out, ZFY_EIO, "read_file: 读取失败");
+        return;
+    }
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value.p = s;
+}
+
+/* 一步式覆盖写：open("w") + 写全部 + close；成功返回写入字节数 */
+void zfy_file_write_file_err(zfy_err *out, const char *path, const char *s) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        err_set(out, ZFY_EIO, "write_file: 无法打开文件");
+        return;
+    }
+    size_t len = strlen(s);
+    if (len > 0 && fwrite(s, 1, len, fp) != len) {
+        fclose(fp);
+        err_set(out, ZFY_EIO, "write_file: 写入失败");
+        return;
+    }
+    if (fclose(fp) != 0) {
+        err_set(out, ZFY_EIO, "write_file: 关闭失败");
+        return;
+    }
+    err_ok_i(out, (long long)len);
 }
 
 /* 程序加载时调大 stdout 缓冲（默认 4KB）：大量逐行输出时减少系统调用。

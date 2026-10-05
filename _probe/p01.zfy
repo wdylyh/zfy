@@ -1,0 +1,7 @@
+//列表嵌套：列表的列表
+i32 a[][]
+void main()
+    i32 b[] = 1,2,3
+    push(a, b)
+    output(a[0][1])
+    return

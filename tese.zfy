@@ -1,0 +1,3 @@
+void main()
+    string n="123456"
+    output(replace(n,0,2,"321"))

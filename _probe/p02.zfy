@@ -1,0 +1,10 @@
+//struct 含列表字段 + struct 作列表元素
+struct S
+    i32 v = 0
+    i32 xs[]
+void main()
+    S s
+    push(s.xs, 7)
+    S list = ...
+    output("done")
+    return

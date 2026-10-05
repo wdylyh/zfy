@@ -1,0 +1,47 @@
+// t03: 函数——ref 参数（标量/string/数组/列表）、返回 T[]/T[N]、函数类型参数（grammar.md §5）
+type Fun = i32(i32)
+
+void bump(i32 ref x)
+    x += 10
+
+void wrap(string ref s)
+    s = s + "!"
+
+void fill(i32 ref xs[])
+    push(xs, 10)
+    push(xs, 20)
+    xs[0] = 99
+
+void fill2(i32[] ref xs)
+    push(xs, 1)
+
+i32[] upto(i32 n)
+    i32 a[]
+    for i32 i = 0, i < n, i++
+        push(a, i)
+    return a
+
+i32[3] triple()
+    i32 a[3] = 1, 2, 3
+    return a
+
+i32 apply(Fun f, i32 v)
+    return f(v)
+
+i32 inc(i32 x)
+    return x + 1
+
+i64 main()
+    i32 v = 5
+    bump(ref v)
+    string s = "a"
+    wrap(ref s)
+    i32 e[]
+    fill(ref e)
+    i32 e2[]
+    fill2(ref e2)
+    i32[] a = upto(5)
+    i32[3] t = triple()
+    output(v, s, e, e2, a, t)
+    output(apply(inc, 41))
+    return 0

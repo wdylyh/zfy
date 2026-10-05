@@ -1,0 +1,8 @@
+// 列表参数值语义确认：函数内 push 是否影响调用方
+void fill(i32 a[])
+    push(a, 42)
+void main()
+    i32 a[] = 1
+    fill(a)
+    output(length(a))
+    return

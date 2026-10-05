@@ -162,7 +162,7 @@ let op k t = { o = k; oty = t }
    全局变量槽（'@' 前缀）不属于函数作用域，永不释放 *)
 let owned_ty (name : string) (t : zty) =
   match t with
-  | TString | TArray _ | TList _ | TStruct _ -> name.[0] <> '@'
+  | TString | TArray _ | TList _ | TStruct _ | TFile -> name.[0] <> '@'
   | _ -> false
 
 (* 在当前作用域登记需 RAII 释放的变量（后声明先释放） *)
@@ -382,9 +382,9 @@ let rec lexpr l (e : texpr) : operand =
         (fun i o ->
           match List.nth_opt moves i with
           | Some true ->
-            (* 显式 move：typeck 已保证局部 owned 变量（string/数组/列表） *)
+            (* 显式 move：typeck 已保证局部 owned 变量（string/数组/列表/File） *)
             (match o.o, o.oty with
-             | OLocal n, (TString | TArray _ | TList _) when n.[0] <> '@' ->
+             | OLocal n, (TString | TArray _ | TList _ | TFile) when n.[0] <> '@' ->
                (true, Some (n, o.oty))
              | _ -> (false, None))
           | _ -> arg_moveable l o)
@@ -681,11 +681,21 @@ and lstmt_inner l (s : tstmt) : unit =
   match s.s with
   | SDeclK (_, name, ty, init, nn) ->
     (* 标量声明：变量永远有值，必有初值；非 unred frac 存入后约分。
-       初值是本语句的 seq 临时（如 split 结果）时直接 move 所有权免克隆 *)
+       初值是本语句的 seq 临时（如 split 结果）时直接 move 所有权免克隆。
+       File（move-only）：初值为局部变量槽时为所有权转移（清空源槽，
+       运行期失效兜底；design_fileio.md） *)
     declare_owned l name ty;
     let v = lexpr l init in
     let moved =
-      match ty with TString | TArray _ | TList _ -> move_owned_temp l name v ty | _ -> false
+      match ty, v.o with
+      | TFile, OLocal src when src.[0] <> '%' && src.[0] <> '@' ->
+        emit l (MCopy (name, v, ty));
+        emit l (MClear (src, ty));
+        true
+      | _ ->
+        (match ty with
+         | TString | TArray _ | TList _ -> move_owned_temp l name v ty
+         | _ -> false)
     in
     if not moved then begin
       emit l (MCopy (name, v, ty));
@@ -726,10 +736,19 @@ and lstmt_inner l (s : tstmt) : unit =
          (* move 赋值（new2.md #1：自动 move/显式 move）：源为变量槽时
             所有权直接转移（释放目标旧值 + 接管指针），随后清空源槽防双释放 *)
          (match lhs.ety, v.o with
-          | (TString | TArray _ | TList _), OLocal src ->
+          | (TString | TArray _ | TList _ | TFile), OLocal src ->
             emit l (MMoveSeq (name, v, lhs.ety));
             emit l (MClear (src, lhs.ety))
           | _ -> merr lhs.epos "move assignment requires an aggregate variable source")
+       end
+       else if lhs.ety = TFile then begin
+         (* File move-only（design_fileio.md）：变量到变量赋值 = 所有权
+            转移（typeck 已标记源变量 moved）；目标旧句柄自动 close *)
+         (match v.o with
+          | OLocal src when src.[0] <> '%' && src.[0] <> '@' ->
+            emit l (MMoveSeq (name, v, lhs.ety));
+            emit l (MClear (src, lhs.ety))
+          | _ -> emit l (MCopy (name, v, lhs.ety)))
        end
        else begin
          (* 聚合整体赋值：值为本语句临时（切片/split/调用结果等）时 move 免克隆 *)

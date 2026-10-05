@@ -113,6 +113,13 @@ let code_of = function
       ["field assignment target must be a struct array/list element"], "E3183";
       ["extern functions do not support array/list return types"], "E3184";
       ["for header declarations do not support arrays/lists"], "E3185";
+      (* 文件 I/O（design_fileio.md，E3186~E3188） *)
+      ["File cannot be a struct field"], "E3186";
+      ["File cannot be an array/list element"], "E3186";
+      ["File cannot be a type argument"], "E3186";
+      ["File cannot be an array element"], "E3186";
+      ["File parameters are move-only"], "E3187";
+      ["invalid open mode"], "E3188";
       ["ref parameters support scalar/string/array/list types only"], "E3162";
       ["push target must be a list, not a fixed-length array"], "E3061";
       ["(extern conflicts with an existing function)"], "E3106";

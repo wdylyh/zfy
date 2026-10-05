@@ -15,6 +15,8 @@ type zty =
   | TStruct of string               (* struct：名字在 hstructs 中查定义 *)
   | TPtr of zty                     (* 指针：指向 T（T* const 不可变约束由 typeck 检查） *)
   | TErr of zty                     (* T!：可失败值（元素为标量/string/指针） *)
+  | TFile                           (* 文件句柄（move-only）：槽为句柄对象指针
+                                       {FILE* fp; int closed}，open 分配，close/RAII 释放 *)
   | TFunSig of zty list * zty       (* 函数签名：(参数类型, 返回类型)——仅经 type 别名 *)
   | TVar of int                     (* 类型推断变量 *)
 
@@ -173,6 +175,7 @@ let prim_type name =
      | "char" -> Some TChar
      | "string" -> Some TString
      | "void" -> Some TVoid
+     | "File" -> Some TFile
      | _ -> None)
 
 (* frac 支持的元素类型（f16 分数暂不支持；f128=long double 与整数/f32/f64 同模板） *)
@@ -191,6 +194,7 @@ let rec pp_zty = function
   | TStruct s -> s
   | TPtr t -> Printf.sprintf "%s*" (pp_zty t)
   | TErr t -> Printf.sprintf "%s!" (pp_zty t)
+  | TFile -> "File"
   | TFunSig (ptys, ret) ->
     Printf.sprintf "%s(%s)" (pp_zty ret)
       (String.concat "," (List.map pp_zty ptys))
@@ -224,7 +228,7 @@ let rec scalar_size_align (t : zty) : int * int =
   | TFloat 64 -> (8, 8)
   | TFloat 128 -> (16, 16)         (* x86_fp80（long double） *)
   | TBool | TChar -> (1, 1)
-  | TString | TArray _ | TList _ -> (8, 8)
+  | TString | TArray _ | TList _ | TFile -> (8, 8)
   | TPtr _ | TFunSig _ -> (8, 8)
   | TFrac e -> let (s, a) = scalar_size_align e in (2 * s, a)
   | _ -> (-1, 1)

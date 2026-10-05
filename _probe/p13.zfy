@@ -1,0 +1,5 @@
+// 全局列表带初值 + 递归 struct（值字段应报错）
+i64 g[] = 1,2,3
+void main()
+    output(length(g), g[2])
+    return

@@ -1,0 +1,11 @@
+//struct 复制语义：函数内改不影响外部
+struct P
+    i32 x = 0
+void bump(P q)
+    q.x = 99
+    output("in:", q.x)
+void main()
+    P p
+    bump(p)
+    output("out:", p.x)
+    return

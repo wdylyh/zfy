@@ -255,6 +255,7 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
              (match z with
               | TErr _ -> terr pp "T! cannot be a type argument"
               | TFrac _ -> terr pp "frac cannot be a type argument"
+              | TFile -> terr pp "File cannot be a type argument (move-only handle)"
               | TVar _ -> terr pp "a generic type argument must be a concrete type"
               | _ -> ());
              z)
@@ -265,12 +266,21 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
     (* T[]：动态数组/列表（类型后缀形式，w-014 #1）；
        声明/参数/字段的数组形状由 parser 归一到 pseq/fseq，此处兜底
        元素类型位置的嵌套（i32 a[][] 的元素 TSeq） *)
-    TList (conv_ty g pp t')
+    let e = conv_ty g pp t' in
+    (match resolve e with
+     | TFile -> terr pp "File cannot be an array/list element (move-only handle)"
+     | _ -> ());
+    TList e
   | TSeqN (t', len, pp) ->
     (* T[N]：定长数组（类型后缀形式）。类型位置（返回类型/字段元素/别名）
        长度须整数字面量；声明/参数处完整表达式长度由 pseq/PArray 承载 *)
     (match len with
-     | EInt (n, _) when n >= 0L -> TArray (conv_ty g pp t', Int64.to_int n)
+     | EInt (n, _) when n >= 0L ->
+       let e = conv_ty g pp t' in
+       (match resolve e with
+        | TFile -> terr pp "File cannot be an array element (move-only handle)"
+        | _ -> ());
+       TArray (e, Int64.to_int n)
      | _ -> terr pp "fixed array type length must be a non-negative integer literal here")
 
 (* 注册具体实例（幂等）：先占位再展开字段（自引用指针字段可引用）；
@@ -305,6 +315,8 @@ and instantiate_struct_zty (g : genv) (gname : string)
              terr sf.fpos "struct %s field type cannot be itself (infinite size)" mangle
            | TErr _ ->
              terr sf.fpos "T! cannot be a struct field (error values are aggregates and cannot be loaded as a field)"
+           | TFile ->
+             terr sf.fpos "File cannot be a struct field (move-only handle)"
            | _ -> ());
           if List.mem sf.fname !seen then
             terr p "struct %s has duplicate field %s" mangle sf.fname;
@@ -395,7 +407,7 @@ let structs_list (g : genv) : Hir.sdef list =
 let errcode_const = function
   | "OK" -> Some 0L | "DIV_ZERO" -> Some 1L | "OOB" -> Some 2L
   | "NOT_FOUND" -> Some 3L | "IO" -> Some 4L | "CAST" -> Some 5L
-  | "INPUT" -> Some 6L | "CUSTOM" -> Some 100L
+  | "INPUT" -> Some 6L | "EOF" -> Some 7L | "CUSTOM" -> Some 100L
   | _ -> None
 
 (* ---------- 表达式检查 ---------- *)
@@ -775,6 +787,94 @@ and check_expr env (e : expr) : texpr =
                   (String.concat ", " (List.map pp_zty s.params)) (pp_zty s.ret)
               | None -> terr fp "undefined function: %s" fname)
            | _ -> terr p' "panic_handler expects a function name argument: panic_handler(fn)")
+        | "open" ->
+          (* open(path, mode) -> File!（design_fileio.md）：失败产 ErrCode.IO
+             错误值；mode 字面量编译期校验（r/w/a），变量实参运行期校验 *)
+          (match args with
+           | [ CPos path; CPos mode ] ->
+             let tp = check_expr env path in
+             (match resolve tp.ety with
+              | TString -> ()
+              | t -> terr p' "open's path must be a string, got %s" (pp_zty t));
+             let tm = check_expr env mode in
+             (match resolve tm.ety with
+              | TString -> ()
+              | t -> terr p' "open's mode must be a string, got %s" (pp_zty t));
+             (match tm.e, resolve tm.ety with
+              | EStrK m, TString ->
+                if not (List.mem m [ "r"; "w"; "a" ]) then
+                  terr p' "invalid open mode \"%s\" (expected \"r\", \"w\" or \"a\")" m
+              | _ -> ());
+             mk (ECallK ("zfy_file_open_err", [ tp; tm ], [])) (TErr TFile)
+           | _ -> terr p' "open takes two arguments: open(path, mode)")
+        | "read_all" | "read_line" ->
+          (* read_all(f) / read_line(f) -> string!：IO 错误产 ErrCode.IO，
+             read_line 的文件结束产 ErrCode.EOF *)
+          (match args with
+           | [ CPos f ] ->
+             let tf = check_expr env f in
+             (match resolve tf.ety with
+              | TFile -> ()
+              | t -> terr p' "%s expects a File, got %s" name (pp_zty t));
+             mk (ECallK ((if name = "read_all" then "zfy_file_read_all_err"
+                          else "zfy_file_read_line_err"), [ tf ], []))
+               (TErr TString)
+           | _ -> terr p' "%s takes one argument: %s(f)" name name)
+        | "write" | "writeln" ->
+          (* write(f, s) / writeln(f, s)：写失败 panic（不产 T!，design_fileio.md）；
+             writeln = write + '\n'（nl 标志） *)
+          (match args with
+           | [ CPos f; CPos s ] ->
+             let tf = check_expr env f in
+             (match resolve tf.ety with
+              | TFile -> ()
+              | t -> terr p' "%s expects a File as first argument, got %s" name (pp_zty t));
+             let ts = to_string_of (check_expr env s) in
+             let nl = { e = EIntK (if name = "writeln" then 1L else 0L);
+                        ety = TInt 32; epos = p' } in
+             mk (ECallK ("zfy_file_write", [ tf; ts; nl ], [])) TVoid
+           | _ -> terr p' "%s takes two arguments: %s(f, s)" name name)
+        | "close" ->
+          (* close(f)：幂等；close 失败 / 使用已关闭句柄 → panic *)
+          (match args with
+           | [ CPos f ] ->
+             let tf = check_expr env f in
+             (match resolve tf.ety with
+              | TFile -> ()
+              | t -> terr p' "close expects a File, got %s" (pp_zty t));
+             mk (ECallK ("zfy_file_close", [ tf ], [])) TVoid
+           | _ -> terr p' "close takes one argument: close(f)")
+        | "exists" ->
+          (* exists(path) -> bool：文件是否存在 *)
+          (match args with
+           | [ CPos path ] ->
+             let tp = check_expr env path in
+             (match resolve tp.ety with
+              | TString -> ()
+              | t -> terr p' "exists expects a string path, got %s" (pp_zty t));
+             mk (ECallK ("zfy_file_exists", [ tp ], [])) TBool
+           | _ -> terr p' "exists takes one argument: exists(path)")
+        | "read_file" ->
+          (* read_file(path) -> string!：一步式整读（open+read_all+close） *)
+          (match args with
+           | [ CPos path ] ->
+             let tp = check_expr env path in
+             (match resolve tp.ety with
+              | TString -> ()
+              | t -> terr p' "read_file expects a string path, got %s" (pp_zty t));
+             mk (ECallK ("zfy_file_read_file_err", [ tp ], [])) (TErr TString)
+           | _ -> terr p' "read_file takes one argument: read_file(path)")
+        | "write_file" ->
+          (* write_file(path, s) -> i64!：一步式覆盖写，成功返回写入字节数 *)
+          (match args with
+           | [ CPos path; CPos s ] ->
+             let tp = check_expr env path in
+             (match resolve tp.ety with
+              | TString -> ()
+              | t -> terr p' "write_file's path must be a string, got %s" (pp_zty t));
+             let ts = to_string_of (check_expr env s) in
+             mk (ECallK ("zfy_file_write_file_err", [ tp; ts ], [])) (TErr (TInt 64))
+           | _ -> terr p' "write_file takes two arguments: write_file(path, s)")
         | "ord" ->
           (* ord(c)：char 的码值（i32），w-014 #5 *)
           (match args with
@@ -1023,6 +1123,10 @@ and check_expr env (e : expr) : texpr =
     (match rhs with
      | EBlock (_, bp) ->
        terr bp "??-block form (a ?? indented block) is only allowed as the RHS of a declaration or assignment"
+     | EPanic _ as prhs ->
+       (* a ?? panic(...)：失败即终止（panic 永不产生值，类型取 elem） *)
+       let tb = check_expr env prhs in
+       mk (EUnwrapK (ta, tb)) elem
      | _ ->
        let tb = coerce p' (check_expr env rhs) elem in
        mk (EUnwrapK (ta, tb)) elem)
@@ -1070,6 +1174,15 @@ and check_call env p name0 targs modes =
       else if pref && m <> 2 then
         terr p "parameter %d of %s is ref, pass the argument with ref (f(ref x))" (i + 1) !name)
     modes;
+  (* File 参数 move-only（design_fileio.md）：只能 f(move f) 所有权移交；
+     值传/copy/ref 一律报错（句柄共享会破坏"谁持有谁关闭"约定） *)
+  List.iteri
+    (fun i pt ->
+      if resolve pt = TFile then
+        let m = try List.nth modes i with _ -> 0 in
+        if m <> 1 then
+          terr p "File parameters are move-only: pass with %s(move x)" !name)
+    sig_.params;
   let targs =
     List.map2 (fun ta pt -> coerce p ta pt) targs sig_.params in
   let moves = List.map (fun m -> m = 1) modes in
@@ -1090,13 +1203,13 @@ and check_move_arg env (e : expr) : texpr =
        if Hashtbl.mem env.moved l.lslot then
          terr p "variable %s has already been moved" name;
        (match resolve l.lty with
-        | TString | TArray _ | TList _ ->
+        | TString | TArray _ | TList _ | TFile ->
           (* 先按普通读检查实参（此时尚未标记 moved），再标记已 move *)
           let te = check_expr env e in
           Hashtbl.replace env.moved l.lslot ();
           te
         | t ->
-          terr p "move supports only string/array/list arguments, %s has type %s"
+          terr p "move supports only string/array/list/File arguments, %s has type %s"
             name (pp_zty t))
      | None -> check_expr env e)
   | _ -> terr (pos_of_expr e) "move can only apply to a local variable"
@@ -1916,6 +2029,15 @@ let rec check_decl env p isconst is_frac is_unred name ty init =
   let needs_norm =
     (match resolve want with TFrac _ -> true | _ -> false) && not is_unred
   in
+  (* File move-only（design_fileio.md）：声明初始化 `File g = f` 为所有权
+     转移（mir 侧清空源槽，运行期失效兜底）；编译期标记源变量已 move，
+     同块复用报错 *)
+  (match resolve want, init with
+   | TFile, Some (EVar (n2, _)) ->
+     (match lookup_var env n2 with
+      | Some src when resolve src.lty = TFile -> Hashtbl.replace env.moved src.lslot ()
+      | _ -> ())
+   | _ -> ());
   SDeclK (isconst, slot, want, tinit, needs_norm)
 
 (* 赋值目标为变量槽时的公共检查，返回槽名 *)
@@ -2163,6 +2285,7 @@ and check_seq_decl env p isconst name e len is_list inits =
   (match resolve e with
    | TFrac _ -> terr p "frac arrays/lists are not yet supported"
    | TErr _ -> terr p "T! cannot be an array/list element (error values are aggregates and cannot be loaded by index)"
+   | TFile -> terr p "File cannot be an array/list element (move-only handle)"
    | _ -> ());   (* struct/嵌套 seq 元素合法（w-014 #2/#4），运行时按头部 kind 深拷贝 *)
   let vlen =
     match len, is_list with
@@ -2424,6 +2547,14 @@ and check_stmt env (st : stmt) : tstmt =
                 mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, false, false))
               | _, _ ->
                 let trhs = coerce p' trhs lty in
+                (* File move-only：变量到变量赋值 = 所有权转移（mir 侧清源槽） *)
+                (match resolve lty, rhs' with
+                 | TFile, EVar (n2, _) ->
+                   (match lookup_var env n2 with
+                    | Some src when resolve src.lty = TFile ->
+                      Hashtbl.replace env.moved src.lslot ()
+                    | _ -> ())
+                 | _ -> ());
                 (* s = s + p1 + ... + pn（T7 优化）：concat 链根为槽本身时
                    改原地追加（realloc 扩容，O(追加量) 免 O(总长) 全量拷贝）；
                    任一操作数引用槽本身则回退（realloc 可能移动缓冲区，
@@ -2784,7 +2915,9 @@ let rec subst_ty (t : zty) : zty =
 (* ---------- 程序级检查 ---------- *)
 
 (* 函数式内建名（用户自定义函数不得与之冲突） *)
-let builtin_names = [ "length"; "find"; "trim"; "split"; "replace"; "prec" ]
+let builtin_names = [ "length"; "find"; "trim"; "split"; "replace"; "prec";
+                      "open"; "read_all"; "read_line"; "write"; "writeln";
+                      "close"; "exists"; "read_file"; "write_file" ]
 
 (* 参数 -> zty：
    - 标量：可带 frac 修饰
@@ -2882,6 +3015,8 @@ let check_program (prog : program) : hir =
                  terr sf.fpos "struct %s field type cannot be itself (infinite size)" name
                | TErr _ ->
                  terr sf.fpos "T! cannot be a struct field (error values are aggregates and cannot be loaded as a field)"
+               | TFile ->
+                 terr sf.fpos "File cannot be a struct field (move-only handle)"
                | _ -> ());
               (sf.fname, ft, sf.fdefault))
             fields

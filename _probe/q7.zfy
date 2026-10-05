@@ -1,0 +1,5 @@
+void main()
+    i128 a = 9223372036854775807
+    a = a * 4 + 3
+    output(a)
+    return

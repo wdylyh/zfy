@@ -1,0 +1,14 @@
+//函数返回 struct / 列表
+struct P
+    i32 x = 0
+P mk(i32 v)
+    P p = P(x=v)
+    return p
+i32[] mklist()
+    i32 a[] = 1,2
+    return a
+void main()
+    P p = mk(5)
+    i32 a[] = mklist()
+    output(p.x, a[1])
+    return

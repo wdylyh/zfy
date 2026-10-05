@@ -1,0 +1,10 @@
+//泛型容器：Box 嵌套泛型 + 指针字段自引用
+struct Box<T>
+    T v = 0
+struct Node<T>
+    T v = 0
+    Node<T>* next = null
+void main()
+    Box<Box<i32>> b = Box(Box(3))
+    output(b.v.v)
+    return

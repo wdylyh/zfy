@@ -1,0 +1,9 @@
+// while 条件里的赋值、for 多段、break 标签?
+void main()
+    i32 i = 0
+    while i < 3
+        i++
+        if i == 2
+            continue
+        output(i)
+    return

@@ -1,0 +1,7 @@
+void main()
+    File! fo = open("a.txt", "r")
+    File a = fo ?? panic("no")
+    File b = a
+    close(b)
+    close(a)
+    return

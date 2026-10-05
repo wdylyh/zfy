@@ -1,0 +1,26 @@
+// t11: 模块——内联 mod、pub 导出、use a::b::item / 分组 / as（grammar.md §9）
+mod math
+    pub i64 sq(i64 x)
+        return x * x
+
+    pub i64 one
+    i64 hidden = 7
+
+    mod inner
+        pub i64 add(i64 a, i64 b)
+            return a + b
+
+mod util
+    pub f64 frac hl = 1/2
+    pub string tag = "u"
+
+use math::sq
+use math::{one, inner as mi}
+use util as ut
+
+i64 main()
+    i64 a = sq(6)
+    i64 b = mi.add(1, 2)
+    output(a, b, one)
+    output(ut.tag, ut.hl)
+    return 0

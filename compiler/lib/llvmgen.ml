@@ -23,6 +23,7 @@ let rec ll_ty (t : zty) : string =
   | TVoid -> "void"
   | TFrac e -> Printf.sprintf "%%frac.%s" (Hir.suffix_of e)
   | TArray _ | TList _ -> "ptr"      (* 槽内是指向 zfy_seq 的指针 *)
+  | TFile -> "ptr"                   (* 槽内是句柄对象指针 {FILE* fp; int closed} *)
   | TStruct s -> Printf.sprintf "%%struct.%s" s
   | TPtr _ | TFunSig _ -> "ptr"      (* 指针/函数指针：裸地址 *)
   | TErr e ->
@@ -39,7 +40,7 @@ let rec ll_ty (t : zty) : string =
      | TBool -> "%err.bool"
      | TChar -> "%err.char"
      | TString -> "%err.str"
-     | TPtr _ -> "%err.ptr"
+     | TPtr _ | TFile -> "%err.ptr"
      | _ -> lerr None "invalid error value element type (scalar/string/pointer only)")
   | TVar _ -> lerr None "unresolved type variable"
 
@@ -1220,6 +1221,14 @@ let gen_instr fc (i : instr) : unit =
        emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s dstp;
        let (sp, _) = ptr_of fc v in
        gen_memcpy fc dstp sp (size_of fc.g ty)
+     | TFile ->
+       (* File：目标旧句柄自动 close（幂等，null/已关闭跳过）后接管新句柄 *)
+       let ov = fresh_r fc in
+       emitf fc "  %s = load ptr, ptr %s" ov dstp;
+       emitf fc "  call void @zfy_file_autoclose(ptr %s)" ov;
+       let (sv, st) = val_of fc v in
+       if st <> "ptr" then lerr None "invalid move target slot type %s" st;
+       emitf fc "  store ptr %s, ptr %s" sv dstp
      | _ ->
        let ov = fresh_r fc in
        emitf fc "  %s = load ptr, ptr %s" ov dstp;
@@ -1321,7 +1330,7 @@ let gen_instr fc (i : instr) : unit =
        let r = fresh_r fc in
        emitf fc "  %s = call ptr @zfy_strdup(ptr %s)" r sv;
        emitf fc "  store ptr %s, ptr %s" r vp
-     | TPtr _ ->
+     | TPtr _ | TFile ->
        let (pv, pt) = val_of fc v in
        emitf fc "  store %s %s, ptr %s" pt pv vp
      | TFloat 64 ->
@@ -1381,7 +1390,7 @@ let gen_instr fc (i : instr) : unit =
     let vp = gen_gep fc sp (ll_ty ty) 2 in
     let elem = (match ty with TErr e -> e | _ -> lerr None "MErrValue type error") in
     (match elem with
-     | TString | TPtr _ ->
+     | TString | TPtr _ | TFile ->
        let r = fresh_r fc in
        emitf fc "  %s = load ptr, ptr %s" r vp;
        Hashtbl.replace fc.regs d r
@@ -1605,6 +1614,13 @@ let gen_instr fc (i : instr) : unit =
           (* struct：释放内含堆资源后清零槽（防重复释放） *)
           emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s addr;
           emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr
+        | TFile ->
+          (* File：作用域退出自动 close（幂等；null=已 move，跳过；
+             close 失败 panic——design_fileio.md 规则 3/4） *)
+          let sp = fresh_r fc in
+          emitf fc "  %s = load ptr, ptr %s" sp addr;
+          emitf fc "  call void @zfy_file_autoclose(ptr %s)" sp;
+          emitf fc "  store ptr null, ptr %s" addr
         | _ -> ())
      | None -> lerr None "undefined variable %s" name)
   | MFreeTemp name ->
@@ -2318,6 +2334,26 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_seq_remove(ptr, i64)\n";
   Buffer.add_string g.mbuf
     "declare void @zfy_seq_aug_range(ptr, i64, i64, i64, i32, ptr, i32, i32, i32)\n";
+  (* 文件 I/O（design_fileio.md）：句柄对象 {FILE* fp; int closed}，
+     open 分配 / autoclose 幂等 / 失效与关闭后使用 panic *)
+  Buffer.add_string g.mbuf
+    "declare void @zfy_file_open_err(ptr sret(%err.ptr), ptr, ptr)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_file_read_all_err(ptr sret(%err.str), ptr)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_file_read_line_err(ptr sret(%err.str), ptr)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_file_write(ptr, ptr, i32)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_file_close(ptr)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_file_autoclose(ptr)\n";
+  Buffer.add_string g.mbuf
+    "declare i32 @zfy_file_exists(ptr)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_file_read_file_err(ptr sret(%err.str), ptr)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_file_write_file_err(ptr sret(%err.i64), ptr, ptr)\n";
   (* 函数 *)
   let fbuf = Buffer.create 4096 in
   Hashtbl.reset user_fns;

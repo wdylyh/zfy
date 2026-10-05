@@ -1,0 +1,51 @@
+// t04: struct——声明/packed/嵌套/数组列表字段/默认值/构造方式/struct 作序列元素（grammar.md §6）
+struct Point
+    f32 x = 0.0
+    f32 y = 0.0
+
+struct Node
+    Point p
+    i32 v = 1
+    string tag
+
+struct Buf
+    i32 data[4]
+    i32 vals[]
+
+struct packed Header
+    u8 tag
+    i32 value
+
+// struct 作列表元素（w-014 #2 值语义）
+Point make(f32 x, f32 y)
+    return Point(x, y)
+
+i64 main()
+    // 位置 / 命名 / 补全 / 裸声明
+    Point p1 = Point(1.0, 2.0)
+    Point p2 = Point(x=3.5, y=4.5)
+    Point p3 = Point(5.0)
+    Point p4
+    // 字段读写与增广
+    p1.x = 10.0
+    p1.y += 1.0
+    // 嵌套 struct
+    Node n = Node(Point(1.0, 1.0), 7, "nd")
+    output(n.p.x, n.v, n.tag)
+    // 含数组/列表字段的 struct
+    Buf b
+    b.data[0] = 9
+    push(b.vals, 3)
+    // struct 作列表元素：深拷贝值语义
+    Point ps[]
+    push(ps, p1)
+    Point got = ps[0]
+    got.x = 99.0
+    ps[0].x = 55.0
+    output(p1.x, p1.y, got.x, ps[0].x)
+    // packed 与 sizeof/alignof
+    Header hd = Header(1, 100)
+    output(hd.tag, hd.value)
+    output(sizeof(Point), alignof(Point))
+    output(sizeof(Header), alignof(Header))
+    return 0

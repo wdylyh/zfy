@@ -1,0 +1,6 @@
+struct Bag
+    i32 xs[]
+void main()
+    Bag bag
+    push(bag.xs, 5)
+    return

@@ -1,0 +1,8 @@
+// char/bool 打印与 char 运算
+void main()
+    char c = 'A'
+    output(c)
+    output(c + 1)
+    bool b = true
+    output(b)
+    return

@@ -1,0 +1,35 @@
+// t06: ZEM 错误值——T!、fail、?? 值/块形式、e? 传播、ErrCode、panic（grammar.md §10）
+i32! safe_div(i32 a, i32 b)
+    if b == 0
+        fail(ErrCode.DIV_ZERO, "div by zero")
+    return a / b
+
+i32! chain(i32 a, i32 b)
+    i32 r = safe_div(a, b)?
+    return r
+
+i32 fallback(i32 a, i32 b)
+    return safe_div(a, b) ?? -1
+
+i32! code_msg(i32 a, i32 b)
+    return safe_div(a, b) ??
+        ErrCode.CUSTOM
+
+void handler(i32 code, string msg)
+    output("[handler]", code, msg)
+
+i64 main()
+    i32 ok = fallback(10, 2)
+    i32 bad = fallback(1, 0)
+    i32! c = code_msg(3, 0)
+    output(ok, bad)
+    // ?? 块形式语句位置（缩进块，非花括号）
+    i32 r = safe_div(6, 0) ??
+        output("caught", err.code)
+        -1
+    output(r)
+    // panic / panic_handler
+    panic_handler(handler)
+    i32 d = chain(8, 4) ?? 0
+    output(d)
+    return 0

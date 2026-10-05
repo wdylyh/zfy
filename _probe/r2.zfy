@@ -1,0 +1,7 @@
+struct Bag
+    i32 xs[]
+// struct 列表字段整体赋值能否绕过 push
+void main()
+    Bag bag
+    bag.xs = 1, 2
+    return

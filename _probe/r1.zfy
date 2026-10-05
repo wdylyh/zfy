@@ -1,0 +1,7 @@
+// 尝试返回列表
+i32[] mk()
+    i32 a[] = 1,2
+    return a
+void main()
+    output(mk()[0])
+    return

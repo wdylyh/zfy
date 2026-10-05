@@ -1,0 +1,8 @@
+//字符串按下标赋值与切片赋值
+void main()
+    string s = "hello"
+    s[0] = 'H'
+    output(s)
+    string t = s[0,2]
+    output(t)
+    return

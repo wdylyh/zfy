@@ -1,0 +1,12 @@
+//引用传参免拷贝 + 列表参数默认拷贝
+void fill(i32 a[])
+    push(a, 42)
+void fillref(ref i32 a[])
+    push(a, 43)
+void main()
+    i32 a[] = 1
+    fill(a)
+    output(length(a))
+    fillref(a)
+    output(length(a))
+    return
