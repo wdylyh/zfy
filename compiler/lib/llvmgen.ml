@@ -246,6 +246,10 @@ let rec val_of fc (o : operand) : string * string =
        if n = 0L then ("null", t)
        else lerr None "pointer constant must be null"
      | _ -> (Printf.sprintf "%Ld" n, t))
+  | OBig digits ->
+    (* i128/u128 大字面量（w-014 #6）：LLVM 任意精度整数字面量按
+       目标类型截断（数字串已由 typeck 校验范围） *)
+    ((if String.length digits = 0 then "0" else digits), t)
   | OFloat f -> (float_const o.oty f, t)
   | OBool b -> ((if b then "1" else "0"), t)
   | OChar c -> (string_of_int (Char.code c), t)
@@ -589,14 +593,32 @@ let gen_cast fc d (a : operand) (t : zty) =
 
 (* 数组/列表元素的存储宽度（字节）：bool/char/i8/u8/f16 1-2、i32/f32 4、
    i64/f64/string 8、i128/u128/f128 16 *)
-let elem_width (e : zty) : int =
+let elem_width (g : gctx) (e : zty) : int =
   match e with
   | TInt 8 | TUint 8 | TBool | TChar -> 1
   | TFloat 16 | TInt 16 | TUint 16 -> 2
   | TInt 32 | TUint 32 | TFloat 32 -> 4
   | TInt 64 | TUint 64 | TFloat 64 | TString -> 8
   | TInt 128 | TUint 128 | TFloat 128 -> 16
+  | TList _ | TArray _ -> 8   (* 嵌套 seq：元素为内层 seq 指针（w-014 #4） *)
+  | TStruct _ ->              (* struct 元素：按 C 布局大小整块存储（w-014 #2） *)
+    (match e with
+     | TStruct s ->
+       (match find_struct g s with
+        | Some sd -> fst (Hir.struct_size_align g.structs sd)
+        | None -> lerr None "undefined struct in element position")
+     | _ -> assert false)
   | _ -> lerr None "unsupported array/list element type"
+
+(* 元素存储种类（w-014 #2/#4）：随 zfy_seq_new_k 写入 seq 头部，
+   运行时 free/clone/slice/set/get 按头部驱动：
+   0=标量 1=string 2=嵌套 seq 3=struct（ops 指向深拷贝/释放函数对） *)
+let elem_kind_ops (e : zty) : int * string option =
+  match e with
+  | TString -> (1, None)
+  | TList _ | TArray _ -> (2, None)
+  | TStruct s -> (3, Some ("@zfy.ops.struct." ^ s))
+  | _ -> (0, None)
 
 (* 元素读出时的扩展方式：有符号整数符号扩展，其余零扩展 *)
 let elem_signed (e : zty) : int =
@@ -613,7 +635,7 @@ let inline_elem_addr fc (seqp : string) (iv : string) (elem : zty) ~(checked : b
   if not checked then begin
     (* unsafe：跳过边界检查，直接 GEP 元素地址 *)
     let off = fresh_r fc in
-    emitf fc "  %s = mul i64 %s, %d" off iv (elem_width elem);
+    emitf fc "  %s = mul i64 %s, %d" off iv (elem_width fc.g elem);
     let ep = fresh_r fc in
     emitf fc "  %s = getelementptr inbounds i8, ptr %s, i64 %s" ep dp0 off;
     (ep, fresh_lbl fc)   (* join 标签由调用方 br 收尾（无phi，同检查路径） *)
@@ -632,7 +654,7 @@ let inline_elem_addr fc (seqp : string) (iv : string) (elem : zty) ~(checked : b
     emitf fc "  unreachable";
     emitf fc "%s:" lb;
     let off = fresh_r fc in
-    emitf fc "  %s = mul i64 %s, %d" off iv (elem_width elem);
+    emitf fc "  %s = mul i64 %s, %d" off iv (elem_width fc.g elem);
     let ep = fresh_r fc in
     emitf fc "  %s = getelementptr inbounds i8, ptr %s, i64 %s" ep dp0 off;
     (ep, jb)
@@ -748,6 +770,30 @@ let gen_input fc name (ty : zty) delim =
 let is_i128 = function TInt 128 | TUint 128 -> true | _ -> false
 
 let gen_call fc dst name (args : operand list) (ret_ty : zty) =
+  if name = "zfy_stoi_wide" then begin
+    (* string → 128 位整数 fail-fast 转换（t-016 遗留修复）：运行时以
+       返回值写低 64 位、指针写高 64 位（规避 win32 __int128 返回值
+       ABI 的 sret 隐藏指针约定），LLVM 侧拼装 i128 *)
+    (match dst, args with
+     | Some d, [ s ] ->
+       let (sp, _) = val_of fc s in
+       let hip = fresh_r fc in
+       emitf_entry fc "  %s = alloca i64" hip;
+       let lo = fresh_r fc in
+       emitf fc "  %s = call i64 @zfy_stoi_wide(ptr %s, ptr %s)" lo hip sp;
+       let hi = fresh_r fc in
+       emitf fc "  %s = load i64, ptr %s" hi hip;
+       let low = fresh_r fc in
+       emitf fc "  %s = zext i64 %s to i128" low lo;
+       let hiw = fresh_r fc in
+       emitf fc "  %s = zext i64 %s to i128" hiw hi;
+       let his = fresh_r fc in
+       emitf fc "  %s = shl i128 %s, 64" his hiw;
+       (* 结果直接绑定 dst 寄存器名（MCall 约定 regs[dst]=dst） *)
+       emitf fc "  %s = or i128 %s, %s" d low his
+     | _ -> lerr None "zfy_stoi_wide call shape error")
+  end
+  else
   match name, args with
   | "str_len", [ a ] ->
     let (v, _) = val_of fc a in
@@ -1000,6 +1046,90 @@ let gen_field_store ~(free_old : bool) fc (fp : string) (v : operand) : unit =
   | _ ->
     let (vv, tt) = val_of fc v in
     emitf fc "  store %s %s, ptr %s" tt vv fp
+
+(* 元素写入公共体（MSeqSet/MSeqSetAt/MSeqLit 共用，w-014 #3）：
+   seqp 为 seq 结构指针值。按元素宽度存储；string 元素深拷贝（数组独占
+   堆串）；非 string 且不扩长时走内联路径（边界检查 + 直接 store），
+   消除逐元素函数调用与 i128 中转槽；其余走运行时函数。 *)
+let gen_seq_set fc seqp (elem : zty) (idx : operand) (v : operand) grow unchecked =
+  let (iv, _) = val_of fc idx in
+  match elem, grow with
+  | TString, _ ->
+    let (sv, _) = val_of fc v in
+    emitf fc
+      "  call void @zfy_seq_set_str(ptr %s, i64 %s, ptr %s, i8 %d)"
+      seqp iv sv (if grow then 1 else 0)
+  | (TStruct _ | TList _ | TArray _), _ ->
+    (* 聚合元素（struct 深拷贝 / 嵌套 seq clone，w-014 #2/#4）：
+       值以指针传递——alloca 槽 load 出指针（struct 槽即槽地址、
+       seq 槽 load 出内层 seq 指针），寄存器临时（切片结果）已是
+       seq 指针值直接使用；运行时按头部 kind/ops 深拷贝进槽位
+       （先释放旧元素），扩长与边界检查同在运行时完成 *)
+    let sv =
+      match v.o with
+      | OLocal n when Hashtbl.mem fc.allocas n -> fst (ptr_of fc v)
+      | _ ->
+        (* 寄存器临时（切片结果）：落入临时槽（set_agg 的 src 须指向
+           持值槽：struct 字节 / seq 指针持有者） *)
+        let t = fresh_r fc in
+        emitf_entry fc "  %s = alloca ptr" t;
+        let (rv, _) = val_of fc v in
+        emitf fc "  store ptr %s, ptr %s" rv t;
+        t
+    in
+    emitf fc
+      "  call void @zfy_seq_set_agg(ptr %s, i64 %s, ptr %s, i8 %d)"
+      seqp iv sv (if grow then 1 else 0)
+  | _, true ->
+    (* 扩长写入（列表下标=len 追加）：仍走运行时 *)
+    let bits = bits_of fc v in
+    let slot = fresh_r fc in
+    emitf_entry fc "  %s = alloca i128" slot;
+    emitf fc "  store i128 %s, ptr %s" bits slot;
+    emitf fc
+      "  call void @zfy_seq_set_w(ptr %s, i64 %s, ptr %s, i32 %d, i8 %d)"
+      seqp iv slot (elem_width fc.g elem) 1
+  | _, false ->
+    let (ep, jb) = inline_elem_addr fc seqp iv elem ~checked:(not unchecked) in
+    let bits = bits_of fc v in
+    let w = elem_width fc.g elem * 8 in
+    (if w < 128 then begin
+       let sv = fresh_r fc in
+       emitf fc "  %s = trunc i128 %s to i%d" sv bits w;
+       emitf fc "  store i%d %s, ptr %s, align 1" w sv ep
+     end else
+       emitf fc "  store i128 %s, ptr %s, align 1" bits ep);
+    emitf fc "  br label %%%s" jb;
+    emitf fc "%s:" jb
+
+(* 嵌套定长数组行分配（w-014 #4）：新分配的外层 seq 若元素为 TArray，
+   每个元素槽写入新分配的内层行 seq（len=cap=行长度，元素种类随内层）；
+   递归处理更深嵌套。seqp 为 seq 结构指针值，count 为外层长度 *)
+let rec gen_seq_rows fc (seqp : string) (elem : zty) (count : Int64.t) =
+  match elem with
+  | TArray (ie, n) when count > 0L ->
+    let dp = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" dp seqp;   (* data 字段（偏移 0） *)
+    (* 行 seq 的头部描述"行的元素"（ie）：宽度/种类取内层层级 *)
+    let (rkind, rops) = elem_kind_ops ie in
+    let w = elem_width fc.g ie and ln = Int64.of_int n in
+    for i = 0 to Int64.to_int count - 1 do
+      let off = fresh_r fc in
+      emitf fc "  %s = mul i64 %d, 8" off i;
+      let slot = fresh_r fc in
+      emitf fc "  %s = getelementptr inbounds i8, ptr %s, i64 %s" slot dp off;
+      let row = fresh_r fc in
+      (match rops with
+       | Some og ->
+         emitf fc "  %s = call ptr @zfy_seq_new_k(i64 %Ld, i64 %Ld, i32 %d, i32 %d, ptr %s)"
+           row ln ln w rkind og
+       | None ->
+         emitf fc "  %s = call ptr @zfy_seq_new_k(i64 %Ld, i64 %Ld, i32 %d, i32 %d, ptr null)"
+           row ln ln w rkind);
+      gen_seq_rows fc row ie ln;
+      emitf fc "  store ptr %s, ptr %s" row slot
+    done
+  | _ -> ()
 
 let gen_instr fc (i : instr) : unit =
   match i with
@@ -1374,16 +1504,13 @@ let gen_instr fc (i : instr) : unit =
        emitf fc "  call void @zfy_frac_norm_%s(ptr %s)" (Hir.suffix_of elem) p
      | None -> lerr None "undefined variable %s" name)
   | MSeqRemove (name, elem, idx, is_list) ->
-    (* remove：数组=槽位填零值（string 元素先释放旧串）；列表=删除并左移，长度-1 *)
+    (* remove：数组=槽位填零值（元素资源按头部释放）；列表=删除并左移 *)
     let (seqp, _) = val_of fc (operand_of_name name (TList (TInt 64))) in
     let (iv, _) = val_of fc idx in
-    if is_list then begin
-      let free_elems = (match elem with TString -> 1 | _ -> 0) in
-      emitf fc "  call void @zfy_seq_remove(ptr %s, i64 %s, i8 %d)" seqp iv free_elems
-    end else begin
-      let free_elems = (match elem with TString -> 1 | _ -> 0) in
-      emitf fc "  call void @zfy_seq_zero(ptr %s, i64 %s, i8 %d)" seqp iv free_elems
-    end
+    if is_list then
+      emitf fc "  call void @zfy_seq_remove(ptr %s, i64 %s)" seqp iv
+    else
+      emitf fc "  call void @zfy_seq_zero(ptr %s, i64 %s)" seqp iv
   | MAugSlice (name, elem, a, b, st, bop, v) ->
     (* a[x,y:st] op= v：运行时逐元素原地运算（值经 i128 位模式缓冲传递） *)
     let (seqp, _) = val_of fc (operand_of_name name (TList (TInt 64))) in
@@ -1394,7 +1521,7 @@ let gen_instr fc (i : instr) : unit =
       | BAdd -> 0 | BSub -> 1 | BMul -> 2 | BDiv -> 3 | BMod -> 4
       | _ -> lerr None "unsupported augmented-assignment operation on slices"
     in
-    let width = elem_width elem in
+    let width = elem_width fc.g elem in
     let sgn = elem_signed elem in
     let isf = (match elem with TFloat _ -> 1 | _ -> 0) in
     let bits = fresh_r fc in
@@ -1451,10 +1578,10 @@ let gen_instr fc (i : instr) : unit =
   | MPrintVal o -> gen_print_val fc o
   | MPrintSeq (o, kind, sep) ->
     (* output(数组/列表)（w-013）：槽内是 zfy_seq 指针，长度/元素大小由
-       运行时读（data+0 / len+16 / elemsz+32），元素间以 sep 分隔 *)
-    let (slotp, _) = ptr_of fc o in
-    let sp = fresh_r fc in
-    emitf fc "  %s = load ptr, ptr %s" sp slotp;
+       运行时读（data+0 / len+16 / elemsz+32），元素间以 sep 分隔。
+       操作数可为变量槽（alloca，load 取指针）或切片等寄存器临时
+       （regs 中已是 seq 指针）——val_of 两种形态统一处理（w-014 #7） *)
+    let (sp, _) = val_of fc o in
     let (sv, _) = val_of fc sep in
     emitf fc "  call void @zfy_print_seq(ptr %s, i32 %d, ptr %s)" sp kind sv
   | MInput (name, ty, delim) -> gen_input fc name ty delim
@@ -1468,15 +1595,11 @@ let gen_instr fc (i : instr) : unit =
           emitf fc "  %s = load ptr, ptr %s" sp addr;
           emitf fc "  call void @zfy_free_str(ptr %s)" sp;
           emitf fc "  store ptr null, ptr %s" addr
-        | TArray (TString, _) | TList TString ->
-          let sp = fresh_r fc in
-          emitf fc "  %s = load ptr, ptr %s" sp addr;
-          emitf fc "  call void @zfy_seq_free(ptr %s, i8 1)" sp;
-          emitf fc "  store ptr null, ptr %s" addr
         | TArray _ | TList _ ->
+          (* 元素资源按 seq 头部 kind/ops 释放（w-014 #2/#4） *)
           let sp = fresh_r fc in
           emitf fc "  %s = load ptr, ptr %s" sp addr;
-          emitf fc "  call void @zfy_seq_free(ptr %s, i8 0)" sp;
+          emitf fc "  call void @zfy_seq_free(ptr %s)" sp;
           emitf fc "  store ptr null, ptr %s" addr
         | TStruct s ->
           (* struct：释放内含堆资源后清零槽（防重复释放） *)
@@ -1490,66 +1613,116 @@ let gen_instr fc (i : instr) : unit =
      | Some v -> emitf fc "  call void @zfy_free_str(ptr %s)" v
      | None -> lerr None "undefined temp %s" name)
   | MFreeSeqTemp (name, is_str) ->
-    (* 语句末释放临时 seq（切片结果等） *)
-    (match Hashtbl.find_opt fc.regs name with
+    (* 语句末释放临时 seq（切片结果为寄存器；MSeqLit 字面量临时为
+       alloca 持指针槽，w-014 #3——两种形态都支持） *)
+    let v =
+      match Hashtbl.find_opt fc.regs name with
+      | Some v -> Some v
+      | None ->
+        (match Hashtbl.find_opt fc.allocas name with
+         | Some (addr, _) ->
+           let r = fresh_r fc in
+           emitf fc "  %s = load ptr, ptr %s" r addr;
+           Some r
+         | None -> None)
+    in
+    (match v with
      | Some v ->
-       emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" v (if is_str then 1 else 0)
+       emitf fc "  call void @zfy_seq_free(ptr %s)" v
      | None -> lerr None "undefined temp %s" name)
   | MSeqAlloc (name, elem, len, is_list) ->
-    (* 分配数组/列表：数组 len=容量=长度；列表空起步、初始容量 8（不够自动扩长） *)
+    (* 分配数组/列表：数组 len=容量=长度；列表空起步、初始容量 8（不够自动扩长）。
+       元素种类 kind/ops 写入 seq 头部（w-014 #2/#4） *)
     let (slotp, _) = ptr_of fc (operand_of_name name (TList (TInt 64))) in
     let (cnt, cap) =
       if is_list then (0L, 8L)
       else (len, max len 1L)
     in
+    let (kind, ops) = elem_kind_ops elem in
     let r = fresh_r fc in
-    emitf fc "  %s = call ptr @zfy_seq_new(i64 %Ld, i64 %Ld, i32 %d)"
-      r cnt cap (elem_width elem);
+    (match ops with
+     | Some og ->
+       emitf fc "  %s = call ptr @zfy_seq_new_k(i64 %Ld, i64 %Ld, i32 %d, i32 %d, ptr %s)"
+         r cnt cap (elem_width fc.g elem) kind og
+     | None ->
+       emitf fc "  %s = call ptr @zfy_seq_new_k(i64 %Ld, i64 %Ld, i32 %d, i32 %d, ptr null)"
+         r cnt cap (elem_width fc.g elem) kind);
+    gen_seq_rows fc r elem cnt;
     emitf fc "  store ptr %s, ptr %s" r slotp
   | MSeqSet (name, elem, idx, v, grow, unchecked) ->
-    (* 元素写入：按元素宽度存储；string 元素深拷贝（数组独占堆串）。
-       非 string 且不扩长时走内联路径（边界检查 + 直接 store），
-       消除逐元素函数调用与 i128 中转槽；其余走运行时函数。 *)
     let (seqp, _) = val_of fc (operand_of_name name (TList (TInt 64))) in
-    let (iv, _) = val_of fc idx in
-    (match elem, grow with
-     | TString, _ ->
-       let (sv, _) = val_of fc v in
-       emitf fc
-         "  call void @zfy_seq_set_str(ptr %s, i64 %s, ptr %s, i8 %d)"
-         seqp iv sv (if grow then 1 else 0)
-     | _, true ->
-       (* 扩长写入（列表下标=len 追加）：仍走运行时 *)
-       let bits = bits_of fc v in
-       let slot = fresh_r fc in
-       emitf_entry fc "  %s = alloca i128" slot;
-       emitf fc "  store i128 %s, ptr %s" bits slot;
-       emitf fc
-         "  call void @zfy_seq_set_w(ptr %s, i64 %s, ptr %s, i32 %d, i8 %d)"
-         seqp iv slot (elem_width elem) 1
-     | _, false ->
-       let (ep, jb) = inline_elem_addr fc seqp iv elem ~checked:(not unchecked) in
-       let bits = bits_of fc v in
-       let w = elem_width elem * 8 in
-       (if w < 128 then begin
-          let sv = fresh_r fc in
-          emitf fc "  %s = trunc i128 %s to i%d" sv bits w;
-          emitf fc "  store i%d %s, ptr %s, align 1" w sv ep
-        end else
-          emitf fc "  store i128 %s, ptr %s, align 1" bits ep);
-       emitf fc "  br label %%%s" jb;
-       emitf fc "%s:" jb)
+    gen_seq_set fc seqp elem idx v grow unchecked
+  | MSeqSetAt (slot, elem, idx, v, grow, unchecked) ->
+    (* 槽地址版元素写（w-014 #3）：槽地址（字段链 GEP / ref 解引用 /
+       元素槽）先 load 出 seq 指针，再走与 MSeqSet 相同的写入路径 *)
+    let (sp, _) = val_of fc slot in
+    let seqp = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" seqp sp;
+    gen_seq_set fc seqp elem idx v grow unchecked
+  | MLoadSeq (d, slot) ->
+    (* 从槽地址 load seq 指针（w-014 #3） *)
+    let (sp, _) = val_of fc slot in
+    let r = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" r sp;
+    Hashtbl.replace fc.regs d r
+  | MSeqLit (d, elem, vs) ->
+    (* 序列字面量（w-014 #3）：目标为 %tN 临时——自行 alloca 一个持
+       seq 指针的槽并登记 allocas；分配 len=cap=元素个数 的 seq
+       （元素种类 kind/ops 随头部）后逐元素写入（下标静态，免边界检查） *)
+    let addr = fresh_r fc in
+    emitf_entry fc "  %s = alloca ptr" addr;
+    Hashtbl.replace fc.allocas d (addr, TList (TInt 64));
+    let n = Int64.of_int (List.length vs) in
+    let (kind, ops) = elem_kind_ops elem in
+    let r = fresh_r fc in
+    (match ops with
+     | Some og ->
+       emitf fc "  %s = call ptr @zfy_seq_new_k(i64 %Ld, i64 %Ld, i32 %d, i32 %d, ptr %s)"
+         r n (max n 1L) (elem_width fc.g elem) kind og
+     | None ->
+       emitf fc "  %s = call ptr @zfy_seq_new_k(i64 %Ld, i64 %Ld, i32 %d, i32 %d, ptr null)"
+         r n (max n 1L) (elem_width fc.g elem) kind);
+    emitf fc "  store ptr %s, ptr %s" r addr;
+    List.iteri
+      (fun i v ->
+        let idx = op (OInt (Int64.of_int i)) (TInt 64) in
+        gen_seq_set fc r elem idx v false true)
+      vs
+  | MFreeVal (o, ty) ->
+    (* 释放寄存器持有的堆值（w-014 #3） *)
+    let (v, _) = val_of fc o in
+    (match ty with
+     | TString -> emitf fc "  call void @zfy_free_str(ptr %s)" v
+     | TList _ | TArray _ ->
+       emitf fc "  call void @zfy_seq_free(ptr %s)" v
+     | _ -> lerr None "MFreeVal: type does not own heap resources")
   | MSeqGet (d, base, idx, elem, unchecked) ->
-    (* 非 string 元素走内联路径：边界检查 + 直接 load 元素位模式，
+    (* 聚合元素（struct/嵌套 seq，w-014 #2/#4）：运行时深拷贝出独立
+       副本到目标槽（struct 临时 / 持 seq 指针的槽，值语义）。
+       非 string 标量走内联路径：边界检查 + 直接 load 元素位模式，
        再按元素类型还原（窄整数截断/位转换）；string 仍走运行时。 *)
     (match elem with
+     | TStruct _ | TList _ | TArray _ ->
+       let (seqp, _) = val_of fc base in
+       let (iv, _) = val_of fc idx in
+       let dst_addr = fresh_r fc in
+       (match elem with
+        | TStruct _ ->
+          emitf_entry fc "  %s = alloca %s" dst_addr (ll_ty elem);
+          Hashtbl.replace fc.allocas d (dst_addr, elem);
+          emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty elem) dst_addr
+        | _ ->
+          emitf_entry fc "  %s = alloca ptr" dst_addr;
+          Hashtbl.replace fc.allocas d (dst_addr, TList (TInt 64)));
+       emitf fc "  call void @zfy_seq_get_agg(ptr %s, i64 %s, ptr %s)"
+         seqp iv dst_addr
      | TString ->
        let tmp = fresh_r fc in
        emitf_entry fc "  %s = alloca i128" tmp;
        let (seqp, _) = val_of fc base in
        let (iv, _) = val_of fc idx in
        emitf fc "  call void @zfy_seq_get(ptr %s, i64 %s, ptr %s, i32 %d, i8 %d)"
-         seqp iv tmp (elem_width elem) (elem_signed elem);
+         seqp iv tmp (elem_width fc.g elem) (elem_signed elem);
        let raw = fresh_r fc in
        emitf fc "  %s = load i128, ptr %s" raw tmp;
        let (v, _) = from_bits fc raw elem in
@@ -1559,7 +1732,7 @@ let gen_instr fc (i : instr) : unit =
        let (iv, _) = val_of fc idx in
        let (ep, jb) = inline_elem_addr fc seqp iv elem ~checked:(not unchecked) in
        let raw = fresh_r fc in
-       let w = elem_width elem * 8 in
+       let w = elem_width fc.g elem * 8 in
        emitf fc "  %s = load i%d, ptr %s, align 1" raw w ep;
        (* 按元素宽度读出后扩展回 i128 位模式（窄整数符号扩展，复刻
           运行时 zfy_seq_get 语义），再交给 from_bits 还原元素类型 *)
@@ -1584,15 +1757,16 @@ let gen_instr fc (i : instr) : unit =
     let r = fresh_r fc in
     emitf fc "  %s = load i64, ptr %s" r lp;
     Hashtbl.replace fc.regs d r
-  | MSeqSlice (d, src, a, b, st, is_str) ->
-    (* 数组/列表切片：运行时生成新 seq（元素深拷贝，string 元素 strdup） *)
+  | MSeqSlice (d, src, a, b, st, _is_str) ->
+    (* 数组/列表切片：运行时生成新 seq（元素按头部 kind/ops 深拷贝，
+       w-014 #2/#4——is_str 标志已废退役保留占位） *)
     let (sv, _) = val_of fc src in
     let (av, _) = val_of fc a in
     let (bv, _) = val_of fc b in
     let (stv, _) = val_of fc st in
     let r = fresh_r fc in
-    emitf fc "  %s = call ptr @zfy_seq_slice(ptr %s, i64 %s, i64 %s, i64 %s, i8 %d)"
-      r sv av bv stv (if is_str then 1 else 0);
+    emitf fc "  %s = call ptr @zfy_seq_slice(ptr %s, i64 %s, i64 %s, i64 %s)"
+      r sv av bv stv;
     Hashtbl.replace fc.regs d r
   | MStructNew (d, ty, fields) ->
     (* struct 构造：聚合槽清零后逐字段写入（槽已清零，无需释放旧值；
@@ -1644,16 +1818,24 @@ let gen_instr fc (i : instr) : unit =
     gen_field_store ~free_old:true fc fp v
   | MEmptySeq (d, ty) ->
     (* 数组/列表字段缺省分配：定长数组按声明长度分配全零槽；
-       列表空起步（长度 0、容量 8，随 push 扩容） *)
+       列表空起步（长度 0、容量 8，随 push 扩容）。
+       元素种类 kind/ops 随头部；嵌套定长数组递归分配内层行（w-014 #4） *)
     let (elem, len, cap) =
       match ty with
       | TArray (et, n) -> (et, Int64.of_int n, Int64.of_int n)
       | TList et -> (et, 0L, 8L)
       | _ -> lerr None "MEmptySeq type is not an array/list"
     in
+    let (kind, ops) = elem_kind_ops elem in
     let r = fresh_r fc in
-    emitf fc "  %s = call ptr @zfy_seq_new(i64 %Ld, i64 %Ld, i32 %d)" r len cap
-      (elem_width elem);
+    (match ops with
+     | Some og ->
+       emitf fc "  %s = call ptr @zfy_seq_new_k(i64 %Ld, i64 %Ld, i32 %d, i32 %d, ptr %s)"
+         r len cap (elem_width fc.g elem) kind og
+     | None ->
+       emitf fc "  %s = call ptr @zfy_seq_new_k(i64 %Ld, i64 %Ld, i32 %d, i32 %d, ptr null)"
+         r len cap (elem_width fc.g elem) kind);
+    gen_seq_rows fc r elem len;
     Hashtbl.replace fc.regs d r
   | MAddrOf (d, slot) ->
     (* 取地址：dst = 变量槽地址（全局 @g.x 与局部 %v.x 都登记在 allocas） *)
@@ -1683,11 +1865,29 @@ let gen_instr fc (i : instr) : unit =
     in
     let fp = gen_field_path fc rp base_ty idxs in
     Hashtbl.replace fc.regs d fp
-  | MElemAddr (d, base, idx, elem) ->
-    (* 元素地址（裸指针，无越界检查）：&a[i] 或 &p[i]。
+  | MElemAddr (d, base, idx, elem, checked) ->
+    (* 元素地址：&a[i] / &p[i]（显式取地址无越界检查）或写目标定位
+       （checked=1 时先做 icmp ult 边界检查，w-014 #3）。
        基为数组/列表槽（值=seq 指针，再取 data 字段）或指针值（直接指向元素） *)
     let (bp, _) = val_of fc base in
     let (iv, _) = val_of fc idx in
+    let jb =
+      if checked then begin
+        let lenp = fresh_r fc in
+        emitf fc "  %s = getelementptr inbounds %%zfy.seq, ptr %s, i32 0, i32 2" lenp bp;
+        let len = fresh_r fc in
+        emitf fc "  %s = load i64, ptr %s" len lenp;
+        let ok = fresh_r fc in
+        emitf fc "  %s = icmp ult i64 %s, %s" ok iv len;
+        let lb = fresh_lbl fc and fb = fresh_lbl fc and jb' = fresh_lbl fc in
+        emitf fc "  br i1 %s, label %%%s, label %%%s" ok lb fb;
+        emitf fc "%s:" fb;
+        emitf fc "  call void @zfy_bounds_fail()";
+        emitf fc "  unreachable";
+        emitf fc "%s:" lb;
+        jb'
+      end else ""
+    in
     let dp =
       match base.oty with
       | TArray _ | TList _ ->
@@ -1699,9 +1899,13 @@ let gen_instr fc (i : instr) : unit =
       | _ -> lerr None "invalid root type for element address"
     in
     let off = fresh_r fc in
-    emitf fc "  %s = mul i64 %s, %d" off iv (elem_width elem);
+    emitf fc "  %s = mul i64 %s, %d" off iv (elem_width fc.g elem);
     let ep = fresh_r fc in
     emitf fc "  %s = getelementptr inbounds i8, ptr %s, i64 %s" ep dp off;
+    (if checked then begin
+       emitf fc "  br label %%%s" jb;
+       emitf fc "%s:" jb
+     end);
     Hashtbl.replace fc.regs d ep
   | MIndirectCall (d, f, args, ret) ->
     (* 函数指针间接调用：call <ret> ptr %f(<args>)（实参标量语义借传） *)
@@ -1971,7 +2175,7 @@ let gen_program (m : mir) : string =
         (Printf.sprintf "%%frac.%s = type { %s, %s }\n" suf ll ll))
     frac_defs;
   (* 数组/列表与类型定义 *)
-  Buffer.add_string g.mbuf "%zfy.seq = type { ptr, ptr, i64 }\n";
+  Buffer.add_string g.mbuf "%zfy.seq = type { ptr, ptr, i64, i64, i64, i32, ptr }\n";
   (* 错误值类型定义：{ i32 code; ptr msg; <8 字节 value 容器> }（全部 24 字节，
      与 C 端 zfy_err 布局一致；预生成全部后缀，未使用的定义合法） *)
   let err_defs =
@@ -1993,6 +2197,15 @@ let gen_program (m : mir) : string =
     (fun sd ->
       Buffer.add_string g.mbuf (gen_struct_free_fn sd);
       Buffer.add_string g.mbuf (gen_struct_assign_fn sd))
+    m.mstructs;
+  (* 每个 struct 的元素操作对（w-014 #2）：struct 作 seq 元素时
+     zfy_seq_set_agg/get_agg/free 按头部 ops 深拷贝/释放 *)
+  List.iter
+    (fun sd ->
+      Buffer.add_string g.mbuf
+        (Printf.sprintf
+           "@zfy.ops.struct.%s = constant { ptr, ptr } { ptr @zfy_struct_assign_%s, ptr @zfy_struct_free_%s }\n"
+           sd.sname sd.sname sd.sname))
     m.mstructs;
   (* 运行时声明 *)
   Buffer.add_string g.mbuf "declare i64 @strlen(ptr)\n";
@@ -2030,11 +2243,16 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_input_f64(ptr, ptr, i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_bool(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_char(ptr, ptr)\n";
-  (* 数组/列表运行时函数（按元素宽度存储，未初始化槽位填零值） *)
+  (* 数组/列表运行时函数（按元素宽度存储，未初始化槽位填零值）。
+     zfy_seq 头部携带元素种类 kind/ops（w-014 #2/#4）：
+     free/clone/slice/set_agg/get_agg 全部头部驱动，无需逐调用点传标志 *)
   Buffer.add_string g.mbuf "declare ptr @zfy_seq_new(i64, i64, i32)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_seq_new_k(i64, i64, i32, i32, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_seq_set_w(ptr, i64, ptr, i32, i8)\n";
   Buffer.add_string g.mbuf "declare void @zfy_seq_set_str(ptr, i64, ptr, i8)\n";
   Buffer.add_string g.mbuf "declare void @zfy_seq_get(ptr, i64, ptr, i32, i8)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_seq_set_agg(ptr, i64, ptr, i8)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_seq_get_agg(ptr, i64, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_bounds_fail()\n";
   (* ZEM 错误模型运行时：panic / 错误值构造（sret 写 TErr 聚合） /
      错误码查找 / T! 输入；sret 参数为首个 ptr（布局由调用方槽决定） *)
@@ -2042,16 +2260,19 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_set_panic_handler(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_stoi_err(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_stod_err(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_stoi_wide(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare x86_fp80 @zfy_stod_wide(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_err_find(ptr, ptr, i8, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_i64(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_f64(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_str(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_bool(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_char(ptr, ptr)\n";
-  Buffer.add_string g.mbuf "declare void @zfy_seq_free(ptr, i8)\n";
-  Buffer.add_string g.mbuf "declare ptr @zfy_seq_clone(ptr, i8)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_seq_free(ptr)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_seq_clone(ptr)\n";
   (* 字符串操作运行时函数 *)
   Buffer.add_string g.mbuf "declare i8 @zfy_str_char(ptr, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_str_set(ptr, i64, i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_slice(ptr, i64, i64, i64)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_str_find(ptr, i8, i64)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_trim(ptr, i8)\n";
@@ -2065,7 +2286,7 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare ptr @zfy_str_append_n(ptr, ptr, i64)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split(ptr, i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split_str(ptr, ptr)\n";
-  Buffer.add_string g.mbuf "declare ptr @zfy_seq_slice(ptr, i64, i64, i64, i8)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_seq_slice(ptr, i64, i64, i64)\n";
   (* frac 运行时函数声明（12 后缀 × add/sub/mul/div + 比较 + reduce/print） *)
   let sufs = [ "i8"; "i16"; "i32"; "i64"; "i128"; "u8"; "u16"; "u32"; "u64";
                "u128"; "f32"; "f64"; "f128" ] in
@@ -2092,9 +2313,9 @@ let gen_program (m : mir) : string =
       Buffer.add_string g.mbuf
         (Printf.sprintf "declare ptr @zfy_frac_str_%s(ptr)\n" suf))
     sufs;
-  (* remove 运行时函数：数组槽位填零 / 列表删除并左移 *)
-  Buffer.add_string g.mbuf "declare void @zfy_seq_zero(ptr, i64, i8)\n";
-  Buffer.add_string g.mbuf "declare void @zfy_seq_remove(ptr, i64, i8)\n";
+  (* remove 运行时函数：数组槽位填零 / 列表删除并左移（元素资源按头部释放） *)
+  Buffer.add_string g.mbuf "declare void @zfy_seq_zero(ptr, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_seq_remove(ptr, i64)\n";
   Buffer.add_string g.mbuf
     "declare void @zfy_seq_aug_range(ptr, i64, i64, i64, i32, ptr, i32, i32, i32)\n";
   (* 函数 *)

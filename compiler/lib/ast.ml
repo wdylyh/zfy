@@ -1,7 +1,8 @@
 (* zfy 抽象语法树（Parser 产物，未做语义分析） *)
 open Tokens
 
-(* 类型：裸名字（i8..f128 / bool / char / string / void / struct 名 / type 别名），
+(* 类型与表达式互递归定义（w-014 #1：TSeqN 的定长带表达式长度）：
+   类型：裸名字（i8..f128 / bool / char / string / void / struct 名 / type 别名），
    加指针 T*（T* const 为不可变指针）与函数类型（仅 type 别名处允许） *)
 type ty =
   | TNamed of string * pos
@@ -10,17 +11,23 @@ type ty =
   | TErr of ty * pos                  (* T!：可失败值（错误模型 ZEM） *)
   | TFun of ty * ty list * pos        (* 返回类型, 参数类型列表（仅 type 别名） *)
   | TApp of string * ty list * pos    (* 泛型实例化：Box<i32, T*>（名字 + 类型实参） *)
+  | TSeq of ty * pos                  (* T[]：动态数组/列表（类型后缀形式，w-014 #1） *)
+  | TSeqN of ty * expr * pos          (* T[N]：定长数组（类型后缀形式；N 须整数字面量，
+                                         声明/参数处仍可用完整表达式长度） *)
 
-type binop = Add | Sub | Mul | Div | Mod | Eq | Ne | Lt | Gt | Le | Ge | And | Or
-type unop = Neg | Not
+and binop = Add | Sub | Mul | Div | Mod | Eq | Ne | Lt | Gt | Le | Ge | And | Or
+
+and unop = Neg | Not
 
 (* input 的目标：声明新变量（<类型> 名）或使用已有变量（名） *)
-type in_target =
+and in_target =
   | InNew of string * ty * pos
   | InUse of string * pos
 
-type expr =
+and expr =
   | EInt of int64 * pos
+  | EBigInt of string * pos       (* 超出 i64 的十进制大字面量（w-014 #6）：
+                                     仅在 i128/u128 期望上下文合法 *)
   | EFloat of float * pos
   | EStr of string * pos
   | EChar of char * pos
@@ -58,6 +65,9 @@ and stmt =
        修饰符（const/frac/unred），初值各自独立；仅语句位置（顶层与 for
        头部保持单声明器，避免与 for 头逗号段冲突） *)
   | SAssign of expr * expr * pos
+  | SAssignList of expr * expr list * pos
+    (* 序列字面量整体赋值（w-014 #3）：a = 1, 2, 3 / bag.xs = 1, 2——
+       目标须为数组/列表槽（变量/字段链/ref 解引用），元素逐个检查 *)
   | SAug of binop * expr * expr * pos      (* 复合赋值：lhs op= rhs（左值地址只求值一次） *)
   | SInc of expr * pos                     (* x++（仅后缀） *)
   | SDec of expr * pos                     (* x--（仅后缀） *)

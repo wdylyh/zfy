@@ -120,6 +120,42 @@ void zfy_stod_err(zfy_err *out, const char *s) {
     }
 }
 
+/* string -> 128 位整数（fail-fast：解析失败/溢出直接终止；w-014 顺带修
+ * t-016 遗留——128 位目标无 8 字节错误值容器，走独立转换通道）。
+ * 返回低 64 位，*hi 写高 64 位（LLVM 侧拼装 i128，规避 win32 __int128
+ * 返回值 ABI 的 sret 隐藏指针约定） */
+long long zfy_stoi_wide(long long *hi, const char *s) {
+    unsigned __int128 v = 0;
+    const char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    int neg = 0;
+    if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+    if (*p < '0' || *p > '9') zfy_die("cast：无法把 string 解析为整数");
+    for (; *p >= '0' && *p <= '9'; p++) {
+        unsigned d = (unsigned)(*p - '0');
+        if (v > ((~(unsigned __int128)0) - d) / 10)
+            zfy_die("cast：整数超出 128 位范围");
+        v = v * 10 + d;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\0') zfy_die("cast：无法把 string 解析为整数（尾随字符）");
+    if (neg) {
+        if (v > (unsigned __int128)1 << 127)
+            zfy_die("cast：整数超出 128 位范围");
+        v = (unsigned __int128)0 - v;
+    }
+    *hi = (long long)(unsigned long long)(v >> 64);
+    return (long long)(unsigned long long)v;
+}
+
+/* string -> f128（fail-fast；x86_fp80 经 x87 st0 返回，与 LLVM 调用约定一致） */
+long double zfy_stod_wide(const char *s) {
+    char *end;
+    long double v = strtold(s, &end);
+    if (end == s) zfy_die("cast：无法把 string 解析为浮点数");
+    return v;
+}
+
 /* find(s, c, k)：第 k 次出现的下标；未找到产 NOT_FOUND 错误 */
 void zfy_err_find(zfy_err *out, const char *s, char c, long long k) {
     if (k < 1) {
@@ -958,20 +994,39 @@ void zfy_input_err_char(zfy_err *out, const char *delim) {
 
 /* ---------- 数组/列表运行时支持（按元素宽度存储） ---------- */
 
-/* 定长数组与列表统一表示（与 LLVM 的 %zfy.seq = { ptr, ptr, i64 } 前三字段
- * 布局一致，len 在偏移 16；第二字段为占位（历史 present 位图，现已废弃），
- * cap/elemsz 仅供运行时内部使用）：
+/* 前置声明：元素级操作按头部 kind 递归释放/复制嵌套 seq（w-014 #2/#4） */
+typedef struct zfy_ops zfy_ops;
+typedef struct zfy_seq zfy_seq;
+zfy_seq *zfy_seq_new(long long count, long long cap, long long elemsz);
+zfy_seq *zfy_seq_new_k(long long count, long long cap, long long elemsz,
+                       int kind, zfy_ops *ops);
+zfy_seq *zfy_seq_clone(const zfy_seq *src);
+void zfy_seq_free(zfy_seq *s);
+
+/* 定长数组与列表统一表示（与 LLVM 的 %zfy.seq = { ptr, ptr, i64, i64, i64, i32, ptr }
+ * 前五字段布局一致，len 在偏移 16；第二字段为占位（历史 present 位图，现已废弃），
+ * cap/elemsz/kind/ops 供运行时元素操作使用（w-014 #2/#4）：
  *  - data：元素按 elemsz 字节连续存储，未初始化槽位为全零位模式
  *  - len：当前元素个数（定长数组不变，列表可扩长）
  *  - cap：容量（列表扩长用）
- *  - elemsz：元素字节数 */
-typedef struct {
+ *  - elemsz：元素字节数
+ *  - kind：元素种类 0=标量 1=string 2=嵌套 seq（列表的列表/二维数组）
+ *          3=struct（ops 指向深拷贝/释放函数对）
+ *  - ops：kind=3 时的 struct 元素操作（copy/dtor），其余 NULL */
+typedef struct zfy_ops {
+    void (*copy)(void *dst, const void *src);  /* 深拷贝 src → dst（dst 须为已定位槽） */
+    void (*dtor)(void *elem);                  /* 释放元素内含堆资源 */
+} zfy_ops;
+
+struct zfy_seq {
     void *data;
     void *_pad;
     long long len;
     long long cap;
     long long elemsz;
-} zfy_seq;
+    int kind;
+    zfy_ops *ops;
+};
 
 /* 分配一个全零位模式槽位的数组/列表（数值 0、bool false、char '\0'、string NULL） */
 zfy_seq *zfy_seq_new(long long count, long long cap, long long elemsz) {
@@ -984,9 +1039,54 @@ zfy_seq *zfy_seq_new(long long count, long long cap, long long elemsz) {
     s->elemsz = elemsz;
     s->data = malloc((size_t)cap * (size_t)elemsz);
     s->_pad = NULL;
+    s->kind = 0;
+    s->ops = NULL;
     if (!s->data) zfy_die("数组: 内存分配失败");
     memset(s->data, 0, (size_t)cap * (size_t)elemsz);
     return s;
+}
+
+/* 带元素种类的分配（w-014 #2/#4）：kind/ops 随头部传递，后续
+   free/clone/slice/set/get 全部按头部驱动，无需逐调用点传标志 */
+zfy_seq *zfy_seq_new_k(long long count, long long cap, long long elemsz,
+                       int kind, zfy_ops *ops) {
+    zfy_seq *s = zfy_seq_new(count, cap, elemsz);
+    s->kind = kind;
+    s->ops = ops;
+    return s;
+}
+
+/* ---- 元素级操作（按头部 kind/ops 分派） ---- */
+
+/* 释放单个元素内含的堆资源（槽位本身归 seq 数据缓冲所有） */
+static void elem_dtor(void *elem, int kind, zfy_ops *ops) {
+    switch (kind) {
+    case 1: zfy_free_str(*(char **)elem); break;
+    case 2: zfy_seq_free(*(zfy_seq **)elem); break;
+    case 3: if (ops) ops->dtor(elem); break;
+    default: break;
+    }
+}
+
+/* 把 src 元素深拷贝进"新分配全零"槽（无旧资源，读/clone 路径） */
+static void elem_init(void *dst, const void *src, int kind, zfy_ops *ops,
+                      long long esz) {
+    switch (kind) {
+    case 1: *(char **)dst = zfy_strdup(*(char *const *)src); break;
+    case 2: *(zfy_seq **)dst = zfy_seq_clone(*(zfy_seq *const *)src); break;
+    case 3: if (ops) ops->copy(dst, src); else memcpy(dst, src, (size_t)esz); break;
+    default: memcpy(dst, src, (size_t)esz); break;
+    }
+}
+
+/* 把 src 元素深拷贝进"已有元素"槽（覆盖写路径：先释放旧资源） */
+static void elem_assign(void *dst, const void *src, int kind, zfy_ops *ops,
+                        long long esz) {
+    if (kind != 0) {
+        elem_dtor(dst, kind, ops);
+        memset(dst, 0, (size_t)esz);
+    }
+    elem_init(dst, src, kind, ops, esz);
 }
 
 /* output(数组/列表)（w-013）：按元素类型码打印序列，元素间以 sep 分隔。
@@ -1091,59 +1191,72 @@ void zfy_seq_get(const zfy_seq *s, long long idx, void *out, int width,
     memcpy(out, &bits, 16);
 }
 
-/* 释放 seq：free_elems=1 时逐元素释放堆串（string 数组/列表；零值槽 free(NULL) 安全） */
-void zfy_seq_free(zfy_seq *s, unsigned char free_elems) {
+/* 释放 seq：按头部 kind/ops 逐元素释放内含堆资源（w-014 #2/#4）；
+   零值槽 free(NULL)/空 struct 释放均安全 */
+void zfy_seq_free(zfy_seq *s) {
     if (!s) return;
-    if (free_elems)
-        for (long long i = 0; i < s->len; i++)
-            free(*(char **)seq_at(s, i));
+    for (long long i = 0; i < s->len; i++)
+        elem_dtor(seq_at(s, i), s->kind, s->ops);
     free(s->data);
     free(s);
 }
 
-/* 深拷贝 seq（数组/列表整体赋值）：string 元素一并复制 */
-zfy_seq *zfy_seq_clone(const zfy_seq *src, unsigned char is_str) {
+/* 深拷贝 seq（数组/列表整体赋值/元素读出）：按头部 kind/ops 逐元素复制 */
+zfy_seq *zfy_seq_clone(const zfy_seq *src) {
     if (!src) return NULL;
     zfy_seq *s = (zfy_seq *)malloc(sizeof(zfy_seq));
     if (!s) zfy_die("数组赋值: 内存分配失败");
     s->len = src->len;
     s->cap = src->len > 0 ? src->len : 1;
     s->elemsz = src->elemsz;
+    s->kind = src->kind;
+    s->ops = src->ops;
     s->_pad = NULL;
     s->data = malloc((size_t)s->cap * (size_t)s->elemsz);
     if (!s->data) zfy_die("数组赋值: 内存分配失败");
-    memcpy(s->data, src->data, (size_t)src->len * (size_t)src->elemsz);
-    memset((char *)s->data + (size_t)src->len * (size_t)src->elemsz, 0,
-           (size_t)(s->cap - src->len) * (size_t)src->elemsz);
-    if (is_str)
-        for (long long i = 0; i < s->len; i++) {
-            char **slot = (char **)seq_at(s, i);
-            *slot = zfy_strdup(*slot);
-        }
+    memset(s->data, 0, (size_t)s->cap * (size_t)s->elemsz);
+    for (long long i = 0; i < s->len; i++)
+        elem_init(seq_at(s, i), seq_at(src, i), s->kind, s->ops, s->elemsz);
     return s;
 }
 
 /* remove(数组, idx)：把 idx 槽位填零值（长度不变）。
- * string 元素先释放旧堆串（零值槽 free(NULL) 安全）；越界报错 */
-void zfy_seq_zero(zfy_seq *s, long long idx, unsigned char free_elems) {
+ * 元素内含堆资源先按头部释放；越界报错 */
+void zfy_seq_zero(zfy_seq *s, long long idx) {
     if (!s) zfy_die("remove: 源为空");
     if (idx < 0 || idx >= s->len) zfy_die("remove: 数组下标越界");
     void *slot = seq_at(s, idx);
-    if (free_elems) zfy_free_str(*(char **)slot);
+    elem_dtor(slot, s->kind, s->ops);
     memset(slot, 0, (size_t)s->elemsz);
 }
 
 /* remove(列表, idx)：删除第 idx 个元素，后续元素左移，长度 -1。
- * string 元素（free_elems=1）先释放被删的堆串；越界报错 */
-void zfy_seq_remove(zfy_seq *s, long long idx, unsigned char free_elems) {
+ * 被删元素内含堆资源先按头部释放；越界报错 */
+void zfy_seq_remove(zfy_seq *s, long long idx) {
     if (!s) zfy_die("remove: 源为空");
     if (idx < 0 || idx >= s->len) zfy_die("remove: 列表下标越界");
     void *slot = seq_at(s, idx);
-    if (free_elems) zfy_free_str(*(char **)slot);
+    elem_dtor(slot, s->kind, s->ops);
     memmove(slot, (char *)slot + s->elemsz,
             (size_t)(s->len - idx - 1) * (size_t)s->elemsz);
     s->len--;
     memset((char *)s->data + s->len * s->elemsz, 0, (size_t)s->elemsz);
+}
+
+/* 聚合元素写入（w-014 #2/#4）：src 为指向元素值的指针（struct 槽 /
+   持 seq 指针的槽），按头部 kind/ops 深拷贝进槽位（先释放旧元素）。
+   标量 kind 也走此路径时按位拷贝（与 zfy_seq_set_w 等价）。 */
+void zfy_seq_set_agg(zfy_seq *s, long long idx, const void *src,
+                     unsigned char grow) {
+    seq_check(s, idx, grow);
+    elem_assign(seq_at(s, idx), src, s->kind, s->ops, s->elemsz);
+}
+
+/* 聚合元素读出（w-014 #2/#4）：dst 为已分配的全零槽（struct 临时 /
+   持 seq 指针的槽），按头部 kind/ops 深拷贝出独立副本（值语义） */
+void zfy_seq_get_agg(const zfy_seq *s, long long idx, void *dst) {
+    if (idx < 0 || idx >= s->len) zfy_die("数组/列表下标越界");
+    elem_init(dst, seq_at(s, idx), s->kind, s->ops, s->elemsz);
 }
 
 /* 切片复合赋值 a[a..b:step] op= v：对区间内每个元素原地做 op（逐元素读-算-写）。
@@ -1246,24 +1359,18 @@ void zfy_seq_aug_range(zfy_seq *s, long long a, long long b, long long step,
     }
 }
 
-/* 切片 base[a..b]（两端含，步长 step）：越界报错退出；返回新 seq（深拷贝）。
- * string 元素（is_str=1）对每个元素 strdup，保证切片独占堆串 */
+/* 切片 base[a..b]（两端含，步长 step）：越界报错退出；返回新 seq。
+ * 元素按头部 kind/ops 逐个深拷贝，保证切片独占堆资源（w-014 #2/#4） */
 zfy_seq *zfy_seq_slice(const zfy_seq *s, long long a, long long b,
-                       long long step, unsigned char is_str) {
+                       long long step) {
     if (!s) zfy_die("切片: 源为空");
     if (step < 1) zfy_die("切片步长必须 >= 1");
     if (a < 0 || b >= s->len || a > b) zfy_die("切片区间越界");
     long long n = (b - a) / step + 1;
-    zfy_seq *r = zfy_seq_new(n, n, s->elemsz);
+    zfy_seq *r = zfy_seq_new_k(n, n, s->elemsz, s->kind, s->ops);
     long long j = 0;
-    for (long long i = a; i <= b; i += step, j++) {
-        if (is_str) {
-            char *dup = zfy_strdup(*(char **)seq_at(s, i));
-            memcpy(seq_at(r, j), &dup, sizeof(dup));
-        } else {
-            memcpy(seq_at(r, j), seq_at(s, i), (size_t)s->elemsz);
-        }
-    }
+    for (long long i = a; i <= b; i += step, j++)
+        elem_init(seq_at(r, j), seq_at(s, i), s->kind, s->ops, s->elemsz);
     return r;
 }
 
@@ -1274,6 +1381,15 @@ char zfy_str_char(const char *s, long long idx) {
     long long n = (long long)strlen(s);
     if (idx < 0 || idx >= n) zfy_die("字符串下标越界");
     return s[idx];
+}
+
+/* s[i] = c：string 下标写字符（w-014 #5）。s 须为槽独占堆串
+ * （MCopy strdup 保证），原地写安全；越界报错 */
+void zfy_str_set(char *s, long long idx, char c) {
+    if (!s) zfy_die("字符串下标写: 源为空");
+    long long n = (long long)strlen(s);
+    if (idx < 0 || idx >= n) zfy_die("字符串下标越界");
+    s[idx] = c;
 }
 
 /* s[a..b]（两端含），按步长 step 收集字符，返回 malloc 新串 */
@@ -1429,7 +1545,7 @@ static zfy_seq *split_impl(const char *s, char c, const char *delim) {
     size_t dl = (c >= 0) ? 1 : strlen(delim);
     if (dl == 0) {
         /* 空分隔符：不切分，返回单段 [s] */
-        zfy_seq *seq = zfy_seq_new(1, 1, 8);
+        zfy_seq *seq = zfy_seq_new_k(1, 1, 8, 1, NULL);
         char *seg = zfy_strdup(s);
         memcpy(seq_at(seq, 0), &seg, sizeof(seg));
         return seq;
@@ -1441,7 +1557,7 @@ static zfy_seq *split_impl(const char *s, char c, const char *delim) {
             (c < 0 && (size_t)(p - s) + dl <= sl &&
              memcmp(p, delim, dl) == 0))
             cnt++;
-    zfy_seq *seq = zfy_seq_new(cnt, cnt, 8);
+    zfy_seq *seq = zfy_seq_new_k(cnt, cnt, 8, 1, NULL);
     const char *start = s;
     long long i = 0;
     const char *p = s;

@@ -1,0 +1,32 @@
+// w-014 #1：类型后缀语法 T[]/T[N]、函数返回数组/列表、ref 列表参数
+i32[] mk()
+    i32 a[] = 1, 2, 3
+    return a
+i32[3] mkarr()
+    i32 a[3] = 7, 8, 9
+    return a
+i32[] upto(i32 n)
+    i32 a[]
+    for i32 i = 0, i < n, i++
+        push(a, i)
+    return a
+void fill(i32 ref xs[])
+    push(xs, 10)
+    push(xs, 20)
+    xs[0] = 99
+void main()
+    i32[] a = mk()
+    output(a)
+    i32[3] b = mkarr()
+    output(b)
+    i32[] c = upto(5)
+    output(c)
+    i32[] d = a[1, 2]
+    output(d)
+    output(mk())
+    i32 e[]
+    fill(ref e)
+    output(e)
+    i64 n = length(e)
+    output(n)
+    return

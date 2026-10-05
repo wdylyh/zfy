@@ -176,7 +176,10 @@ let scan_number l =
     | _ ->
       (match Int64.of_string_opt text with
        | Some n -> IntLit n
-       | None -> err p0 "integer literal overflows i64")
+       | None ->
+         (* 超出 i64 的十进制字面量：产大整数字面量 token（w-014 #6），
+            仅在 i128/u128 期望上下文合法（typeck 反绑校验） *)
+         BigIntLit text)
   end
 
 (* ---------- 注释与空白 ---------- *)

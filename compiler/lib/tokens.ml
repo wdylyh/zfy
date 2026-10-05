@@ -34,6 +34,8 @@ let keyword_table =
 
 type token =
   | IntLit of int64
+  | BigIntLit of string   (* 超出 i64 的十进制整数字面量（w-014 #6）：十进制数字串，
+                              仅在 i128/u128 期望上下文合法 *)
   | FloatLit of float
   | StrLit of string
   | CharLit of char
@@ -81,6 +83,7 @@ let pp_keyword = function
 
 let pp_token = function
   | IntLit n -> Printf.sprintf "Int %Ld" n
+  | BigIntLit s -> Printf.sprintf "Big %s" s
   | FloatLit f -> Printf.sprintf "Float %g" f
   | StrLit s -> Printf.sprintf "Str \"%s\"" (String.escaped s)
   | CharLit c -> Printf.sprintf "Char '%c'" c

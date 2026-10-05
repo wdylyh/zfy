@@ -394,12 +394,15 @@ let resolve (main : program) (main_dir : string)
       | TPtr (t2, p) -> TPtr (rw_ty m t2, p)
       | TPtrC (t2, p) -> TPtrC (rw_ty m t2, p)
       | TErr (t2, p) -> TErr (rw_ty m t2, p)
+      | TSeq (t2, p) -> TSeq (rw_ty m t2, p)
+      | TSeqN (t2, len, p) -> TSeqN (rw_ty m t2, len, p)
       | TFun (r, ps, p) -> TFun (rw_ty m r, List.map (rw_ty m) ps, p)
       | TApp (n, ts, p) -> TApp (resolve_name m n p, List.map (rw_ty m) ts, p)
     in
     let rec rw_expr (m : modt) (e : expr) : expr =
       match e with
       | EVar (n, p) -> EVar (resolve_name m n p, p)
+      | EBigInt _ -> e
       | EBin (op, l, r, p) -> EBin (op, rw_expr m l, rw_expr m r, p)
       | EUn (op, x, p) -> EUn (op, rw_expr m x, p)
       | ECall (callee, args, p) ->
@@ -448,6 +451,8 @@ let resolve (main : program) (main_dir : string)
                   List.map (rw_expr m) inits, p)
       | SDeclList ss -> SDeclList (List.map (rw_stmt m) ss)
       | SAssign (l, r, p) -> SAssign (rw_expr m l, rw_expr m r, p)
+      | SAssignList (l, rs, p) ->
+        SAssignList (rw_expr m l, List.map (rw_expr m) rs, p)
       | SAug (op, l, r, p) -> SAug (op, rw_expr m l, rw_expr m r, p)
       | SInc (x, p) -> SInc (rw_expr m x, p)
       | SDec (x, p) -> SDec (rw_expr m x, p)

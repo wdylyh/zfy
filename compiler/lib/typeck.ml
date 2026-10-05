@@ -215,6 +215,8 @@ let rec subst_ty_ast (map : (string * zty) list) (t : ty) : ty =
   | TPtr (t2, sp) -> TPtr (subst_ty_ast map t2, sp)
   | TPtrC (t2, sp) -> TPtrC (subst_ty_ast map t2, sp)
   | TErr (t2, sp) -> TErr (subst_ty_ast map t2, sp)
+  | TSeq (t2, sp) -> TSeq (subst_ty_ast map t2, sp)
+  | TSeqN (t2, len, sp) -> TSeqN (subst_ty_ast map t2, len, sp)
   | TFun (r, ts, sp) -> TFun (subst_ty_ast map r, List.map (subst_ty_ast map) ts, sp)
   | TApp (n, ts, sp) -> TApp (n, List.map (subst_ty_ast map) ts, sp)
 
@@ -259,6 +261,17 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
            targs
        in
        instantiate_struct_zty g n (List.combine gs.gtp ztys) pp)
+  | TSeq (t', pp) ->
+    (* T[]：动态数组/列表（类型后缀形式，w-014 #1）；
+       声明/参数/字段的数组形状由 parser 归一到 pseq/fseq，此处兜底
+       元素类型位置的嵌套（i32 a[][] 的元素 TSeq） *)
+    TList (conv_ty g pp t')
+  | TSeqN (t', len, pp) ->
+    (* T[N]：定长数组（类型后缀形式）。类型位置（返回类型/字段元素/别名）
+       长度须整数字面量；声明/参数处完整表达式长度由 pseq/PArray 承载 *)
+    (match len with
+     | EInt (n, _) when n >= 0L -> TArray (conv_ty g pp t', Int64.to_int n)
+     | _ -> terr pp "fixed array type length must be a non-negative integer literal here")
 
 (* 注册具体实例（幂等）：先占位再展开字段（自引用指针字段可引用）；
    值形态自引用由字段自查拦截，跨实例值环由检查末尾的循环嵌套复检拦截 *)
@@ -350,7 +363,7 @@ let match_param (g : genv) (tparams : string list) (p : pos)
     (match z with TArray (z2, _) -> match_gty g tparams p pd.pty z2 mref | _ -> false)
 
 let pos_of_expr = function
-  | EInt (_, p) | EFloat (_, p) | EStr (_, p) | EChar (_, p) | EBool (_, p)
+  | EInt (_, p) | EBigInt (_, p) | EFloat (_, p) | EStr (_, p) | EChar (_, p) | EBool (_, p)
   | EVar (_, p) | EBin (_, _, _, p) | EUn (_, _, p) | ECall (_, _, p)
   | EIndex (_, _, p) | ESlice (_, _, _, _, p)
   | ECast (_, _, p)
@@ -498,11 +511,29 @@ and to_string_of (t : texpr) : texpr =
    | TPtr _ | TFunSig _ | TErr _ ->
      terr p "type %s cannot convert to string" (pp_zty t.ety)
 
+(* 大字面量范围校验（w-014 #6）：去前导零后与 i128/u128 十进制上限比较 *)
+and big_ok (digits : string) (unsigned : bool) : bool =
+  let mx =
+    if unsigned then "340282366920938463463374607431768211455"
+    else "170141183460469231731687303715884105727" in
+  let rec strip s =
+    if String.length s > 1 && s.[0] = '0'
+    then strip (String.sub s 1 (String.length s - 1)) else s in
+  let d = strip digits in
+  if d = "" then false
+  else if String.length d < String.length mx then true
+  else if String.length d > String.length mx then false
+  else String.compare d mx <= 0
+
 and check_expr env (e : expr) : texpr =
   let p = pos_of_expr e in
   let mk k ty = { e = k; ety = ty; epos = p } in
   match e with
   | EInt (n, _) -> mk (EIntK n) (fresh_var ())
+  | EBigInt (digits, _) ->
+    (* 超出 i64 的大字面量（w-014 #6）：ety 未定（TVar），由期望上下文
+       反绑到 i128/u128（coerce 校验范围）；其余上下文报错 *)
+    mk (EBigK digits) (fresh_var ())
   | EFloat (f, _) -> mk (EFloatK f) (fresh_var ())
   | EStr (s, _) -> mk (EStrK s) TString
   | EChar (c, _) -> mk (ECharK c) TChar
@@ -642,6 +673,22 @@ and check_expr env (e : expr) : texpr =
             (pp_binop bop)
       end
       else
+      (* char 数值化（w-014 #5）：算术运算中 char 与 char/整数混合 →
+         双方提升为 i32（C 整数提升语义），结果 i32；
+         比较仍要求同型（==/!= 同型 char 已支持） *)
+      let is_char = function TChar -> true | _ -> false in
+      let is_intish = function TInt _ | TUint _ | TVar _ -> true | _ -> false in
+      let is_cmp = match bop with
+        | BEq | BNe | BLt | BGt | BLe | BGe -> true | _ -> false in
+      if (not is_cmp)
+         && ((is_char rl && (is_char rr || is_intish rr))
+          || (is_char rr && is_intish rl)) then begin
+        let ti = TInt 32 in
+        let tl = mk (ECastK (tl, ti)) ti in
+        let tr = mk (ECastK (tr, ti)) ti in
+        mk (EBinK (bop, tl, tr)) ti
+      end
+      else
         let res_ty =
           match bop with
           | BEq | BNe | BLt | BGt | BLe | BGe ->
@@ -728,15 +775,35 @@ and check_expr env (e : expr) : texpr =
                   (String.concat ", " (List.map pp_zty s.params)) (pp_zty s.ret)
               | None -> terr fp "undefined function: %s" fname)
            | _ -> terr p' "panic_handler expects a function name argument: panic_handler(fn)")
+        | "ord" ->
+          (* ord(c)：char 的码值（i32），w-014 #5 *)
+          (match args with
+           | [ CPos e ] ->
+             let tc = check_expr env e in
+             (match resolve tc.ety with
+              | TChar -> mk (ECastK (tc, TInt 32)) (TInt 32)
+              | t -> terr p' "ord expects a char, got %s" (pp_zty t))
+           | _ -> terr p' "ord takes one argument: ord(c)")
+        | "chr" ->
+          (* chr(n)：码值转 char（w-014 #5） *)
+          (match args with
+           | [ CPos e ] ->
+             let tn = to_i64 (check_expr env e) in
+             mk (ECastK (tn, TChar)) TChar
+           | _ -> terr p' "chr takes one argument: chr(n)")
         | "push" ->
-          (* push(列表, 值)：追加到末尾（自动扩长），无返回值 *)
+          (* push(列表, 值)：追加到末尾（自动扩长），无返回值。
+             目标槽根泛化（w-014 #3）：变量/字段链（bag.xs）/ref 参数
+             解引用/嵌套元素槽（push(a[i], v)——内层列表为真实槽） *)
           (match args with
            | [ CPos b; CPos v ] ->
-             let tb = check_expr env b and tv0 = check_expr env v in
-             (match resolve tb.ety with
-              | TList e ->
-                let tv0 = coerce p' tv0 e in
-                mk (EPushK (tb, { tv0 with ety = resolve e })) TVoid
+             let root = seq_slot_root env b "push target" in
+             (match resolve root.ety with
+              | TList e | TPtr (TList e) ->
+                let tv0 = coerce p' (check_expr env v) e in
+                mk (EPushK (root, { tv0 with ety = resolve e })) TVoid
+              | TArray _ | TPtr (TArray _) ->
+                terr p' "push target must be a list, not a fixed-length array"
               | t -> terr p' "push target must be a list, got %s" (pp_zty t))
            | _ -> terr p' "push takes two arguments: push(list, value)")
         | "sizeof" | "alignof" ->
@@ -1045,7 +1112,7 @@ and pos_after (a : pos) (b : pos) =
 and uses_of_expr (acc : (string * pos) list) (e : expr) : (string * pos) list =
   match e with
   | EVar (n, p) -> (n, p) :: acc
-  | EInt _ | EFloat _ | EStr _ | EChar _ | EBool _ | ENull _ -> acc
+  | EInt _ | EBigInt _ | EFloat _ | EStr _ | EChar _ | EBool _ | ENull _ -> acc
   | EBin (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | EUn (_, a, _) -> uses_of_expr acc a
   | ECall (callee, args, _) ->
@@ -1088,6 +1155,8 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
     List.fold_left uses_of_expr acc inits
   | SDeclList ss -> List.fold_left uses_of_stmt acc ss
   | SAssign (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+  | SAssignList (a, bs, _) ->
+    List.fold_left uses_of_expr (uses_of_expr acc a) bs
   | SAug (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | SInc (a, _) | SDec (a, _) -> uses_of_expr acc a
   | SExpr e -> uses_of_expr acc e
@@ -1260,6 +1329,7 @@ and deref_refs (refs : string list) (body : block) : block =
   and rs (s : stmt) : stmt =
     match s with
     | SAssign (l, r, p) -> SAssign (lhs l, re r, p)
+    | SAssignList (l, rl, p) -> SAssignList (lhs l, List.map re rl, p)
     | SAug (o, l, r, p) -> SAug (o, lhs l, re r, p)
     | SInc (l, p) -> SInc (lhs l, p)
     | SDec (l, p) -> SDec (lhs l, p)
@@ -1335,6 +1405,65 @@ and chain_fields env p (ty0 : zty) (segs : string list) : int list * zty =
        let (r, ft2) = chain_fields env p fty rest in
        (idx :: r, ft2)
      | t -> terr p "type %s does not support field access %s" (pp_zty t) seg)
+
+(* 可写 seq 槽根（w-014 #3）：把写目标（元素写/push/整体赋值）的基表达式
+   求值为"持有 seq 指针的槽"形态 texpr：
+   - EVarK 槽（变量）
+   - EFieldK 链（dotted 字段，根为 EVarK；const 根拒绝写）
+   - EDerefK（ref 参数解引用：槽地址 = 指针值）
+   - EAddrOfK (ESeqGetK _)（元素槽地址：嵌套写 a[i][j] / push(a[i], v)）
+   其余形态（整体为副本的表达式等）报错 *)
+and seq_slot_root env (base : expr) (what : string) : texpr =
+  match base with
+  | EVar (name, p') ->
+    (match lookup_var env name with
+     | Some l ->
+       if l.lconst then
+         terr p' "cannot modify %s of constant %s (const is deeply immutable)" what name;
+       if Hashtbl.mem env.moved l.lslot then
+         terr p' "%s has been moved and cannot be written" name;
+       { e = EVarK l.lslot; ety = l.lty; epos = p' }
+     | None ->
+       (* dotted 字段链（bag.xs）：const 根不可变检查后走读路径求值 *)
+       (match split_field_path name with
+        | Some (first, _) ->
+          (match lookup_var env first with
+           | Some l when l.lconst ->
+             terr p' "cannot modify %s of constant %s (const is deeply immutable)" what first
+           | _ -> ())
+        | None -> ());
+       let tb = check_expr env base in
+       (match tb.e with
+        | EFieldK _ | EDerefK _ -> tb
+        | _ ->
+          terr (pos_of_expr base) "%s must be a list variable or field" what;
+          tb))
+  | _ ->
+    (match base with
+     | EIndex (EVar (arr, ap), _, _) ->
+       (* 元素槽地址路径：外层 const 数组深不可变 *)
+       (match lookup_var env arr with
+        | Some l when l.lconst ->
+          terr ap "cannot modify elements of constant %s (const is deeply immutable)" arr
+        | _ -> ())
+     | _ -> ());
+    let tb = check_expr env base in
+    (match tb.e with
+     | EFieldK _ | EDerefK _ -> tb
+     | ESeqGetK (b, i) ->
+       (* 元素槽地址：读副本形态改取地址（嵌套 seq 槽写） *)
+       { e = EAddrOfK { e = ESeqGetK (b, i); ety = tb.ety; epos = tb.epos };
+         ety = TPtr tb.ety; epos = tb.epos }
+     | _ ->
+       terr (pos_of_expr base)
+         "%s must be a list variable, field, ref parameter, or element slot" what)
+
+(* 槽根的元素类型（TList/TArray 或其指针形态） *)
+and seq_elem_of_root env (root : texpr) (p : pos) : zty =
+  match resolve root.ety with
+  | TList e | TArray (e, _) -> e
+  | TPtr (TList e) | TPtr (TArray (e, _)) -> e
+  | t -> terr p "index/push target is not an array or list: %s" (pp_zty t)
 
 (* struct 构造：Name(位置参数..., 命名参数...) → 全字段补全
    （位置按序 + 命名按字段名 + default + 零值；数组/列表字段缺省填空 seq） *)
@@ -1533,6 +1662,17 @@ and coerce p (te : texpr) (want : zty) : texpr =
   if a = b then te
   else
     match a, b with
+    | TVar _, (TInt 128 | TUint 128 as tgt)
+      when (match te.e with EBigK _ -> true | _ -> false) ->
+      (* 大字面量反绑（w-014 #6）：i128/u128 期望上下文 + 范围校验 *)
+      let digits = (match te.e with EBigK d -> d | _ -> assert false) in
+      if not (big_ok digits (match tgt with TUint _ -> true | _ -> false)) then
+        terr p "integer literal %s overflows %s" digits (pp_zty tgt);
+      { te with ety = tgt }
+    | TVar _, _ when (match te.e with EBigK _ -> true | _ -> false) ->
+      terr p "large integer literal %s requires an i128/u128 context, got %s"
+        (match te.e with EBigK d -> d | _ -> "")
+        (pp_zty b)
     | TVar _, TErr t ->
       (* 目标为 T! 且值类型未定（整型/浮点面值 ety=TVar）：按元素类型
          求解后自动包装成功值（否则面值会以裸 OInt 落进 TErr 槽） *)
@@ -1558,8 +1698,8 @@ and coerce p (te : texpr) (want : zty) : texpr =
           (pp_zty a) (pp_zty b)
     (* 定长数组 -> 动态长度数组参数（TList 运行期与 TArray 同构） *)
     | TArray (ea, _), TList eb when ea = eb ->
-      if (match resolve ea with TStruct _ -> true | _ -> false) then
-        terr p "struct is not yet supported as an array/list element";
+      (* 定长数组 -> 列表（TList 运行期与 TArray 同构；struct/嵌套元素
+         亦合法，w-014 #2/#4） *)
       te
     (* T! 与 T 的互转：T! 不能当普通值用；T 自动包装为成功值 *)
     | TErr _, TErr _ -> unify p te.ety want; te
@@ -1810,7 +1950,7 @@ and conv_binop (o : Ast.binop) : Hir.binop =
 and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
   let bop = conv_binop bop in
   match lhs with
-  | EIndex (EVar (arr, ap), idx, ip) ->
+  | EIndex (EVar (arr, ap), idx, ip) when lookup_var env arr <> None ->
     (match lookup_var env arr with
      | Some l ->
        if Hashtbl.mem env.moved l.lslot then
@@ -1822,7 +1962,8 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           let trhs = check_expr env rhs in
           let grow = (match seqty with TList _ -> true | _ -> false) in
           let trhs = coerce ip trhs e in
-          SAugIndexK (l.lslot, e, ti, bop, trhs, grow)
+          SAugIndexK ({ e = EVarK l.lslot; ety = l.lty; epos = ap },
+                      e, ti, bop, trhs, grow)
         | TPtr t ->
           (* 指针下标复合赋值（自动解引用，无越界检查）：p[i] op= v，
              地址 p+i 只求值一次；强制 unsafe 块（new2.md #8） *)
@@ -1838,6 +1979,16 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           SAugDerefK (addr, bop, trhs)
         | t -> terr ap "augmented assignment target does not support indexing: %s" (pp_zty t))
      | None -> terr ap "undefined variable: %s" arr)
+  | EIndex (base, idx, ip) ->
+    (* 元素复合赋值槽根泛化（w-014 #3）：bag.xs[i] += v / xs[i]++（ref）等 *)
+    let root = seq_slot_root env base "augmented index-assignment target" in
+    let e = seq_elem_of_root env root ip in
+    let grow = (match resolve root.ety with
+                | TList _ | TPtr (TList _) -> true | _ -> false) in
+    let ti = to_i64 (check_expr env idx) in
+    let trhs = check_expr env rhs in
+    let trhs = coerce ip trhs e in
+    SAugIndexK (root, e, ti, bop, trhs, grow)
   | ESlice (EVar (arr, ap), a, b, step, sp) ->
      (* a[x,y:st] op= v：原地作用于原数组的区间元素（string/frac/f16/f128 不支持） *)
      (match lookup_var env arr with
@@ -2011,9 +2162,8 @@ and check_block env (stmts : stmt list) : tblock =
 and check_seq_decl env p isconst name e len is_list inits =
   (match resolve e with
    | TFrac _ -> terr p "frac arrays/lists are not yet supported"
-   | TStruct _ -> terr p "struct is not yet supported as an array/list element"
    | TErr _ -> terr p "T! cannot be an array/list element (error values are aggregates and cannot be loaded by index)"
-   | _ -> ());
+   | _ -> ());   (* struct/嵌套 seq 元素合法（w-014 #2/#4），运行时按头部 kind 深拷贝 *)
   let vlen =
     match len, is_list with
     | None, true -> 0L
@@ -2134,7 +2284,7 @@ and check_stmt env (st : stmt) : tstmt =
      | _ -> terr p "??-block assignment target must be a variable (for now)")
   | SAssign (lhs, rhs, p) ->
     (match lhs, rhs with
-     | EIndex (EVar (arr, ap), idx, ip), _ ->
+     | EIndex (EVar (arr, ap), idx, ip), _ when lookup_var env arr <> None ->
        (* arr[i] = v：元素写入（下标只求值一次） *)
        (match lookup_var env arr with
         | Some l ->
@@ -2148,9 +2298,20 @@ and check_stmt env (st : stmt) : tstmt =
              let trhs = check_expr env rhs in
              let grow = (match seqty with TList _ -> true | _ -> false) in
              let trhs = coerce ip trhs e in
-             mk (SSeqSetK (l.lslot, e, ti, trhs, grow))
+             mk (SSeqSetK ({ e = EVarK l.lslot; ety = l.lty; epos = ap },
+                           e, ti, trhs, grow))
            | TString ->
-             terr ip "strings do not support index assignment (use replace for ranges)"
+             (* s[i] = c：string 下标写（w-014 #5）——槽内堆串原地写，
+                越界运行时报错；槽独占堆串由 MCopy strdup 保证 *)
+             if l.lconst then
+               terr ap "cannot modify a constant string %s" arr;
+             let ti = to_i64 (check_expr env idx) in
+             let trhs = check_expr env rhs in
+             (match resolve trhs.ety with
+              | TChar -> ()
+              | t -> terr ip "string index assignment requires a char, got %s" (pp_zty t));
+             mk (SStrSetK ({ e = EVarK l.lslot; ety = l.lty; epos = ap },
+                           ti, trhs))
            | TPtr t ->
              (* 指针下标写入（自动解引用，无越界检查）：p[i] = v 等同于
                 先按元素步进地址（p+i）再解引用写入；强制 unsafe（new2.md #8） *)
@@ -2169,35 +2330,54 @@ and check_stmt env (st : stmt) : tstmt =
               | t' ->
                 terr ap "dereference assignment supports only scalar/pointer types (for now), got %s" (pp_zty t'))
            | t -> terr ap "type %s does not support index assignment" (pp_zty t))
-        | None ->
-          (* 第 7 条顺带修：字段链下数组/列表元素写入 b.data[i] = v *)
-          (match split_field_path arr with
-           | Some (first, segs) ->
-             (match lookup_var env first with
-              | Some l ->
-                (match resolve l.lty with
-                 | TStruct _ | TPtr (TStruct _) ->
-                   if l.lconst then
-                     terr ap "cannot modify elements of constant %s (const is deeply immutable)" first;
-                   if Hashtbl.mem env.moved l.lslot then
-                     terr ap "array %s has been moved and cannot be written" arr;
-                   let (fidxs, fty) = chain_fields env ap l.lty segs in
-                   (match resolve fty with
-                    | TArray (e, _) | TList e as seqty ->
-                      let grow = (match seqty with TList _ -> true | _ -> false) in
-                      let ti = to_i64 (check_expr env idx) in
-                      let trhs = check_expr env rhs in
-                      let trhs = coerce ip trhs e in
-                      mk (SFieldSeqSetK (l.lslot, fidxs, l.lty, e, ti, trhs, grow))
-                    | t' ->
-                      terr ap "type %s does not support index assignment" (pp_zty t'))
-                 | t -> terr ap "type %s does not support index assignment %s" (pp_zty t) arr)
-              | None -> terr ap "undefined variable: %s" first)
-           | None -> terr ap "undefined variable: %s" arr))
-     | EIndex (_, _, ip), _ ->
-       terr ip "index-assignment target must be an array/list variable, e.g. n[3] = value"
+        | None -> terr ap "undefined variable: %s" arr)
+     | EIndex (base, idx, ip), _ ->
+       (* 元素写入槽根泛化（w-014 #3）：字段链 bag.xs[i] / ref 参数解引用
+          xs[i] / 嵌套元素槽 a[i][j]（EAddrOfK 元素槽地址）。
+          string 字段/ref（bag.s[i] = c）走 SStrSetK 原地写 *)
+       let root = seq_slot_root env base "index-assignment target" in
+       (match resolve root.ety with
+        | TString | TPtr TString ->
+          let ti = to_i64 (check_expr env idx) in
+          let trhs = check_expr env rhs in
+          (match resolve trhs.ety with
+           | TChar -> ()
+           | t -> terr ip "string index assignment requires a char, got %s" (pp_zty t));
+          mk (SStrSetK (root, ti, trhs))
+        | _ ->
+          let e = seq_elem_of_root env root ip in
+          let grow = (match resolve root.ety with
+                      | TList _ | TPtr (TList _) -> true | _ -> false) in
+          let ti = to_i64 (check_expr env idx) in
+          let trhs = check_expr env rhs in
+          let trhs = coerce ip trhs e in
+          mk (SSeqSetK (root, e, ti, trhs, grow)))
+     | EField (b, seg, fp), _ ->
+       (* 元素槽字段写入（w-014 #8）：ps[1].x = v——元素读求值后取槽地址
+          （ESeqGetK → EAddrOfK），字段链写入该元素 *)
+       (match b with
+        | EIndex (EVar (arr, ap), _, _) ->
+          (match lookup_var env arr with
+           | Some l when l.lconst ->
+             terr ap "cannot modify elements of constant %s (const is deeply immutable)" arr
+           | _ -> ())
+        | _ -> ());
+       let tb = check_expr env b in
+       (match tb.e with
+        | ESeqGetK _ when (match resolve tb.ety with TStruct _ -> true | _ -> false) ->
+          let root = { e = EAddrOfK tb; ety = TPtr tb.ety; epos = tb.epos } in
+          let rootty = (match resolve tb.ety with
+                        | TStruct s -> TStruct s | _ -> assert false) in
+          let (fidxs, fty) = chain_fields env fp rootty [ seg ] in
+          let trhs = check_expr env rhs in
+          let trhs = coerce fp trhs fty in
+          mk (SFieldSetK (root, fidxs, rootty, trhs))
+        | _ ->
+          terr fp "field assignment target must be a struct array/list element (ps[i].x = v)")
      | EDeref (pe, dp), _ ->
-       (* p* = v：解引用写入（仅标量/指针目标；聚合类型暂不支持） *)
+       (* p* = v：解引用写入。标量/指针目标直接 store；聚合目标
+          （string/数组/列表，ref 参数整体赋值，w-014 #3）为引用槽
+          整体替换：释放旧值 + 接管新值 *)
        check_constp env pe dp;
        let tp = check_expr env pe in
        (match resolve tp.ety with
@@ -2207,8 +2387,12 @@ and check_stmt env (st : stmt) : tstmt =
              let trhs = check_expr env rhs in
              let trhs = coerce dp trhs t in
              mk (SDerefSetK (tp, trhs))
+           | TString | TList _ | TArray _ ->
+             let trhs = check_expr env rhs in
+             let trhs = coerce dp trhs t in
+             mk (SDerefSetK (tp, trhs))
            | t' ->
-             terr dp "dereference assignment supports only scalar/pointer types (for now), got %s" (pp_zty t'))
+             terr dp "dereference assignment supports only scalar/pointer/aggregate types, got %s" (pp_zty t'))
         | t -> terr dp "assignment target must be a pointer dereference, got %s" (pp_zty t))
      | EVar (name, p'), rhs' ->
        (match lookup_var env name with
@@ -2282,11 +2466,82 @@ and check_stmt env (st : stmt) : tstmt =
                    let (idxs, fty) = chain_fields env p' l.lty segs in
                    let trhs = check_expr env rhs' in
                    let trhs = coerce p' trhs fty in
-                   mk (SFieldSetK (l.lslot, idxs, l.lty, trhs))
+                   mk (SFieldSetK ({ e = EVarK l.lslot; ety = l.lty; epos = p' },
+                                   idxs, l.lty, trhs))
                  | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
               | None -> terr p' "undefined variable: %s" name)
            | None -> terr p' "undefined variable: %s" name))
      | _ -> terr p "unsupported assignment target")
+  | SAssignList (lhs, exprs, p) ->
+    (* 序列字面量整体赋值（w-014 #3）：a = 1, 2, 3 / bag.xs = 1, 2 /
+       ref 参数 xs = 新表——构造 ESeqLitK 临时 seq，走整体赋值路径 *)
+    let mk_lit elem elems =
+      { e = ESeqLitK (elem, elems); ety = TList elem; epos = p } in
+    (match lhs with
+     | EVar (name, p') ->
+       (match lookup_var env name with
+        | Some l ->
+          if l.lconst then
+            terr p' "cannot assign to constant %s (declared const)" name;
+          Hashtbl.remove env.moved l.lslot;
+          (match resolve l.lty with
+           | TArray (e, _) | TList e as seqty ->
+             let elems =
+               List.map (fun ie -> coerce p (check_expr env ie) e) exprs in
+             (match seqty with
+              | TList _ -> mk (SAssignK ({ e = EVarK l.lslot; ety = TList e; epos = p' },
+                                         mk_lit e elems, false, false))
+              | TArray _ ->
+                (* 定长数组目标：字面量长度须一致（整体替换语义） *)
+                (match resolve l.lty with
+                 | TArray (_, n) when List.length exprs <> n ->
+                   terr p "array literal has %d elements but target length is %d"
+                     (List.length exprs) n
+                 | _ ->
+                   mk (SAssignK ({ e = EVarK l.lslot; ety = TList e; epos = p' },
+                                 mk_lit e elems, false, false))))
+           | t -> terr p' "sequence literal assignment requires an array/list target, got %s" (pp_zty t))
+        | None ->
+          (* dotted 字段链目标：bag.xs = 1, 2 *)
+          (match split_field_path name with
+           | Some (first, segs) ->
+             (match lookup_var env first with
+              | Some l ->
+                (match resolve l.lty with
+                 | TStruct _ | TPtr (TStruct _) ->
+                   if l.lconst then
+                     terr p' "cannot assign to field of constant %s (const is deeply immutable)" first;
+                   let (idxs, fty) = chain_fields env p' l.lty segs in
+                   (match resolve fty with
+                    | TList e ->
+                      let elems =
+                        List.map (fun ie -> coerce p (check_expr env ie) e) exprs in
+                      mk (SFieldSetK ({ e = EVarK l.lslot; ety = l.lty; epos = p' },
+                                      idxs, l.lty, mk_lit e elems))
+                    | TArray (e, n) ->
+                      if List.length exprs <> n then
+                        terr p "array literal has %d elements but field length is %d"
+                          (List.length exprs) n;
+                      let elems =
+                        List.map (fun ie -> coerce p (check_expr env ie) e) exprs in
+                      mk (SFieldSetK ({ e = EVarK l.lslot; ety = l.lty; epos = p' },
+                                      idxs, l.lty, mk_lit e elems))
+                    | t -> terr p' "sequence literal assignment requires an array/list field, got %s" (pp_zty t))
+                 | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
+              | None -> terr p' "undefined variable: %s" name)
+           | None -> terr p' "undefined variable: %s" name))
+     | EDeref (pe, dp) ->
+       (* ref 参数整体赋值：xs = 1, 2 / xs = 新表 *)
+       check_constp env pe dp;
+       let tp = check_expr env pe in
+       (match resolve tp.ety with
+        | TPtr (TList e) | TPtr (TArray (e, _)) ->
+          let elems = List.map (fun ie -> coerce p (check_expr env ie) e) exprs in
+          mk (SDerefSetK (tp, mk_lit e elems))
+        | t ->
+          terr dp "sequence literal assignment through ref requires a list parameter, got %s" (pp_zty t))
+     | _ ->
+       terr p "sequence literal assignment target must be a list variable, field, or ref parameter")
   | SAug (op, lhs, rhs, p) ->
     mk (check_aug env p lhs op rhs)
   | SInc (e, p) ->
@@ -2494,7 +2749,8 @@ and check_for_update env (u : for_update) : tstmt =
   | FUDec (e, p) -> check_stmt env (SDec (e, p))
 
 and pos_of_stmt = function
-  | SDecl (_, _, _, _, _, _, p) | SAssign (_, _, p) | SAug (_, _, _, p)
+  | SDecl (_, _, _, _, _, _, p) | SAssign (_, _, p) | SAssignList (_, _, p)
+  | SAug (_, _, _, p)
   | SInc (_, p) | SDec (_, p)
   | SReturn (_, p) | SIf (_, _, _, p)
   | SWhile (_, _, p) | SFor (_, _, _, _, p) | SReduce (_, _, _, p)
@@ -2719,14 +2975,14 @@ let check_program (prog : program) : hir =
               let t = conv_param g pos !prev pd in
               prev := pd.pname :: !prev;
               if pd.pref then begin
-                (* ref 参数（new2.md #1）：签名侧降为指针（调用方传地址），
-                   仅标量/string；函数体内由 deref_refs 自动解引用 *)
-                if pd.pseq <> Ast.PScalar then
-                  terr pd.ppos "ref parameters support scalar/string types only";
+                (* ref 参数（new2.md #1 / w-014 #1）：签名侧降为指针（调用方
+                   传地址）；标量/string/数组/列表——seq 槽引用使函数内
+                   push/元素写直接作用于调用方列表 *)
                 (match resolve t with
-                 | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString -> ()
+                 | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString
+                 | TList _ | TArray _ -> ()
                  | _ ->
-                   terr pd.ppos "ref parameters support scalar/string types only (got %s)"
+                   terr pd.ppos "ref parameters support scalar/string/array/list types only (got %s)"
                      (pp_zty t));
                 TPtr t
               end else t)
@@ -2771,6 +3027,8 @@ let check_program (prog : program) : hir =
             let rty = conv_ty g f.epos f.eret in
             (match rty with
              | TErr _ -> terr f.epos "extern functions do not support a T! return type (the error model is for zfy functions only)"
+             | TList _ | TArray _ ->
+               terr f.epos "extern functions do not support array/list return types (zfy seq is not a C type)"
              | _ -> ());
             Hashtbl.replace g.fns f.ename
               { params = ptys; prefs = List.map (fun _ -> false) ptys; ret = rty };
@@ -3023,6 +3281,13 @@ let check_program (prog : program) : hir =
     in
     let e' =
       match e.e with
+      | EBigK d ->
+        (* 大字面量（w-014 #6）：期望上下文未落到 i128/u128（如裸表达式
+           语句/算术操作数）即报错；合法时保留由后端按 i128 字面量发射 *)
+        (match ety with
+         | TInt 128 | TUint 128 -> EBigK d
+         | _ ->
+           terr e.epos "large integer literal %s requires an i128/u128 context" d)
       | EBinK (op, a, b) -> EBinK (op, fix_texpr a, fix_texpr b)
       | EUnK (op, a) -> EUnK (op, fix_texpr a)
       | ECallK (c, args, moves) -> ECallK (c, List.map fix_texpr args, moves)
@@ -3033,6 +3298,7 @@ let check_program (prog : program) : hir =
       | ESeqSliceK (a, b, c, d) ->
         ESeqSliceK (fix_texpr a, fix_texpr b, fix_texpr c, fix_texpr d)
       | ESplitK (a, c) -> ESplitK (fix_texpr a, fix_texpr c)
+      | ESeqLitK (t, es) -> ESeqLitK (subst_ty t, List.map fix_texpr es)
       | EPushK (a, v) -> EPushK (fix_texpr a, fix_texpr v)
       | EStructNewK (s, args) -> EStructNewK (s, List.map fix_texpr args)
       | EFieldK (b, i) -> EFieldK (fix_texpr b, i)
@@ -3062,15 +3328,16 @@ let check_program (prog : program) : hir =
         SSeqCopyK (c, n, subst_ty t, len, fix_texpr src, isl)
       | SAssignK (a, b, nn, mv) -> SAssignK (fix_texpr a, fix_texpr b, nn, mv)
       | SStrAppendK (n, parts) -> SStrAppendK (n, List.map fix_texpr parts)
-      | SAugIndexK (n, t, i, op, v, g) ->
-        SAugIndexK (n, subst_ty t, fix_texpr i, op, fix_texpr v, g)
+      | SAugIndexK (r, t, i, op, v, g) ->
+        SAugIndexK (fix_texpr r, subst_ty t, fix_texpr i, op, fix_texpr v, g)
       | SAugVarK (n, t, op, v, nn) ->
         SAugVarK (n, subst_ty t, op, fix_texpr v, nn)
       | SAugSliceK (n, t, a, b, st, op, v) ->
         SAugSliceK (n, subst_ty t, fix_texpr a, fix_texpr b, fix_texpr st, op,
                     fix_texpr v)
-      | SSeqSetK (n, t, i, v, g) ->
-        SSeqSetK (n, subst_ty t, fix_texpr i, fix_texpr v, g)
+      | SSeqSetK (r, t, i, v, g) ->
+        SSeqSetK (fix_texpr r, subst_ty t, fix_texpr i, fix_texpr v, g)
+      | SStrSetK (r, i, v) -> SStrSetK (fix_texpr r, fix_texpr i, fix_texpr v)
       | SRemoveK (n, t, i, b) -> SRemoveK (n, subst_ty t, fix_texpr i, b)
       | SExprK e -> SExprK (fix_texpr e)
       | SReturnK e -> SReturnK (Option.map fix_texpr e)
@@ -3087,10 +3354,8 @@ let check_program (prog : program) : hir =
       | SReduceK (x, n, st) -> SReduceK (fix_texpr x, fix_texpr n, fix_texpr st)
       | SUnwrapBlockK (d, n, t, a, es, b) ->
         SUnwrapBlockK (d, n, subst_ty t, fix_texpr a, es, List.map fix_stmt b)
-      | SFieldSetK (n, idxs, rt, v) ->
-        SFieldSetK (n, idxs, subst_ty rt, fix_texpr v)
-      | SFieldSeqSetK (n, idxs, rt, e, i, v, g) ->
-        SFieldSeqSetK (n, idxs, subst_ty rt, subst_ty e, fix_texpr i, fix_texpr v, g)
+      | SFieldSetK (r, idxs, rt, v) ->
+        SFieldSetK (fix_texpr r, idxs, subst_ty rt, fix_texpr v)
       | SAugFieldK (n, idxs, rt, op, v) ->
         SAugFieldK (n, idxs, subst_ty rt, op, fix_texpr v)
       | SDerefSetK (p, v) -> SDerefSetK (fix_texpr p, fix_texpr v)

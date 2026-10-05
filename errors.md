@@ -8,7 +8,7 @@
 >
 > **跳号说明**：号段不连续是条目合并的结果（同一错误多处触发 / 同文案合并同码），各节末尾列出。已删除两条占位交叉引用：E300-112（main 返回类型检查实际由 LLVM 阶段报，归 E4012）、E300-143（TErr 元素非法由 E4002 承担）。
 >
-> 统计：词法 14 码 / 语法 35 码 / 类型语义 139 码 / 代码生成 50 码 / 驱动配置 6 码，**合计 244 码**；另有 4 个兜底码（E1000 / E3000 / E4000 / E5000，错误消息未命中映射表时回退，正常不触发）。运行期 die（不入 EXXX 码体系，附录 A）38 类。
+> 统计：词法 14 码 / 语法 35 码 / 类型语义 170 码 / 代码生成 50 码 / 驱动配置 6 码，**合计 275 码**；另有 4 个兜底码（E1000 / E3000 / E4000 / E5000，错误消息未命中映射表时回退，正常不触发）。运行期 die（不入 EXXX 码体系，附录 A）38 类。
 
 格式说明：
 - 「触发」列给最小触发示例（`…` 表示任意合法代码）；「文案」列为编译器当前输出原文。
@@ -79,7 +79,7 @@
 
 | 码 | 触发示例 | 文案 |
 |---|---|---|
-| E2017 | `a.b = 1`（非 use 命名空间的点访问） | dot syntax removed: '.' is only for use-namespace access (e.g. t.item) |
+| E2017 | `t.item`（保留码：点访问已开放为 struct 字段语法 ps[1].x，仅命名空间形态仍用 dotted 名） | （现版本不再报 dot syntax removed；字段访问经 EField 节点） |
 | E2018 | `array int a` / `list f64 b` | 'array'/'list' keywords removed: arrays are written T a[N], lists T a[] |
 | E2019 | `* p = 1`（星号在声明开头） | '*' must follow a type to form a pointer (syntax T*, e.g. i32* p) |
 | E2020 | `[i32; 4] x`（旧切片类型写法） | '[]T' / '[T;N]' (slice/array type) syntax removed |
@@ -161,7 +161,7 @@
 | E3029 | `1.field = 2`（类型不支持字段赋值） | type %s does not support field assignment %s |
 | E3031 | `*p = "s"`（写非标量） | dereference assignment supports only scalar/pointer types (for now), got %s |
 | E3032 | `a[0] = p`（写 struct 等聚合） | type %s does not support index assignment |
-| E3033 | `f(1)[0] = 2`（调用结果下标写） | index-assignment target must be an array/list variable, e.g. n[3] = value |
+| E3033 | （已删除：下标写目标泛化为槽根——变量/字段链/ref/元素槽，w-014 #3） | — |
 | E3034 | `*x = 1`（x 非指针，普通赋值） | assignment target must be a pointer dereference, got %s |
 | E3035 | 无法解析的赋值目标 | unsupported assignment target |
 | E3036 | `move 5` 或 `move f()` | cannot move constant %s |
@@ -278,7 +278,7 @@
 
 | 码 | 触发示例 | 文案 |
 |---|---|---|
-| E3126 | `Point ps[3]` | struct is not yet supported as an array/list element |
+| E3126 | （已删除：struct 作数组/列表元素已支持，w-014 #2——运行时按 seq 头部 kind/ops 深拷贝） | — |
 | E3127 | `i32! xs[]` | T! cannot be an array/list element (error values are aggregates and cannot be loaded by index) |
 | E3128 | `i32 a["n"]` | array length must be an integer, got %s |
 | E3129 | `i32 a[x]`（x 非 const） | array length must be a compile-time constant (a literal or const integer variable) |
@@ -336,6 +336,16 @@
 | E3173 | `<T> void f(T ref x)`（泛型函数带 ref 参数） | generic functions do not support ref parameters |
 | E3174 | `<T> void main()` | main cannot be a generic function |
 | E3175 | `<T, T> void f(T x)`（类型参数重名） | duplicate type parameter in %s |
+| E3176 | `i64 a = 1267650600228229401496703205376`（大字面量非 i128/u128 上下文） | large integer literal %s requires an i128/u128 context, got %s |
+| E3177 | `u128 b = 340282366920938463463374607431768211456`（超出 u128） | integer literal %s overflows i128 / integer literal %s overflows u128 |
+| E3178 | `1 = 2, 3`（序列字面量赋值目标非法） | sequence literal assignment requires an array/list target, got %s / sequence literal assignment target must be a list variable, field, or ref parameter / sequence literal assignment through ref requires a list parameter, got %s / sequence literal assignment requires an array/list field, got %s |
+| E3179 | `i32 a[2]` 下 `a = 1, 2, 3`（字面量长度不符） | array literal has %d elements but target length is %d / array literal has %d elements but field length is %d |
+| E3180 | `s[0] = "x"`（string 下标写非 char） | string index assignment requires a char, got %s |
+| E3181 | `i32[x] mk()`（类型位置数组长度非字面量） | type-position array length must be an integer literal (T[N]) |
+| E3182 | `i32 a[2][3] = 1, 2`（嵌套声明带初值） | nested array/list declarations do not support initializers yet |
+| E3183 | `f().x = 1`（字段写目标非 struct 元素槽） | field assignment target must be a struct array/list element (ps[i].x = v) |
+| E3184 | `extern "C" { i32[] f() }`（extern 返回序列） | extern functions do not support array/list return types (zfy seq is not a C type) |
+| E3185 | `for i32 a[] = ...`（for 头部声明数组/列表） | for header declarations do not support arrays/lists |
 
 > 跳号（类型段）：E3002/E3003 并入 E3001、E3006 并入 E3005、E3012 并入 E3011、E3030 并入 E3011、E3044 并入 E3043、E3046 并入 E3045、E3050/E3051 并入 E3047、E3060 并入 E3101、E3090 并入 E3001、E3112 删除（归 E4012）、E3116 并入 E3115、E3134 并入 E3133、E3143 删除（TErr 元素非法归 E4002）。
 
@@ -347,7 +357,7 @@
 
 | 码 | 触发示例 | 文案 |
 |---|---|---|
-| E4001 | `push(1, 2)`（漏过前端的极端形状） | push target must be a list variable |
+| E4001 | （已删除：push 目标泛化为槽根——变量/字段链/ref/元素槽，w-014 #3） | — |
 | E4002 | `f()!`（TErr 元素为 f128 等 128 位类型） | error value element type does not support 128-bit width (T! is limited to <=64-bit scalars/string/pointers) |
 | E4003 | TErr 元素为聚合 | invalid error value element type (scalar/string/pointer only)（无括号短形态同码） |
 | E4004 | — | unsupported frac operation |

@@ -66,7 +66,6 @@ let code_of = function
         ["'array'/'list' keywords removed"], "E2018";
         ["'*' must follow a type"], "E2019";
         ["'[]T' / '[T;N]'"], "E2020";
-        ["dot syntax removed"], "E2017";
         ["panic requires a message argument"], "E2021";
         ["duplicate sep parameter in output"], "E2022";
         ["duplicate end parameter in output"], "E2023";
@@ -100,6 +99,22 @@ let code_of = function
       ["generic functions do not support ref parameters"], "E3173";
       ["main cannot be a generic function"], "E3174";
       ["duplicate type parameter in "], "E3175";
+      (* w-014 容器与数值扩展（E3176~E3185） *)
+      ["requires an i128/u128 context, got "], "E3176";
+      ["requires an i128/u128 context)"], "E3176";
+      [" overflows i128"], "E3177";
+      [" overflows u128"], "E3177";
+      ["sequence literal assignment"], "E3178";
+      ["elements but target length is "], "E3179";
+      ["elements but field length is "], "E3179";
+      ["string index assignment requires a char"], "E3180";
+      ["type-position array length must be an integer literal"], "E3181";
+      ["nested array/list declarations do not support initializers"], "E3182";
+      ["field assignment target must be a struct array/list element"], "E3183";
+      ["extern functions do not support array/list return types"], "E3184";
+      ["for header declarations do not support arrays/lists"], "E3185";
+      ["ref parameters support scalar/string/array/list types only"], "E3162";
+      ["push target must be a list, not a fixed-length array"], "E3061";
       ["(extern conflicts with an existing function)"], "E3106";
       ["duplicate function definition: "], "E3105";
       ["dot access is only for structs"], "E3088";
@@ -213,7 +228,7 @@ let code_of = function
       ([" fields, got "; " positional arguments"], "E3092");
       ["initialized twice"], "E3093";
       ["an integer type is required"], "E3075";
-      ["is not yet supported as an array/list element"], "E3126";
+      ["struct field array length must be a compile-time literal"], "E3097";
       (["builtin "; " does not support move arguments"], "E3145");
       ["expects a string for its "], "E3076";
       ["does not accept type "], "E3077";
@@ -229,7 +244,7 @@ let code_of = function
       ["strings do not support index assignment"], "E3017";
       ["dereference assignment supports only scalar/pointer types"], "E3031";
       ["does not support index assignment"], "E3032";
-      ["index-assignment target must be an array/list variable"], "E3033";
+      ["index-assignment target must be"], "E3033";
       ["assignment target must be a pointer dereference"], "E3034";
       ["unsupported assignment target"], "E3035";
       ["frac arrays/lists are not yet supported"], "E3119";
@@ -259,7 +274,6 @@ let code_of = function
     ]
   | `Mir ->
     code_of_tbl "E4000" [
-      ["push target must be a list variable"], "E4001";
       ["unsupported frac operation"], "E4004";
       ["unsupported field-access target"], "E4005";
       ["unsupported address-of target"], "E4006";

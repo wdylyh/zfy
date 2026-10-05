@@ -9,6 +9,7 @@ let merr p fmt = Printf.ksprintf (fun s -> raise (MirError (p, s))) fmt
 type operand = { o : op_kind; oty : zty }
 and op_kind =
   | OInt of int64
+  | OBig of string              (* i128/u128 大字面量（w-014 #6）：十进制数字串 *)
   | OFloat of float
   | OStr of string
   | OBool of bool
@@ -65,10 +66,18 @@ type instr =
   | MFreeVar of string * zty                     (* RAII：作用域退出释放变量持有的资源 *)
   | MFreeTemp of string                          (* 语句末释放临时堆�?*)
   | MFreeSeqTemp of string * bool                (* 语句末释放临�?seq（bool=元素是否 string�?*)
+  | MFreeVal of operand * zty
+    (* 释放寄存器持有的堆值（w-014 #3 引用槽整体赋值用）：
+       string 释放堆串；数组/列表释放 seq（bool 元素标志按类型推导） *)
   | MSeqAlloc of string * zty * int64 * bool
     (* 数组/列表分配：槽, 元素类型, 长度(列表�?0→编译器自选初始容�?, 是否列表 *)
   | MSeqSet of string * zty * operand * operand * bool * bool
-    (* arr[i]=v：槽, 元素类型(决定写入宽度), 下标, �? 可扩�?*)
+    (* arr[i]=v：槽, 元素类型(决定写入宽度), 下标, 值, 可扩长 *)
+  | MSeqSetAt of operand * zty * operand * operand * bool * bool
+    (* arr[i]=v 槽地址版（w-014 #3）：槽地址(持有 seq 指针的槽), 元素类型,
+       下标, 值, 可扩长, unchecked——字段链/ref 解引用/元素槽写目标 *)
+  | MLoadSeq of string * operand
+    (* 从槽地址 load seq 指针：目标, 槽地址操作数（MSeqSetAt/MSeqLenAt 前置） *)
   | MSeqGet of string * operand * operand * zty * bool  (* 读元素到临时：目标, 数组, 下标, 元素类型, unchecked(关闭越界检查) *)
   | MSeqLen of string * operand                  (* length(x)：目标临�? 数组/列表 *)
   | MSeqSlice of string * operand * operand * operand * operand * bool
@@ -93,8 +102,12 @@ type instr =
     (* 解引用写：store <值>, ptr <地址>（地址, 目标类型, 值；仅标量/指针目标） *)
   | MFieldAddr of string * operand * zty * int list * zty
     (* 字段地址：dst = GEP 链地址（root 操作数, 根类型(可为 TPtr), 字段链, 字段类型） *)
-  | MElemAddr of string * operand * operand * zty
-    (* 元素地址（裸指针，无越界检查）：dst = getelementptr（base ptr, 下标, 元素类型） *)
+  | MElemAddr of string * operand * operand * zty * bool
+    (* 元素地址：dst = getelementptr（base ptr, 下标, 元素类型）；
+       bool = 是否做边界检查（&x 显式取地址为 false，写目标定位为 true） *)
+  | MSeqLit of string * zty * operand list
+    (* 序列字面量（w-014 #3）：目标槽（alloca 持 seq 指针）, 元素类型, 元素值——
+       分配 len=cap=元素个数的 seq 并逐元素写入 *)
   | MIndirectCall of string option * operand * operand list * zty
     (* 函数指针间接调用：dst, 被调指针值, 实参（标量语义借传）, 返回类型 *)
   | MFunAddr of string * string
@@ -272,6 +285,7 @@ let rec lexpr l (e : texpr) : operand =
     (match e.ety with
      | TFloat _ -> op (OFloat (Int64.to_float n)) e.ety
      | _ -> op (OInt n) e.ety)
+  | EBigK digits -> op (OBig digits) e.ety
   | EFloatK f -> op (OFloat f) e.ety
   | EStrK s -> op (OStr s) e.ety
   | ECharK c -> op (OChar c) e.ety
@@ -334,13 +348,23 @@ let rec lexpr l (e : texpr) : operand =
     emit l (MUnop (d, u, oa));
     op (OLocal d) e.ety
   | ECastK (a, t) when a.ety = TString ->
-    (* string → 数值 cast：错误值路径（失败产 TErr 值，code=CAST）；
+    (* string → 数值 cast。128 位目标走 fail-fast 独立通道（w-014 顺带修
+       t-016 遗留：TErr 无 128 位容器，原实现经 zfy_stoi_err 时调用约定
+       与 C sret 不匹配产出垃圾值）；其余错误值路径（失败产 TErr，code=CAST）：
        zfy_stoi_err / zfy_stod_err 以 sret 写 TErr 聚合 *)
     let oa = lexpr l a in
-    let fn = match t with TFloat _ -> "zfy_stod_err" | _ -> "zfy_stoi_err" in
-    let d = fresh l in
-    emit l (MCall (Some d, fn, [ oa ], e.ety));
-    op (OLocal d) e.ety
+    let wide = match t with TInt 128 | TUint 128 | TFloat 128 -> true | _ -> false in
+    if wide then begin
+      let fn = match t with TFloat 128 -> "zfy_stod_wide" | _ -> "zfy_stoi_wide" in
+      let d = fresh l in
+      emit l (MCall (Some d, fn, [ oa ], t));
+      op (OLocal d) e.ety
+    end else begin
+      let fn = match t with TFloat _ -> "zfy_stod_err" | _ -> "zfy_stoi_err" in
+      let d = fresh l in
+      emit l (MCall (Some d, fn, [ oa ], e.ety));
+      op (OLocal d) e.ety
+    end
   | ECastK (a, t) ->
     let oa = lexpr l a in
     let d = fresh l in
@@ -383,11 +407,17 @@ let rec lexpr l (e : texpr) : operand =
      | Some d' -> op (OLocal d') e.ety
      | None -> op (OInt 0L) TVoid)
   | ESeqGetK (b, i) ->
-    (* arr[i]：结果写入元素类型临时（越界运行时报错） *)
+    (* arr[i]：结果写入元素类型临时（越界运行时报错）。
+       聚合元素（struct/嵌套 seq，w-014 #2/#4）为深拷贝副本：
+       登记语句临时（语句末释放，整体赋值时 move 接管） *)
     let ob = lexpr l b and oi = lexpr l i in
     let elem = e.ety in
     let d = fresh l in
     emit l (MSeqGet (d, ob, oi, elem, l.unchecked));
+    (match elem with
+     | TStruct _ -> add_temp l d (FStruct elem)
+     | TList _ | TArray _ -> add_temp l d (FSeq false)
+     | _ -> ());
     op (OLocal d) elem
   | ESeqLenK b ->
     (* length(x)：数�?列表长度（string �?length �?typeck 已转�?strlen 调用�?*)
@@ -415,17 +445,37 @@ let rec lexpr l (e : texpr) : operand =
        emit l (MCall (Some d, "zfy_str_split_str", [ oa; oc ], TList TString)));
     add_temp l d (FSeq true);
     op (OLocal d) (TList TString)
+  | ESeqLitK (elem, elems) ->
+    (* 序列字面量（w-014 #3）：分配 len=cap=N 的 seq 逐元素写入；
+       结果登记为语句临时（整体赋值时 move 接管，免克隆） *)
+    let d = fresh l in
+    let vals = List.map (lexpr l) elems in
+    emit l (MSeqLit (d, elem, vals));
+    add_temp l d (FSeq (match elem with TString -> true | _ -> false));
+    op (OLocal d) (TList elem)
   | EPushK (base, v) ->
-    (* push(列表, 值)：下标 = 当前长度，写入时自动扩长 *)
+    (* push(列表, 值)：下标 = 当前长度，写入时自动扩长。
+       槽根分派（w-014 #3）：变量槽直写；字段链/ref 解引用/元素槽经槽地址 *)
+    let elem = (match base.ety with
+                | TList t -> t
+                | TPtr (TList t) -> t
+                | _ -> assert false) in
     (match base.e with
      | EVarK name ->
-       let elem = (match base.ety with TList t -> t | _ -> assert false) in
        let dl = fresh l in
        emit l (MSeqLen (dl, op (OLocal name) base.ety));
        let ov = lexpr l v in
        emit l (MSeqSet (name, elem, op (OLocal dl) (TInt 64), ov, true, l.unchecked));
        op (OInt 0L) TVoid
-     | _ -> merr e.epos "push target must be a list variable")
+     | _ ->
+       let addr = seq_slot_addr l base elem in
+       let sp = fresh l in
+       emit l (MLoadSeq (sp, addr));
+       let dl = fresh l in
+       emit l (MSeqLen (dl, op (OLocal sp) (TList elem)));
+       let ov = lexpr l v in
+       emit l (MSeqSetAt (addr, elem, op (OLocal dl) (TInt 64), ov, true, l.unchecked));
+       op (OInt 0L) TVoid)
   | EStructNewK (_, fields) ->
     (* struct 构造：逐字段求值后写入聚合目标槽（llvmgen 负责 alloca 与
        深拷贝语义）。目标登记为语句临时：语句末释放，或整体赋值时 move 接管 *)
@@ -437,22 +487,28 @@ let rec lexpr l (e : texpr) : operand =
   | EFieldK (base, idx) ->
     (* 字段读取：字段链展平为 (根槽, 序号链)，一次 GEP 直达最终字段。
        标量/string/seq 字段 load 值（借用语义，赋值时才深拷贝）；
-       嵌套 struct 字段深拷贝到临时槽（值语义） *)
+       嵌套 struct 字段深拷贝到临时槽（值语义）。
+       展平到 EVarK 失败时（w-014 #8：ps[1].x / f().x 等），先求基
+       表达式（struct 结果为深拷贝临时槽/借用根），再从根 GEP 取字段 *)
     let rec flatten acc b =
       match b.e with
       | EFieldK (b', i) -> flatten (i :: acc) b'
       | EVarK n -> Some (n, acc, b.ety)
       | _ -> None
     in
-    (match flatten [ idx ] base with
-     | Some (root, idxs, rootty) ->
-       let d = fresh l in
-       emit l (MFieldGet (d, op (OLocal root) rootty, rootty, idxs, e.ety));
-       (match e.ety with
-        | TStruct _ -> add_temp l d (FStruct e.ety)  (* 深拷贝副本：语句末释放 *)
-        | _ -> ());
-       op (OLocal d) e.ety
-     | None -> merr e.epos "unsupported field-access target")
+    let (root, idxs, rootty) =
+      match flatten [ idx ] base with
+      | Some (n, idxs, rootty) -> (op (OLocal n) rootty, idxs, rootty)
+      | None ->
+        let rb = lexpr l base in
+        (rb, [ idx ], base.ety)
+    in
+    let d = fresh l in
+    emit l (MFieldGet (d, root, rootty, idxs, e.ety));
+    (match e.ety with
+     | TStruct _ -> add_temp l d (FStruct e.ety)  (* 深拷贝副本：语句末释放 *)
+     | _ -> ());
+    op (OLocal d) e.ety
   | ENullK ->
     (* null：0 值（llvmgen 对指针类型的 OInt 0 落为 null 常量） *)
     op (OInt 0L) e.ety
@@ -482,13 +538,12 @@ let rec lexpr l (e : texpr) : operand =
           op (OLocal d) e.ety
         | None -> merr e.epos "unsupported address-of target")
      | ESeqGetK (b, i) ->
-       (match b.e with
-        | EVarK _ ->
-          let ob = lexpr l b and oi = lexpr l i in
-          let d = fresh l in
-          emit l (MElemAddr (d, ob, oi, a.ety));
-          op (OLocal d) e.ety
-        | _ -> merr e.epos "element address-of target must be a variable")
+       (* 元素地址：基为变量槽/字段链/解引用等任意"seq 指针值"形态
+          （w-014 #8 泛化；显式取地址，无越界检查） *)
+       let ob = lexpr l b and oi = lexpr l i in
+       let d = fresh l in
+       emit l (MElemAddr (d, ob, oi, a.ety, false));
+       op (OLocal d) e.ety
      | _ -> merr e.epos "unsupported address-of target")
   | EDerefK p ->
     (* 解引用读：p 为指针值，load 目标类型（聚合类型已在 typeck 拒绝） *)
@@ -582,6 +637,36 @@ let rec lexpr l (e : texpr) : operand =
     emit l (MCall (Some d, "zfy_err_find", [ os; oc; ok ], e.ety));
     op (OLocal d) e.ety
 
+(* 可写 seq 槽地址（w-014 #3）：非变量槽根（字段链/解引用/元素槽）
+   统一产出一个"持有 seq 指针的槽地址"寄存器操作数。
+   EVarK 不走此函数（MSeqSet 直写槽名的快速路径） *)
+and seq_slot_addr l (root : texpr) (elem : zty) : operand =
+  match root.e with
+  | EFieldK _ ->
+    let rec flatten acc b =
+      match b.e with
+      | EFieldK (b', i) -> flatten (i :: acc) b'
+      | EVarK n -> Some (n, acc, b.ety)
+      | _ -> None
+    in
+    (match flatten [] root with
+     | Some (n, idxs, rootty) ->
+       let d = fresh l in
+       emit l (MFieldAddr (d, op (OLocal n) rootty, rootty, idxs, TList elem));
+       op (OLocal d) (TList elem)
+     | None -> merr root.epos "unsupported field slot target")
+  | EDerefK p -> lexpr l p
+  | EAddrOfK { e = ESeqGetK (b, i); _ } ->
+    (* 元素槽地址（嵌套 seq 写）：带边界检查定位外层元素槽。
+       定位的元素类型 = 基的元素类型（行/子列表，宽度 8），非最内层元素 *)
+    let et = (match b.ety with
+              | TList t | TArray (t, _) -> t
+              | _ -> merr root.epos "element slot base is not a seq") in
+    let d = fresh l in
+    emit l (MElemAddr (d, lexpr l b, lexpr l i, et, true));
+    op (OLocal d) et
+  | _ -> merr root.epos "unsupported seq slot target"
+
 (* ---------- 语句降码 ---------- *)
 
 let rec lblock l (stmts : tblock) : unit =
@@ -658,16 +743,47 @@ and lstmt_inner l (s : tstmt) : unit =
            if nn then emit l (MNorm (name, lhs.ety))
          end
        end
+     | EFieldK _ ->
+       (* 字段链整体赋值（bag.xs = ...，w-14 #3）：GEP 定位字段 +
+          深拷贝写入（值语义，旧字段资源由 MFieldStore 释放）。
+          字面量临时不 move（深拷贝进字段，临时语句末释放） *)
+       let rec flatten acc b =
+         match b.e with
+         | EFieldK (b', i) -> flatten (i :: acc) b'
+         | EVarK n -> Some (n, acc, b.ety)
+         | _ -> None
+       in
+       (match flatten [] lhs with
+        | Some (rootn, idxs, rootty) ->
+          emit l (MFieldStore (op (OLocal rootn) rootty, rootty, idxs, v))
+        | None -> merr lhs.epos "unsupported field assignment target")
      | _ -> merr lhs.epos "unsupported assignment target")
-  | SAugIndexK (name, elem, idx, bop, v, grow) ->
-    (* a[i] op= v：下标只求值一次（load + op + store 同一槽位�?*)
+  | SAugIndexK (root, elem, idx, bop, v, grow) ->
+    (* a[i] op= v：下标只求值一次（load + op + store 同一槽位）。
+       槽根分派（w-014 #3）：变量槽直写；其余经槽地址 *)
     let oi = lexpr l idx in
+    let (seqop, addr) =
+      match root.e with
+      | EVarK name -> (op (OLocal name) (TList elem), None)
+      | _ ->
+        let a = seq_slot_addr l root elem in
+        let sp = fresh l in
+        emit l (MLoadSeq (sp, a));
+        (op (OLocal sp) (TList elem), Some a)
+    in
     let old = fresh l in
-    emit l (MSeqGet (old, op (OLocal name) (TList elem), oi, elem, l.unchecked));
+    emit l (MSeqGet (old, seqop, oi, elem, l.unchecked));
     let ov = lexpr l v in
     let r = fresh l in
     emit l (MBinop (r, bop, op (OLocal old) elem, ov));
-    emit l (MSeqSet (name, elem, oi, op (OLocal r) elem, grow, l.unchecked))
+    (match addr with
+     | None ->
+       (match root.e with
+        | EVarK name ->
+          emit l (MSeqSet (name, elem, oi, op (OLocal r) elem, grow, l.unchecked))
+        | _ -> assert false)
+     | Some a ->
+       emit l (MSeqSetAt (a, elem, oi, op (OLocal r) elem, grow, l.unchecked)))
   | SAugVarK (name, ty, bop, v, nn) ->
     (* x op= v：load + op + store 同一槽位 *)
     let ov = lexpr l v in
@@ -675,9 +791,27 @@ and lstmt_inner l (s : tstmt) : unit =
     emit l (MBinop (r, bop, op (OLocal name) ty, ov));
     emit l (MCopy (name, op (OLocal r) ty, ty));
     if nn then emit l (MNorm (name, ty))
-  | SSeqSetK (name, elem, idx, v, grow) ->
-    (* 元素写入：元素类型决定写入宽度；grow 允许列表扩长 *)
-    emit l (MSeqSet (name, elem, lexpr l idx, lexpr l v, grow, l.unchecked))
+  | SSeqSetK (root, elem, idx, v, grow) ->
+    (* 元素写入：元素类型决定写入宽度；grow 允许列表扩长。
+       槽根分派（w-014 #3）：变量槽直写；字段链/ref 解引用/元素槽经槽地址 *)
+    (match root.e with
+     | EVarK name ->
+       emit l (MSeqSet (name, elem, lexpr l idx, lexpr l v, grow, l.unchecked))
+     | _ ->
+       let addr = seq_slot_addr l root elem in
+       emit l (MSeqSetAt (addr, elem, lexpr l idx, lexpr l v, grow, l.unchecked)))
+  | SStrSetK (root, idx, v) ->
+    (* string 下标写（w-014 #5）：槽内堆串原地写（槽独占由 MCopy strdup
+       保证），越界运行时报错。变量槽 load 串指针；字段/ref 路径
+       load 出串指针后同写 *)
+    let sp =
+      match root.e with
+      | EVarK n -> op (OLocal n) root.ety
+      | EFieldK _ | EDerefK _ -> lexpr l root
+      | _ -> merr root.epos "unsupported string index-assignment target"
+    in
+    let oi = lexpr l idx and ov = lexpr l v in
+    emit l (MCall (None, "zfy_str_set", [ sp; oi; ov ], TVoid))
   | SRemoveK (name, elem, idx, is_list) ->
     (* remove(数组/列表, i)：数组槽位填零值；列表删除并左移，长度-1 *)
     emit l (MSeqRemove (name, elem, lexpr l idx, is_list))
@@ -686,14 +820,20 @@ and lstmt_inner l (s : tstmt) : unit =
     emit l (MAugSlice (name, elem, lexpr l a, lexpr l b, lexpr l st, bop,
                        lexpr l v))
   | SFieldSetK (root, idxs, rootty, v) ->
-    (* 字段写入：GEP 直达字段，深拷贝新值 + 释放旧值（llvmgen 按字段类型分派） *)
-    emit l (MFieldStore (op (OLocal root) rootty, rootty, idxs, lexpr l v))
-  | SFieldSeqSetK (root, idxs, rootty, elem, i, v, grow) ->
-    (* 字段链下数组/列表元素写入：b.data[i] = v（第 7 条顺带修）——
-       先 load 字段值（= seq 指针），再按元素写入（与 SSeqSetK 同路径） *)
-    let d = fresh l in
-    emit l (MFieldGet (d, op (OLocal root) rootty, rootty, idxs, TList elem));
-    emit l (MSeqSet (d, elem, lexpr l i, lexpr l v, grow, l.unchecked))
+    (* 字段写入：根地址（变量槽/元素槽地址/解引用）定位一次 + GEP 链，
+       深拷贝新值 + 释放旧值（llvmgen 按字段类型分派） *)
+    let rp =
+      match root.e with
+      | EVarK n -> op (OLocal n) root.ety
+      | EAddrOfK { e = ESeqGetK (b, i); _ } ->
+        let d = fresh l in
+        let ety = (match root.ety with TPtr t -> t | _ -> assert false) in
+        emit l (MElemAddr (d, lexpr l b, lexpr l i, ety, true));
+        op (OLocal d) ety
+      | EDerefK p -> lexpr l p
+      | _ -> merr root.epos "unsupported field-set root"
+    in
+    emit l (MFieldStore (rp, root.ety, idxs, lexpr l v))
   | SAugFieldK (root, idxs, rootty, bop, v) ->
     (* 字段增广：load 字段 + op + 写回（字段只求值一次；字段类型 = 右值类型） *)
     let fty = v.ety in
@@ -705,10 +845,26 @@ and lstmt_inner l (s : tstmt) : unit =
     emit l (MFieldStore (op (OLocal root) rootty, rootty, idxs,
                          op (OLocal r) fty))
   | SDerefSetK (p, v) ->
-    (* 指针解引用写入 p* = v：地址先求值，store 值（仅标量/指针目标） *)
+    (* 指针解引用写入 p* = v：地址先求值。
+       标量/指针目标：直接 store 值。
+       聚合目标（string/数组/列表，ref 参数整体赋值，w-014 #3）：
+       新值落入临时槽（右值为本语句临时则 move 接管）→ 释放旧值 →
+       store 新指针（引用槽整体替换） *)
     let pv = lexpr l p in
-    let vv = lexpr l v in
-    emit l (MStoreK (pv, v.ety, vv))
+    (match v.ety with
+     | TString | TList _ | TArray _ ->
+       let tmp = fresh l in
+       emit l (MAlloca (tmp, v.ety));
+       let vv = lexpr l v in
+       if not (move_owned_temp l tmp vv v.ety) then
+         emit l (MCopy (tmp, vv, v.ety));
+       let old = fresh l in
+       emit l (MLoadK (old, pv, v.ety));
+       emit l (MFreeVal (op (OLocal old) v.ety, v.ety));
+       emit l (MStoreK (pv, v.ety, op (OLocal tmp) v.ety))
+     | _ ->
+       let vv = lexpr l v in
+       emit l (MStoreK (pv, v.ety, vv)))
   | SAugDerefK (p, bop, v) ->
     (* 指针解引用复合赋值 p* op= v：load 旧值 + op + store（p 只求值一次） *)
     let pv = lexpr l p in
@@ -1091,9 +1247,14 @@ let uses_of (i : instr) : string list =
   | MInput (_, _, d) -> operand_names d
   | MSeqAlloc _ -> []
   | MSeqSet (name, _, idx, v, _, _) ->
-    (* name 亦为 use：字段链下数组写（SFieldSeqSetK）经 MFieldAddr 临时
+    (* name 亦为 use：字段链下数组写经 MFieldAddr 临时
        指针 %tN 作为 seq 来源，须保持其纯指令不被死代码消除 *)
     name :: operand_names idx @ operand_names v
+  | MSeqSetAt (slot, _, idx, v, _, _) ->
+    operand_names slot @ operand_names idx @ operand_names v
+  | MLoadSeq (_, a) -> operand_names a
+  | MSeqLit (_, _, vs) -> List.concat_map operand_names vs
+  | MFreeVal (o, _) -> operand_names o
   | MFreeVar _ -> []
   | MFreeTemp _ -> []
   | MFreeSeqTemp _ -> []
@@ -1110,7 +1271,7 @@ let uses_of (i : instr) : string list =
   | MLoadK (_, a, _) -> operand_names a
   | MStoreK (a, _, v) -> operand_names a @ operand_names v
   | MFieldAddr (_, root, _, _, _) -> operand_names root
-  | MElemAddr (_, base, idx, _) -> operand_names base @ operand_names idx
+  | MElemAddr (_, base, idx, _, _) -> operand_names base @ operand_names idx
   | MIndirectCall (_, f, args, _) ->
     operand_names f @ List.concat_map operand_names args
   | MFunAddr _ -> []
@@ -1122,7 +1283,7 @@ let pure_dst (i : instr) : string option =
   (* 指针取地址/读/字段地址/元素地址/函数地址均为纯求值（间接调用有副作用除外）；
      错误值判定/取值同理（只读槽） *)
   | MAddrOf (d, _) | MLoadK (d, _, _) | MFieldAddr (d, _, _, _, _)
-  | MElemAddr (d, _, _, _) | MFunAddr (d, _)
+  | MElemAddr (d, _, _, _, _) | MFunAddr (d, _)
   | MErrIsOk (d, _, _) | MErrValue (d, _, _) ->
     if String.length d > 0 && d.[0] = '%' then Some d else None
   | _ -> None

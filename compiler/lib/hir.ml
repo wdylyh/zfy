@@ -29,6 +29,7 @@ type texpr =
 
 and texpr_kind =
   | EIntK of int64
+  | EBigK of string               (* i128/u128 大字面量（w-014 #6）：十进制数字串 *)
   | EFloatK of float
   | EStrK of string
   | ECharK of char
@@ -45,7 +46,9 @@ and texpr_kind =
   | ESeqSliceK of texpr * texpr * texpr * texpr
     (* base[a,b:step]：数组/列表切片，返回同元素类型的动态序列（TList 元素） *)
   | ESplitK of texpr * texpr        (* split(s, x)：结果为 string 列表（新 seq，临时） *)
-  | EPushK of texpr * texpr         (* push(list, v)：追加到列表末尾（自动扩长），结果 void *)
+  | ESeqLitK of zty * texpr list    (* 序列字面量（整体赋值右值，w-014 #3）：新分配 seq + 逐元素写入 *)
+  | EPushK of texpr * texpr         (* push(list, v)：追加到列表末尾（自动扩长），结果 void。
+                                       base 为可写 seq 槽根：变量槽/字段链/解引用（ref 参数） *)
   | EStructNewK of string * texpr list
     (* struct 构造：名, 字段值（按声明序，typeck 已补全 default/零值） *)
   | EFieldK of texpr * int          (* 字段读取：base, 字段序号（ety = 字段类型） *)
@@ -85,16 +88,23 @@ and tstmt_kind =
        语义同 s = s + p1 + p2 + ...，但走 realloc 扩容（O(追加量) 而非
        O(总长) 拷贝）；槽须独占堆串（MCopy strdup 保证），且各操作数
        不得引用槽本身（typeck 侧保证，否则 realloc 后悬垂读） *)
-  | SAugIndexK of string * zty * texpr * binop * texpr * bool
+  | SAugIndexK of texpr * zty * texpr * binop * texpr * bool
     (* 复合赋值作用于数组/列表元素：a[i] op= v
-       (槽名, 元素类型, 下标(只求值一次), 运算, 右值, 可扩长) *)
+       (槽根, 元素类型, 下标(只求值一次), 运算, 右值, 可扩长)——槽根为
+       变量槽 EVarK / 字段链 EFieldK / 解引用 EDerefK（w-014 #3） *)
   | SAugVarK of string * zty * binop * texpr * bool
     (* 复合赋值作用于标量变量：x op= v（槽名, 类型, 运算, 右值, 需自动约分） *)
   | SAugSliceK of string * zty * texpr * texpr * texpr * binop * texpr
     (* 复合赋值作用于切片区间：a[x,y:st] op= v（槽名, 元素类型, 起点, 终点, 步长,
        运算, 右值）——原地作用于原数组的每个元素 *)
-  | SSeqSetK of string * zty * texpr * texpr * bool
-    (* arr[i] = v：(槽名, 元素类型, 下标, 值, 是否列表可扩长) *)
+  | SSeqSetK of texpr * zty * texpr * texpr * bool
+    (* arr[i] = v：(槽根, 元素类型, 下标, 值, 是否列表可扩长)。槽根为可写
+       seq 槽：变量槽 EVarK / 字段链 EFieldK / 解引用 EDerefK（ref 参数）/
+       元素槽地址 EAddrOfK (ESeqGetK _)（嵌套写 a[i][j]，w-014 #3/#4） *)
+  | SStrSetK of texpr * texpr * texpr
+    (* s[i] = c：string 下标写字符（w-014 #5）——(槽根, 下标, char 值)。
+       槽内堆串原地写（槽独占由 MCopy strdup 保证），越界运行时报错；
+       字段/ref 路径 load 出串指针后同写 *)
   | SExprK of texpr
   | SReturnK of texpr option
   | SIfK of texpr * tblock * tblock
@@ -111,17 +121,17 @@ and tstmt_kind =
        的赋值；块也可 return/break/continue/panic 提前离开 *)
   | SBreakK
   | SContinueK
-  | SFieldSetK of string * int list * zty * texpr
-    (* struct 字段链写入：(根槽名, 字段序号链, 根 struct 类型, 值)——
-       根槽只定位一次，链逐级 GEP；聚合字段写入为深拷贝（值语义） *)
+  | SFieldSetK of texpr * int list * zty * texpr
+    (* struct 字段链写入：(根地址, 字段序号链, 根 struct 类型, 值)——
+       根地址为 TStruct/TPtr(TStruct) 形态：变量槽 EVarK / 元素槽地址
+       EAddrOfK (ESeqGetK _)（ps[1].x = v，w-014 #8）/ 解引用 EDerefK；
+       根只定位一次，链逐级 GEP；聚合字段写入为深拷贝（值语义） *)
   | SAugFieldK of string * int list * zty * binop * texpr
     (* struct 字段链复合赋值：(根槽名, 链, 根类型, 运算, 右值)——
        仅数值标量字段（load + op + store 同一字段） *)
   | SDerefSetK of texpr * texpr
-    (* 指针解引用写入：p* = v（p 表达式, 值——目标类型 = v.ety，仅标量/指针） *)
-  | SFieldSeqSetK of string * int list * zty * zty * texpr * texpr * bool
-    (* 字段链下数组/列表元素写入：b.data[i] = v（根槽名, 字段链, 根类型,
-       元素类型, 元素下标, 值, 是否列表）——第 7 条顺带修 *)
+    (* 指针解引用写入：p* = v（p 表达式, 值——目标类型 = v.ety，仅标量/指针；
+       聚合（string/数组/列表）目标为引用槽整体赋值：释放旧值 + 接管新值（w-014 #3） *)
   | SAugDerefK of texpr * binop * texpr
     (* 指针解引用复合赋值：p* op= v（p 表达式, 运算, 右值）；p*++ 亦归此 *)
   | SUnsafeK of tblock

@@ -1,0 +1,19 @@
+// w-014 #5/#6：char 算术 / ord / chr / string 下标写 / i128 大字面量
+void main()
+    char c = 'A'
+    output(c + 1)
+    output(ord(c))
+    output(chr(66))
+    string s = "hello"
+    s[0] = 'H'
+    output(s)
+    output(s[0])
+    s[4] = chr(ord('O'))
+    output(s)
+    i128 a = 1267650600228229401496703205376
+    output(a)
+    u128 b = 340282366920938463463374607431768211455
+    output(b)
+    i128 cc = 12345
+    output(cc)
+    return

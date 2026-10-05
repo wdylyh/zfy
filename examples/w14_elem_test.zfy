@@ -1,0 +1,45 @@
+// w-014 #2/#3/#4/#8：struct 作列表元素、字段访问/写入体系、嵌套列表、二维数组
+struct P
+    i32 x = 0
+    string name
+struct Bag
+    i32 xs[]
+void main()
+    P a = P(x=1, name="a")
+    P b = P(x=2, name="b")
+    P ps[]
+    push(ps, a)
+    push(ps, b)
+    a.x = 100
+    output(ps[1].x)
+    output(ps[0].name)
+    ps[0].x = 77
+    output(a.x)
+    output(ps[0].x)
+    Bag bag
+    push(bag.xs, 5)
+    push(bag.xs, 7)
+    output(bag.xs)
+    output(bag.xs[0])
+    bag.xs = 1, 2, 3
+    output(bag.xs)
+    bag.xs[1] = 99
+    output(bag.xs)
+    bag.xs[2] += 1
+    output(bag.xs)
+    // 嵌套列表：列表的列表
+    i32 m[][]
+    i32 r1[]
+    push(r1, 1)
+    push(r1, 2)
+    push(m, r1)
+    push(m[0], 3)
+    output(m[0])
+    output(m[0][2])
+    // 定长二维数组
+    i32 g[2][3]
+    g[1][2] = 9
+    output(g[1])
+    output(g[1][2])
+    output(g[0][0])
+    return
