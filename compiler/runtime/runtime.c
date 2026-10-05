@@ -1317,6 +1317,18 @@ char *zfy_str_concat(const char *a, const char *b) {
     return buf;
 }
 
+/* 原地追加（T7 优化）：b 并入 a 的缓冲区（realloc 扩容），返回新指针。
+   a 必须是槽独占的 malloc 堆串（MCopy 对字面量 strdup 保证），
+   调用方不得再使用旧 a（realloc 可能移动缓冲区） */
+char *zfy_str_append(char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char *p = (char *)realloc(a, la + lb + 1);
+    if (!p) zfy_die("字符串追加: 内存分配失败");
+    memcpy(p + la, b, lb);
+    p[la + lb] = '\0';
+    return p;
+}
+
 /* 按分隔符切分为 string 列表：返回 zfy_seq（元素宽度 8=指针），
  * 各段为 malloc 堆串、len = 段数（连续分隔符产生空段）。
  * 内部公共实现：c>=0 按单字符，否则按 delim 整串 */

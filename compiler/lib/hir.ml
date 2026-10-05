@@ -80,6 +80,11 @@ and tstmt_kind =
   | SAssignK of texpr * texpr * bool * bool
     (* 标量赋值：(目标, 值, 需自动约分, move)——move=true 时值为同一变量槽
        （EVarK src），所有权转移免克隆（自动 move/显式 move 赋值，new2.md #1） *)
+  | SStrAppendK of string * texpr list
+    (* string 原地追加（T7 优化）：槽名 + 追加操作数（各为 string 值）。
+       语义同 s = s + p1 + p2 + ...，但走 realloc 扩容（O(追加量) 而非
+       O(总长) 拷贝）；槽须独占堆串（MCopy strdup 保证），且各操作数
+       不得引用槽本身（typeck 侧保证，否则 realloc 后悬垂读） *)
   | SAugIndexK of string * zty * texpr * binop * texpr * bool
     (* 复合赋值作用于数组/列表元素：a[i] op= v
        (槽名, 元素类型, 下标(只求值一次), 运算, 右值, 可扩长) *)

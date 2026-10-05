@@ -1860,16 +1860,12 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
        let slot = l.lslot in
        (match resolve l.lty, bop with
         | TString, BAdd ->
-          (* s += v：string 拼接后重新赋值（结果为独立堆串） *)
-          let tself = { e = EVarK slot; ety = TString; epos = p' } in
+          (* s += v：原地追加（T7 优化，realloc 扩容免全量拷贝）；
+             槽独占堆串（MCopy strdup 保证），语义同 s = s + v *)
           let trhs = check_expr env rhs in
           if resolve trhs.ety <> TString then
             terr p' "string concatenation requires both sides to be string, got %s" (pp_zty trhs.ety);
-          let cat =
-            { e = ECallK ("zfy_str_concat", [ tself; trhs ], []);
-              ety = TString; epos = p' }
-          in
-          SAssignK (tself, cat, false, false)
+          SStrAppendK (slot, [ trhs ])
         | _ ->
           let lty = l.lty in
           let trhs = check_expr env rhs in
@@ -2220,7 +2216,35 @@ and check_stmt env (st : stmt) : tstmt =
                 mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, false, false))
               | _, _ ->
                 let trhs = coerce p' trhs lty in
-                mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, needs_norm, false))))
+                (* s = s + p1 + ... + pn（T7 优化）：concat 链根为槽本身时
+                   改原地追加（realloc 扩容，O(追加量) 免 O(总长) 全量拷贝）；
+                   任一操作数引用槽本身则回退（realloc 可能移动缓冲区，
+                   旧指针读悬垂）。texpr_uses_slot 对未知复合节点保守回退 *)
+                let rec flat (te : texpr) acc =
+                  match te.e with
+                  | ECallK ("zfy_str_concat", [ l; r ], _) -> flat l (r :: acc)
+                  | EVarK s when s = slot -> Some acc
+                  | _ -> None
+                in
+                let rec uses_slot (te : texpr) : bool =
+                  match te.e with
+                  | EVarK s -> s = slot
+                  | EIntK _ | EFloatK _ | EStrK _ | ECharK _ | EBoolK _ | ENullK _ -> false
+                  | ECallK (_, args, _) | EIndirectCallK (_, args) ->
+                    List.exists uses_slot args
+                  | EBinK (_, a, b) | EUnwrapK (a, b) | EFracNewK (a, b) ->
+                    uses_slot a || uses_slot b
+                  | EUnK (_, a) | ECastK (a, _) | EFieldK (a, _) | EDerefK a
+                  | EAddrOfK a | ESeqGetK (a, _) | ESeqLenK a | EErrOkK a
+                  | EPropagateK a | ESplitK (a, _) | ESeqSliceK (a, _, _, _) ->
+                    uses_slot a
+                  | _ -> true
+                in
+                (match resolve lty, flat trhs [] with
+                 | TString, Some (_ :: _ as parts) when not (List.exists uses_slot parts) ->
+                   mk (SStrAppendK (slot, parts))
+                 | _ ->
+                   mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, needs_norm, false)))))
         | None ->
           (* 名字含 '.'：struct 字段链写入（p.x = v / p.pos.x = v / r.x = v 指针自动解引用） *)
           (match split_field_path name with
@@ -2994,6 +3018,7 @@ let check_program (prog : program) : hir =
       | SSeqCopyK (c, n, t, len, src, isl) ->
         SSeqCopyK (c, n, subst_ty t, len, fix_texpr src, isl)
       | SAssignK (a, b, nn, mv) -> SAssignK (fix_texpr a, fix_texpr b, nn, mv)
+      | SStrAppendK (n, parts) -> SStrAppendK (n, List.map fix_texpr parts)
       | SAugIndexK (n, t, i, op, v, g) ->
         SAugIndexK (n, subst_ty t, fix_texpr i, op, fix_texpr v, g)
       | SAugVarK (n, t, op, v, nn) ->

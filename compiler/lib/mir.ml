@@ -23,6 +23,7 @@ type term =
 
 type instr =
   | MCopy of string * operand * zty              (* 槽位写入（聚合为 memcpy/克隆） *)
+  | MStrAppend of string * operand list          (* string 原地追加（T7 优化）：槽 realloc 扩容逐个并入，旧指针所有权保留（不 free） *)
   | MMoveSeq of string * operand * zty           (* 所有权转移：释放目标旧值后直接接管临时（免克隆）；string/数组/列表=指针接管，struct=槽 memcpy *)
   | MClear of string * zty                       (* move 后清空变量槽（store null，防 RAII 双释放） *)
   | MBinop of string * binop * operand * operand
@@ -603,6 +604,12 @@ and lstmt_inner l (s : tstmt) : unit =
     let v = lexpr l src in
     if not (move_owned_temp l name v tgt) then
       emit l (MCopy (name, v, tgt))
+  | SStrAppendK (name, parts) ->
+    (* string 原地追加（T7 优化）：各操作数求值为临时后逐个并入槽串。
+       槽指针所有权保留（不 free），realloc 可能移动缓冲区——typeck
+       保证操作数不引用槽本身 *)
+    let ops = List.map (lexpr l) parts in
+    emit l (MStrAppend (name, ops))
   | SAssignK (lhs, rhs, nn, mov) ->
     let v = lexpr l rhs in
     (match lhs.e with
@@ -1006,6 +1013,9 @@ let uses_of (i : instr) : string list =
   in
   match i with
   | MCopy (_, v, _) -> operand_names v
+  | MStrAppend (name, ops) ->
+    (* 槽名计为 use：名字后续仍被读时本语句不可删（同时是 def） *)
+    name :: List.concat_map operand_names ops
   | MMoveSeq (_, v, _) -> operand_names v
   | MClear _ -> []
   | MBinop (_, _, a, b) -> operand_names a @ operand_names b

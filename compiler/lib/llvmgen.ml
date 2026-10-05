@@ -1059,6 +1059,23 @@ let gen_instr fc (i : instr) : unit =
          if t <> tt then lerr None "slot type %s does not match value type %s" tt t;
          emitf fc "  store %s %s, ptr %s" tt v' dstp)
     end
+  | MStrAppend (name, ops) ->
+    (* string 原地追加（T7 优化）：槽独占堆串 realloc 扩容逐个并入，
+       槽指针所有权保留（不 free 旧串）；realloc 可能移动缓冲区，
+       typeck 保证操作数不引用槽本身 *)
+    let (dstp, _) = ptr_of fc (operand_of_name name TString) in
+    let cur0 = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" cur0 dstp;
+    let cur =
+      List.fold_left
+        (fun cur (o : operand) ->
+          let (vv, _) = val_of fc o in
+          let r = fresh_r fc in
+          emitf fc "  %s = call ptr @zfy_str_append(ptr %s, ptr %s)" r cur vv;
+          r)
+        cur0 ops
+    in
+    emitf fc "  store ptr %s, ptr %s" cur dstp
   | MMoveSeq (name, v, ty) ->
     (* 所有权转移：释放目标旧值后直接接管临时（免克隆）。
        临时从 stmt_temps 移除，语句末不会再释放（mir 侧保证）。 *)
@@ -2030,6 +2047,7 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare ptr @zfy_str_replace(ptr, i64, i64, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_replace_from(ptr, i64, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_concat(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_str_append(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split(ptr, i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split_str(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_seq_slice(ptr, i64, i64, i64, i8)\n";
