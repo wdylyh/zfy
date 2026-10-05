@@ -80,7 +80,7 @@ for string line in file        // for-in 语法糖（依赖 for-in 设计，另�
      （与数组越界同列附录 A），消息统一 "use of closed file" /
      "use of moved file handle"。
 3. **mode 校验 → 双层**：
-   - 编译期：实参为字符串字面量时，校验 ∈ {"r","w","a"}，非法报 E3178
+   - 编译期：实参为字符串字面量时，校验 ∈ {"r","w","a"}，非法报 E3177
      （第二阶段扩为 +"rb","wb","ab"）。
    - 运行期：非字面量实参（变量/拼接结果）在 open 内校验，非法 panic
      （消息 "invalid open mode: %s"）。
