@@ -701,7 +701,23 @@ and lstmt_inner l (s : tstmt) : unit =
     l.unchecked <- true;
     lblock l b;
     l.unchecked <- saved
-  | SExprK e -> ignore (lexpr l e)
+  | SExprK e ->
+    (* 语句级 fail(code, msg)（w-009）：构造错误值后按 ? 失败路径终止
+       函数（RAII 释放局部资源 + 错误值 memcpy 到 sret 返回槽 + ret
+       void），后继语句为死块。原实现把错误值当普通表达式丢弃后继续
+       执行（return 10/b 除零/垃圾值）；fail 返回 TErr 说明函数本身
+       返回 T!，MErrFillOut 合法 *)
+    (match e.e with
+     | EFailK _ ->
+       (match e.ety with
+        | TErr _ ->
+          let va = lexpr l e in
+          emit_frees_from l 0;
+          emit l (MErrFillOut (va, e.ety));
+          set_term l (TRet None);
+          l.cur <- new_block l
+        | _ -> ignore (lexpr l e))
+     | _ -> ignore (lexpr l e))
   | SReturnK e ->
     (* 先求返回值，再释放全部局部资源（RAII）；
        若返回值本身就�?owned 局部变量，跳过其释放（所有权随返回转移）�?       本语句的临时串所有权同样随返回转移，不再释放 *)
