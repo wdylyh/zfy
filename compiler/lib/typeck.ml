@@ -317,7 +317,9 @@ let rec match_gty (g : genv) (tparams : string list) (p : pos)
   | TNamed _ -> resolve (conv_ty g p t) = z
   | TPtr (t2, _) -> (match z with TPtr z2 -> match_gty g tparams p t2 z2 mref | _ -> false)
   | TPtrC (t2, _) -> (match z with TPtr z2 -> match_gty g tparams p t2 z2 mref | _ -> false)
-  | TErr _ -> false
+  | TErr (t2, _) ->
+    (* T! 返回类型下钻：声明期望 i32! 与返回 T! 反绑 T=i32（w-011 后续） *)
+    (match z with TErr z2 -> match_gty g tparams p t2 z2 mref | _ -> false)
   | TFun (r, ps, _) ->
     (match z with
      | TPtr (TFunSig (zs, rz)) ->
@@ -1084,6 +1086,7 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
   | SSeqDecl (_, _, _, len, _, inits, _) ->
     let acc = (match len with Some e -> uses_of_expr acc e | None -> acc) in
     List.fold_left uses_of_expr acc inits
+  | SDeclList ss -> List.fold_left uses_of_stmt acc ss
   | SAssign (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | SAug (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | SInc (a, _) | SDec (a, _) -> uses_of_expr acc a
@@ -1264,6 +1267,7 @@ and deref_refs (refs : string list) (body : block) : block =
     | SSeqDecl (c, n, t, len, isl, inits, p) ->
       SSeqDecl (c, n, t, (match len with Some e -> Some (re e) | None -> None), isl,
                 List.map re inits, p)
+    | SDeclList ss -> SDeclList (List.map rs ss)
     | SExpr e -> SExpr (re e)
     | SReturn (e, p) -> SReturn ((match e with Some e -> Some (re e) | None -> None), p)
     | SIf (c, a, b, p) ->
@@ -1983,6 +1987,13 @@ and check_unwrap_decl env p isconst name ty init =
    （多错误收集）；恢复作用域栈深度（异常会跳过配对的 pop_scope）。
    moved 表/fnvars 的残留可能引起级联报错，可接受（不掩盖首个错误） *)
 and check_block env (stmts : stmt list) : tblock =
+  (* 一行多声明器（SDeclList）展开为逐条语句（w-012），共享同一作用域：
+     声明按序生效，同行后续声明器与语句可见前面的名字 *)
+  let rec expand (st : stmt) : stmt list =
+    match st with
+    | SDeclList ss -> List.concat_map expand ss
+    | s -> [ s ]
+  in
   let recover s =
     let depth = List.length env.scopes in
     let r =
@@ -1994,7 +2005,7 @@ and check_block env (stmts : stmt list) : tblock =
     while List.length env.scopes > depth do pop_scope env done;
     r
   in
-  List.filter_map recover stmts
+  List.filter_map recover (List.concat_map expand stmts)
 
 (* 数组/列表声明检查（不含 split 初值特判）：返回语句种类 *)
 and check_seq_decl env p isconst name e len is_list inits =
@@ -2475,6 +2486,7 @@ and pos_of_stmt = function
   | SUnsafe (_, p)
   | SBreak p
   | SContinue p -> p
+  | SDeclList ss -> (match ss with s :: _ -> pos_of_stmt s | [] -> { file = ""; line = 0; col = 0 })
   | SExpr e -> pos_of_expr e
 
 (* ---------- 收尾：未求解 TVar 默认值 ---------- *)

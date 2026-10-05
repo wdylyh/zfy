@@ -16,13 +16,9 @@ i64 main()
     string s1 = "hello"
     string s2 = "hell"
     output(s1 == "hello", s1 != s2, "abc" == "abc", s1 == s2, sep=',')
-    // 泛型 T == / !=（实例化到 i32 / string）
-    i32 pa = 1
-    i32 pb = 2
-    i32! g1 = pick(pa, pb, 1 == 1)
+    // 泛型 T == / !=（声明期望反绑：字面量实参直接推断为 i32 / string）
+    i32! g1 = pick(1, 2, 1 == 1)
     output(g1 ?? -1)
-    string sx = "x"
-    string sy = "y"
-    string! g2 = pick(sx, sy, "x" == "x")
+    string! g2 = pick("x", "y", "x" == "x")
     output(g2 ?? "err")
     return 0

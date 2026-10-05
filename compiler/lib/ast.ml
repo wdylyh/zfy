@@ -53,6 +53,10 @@ and stmt =
   | SSeqDecl of bool * string * ty * expr option * bool * expr list * pos
     (* 数组/列表声明：(is_const, 名, 元素类型, 长度表达式(列表为 None, 可用 const
        变量), 是否列表, 初始元素)；未给出的槽位填零值 *)
+  | SDeclList of stmt list
+    (* 一行多声明器（w-012）：T a, b = 1, c[3], d[]——各声明器共享类型与前缀
+       修饰符（const/frac/unred），初值各自独立；仅语句位置（顶层与 for
+       头部保持单声明器，避免与 for 头逗号段冲突） *)
   | SAssign of expr * expr * pos
   | SAug of binop * expr * expr * pos      (* 复合赋值：lhs op= rhs（左值地址只求值一次） *)
   | SInc of expr * pos                     (* x++（仅后缀） *)

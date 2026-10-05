@@ -608,44 +608,65 @@ and parse_modifiers p =
    列表：<类型> (const)? 名字[] (= 值1,值2,...)?（中括号必须为空） *)
 and parse_decl p tp =
   let ty = parse_ty p in
-  parse_decl_ty p tp ty
-
-and parse_decl_ty p tp ty =
+  (* 顶层 / for 头部：单声明器（不消费逗号，避免 for 头逗号段冲突） *)
   let (is_const, is_frac, is_unred, is_ref) = parse_modifiers p in
   if is_ref then err tp "ref is only allowed on function parameters";
+  let st = parse_declarator p tp ty is_const is_frac is_unred in
+  end_of_stmt p;
+  st
+
+(* 单个声明器：名字 + 可选 []/[长度]（数组/列表）+ 可选初值。
+   修饰符（const/frac/unred）由调用方解析并对每个声明器生效 *)
+and parse_declarator p tp ty is_const is_frac is_unred =
   let name = expect_ident p "variable name" in
-  (match peek p with
-   | (LBracket, lp) ->
-     (* 数组 / 列表：名字后跟 [长度]（数组）或 []（列表） *)
-     ignore (next p);
-     (match peek p with
-      | (RBracket, _) ->
-        ignore (next p);
-        if is_frac then err lp "lists do not support the frac modifier";
-        let inits = parse_seq_inits p in
-        end_of_stmt p;
-        SSeqDecl (is_const, name, ty, None, true, inits, lp)
-      | _ ->
-        if is_frac then err lp "arrays do not support the frac modifier";
-        let len = parse_expr p in
-        expect p RBracket "]";
-        let inits = parse_seq_inits p in
-        end_of_stmt p;
-        SSeqDecl (is_const, name, ty, Some len, false, inits, lp))
-   | _ ->
-     (* 标量：初值可省略（省略时填零值）；const 必须带初值 *)
-     let init =
-       (match p.toks with
-        | (Assign, _) :: _ ->
-          let (_t, _tp) = next p in
-          Some (parse_expr p)
-        | _ -> None)
-     in
-     (match is_const, init with
-      | true, None -> err tp "const requires an initializer"
-      | _ -> ());
-     end_of_stmt p;
-     SDecl (is_const, is_frac, is_unred, name, ty, init, tp))
+  match peek p with
+  | (LBracket, lp) ->
+    (* 数组 / 列表：名字后跟 [长度]（数组）或 []（列表） *)
+    ignore (next p);
+    (match peek p with
+     | (RBracket, _) ->
+       ignore (next p);
+       if is_frac then err lp "lists do not support the frac modifier";
+       let inits = parse_seq_inits p in
+       SSeqDecl (is_const, name, ty, None, true, inits, lp)
+     | _ ->
+       if is_frac then err lp "arrays do not support the frac modifier";
+       let len = parse_expr p in
+       expect p RBracket "]";
+       let inits = parse_seq_inits p in
+       SSeqDecl (is_const, name, ty, Some len, false, inits, lp))
+  | _ ->
+    (* 标量：初值可省略（省略时填零值）；const 必须带初值 *)
+    let init =
+      (match p.toks with
+       | (Assign, _) :: _ ->
+         let (_t, _tp) = next p in
+         Some (parse_expr p)
+       | _ -> None)
+    in
+    (match is_const, init with
+     | true, None -> err tp "const requires an initializer"
+     | _ -> ());
+    SDecl (is_const, is_frac, is_unred, name, ty, init, tp)
+
+(* 语句位置声明：一行多声明器（w-012）——T a, b = 1, c[3], d[]，逗号分隔，
+   共享类型与前缀修饰符，初值各自独立 *)
+and parse_decl_stmt p tp =
+  let ty = parse_ty p in
+  let (is_const, is_frac, is_unred, is_ref) = parse_modifiers p in
+  if is_ref then err tp "ref is only allowed on function parameters";
+  let rec go acc =
+    let st = parse_declarator p tp ty is_const is_frac is_unred in
+    let acc = st :: acc in
+    match peek p with
+    | (Comma, _) -> ignore (next p); go acc
+    | _ -> List.rev acc
+  in
+  let stmts = go [] in
+  end_of_stmt p;
+  (match stmts with
+   | [ st ] -> st
+   | _ -> SDeclList stmts)
 
 (* 判断当前是否为声明语句开头：类型词 + 名字/const/frac/unred。
    类型位后跟 *（指针声明 T* p 与乘法 x * y 形状相同）：仅当类型位是
@@ -733,8 +754,8 @@ and check_bare_decl p =
 and parse_stmt p =
   let (tk, tp) = peek p in
   match tk with
-  | Ident _ when looks_like_decl p -> parse_decl p tp
-  | Keyword k when is_alias_kw k && looks_like_decl p -> parse_decl p tp
+  | Ident _ when looks_like_decl p -> parse_decl_stmt p tp
+  | Keyword k when is_alias_kw k && looks_like_decl p -> parse_decl_stmt p tp
   | Keyword k when is_alias_kw k ->
     check_bare_decl p; parse_expr_stmt p
   | Keyword KReturn ->

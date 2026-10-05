@@ -456,6 +456,7 @@ let expand_uses (main : program) (main_dir : string)
     | SSeqDecl (a, n, t, len, isl, inits, p) ->
       SSeqDecl (a, n, t, Option.map (rw_expr m) len, isl,
                 List.map (rw_expr m) inits, p)
+    | SDeclList ss -> SDeclList (List.map (rw_stmt m) ss)
     | SAssign (l, r, p) -> SAssign (rw_expr m l, rw_expr m r, p)
     | SAug (op, l, r, p) -> SAug (op, rw_expr m l, rw_expr m r, p)
     | SInc (e, p) -> SInc (rw_expr m e, p)
