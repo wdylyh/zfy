@@ -56,8 +56,12 @@ for t in TASKS:
             rows.append((t, lang, i, round(dt, 4), round(peak_mb, 2), rc))
             print(f"{t} {lang} run{i}: {dt:.3f}s peak={peak_mb:.1f}MB exit={rc}", flush=True)
         key = (t, lang)
-        first_output.setdefault(t, (lang, out.decode(errors="replace").strip()))
-        if out.decode(errors="replace").strip() != first_output[t][1]:
+        first_output.setdefault(t, (lang, out.decode(errors="replace").replace("
+", "
+").strip()))
+        if out.decode(errors="replace").replace("
+", "
+").strip() != first_output[t][1]:
             print(f"!! OUTPUT MISMATCH {t} {lang}: {out.decode(errors='replace').strip()!r} vs {first_output[t][1]!r}")
 
 with open(os.path.join(BENCH, "results_new.csv"), "w", newline="") as f:
