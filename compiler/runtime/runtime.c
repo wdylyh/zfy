@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <malloc.h>
 #include <errno.h>
 
 /* ---------- 致命错误（除零/越界/内存不足等）：统一走 panic 通道 ----------
@@ -1329,6 +1330,35 @@ char *zfy_str_append(char *a, const char *b) {
     return p;
 }
 
+/* 批量原地追加（T7 优化）：n 个片段并入 a 的缓冲区。
+   用 _msize 感知堆块容量：容量足够则原地写入（零重分配），
+   不足则按 2 倍几何扩容（与 C++ std::string 增长策略一致），
+   避免逐次 realloc 的拷贝与堆碎片。a 必须是本运行时 malloc/realloc
+   分配的堆串（槽独占，MCopy strdup 保证），调用方不得再使用旧 a */
+char *zfy_str_append_n(char *a, const char **parts, long long n) {
+    size_t la = strlen(a), total = la + 1;
+    for (long long i = 0; i < n; i++)
+        total += strlen(parts[i]);
+    size_t cap = _msize(a);
+    char *p;
+    if (total <= cap) {
+        p = a;                       /* 容量足够：原地写，零重分配 */
+    } else {
+        size_t nc = cap * 2;
+        if (nc < total) nc = total;
+        p = (char *)realloc(a, nc);
+        if (!p) zfy_die("字符串追加: 内存分配失败");
+    }
+    char *q = p + la;
+    for (long long i = 0; i < n; i++) {
+        size_t lb = strlen(parts[i]);
+        memcpy(q, parts[i], lb);
+        q += lb;
+    }
+    *q = '\0';
+    return p;
+}
+
 /* 按分隔符切分为 string 列表：返回 zfy_seq（元素宽度 8=指针），
  * 各段为 malloc 堆串、len = 段数（连续分隔符产生空段）。
  * 内部公共实现：c>=0 按单字符，否则按 delim 整串 */
@@ -1342,9 +1372,10 @@ static zfy_seq *split_impl(const char *s, char c, const char *delim) {
         return seq;
     }
     long long cnt = 1;
+    size_t sl = strlen(s);   /* 预计算长度：原实现循环内 strlen 是 O(n²) */
     for (const char *p = s; *p; p++)
         if ((c >= 0 && *p == c) ||
-            (c < 0 && (size_t)(p - s) + dl <= strlen(s) &&
+            (c < 0 && (size_t)(p - s) + dl <= sl &&
              memcmp(p, delim, dl) == 0))
             cnt++;
     zfy_seq *seq = zfy_seq_new(cnt, cnt, 8);
