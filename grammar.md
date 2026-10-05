@@ -79,7 +79,7 @@ struct [packed] 名字<T, U>? 缩进块
 | for | `for 项, 项, ... 块`（逗号化多段头部，按形状分类：声明→初始化、布尔表达式→条件（多项 and 连接，可无）、赋值/复合赋值/自增自减→更新；孤立变量名进初始化段） |
 | 返回 | `return` / `return expr` |
 | break/continue | `break` / `continue` |
-| 输出 | `output(参数..., sep=?, end=?)`（命名参数必须最后；sep 默认 ""，end 默认 "\n"） |
+| 输出 | `output(参数..., sep=?, end=?)`（命名参数必须最后；sep 默认 ""，end 默认 "\n"）；参数可为数组/列表（整体按元素打印，元素间以 sep 分隔，w-013） |
 | 输入 | `input(目标..., delim=?)`（目标为 `TYPE 名` 新声明或已有 `名`） |
 | unsafe 块 | `unsafe 块`（指针算术、p[i] 必须） |
 | reduce | `reduce(x, 次数, 起始除数)`（手动约分 frac） |

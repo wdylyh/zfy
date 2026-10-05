@@ -1449,6 +1449,14 @@ let gen_instr fc (i : instr) : unit =
     let p = str_value fc s in
     emitf fc "  call void @zfy_print_str(ptr %s)" p
   | MPrintVal o -> gen_print_val fc o
+  | MPrintSeq (o, kind, sep) ->
+    (* output(数组/列表)（w-013）：槽内是 zfy_seq 指针，长度/元素大小由
+       运行时读（data+0 / len+16 / elemsz+32），元素间以 sep 分隔 *)
+    let (slotp, _) = ptr_of fc o in
+    let sp = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" sp slotp;
+    let (sv, _) = val_of fc sep in
+    emitf fc "  call void @zfy_print_seq(ptr %s, i32 %d, ptr %s)" sp kind sv
   | MInput (name, ty, delim) -> gen_input fc name ty delim
   | MFreeVar (name, ty) ->
     (* RAII 释放：string 释放堆串；数组/列表释放 seq（string 元素一并释放） *)
@@ -2053,6 +2061,7 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare ptr @zfy_str_concat(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_str_eq(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_str_ne(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_print_seq(ptr, i32, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_append_n(ptr, ptr, i64)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split(ptr, i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split_str(ptr, ptr)\n";

@@ -989,6 +989,41 @@ zfy_seq *zfy_seq_new(long long count, long long cap, long long elemsz) {
     return s;
 }
 
+/* output(数组/列表)（w-013）：按元素类型码打印序列，元素间以 sep 分隔。
+   类型码：0 i8 1 i16 2 i32 3 i64 4 u8 5 u16 6 u32 7 u64 8 i128 9 u128
+   10 f32 11 f64 12 char 13 bool 14 string（与 mir elem_kind 对应） */
+void zfy_print_seq(zfy_seq *s, int kind, const char *sep) {
+    if (!s || !s->data) return;
+    const char *base = (const char *)s->data;
+    long long esz = s->elemsz;
+    for (long long i = 0; i < s->len; i++) {
+        if (i && sep) zfy_print_str(sep);
+        const void *p = base + i * esz;
+        switch (kind) {
+        case 0: zfy_print_i64(*(int8_t *)p); break;
+        case 1: zfy_print_i64(*(int16_t *)p); break;
+        case 2: zfy_print_i64(*(int32_t *)p); break;
+        case 3: zfy_print_i64(*(int64_t *)p); break;
+        case 4: zfy_print_u64((unsigned long long)*(uint8_t *)p); break;
+        case 5: zfy_print_u64((unsigned long long)*(uint16_t *)p); break;
+        case 6: zfy_print_u64((unsigned long long)*(uint32_t *)p); break;
+        case 7: zfy_print_u64(*(uint64_t *)p); break;
+        case 8: zfy_print_i128(*(__int128 *)p); break;
+        case 9: zfy_print_u128(*(unsigned __int128 *)p); break;
+        case 10: zfy_print_f64((double)*(float *)p); break;
+        case 11: zfy_print_f64(*(double *)p); break;
+        case 12: zfy_print_char(*(char *)p); break;
+        case 13: zfy_print_bool((int)*(uint8_t *)p); break;
+        case 14: {
+            char *v = *(char **)p;
+            zfy_print_str(v ? v : "(null)");
+            break;
+        }
+        default: break;
+        }
+    }
+}
+
 /* 列表扩长到 need 个元素：容量按需加倍 realloc，新增槽位填零值 */
 static void seq_grow(zfy_seq *s, long long need) {
     if (need <= s->cap) {

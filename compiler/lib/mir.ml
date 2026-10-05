@@ -60,6 +60,7 @@ type instr =
   | MReduce of string * zty * operand * operand  (* reduce(root, frac 类型, 次数, 起始除数) *)
   | MPrintStr of string                          (* output：输出字符串字面�?*)
   | MPrintVal of operand                         (* output：按类型输出一个�?*)
+  | MPrintSeq of operand * int * operand         (* output(数组/列表)（w-013）：(序列槽, 元素类型码, sep) *)
   | MInput of string * zty * operand             (* input：delim 是 string 值（空串 = 默认换行和空白字符集） *)
   | MFreeVar of string * zty                     (* RAII：作用域退出释放变量持有的资源 *)
   | MFreeTemp of string                          (* 语句末释放临时堆�?*)
@@ -248,6 +249,22 @@ let frac_rt_name (bop : binop) (elem : zty) : string =
   Printf.sprintf "zfy_frac_%s_%s" opname (Hir.suffix_of elem)
 
 (* ---------- 表达式降�?---------- *)
+
+(* output 序列元素类型码（对应 runtime zfy_print_seq，w-013）：
+   0 i8 1 i16 2 i32 3 i64 4 u8 5 u16 6 u32 7 u64 8 i128 9 u128
+   10 f32 11 f64 12 char 13 bool 14 string *)
+let elem_kind_of (z : zty) : int =
+  match z with
+  | TArray (e, _) | TList e ->
+    (match e with
+     | TInt 8 -> 0 | TInt 16 -> 1 | TInt 32 -> 2 | TInt 64 -> 3
+     | TUint 8 -> 4 | TUint 16 -> 5 | TUint 32 -> 6 | TUint 64 -> 7
+     | TInt 128 -> 8 | TUint 128 -> 9
+     | TFloat 32 -> 10 | TFloat 64 -> 11
+     | TChar -> 12 | TBool -> 13 | TString -> 14
+     | TVar _ -> 3
+     | _ -> assert false)   (* typeck 已校验元素类型 *)
+  | _ -> assert false
 
 let rec lexpr l (e : texpr) : operand =
   match e.e with
@@ -795,11 +812,18 @@ and lstmt_inner l (s : tstmt) : unit =
     l.scopes <- List.tl l.scopes;
     l.cur <- bend
   | SOutputK (args, sep, end_) ->
-    (* 逐参数输出：sep 只出现在相邻参数之间，最后输�?end *)
+    (* 逐参数输出：sep 只出现在相邻参数之间，最后输出 end。
+       数组/列表参数整体按元素打印（w-013），元素间同样以 sep 分隔
+       （与 output(a[0], a[1], ...) 展开语义一致） *)
+    let sep_op = lexpr l sep in
     List.iteri
       (fun i a ->
-        if i > 0 then emit l (MPrintVal (lexpr l sep));
-        emit l (MPrintVal (lexpr l a)))
+        if i > 0 then emit l (MPrintVal sep_op);
+        let oa = lexpr l a in
+        (match a.ety with
+         | TArray _ | TList _ ->
+           emit l (MPrintSeq (oa, elem_kind_of a.ety, sep_op))
+         | _ -> emit l (MPrintVal oa)))
       args;
     emit l (MPrintVal (lexpr l end_))
   | SInputK (targets, delim) ->
@@ -1063,6 +1087,7 @@ let uses_of (i : instr) : string list =
   | MReduce (r, _, a, b) -> r :: operand_names a @ operand_names b
   | MPrintStr _ -> []
   | MPrintVal o -> operand_names o
+  | MPrintSeq (o, _, sep) -> operand_names o @ operand_names sep
   | MInput (_, _, d) -> operand_names d
   | MSeqAlloc _ -> []
   | MSeqSet (name, _, idx, v, _, _) ->

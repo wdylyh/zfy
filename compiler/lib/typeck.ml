@@ -2369,6 +2369,24 @@ and check_stmt env (st : stmt) : tstmt =
       (fun (ta : texpr) ->
         match resolve ta.ety with
         | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString | TFrac _ | TVar _ -> ()
+        | TArray (e, _) | TList e ->
+          (* 数组/列表整体打印（w-013）：元素须为可打印标量/string；
+             f16/f128 无打印运行时，i128 列表（8 字节槽放不下）除外 *)
+            let elem_ok (t : zty) =
+              match t with
+              | TBool | TChar | TString | TVar _ -> true
+              | TInt w -> w <= 128
+              | TUint w -> w <= 128
+              | TFloat w -> w = 32 || w = 64
+              | _ -> false
+            in
+            (match resolve ta.ety, resolve e with
+             | TList _, (TInt 128 | TUint 128) ->
+               terr p "output does not support element type: %s (128-bit list elements are not supported)"
+                 (pp_zty (resolve e))
+             | _, te when elem_ok te -> ()
+             | _, te ->
+               terr p "output does not support element type: %s" (pp_zty te))
         | t -> terr p "output does not support argument type: %s" (pp_zty t))
       targs;
     (* sep 默认 ""，end 默认 "\n"；非 char/string 值强制转 string *)
