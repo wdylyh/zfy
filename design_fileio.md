@@ -33,7 +33,7 @@
 File! f = open(path, mode)     // mode: "r" "w" "a"（P2 加 b 后缀）
 string! s = read_all(f)        // 整读；IO 错误产 err（ErrCode.IO）
 string! line = read_line(f)    // 单行（不含换行符）；EOF 产 err（ErrCode.EOF，新码）
-write(f, s)                    // 原样写（不产 T!；写失败 panic？见"待定"）
+write(f, s)                    // 原样写（不产 T!；写失败 panic，已定案）
 writeln(f, s)                  // 写 + '\n'
 close(f)                       // 幂等；失败 panic
 bool e = exists(path)
@@ -63,14 +63,28 @@ for string line in file        // for-in 语法糖（依赖 for-in 设计，另�
 - `remove_file` / `rename_file`（避免与内建 `remove(列表,下标)` 撞名）放
   第一阶段可选件，Trae 评估工作量后可挪 P2。
 
-## 六、待定项（实施前需确认）
+## 六、三个待定项（已定案，2026-10-05）
 
-1. `write`/`writeln` 失败语义：写失败（磁盘满/权限）是 panic 还是产 T!？
-   倾向：第一阶段 panic（与 close 一致），第二阶段如需精细化再改 T!。
-2. 错误码分配：ErrCode.IO 已存在；EOF 需新码；"File 不得作 struct 字段"
-   需新码。按 errors.md 现有分段规则分配。
-3. mode 字符串是否接受非法值：建议编译期只查字面量合法集（"r"/"w"/"a"），
-   非字面量运行期校验。
+1. **write/writeln 失败语义 → panic，不产 T!**。
+   理由：写失败（磁盘满/句柄失效）属系统级异常，与 close 一致走 panic 通道；
+   T! 化会强制每次 writeln 写 `?`，99% 场景是纯样板。需要可恢复的写
+   （整文件覆盖写）走一步式 `write_file`（产 T!，可 `?` 传播）。
+   逐行写 + 错误处理的场景等第二阶段按需加 `try_write` 产 T! 变体。
+2. **错误码分配**（按 errors.md 现有分段接续）：
+   - `ErrCode.EOF = 7`（接 INPUT=6 之后，CUSTOM=100 之前）——read_line 的 EOF
+     与 IO 错误区分（ErrCode.IO=4 保持不变）。
+   - `E3176`：File 位置禁用——作 struct 字段 / 泛型实参（Box<File>）/
+     容器元素 / copy 实参，一条码四种形态，消息文本区分。
+   - `E3178`：open 的 mode 字面量非法（编译期校验，见第 3 条）。
+   - use-after-close / use-after-move 的运行期 panic **不入 EXXX 码体系**
+     （与数组越界同列附录 A），消息统一 "use of closed file" /
+     "use of moved file handle"。
+3. **mode 校验 → 双层**：
+   - 编译期：实参为字符串字面量时，校验 ∈ {"r","w","a"}，非法报 E3178
+     （第二阶段扩为 +"rb","wb","ab"）。
+   - 运行期：非字面量实参（变量/拼接结果）在 open 内校验，非法 panic
+     （消息 "invalid open mode: %s"）。
+   好处：初学者拼错 mode 立刻编译期报错，动态构造 mode 也有兜底。
 
 ## 七、改动面清单（供排期参考）
 
