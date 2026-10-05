@@ -316,7 +316,7 @@
 | E3153 | `const arr` 后 `remove(arr, 0)` | cannot remove from constant %s |
 | E3154 | struct A 内含 B、B 内含 A（循环嵌套） | struct %s has circular nesting (infinite size) |
 | E3155 | 窄化转换未加显式 cast（new2.md #5：宽化自动，窄化显式） | narrowing conversion from %s to %s requires an explicit cast |
-| E3156 | 通过指向 const 的指针（T const*）解引用写（new2.md 9c） | cannot write through pointer-to-const %s (declared T const*) |
+| E3156 | 通过指向 const 的指针（T* const）解引用写（new2.md 9c） | cannot write through pointer-to-const %s (declared T* const) |
 | E3157 | `f(copy b)` 且 b 为最后使用（new2.md #1：与自动 move 冲突） | explicit copy conflicts with automatic move: %s is not used after this point, the value is moved automatically (remove 'copy') |
 | E3158 | `f(ref v)` 但参数未声明 ref（new2.md #1） | argument %d of %s is passed by ref, but the parameter is not declared ref |
 | E3159 | 参数为 ref 但实参未加 ref（new2.md #1） | parameter %d of %s is ref, pass the argument with ref (f(ref x)) |

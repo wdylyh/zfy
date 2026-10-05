@@ -1776,7 +1776,7 @@ and check_constp env (pe : expr) p =
   | EVar (name, _) ->
     (match lookup_var env name with
      | Some l when l.lconstp ->
-       terr p "cannot write through pointer-to-const %s (declared T const*)" name
+       terr p "cannot write through pointer-to-const %s (declared T* const)" name
      | _ -> ())
   | _ -> ()
 
@@ -1810,7 +1810,7 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           (* 指针下标复合赋值（自动解引用，无越界检查）：p[i] op= v，
              地址 p+i 只求值一次；强制 unsafe 块（new2.md #8） *)
           if l.lconstp then
-            terr ap "cannot write through pointer-to-const %s (declared T const*)" arr;
+            terr ap "cannot write through pointer-to-const %s (declared T* const)" arr;
           if not env.in_unsafe then
             terr ap "pointer subscript p[i] is only allowed inside an unsafe block";
           let ti = to_i64 (check_expr env idx) in
@@ -2131,7 +2131,7 @@ and check_stmt env (st : stmt) : tstmt =
              (* 指针下标写入（自动解引用，无越界检查）：p[i] = v 等同于
                 先按元素步进地址（p+i）再解引用写入；强制 unsafe（new2.md #8） *)
              if l.lconstp then
-               terr ap "cannot write through pointer-to-const %s (declared T const*)" arr;
+               terr ap "cannot write through pointer-to-const %s (declared T* const)" arr;
              if not env.in_unsafe then
                terr ip "pointer subscript p[i] is only allowed inside an unsafe block";
              (match resolve t with

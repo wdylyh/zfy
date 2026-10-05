@@ -21,7 +21,7 @@
 
 - **宽度名**：`bool char string void i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f16 f32 f64 f128`。
 - **传统别名**（归一化到宽度名）：`short=i8 short int=i16 int=i32 long=i128 ushort=u8 ushort int=u16 uint=u32 ulong=u128 half=f16 float=f32 double=f64 quad=f128`。类型词重复/别名与宽度名混写报错（`int int`、`i32 int`）。
-- **后缀**（可叠加）：`T*` 指针；`T const*` 指向 const 的指针；`T!` 错误值类型（ZEM）。
+- **后缀**（可叠加）：`T*` 指针；`T* const` 指向 const 的指针；`T!` 错误值类型（ZEM）。
 - **函数类型**：`T(参数类型列表)` —— 仅在 `type` 别名、函数参数位、struct 字段位允许。
 - **泛型实例化**：`Box<i32>`、`Box<Box<i32>>`（仅类型位置；表达式比较不受影响）。
 - **模块路径类型**：`m::Point`。

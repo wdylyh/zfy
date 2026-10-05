@@ -24,9 +24,10 @@ i64 main()
     p^ += 5
     output(a)
 
-    // T* const：指针不可重绑，指向值可写
+    // 普通指针：可重绑、指向值可写（const 指针概念已移除；
+    // T* const 现表示指向 const 的指针，见 constp_test）
     i32 b = 1
-    i32* const q = &a
+    i32* q = &a
     q^ = 30
     output(a)
 
