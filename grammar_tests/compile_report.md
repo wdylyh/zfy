@@ -153,3 +153,22 @@
 - 本轮只做编译验证，未运行产物；t02 中 `a[0, 4:2]` 切片在当前数据长度下运行时会 panic
   （编译无错，属运行期语义，非本次范围）。
 - 每个失败文件保留在首次触发真实问题的最小改动状态，连锁错误未清理，便于对照原始报错。
+
+## 七、修复记录（2026-10-05 晚，WorkBuddy，方案经用户逐项拍板）
+
+| # | 问题 | 决定 | 落地 |
+|---|---|---|---|
+| 1 | replace 签名 | 只修文档 | grammar.md §11 改为 `replace(s, 起, 止, 串)` 区间替换（两端含）；t08 测试改用真实语义，运行输出正确 |
+| 2 | 新 use 路径 | 实现完整 | 单项/分组本已可解析；补齐 ①整模块绑定 `use a::b [as m]` 的命名空间解析（resolve BMod 点分展开 `别名.成员`，pub 可见性沿用）②单段 `use 模块名 [as 别名]` 解析（原误入 legacy 报 E2025）；t11 全绿（3630 / u1/2） |
+| 3 | 泛型实例返回类型 | 修解析器 | top_is_fn 前瞻新增类型实参平衡跳过（skip_tyargs_toks/skip_ty_lookahead_toks，`Box<i32> make_box(...)` 可解析；`Box<Box<i32>>` 亦支持）；t05 全绿 |
+| 4 | ?? 块位置 | 放宽实现 | SUnwrapBlockK 增加 ret 标志：`return a ?? 块` 成功路径直接返回成功聚合（RAII 同 SReturnK），失败路径执行块、块末值 coerce 包装为返回类型；E3138 保留用于其余非法位置；探针验证 i32!/string! 两路正确 |
+| 5 | 顶层 const frac | 放宽实现 | 全局分数常量槽（@g.名 + lconst=true + ginit），不做整数内联；顺带修复既有 bug：数值字面量实参经 TVar 静默重打型落进 frac 聚合槽致 E4021——coerce 增加字面量→frac 提升（mk_frac_from），check_call 支持 frac 期望位置的 `n/d` 字面量实参（与声明初值同语义） |
+| 6 | output 嵌套 | 实现递归打印 | 新增 runtime zfy_print_seq_nest（depth=剩余指针层数，逐层 `[...]`，sep 全层生效）+ MIR MPrintSeqNest + typeck 叶元素递归校验（struct 叶/列表 i128 叶仍拒，depth<8）；t02 输出 `[[1234][1020]]`、`[[000][005]]` |
+| 7 | for 空段 | 只修文档 | §7 注明初始化/更新段不可为空 |
+| 8 | triple 警告 | 消除 | llvmgen 输出显式 `target triple = "x86_64-w64-windows-gnu"` |
+
+- 验证：build 零 error；回归 53 例全 PASS（failures: 0）；grammar_tests 12/12 编译通过且运行输出正确。
+- 已知遗留（未在本轮范围，记录备查）：非 unred frac 函数 `return a + b` 不自动约分
+  （如 8/16，值正确表示未归约；"存入后约分"仅覆盖声明路径）——是否补 MNorm 待用户拍板。
+- E3040（顶层 const+frac）检查已删除，码位在 errors.md 中待标记作废；E2025 触发范围缩小
+  （仅 legacy 缺 .zfy 扩展名路径）。errors.md / description.md 侧同步留 Trae 统一处理。

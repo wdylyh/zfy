@@ -117,10 +117,12 @@ and tstmt_kind =
   | SInputK of tin_target list * texpr option   (* (目标列表, delim 表达式；None 默认字符集) *)
   | SReduceK of texpr * texpr * texpr           (* reduce(x, 次数, 起始除数) *)
   | SRemoveK of string * zty * texpr * bool     (* remove(x, i)：(槽名, 元素类型, 下标, 是否列表) *)
-  | SUnwrapBlockK of bool * string * zty * texpr * string * tblock
-    (* 解包块：a ?? 缩进块。(是否声明新变量, 目标槽, 元素类型, a 表达式,
-       err 槽名（TStruct "Err"）, 块)。块末值表达式已由 typeck 改写为对目标槽
-       的赋值；块也可 return/break/continue/panic 提前离开 *)
+  | SUnwrapBlockK of bool * bool * string * zty * texpr * string * tblock
+    (* 解包块：a ?? 缩进块。(是否声明新变量, 是否 return 形式, 目标槽, 元素类型,
+       a 表达式, err 槽名（TStruct "Err"）, 块)。块末值表达式已由 typeck 改写为
+       对目标槽的赋值（return 形式改写为 SReturnK）；块也可 return/break/
+       continue/panic 提前离开。return 形式：成功路径直接返回 a 的成功聚合，
+       目标槽不使用（is_decl=false、slot=""） *)
   | SBreakK
   | SContinueK
   | SFieldSetK of texpr * int list * zty * texpr

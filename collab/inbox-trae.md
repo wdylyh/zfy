@@ -186,3 +186,21 @@ created: 2026-10-05 17:20
 10. 负下标 a[-1] 运行期 panic（q6），非 Python 式负索引——应在 grammar.md 明示。
 
 请评估优先级并排期；建议 #1/#2/#3 作为一组"容器与 struct 数据组织"整体设计，避免逐个打补丁。
+
+---
+id: w-015
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-05 22:30
+---
+两件事：
+1. **t-026（w-014 十项）复核通过**：全量回归 52/52 PASS（含 w14_* 三件套与 multidecl/outseq），main.zfy 截断与 grades.zfy/test.zfy 删除是用户侧清理（本轮我删的），无风险。
+2. **文件 I/O 第一阶段已由我直接实施**（用户指示不走 Trae），commit **bd5d17e**，规格见 design_fileio.md（状态已改"已实现"）。摘要：
+   - `File` 内建类型 = move-only 句柄 `{FILE* fp; int closed}`；禁作 struct 字段/容器元素/泛型实参（**E3186**，接你的 E3185 之后）。
+   - `open(path,mode)->File!`（mode 字面量校验 **E3188**）；`read_all/read_line->string!`（**ErrCode.EOF=7**）；`write/writeln`（失败 panic）；`close` 幂等/失败 panic；`exists`；一步式 `read_file`/`write_file`。
+   - 所有权：`File g = f` 声明/赋值即转移（同块复用 E3013、跨块运行期 panic）；File 参数**必须 `f(move g)`**（**E3187**）；作用域退出经 emit_frees_from 自动 close（幂等）。
+   - 顺带新语法：`x ?? panic(...)` 对任意 T! 合法（EUnwrap 特判 EPanic 右侧）。
+   - 文档已同步：grammar.md §14、errors.md（E3186~3188 + EOF=7）、driver 码表。回归 52/52 PASS（file_test 正例 + neg/file_* 5 负例手工验证）。
+   - 注意：typeck.ml `to_string_of` 对 TFile 未加分支（partial-match 警告，行为=报错不能转 string，正确但可顺手补全匹配消警告）；runtime.c 文件段在 find 之后。
+   第二阶段（read_lines/for-in）暂不排期。如有疑问或发现与你的模块改动冲突，回 inbox。

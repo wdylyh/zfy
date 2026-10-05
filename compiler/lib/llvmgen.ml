@@ -1593,6 +1593,13 @@ let gen_instr fc (i : instr) : unit =
     let (sp, _) = val_of fc o in
     let (sv, _) = val_of fc sep in
     emitf fc "  call void @zfy_print_seq(ptr %s, i32 %d, ptr %s)" sp kind sv
+  | MPrintSeqNest (o, depth, leafkind, sep) ->
+    (* output(嵌套序列)（w-015 #6）：运行时逐层递归输出 [ ... ]，
+       叶元素类型码编译期传入；操作数形态与 MPrintSeq 一致 *)
+    let (sp, _) = val_of fc o in
+    let (sv, _) = val_of fc sep in
+    emitf fc "  call void @zfy_print_seq_nest(ptr %s, i32 %d, i32 %d, ptr %s)"
+      sp depth leafkind sv
   | MInput (name, ty, delim) -> gen_input fc name ty delim
   | MFreeVar (name, ty) ->
     (* RAII 释放：string 释放堆串；数组/列表释放 seq（string 元素一并释放） *)
@@ -2179,6 +2186,9 @@ let gen_program (m : mir) : string =
     { mbuf = Buffer.create 512; nstr = 0; globals = Hashtbl.create 16;
       structs = m.mstructs }
   in
+  (* 显式声明模块 triple：与 clang --target=x86_64-w64-mingw32 的推断一致，
+     消除链接阶段 "overriding the module target triple" 警告（w-015 #8） *)
+  Buffer.add_string g.mbuf "target triple = \"x86_64-w64-windows-gnu\"\n";
   (* frac 类型定义：{ 分子, 分母 }（预生成全部后缀，未使用的定义合法） *)
   let frac_defs =
     [ "i8", "i8"; "i16", "i16"; "i32", "i32"; "i64", "i64"; "i128", "i128";
@@ -2299,6 +2309,7 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare i64 @zfy_str_eq(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_str_ne(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_print_seq(ptr, i32, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_print_seq_nest(ptr, i32, i32, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_append_n(ptr, ptr, i64)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split(ptr, i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split_str(ptr, ptr)\n";

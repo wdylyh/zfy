@@ -173,6 +173,30 @@ let rec skip_ty_suffix_toks (l : (Tokens.token * Tokens.pos) list)
     skip_ty_suffix_toks (skip_balanced 0 l)
   | _ -> l
 
+(* 类型实参 <...> 平衡跳过（泛型实例化 Box<i32>/Box<Box<i32>>）。
+   仅在"类型词已确认"的前瞻上下文（top_is_fn）使用——类型词不能开始
+   表达式，此处 < 只能是类型实参列表，不与比较运算混淆 *)
+let skip_tyargs_toks (l : (Tokens.token * Tokens.pos) list)
+    : (Tokens.token * Tokens.pos) list =
+  match l with
+  | (Tokens.Lt, _) :: _ ->
+    let rec go depth l =
+      match l with
+      | (Tokens.Lt, _) :: r -> go (depth + 1) r
+      | (Tokens.Gt, _) :: r -> if depth <= 1 then r else go (depth - 1) r
+      | [] -> []
+      | _ :: r -> go depth r
+    in
+    go 0 l
+  | _ -> l
+
+(* 前瞻综合跳过：类型后缀与类型实参交替（Box<i32>[] f(...) 等形态） *)
+let rec skip_ty_lookahead_toks (l : (Tokens.token * Tokens.pos) list)
+    : (Tokens.token * Tokens.pos) list =
+  let l2 = skip_ty_suffix_toks l in
+  let l3 = skip_tyargs_toks l2 in
+  if l3 == l2 then l2 else skip_ty_lookahead_toks l3
+
 (* 类型：单词 Ident（bool/char/string/void + i8..f128 宽度类型 + struct 名）
    或多词传统别名（short int 等，归一化为宽度名）+
    指针后缀 T*（可叠加，T** 由 typeck 限制）；函数类型 T(参数类型列表)
@@ -1110,7 +1134,7 @@ and parse_if p tp =
 let top_is_fn p =
   if is_qpath_start p.toks then begin
     let (_segs, rest) = scan_qpath p.toks in
-    match skip_ty_suffix_toks rest with
+    match skip_ty_lookahead_toks rest with
     | (Ident _, _) :: (LParen, _) :: _ -> true
     | _ -> false
   end
@@ -1127,7 +1151,7 @@ let top_is_fn p =
       | _ -> false
     in
     tyname_ok &&
-    (match skip_ty_suffix_toks (drop n toks) with
+    (match skip_ty_lookahead_toks (drop n toks) with
      | (Ident _, _) :: (LParen, _) :: _ -> true
      | _ -> false)
   end
@@ -1382,20 +1406,34 @@ and parse_item p =
              end_of_stmt p;
              IUseP { binds = [ (local, segs, tp) ]; pos = tp })
         | _ ->
-          (* ---- 旧文件语法（legacy）：首段文件名 + .zfy ---- *)
+          (* ---- 单段整模块绑定（w-015 #2）：`use 模块名 [as 别名]` ----
+             后跟 as → 带别名绑定；否则整段名为绑定名。路径解析（子模块
+             存在性/可见性）由 resolve 的 resolve_path 统一处理；
+             含 '.' 的旧文件名（use 名字.zfy）走下方 legacy 分支 ---- *)
           let buf = Buffer.create 16 in
-          Buffer.add_string buf first;
-          let rec ext () =
-            match peek p with
-            | (Dot, _) ->
-              ignore (next p);
-              Buffer.add_char buf '.';
-              Buffer.add_string buf (expect_ident p "extension");
-              ext ()
-            | _ -> ()
-          in
-          ext ();
-          finish_legacy_use p tp buf))
+          (match fst (peek p) with
+           | Keyword KAs ->
+             ignore (next p);
+             let alias = expect_ident p "alias" in
+             end_of_stmt p;
+             IUseP { binds = [ (alias, [ first ], tp) ]; pos = tp }
+           | Dot ->
+             (* legacy：use 文件名.zfy [import 模块名] [as 别名] *)
+             Buffer.add_string buf first;
+             let rec ext () =
+               match peek p with
+               | (Dot, _) ->
+                 ignore (next p);
+                 Buffer.add_char buf '.';
+                 Buffer.add_string buf (expect_ident p "extension");
+                 ext ()
+               | _ -> ()
+             in
+             ext ();
+             finish_legacy_use p tp buf
+           | _ ->
+             end_of_stmt p;
+             IUseP { binds = [ (first, [ first ], tp) ]; pos = tp })))
 
   | Keyword KStruct ->
     (* struct 声明：struct [packed] 名字 缩进块（字段：类型 名字 [= 默认值]，

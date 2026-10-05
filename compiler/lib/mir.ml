@@ -62,6 +62,7 @@ type instr =
   | MPrintStr of string                          (* output：输出字符串字面�?*)
   | MPrintVal of operand                         (* output：按类型输出一个�?*)
   | MPrintSeq of operand * int * operand         (* output(数组/列表)（w-013）：(序列槽, 元素类型码, sep) *)
+  | MPrintSeqNest of operand * int * int * operand (* output(嵌套序列)（w-015 #6）：(序列槽, 剩余层数, 叶元素类型码, sep) *)
   | MInput of string * zty * operand             (* input：delim 是 string 值（空串 = 默认换行和空白字符集） *)
   | MFreeVar of string * zty                     (* RAII：作用域退出释放变量持有的资源 *)
   | MFreeTemp of string                          (* 语句末释放临时堆�?*)
@@ -266,6 +267,30 @@ let frac_rt_name (bop : binop) (elem : zty) : string =
 (* output 序列元素类型码（对应 runtime zfy_print_seq，w-013）：
    0 i8 1 i16 2 i32 3 i64 4 u8 5 u16 6 u32 7 u64 8 i128 9 u128
    10 f32 11 f64 12 char 13 bool 14 string *)
+(* 序列嵌套层数：i32[] → 1，i32[][] → 2，i32[2][3] → 2 *)
+let rec seq_depth (z : zty) : int =
+  match z with
+  | TArray (_, _) | TList _ -> 1 + seq_depth (seq_elem z)
+  | _ -> 0
+
+(* 剥到最内层元素类型 *)
+and seq_elem (z : zty) : zty =
+  match z with
+  | TArray (e, _) | TList e -> e
+  | _ -> z
+
+(* 最内层叶元素的打印类型码（嵌套序列用；typeck 已校验叶可打印） *)
+let rec leaf_kind_of (z : zty) : int =
+  match z with
+  | TArray (_, _) | TList _ -> leaf_kind_of (seq_elem z)
+  | TInt 8 -> 0 | TInt 16 -> 1 | TInt 32 -> 2 | TInt 64 -> 3
+  | TUint 8 -> 4 | TUint 16 -> 5 | TUint 32 -> 6 | TUint 64 -> 7
+  | TInt 128 -> 8 | TUint 128 -> 9
+  | TFloat 32 -> 10 | TFloat 64 -> 11
+  | TChar -> 12 | TBool -> 13 | TString -> 14
+  | TVar _ -> 3
+  | _ -> assert false
+
 let elem_kind_of (z : zty) : int =
   match z with
   | TArray (e, _) | TList e ->
@@ -997,7 +1022,9 @@ and lstmt_inner l (s : tstmt) : unit =
         let oa = lexpr l a in
         (match a.ety with
          | TArray _ | TList _ ->
-           emit l (MPrintSeq (oa, elem_kind_of a.ety, sep_op))
+           (match seq_depth a.ety with
+            | 1 -> emit l (MPrintSeq (oa, elem_kind_of a.ety, sep_op))
+            | d -> emit l (MPrintSeqNest (oa, d, leaf_kind_of a.ety, sep_op)))
          | _ -> emit l (MPrintVal oa)))
       args;
     emit l (MPrintVal (lexpr l end_))
@@ -1042,34 +1069,61 @@ and lstmt_inner l (s : tstmt) : unit =
        set_term l (TBr ck);
        l.cur <- new_block l
      | [] -> merr s.spos "continue outside a loop")
-  | SUnwrapBlockK (is_decl, slot, elem, a, errslot, blk) ->
+  | SUnwrapBlockK (is_decl, is_ret, slot, elem, a, errslot, blk) ->
     (* a ?? 缩进块：a 成功 → value 写入目标槽；失败 → code/msg 拷入 err 槽，
        执行块（块内可用 err，块末表达式已由 typeck 改写为对目标槽的赋值），
-       两路在结尾汇合 *)
+       两路在结尾汇合。
+       return 形式（is_ret）：成功路径直接返回 a 的成功聚合（TErr 值，
+       与 SReturnK 同款 RAII 处理）；失败路径执行块——块末已由 typeck
+       改写为 SReturnK，两路均在块内离开，bend 为死块 *)
     if is_decl then begin
       declare_owned l slot elem
     end;
     let va = lexpr l a in
-    let okr = fresh l in
-    emit l (MErrIsOk (okr, va, a.ety));
-    let bok = new_block l and berr = new_block l and bend = new_block l in
-    set_term l (TCondBr (op (OLocal okr) TBool, bok.bid, berr.bid));
-    (* 成功路径：取 value 写入目标槽 *)
-    l.cur <- bok;
-    let dv = fresh l in
-    emit l (MErrValue (dv, va, a.ety));
-    emit l (MCopy (slot, op (OLocal dv) elem, elem));
-    set_term l (TBr bend.bid);
-    (* 失败路径：填 err 槽后执行块（独立 RAII 作用域） *)
-    l.cur <- berr;
-    emit l (MErrFillErr (errslot, va, a.ety));
-    l.scopes <- ref [] :: l.scopes;
-    let outer = List.length (List.tl l.scopes) in
-    lblock l blk;
-    emit_frees_from l outer;
-    set_term l (TBr bend.bid);
-    l.scopes <- List.tl l.scopes;
-    l.cur <- bend
+    if is_ret then begin
+      let okr = fresh l in
+      emit l (MErrIsOk (okr, va, a.ety));
+      let bok = new_block l and berr = new_block l and bend = new_block l in
+      set_term l (TCondBr (op (OLocal okr) TBool, bok.bid, berr.bid));
+      (* 成功路径：返回成功聚合（所有权随返回转移，跳过其释放） *)
+      l.cur <- bok;
+      l.stmt_temps <- [];
+      let skip = (match va.o with OLocal n -> [ n ] | _ -> []) in
+      emit_frees_from_skip l 0 skip;
+      set_term l (TRet (Some va));
+      (* 失败路径：填 err 槽后执行块（块末为 SReturnK） *)
+      l.cur <- berr;
+      emit l (MErrFillErr (errslot, va, a.ety));
+      l.scopes <- ref [] :: l.scopes;
+      let outer = List.length (List.tl l.scopes) in
+      lblock l blk;
+      emit_frees_from l outer;
+      set_term l (TBr bend.bid);
+      l.scopes <- List.tl l.scopes;
+      l.cur <- bend
+    end
+    else begin
+      let okr = fresh l in
+      emit l (MErrIsOk (okr, va, a.ety));
+      let bok = new_block l and berr = new_block l and bend = new_block l in
+      set_term l (TCondBr (op (OLocal okr) TBool, bok.bid, berr.bid));
+      (* 成功路径：取 value 写入目标槽 *)
+      l.cur <- bok;
+      let dv = fresh l in
+      emit l (MErrValue (dv, va, a.ety));
+      emit l (MCopy (slot, op (OLocal dv) elem, elem));
+      set_term l (TBr bend.bid);
+      (* 失败路径：填 err 槽后执行块（独立 RAII 作用域） *)
+      l.cur <- berr;
+      emit l (MErrFillErr (errslot, va, a.ety));
+      l.scopes <- ref [] :: l.scopes;
+      let outer = List.length (List.tl l.scopes) in
+      lblock l blk;
+      emit_frees_from l outer;
+      set_term l (TBr bend.bid);
+      l.scopes <- List.tl l.scopes;
+      l.cur <- bend
+    end
 
 (* ---------- 函数降码 ---------- *)
 
@@ -1095,9 +1149,10 @@ let rec collect_lets acc (stmts : tblock) =
           (fun (t : tin_target) -> if t.tnew then acc := (t.tname, t.tty) :: !acc)
           targets
       | SIfK (_, a, b) -> collect_lets acc a; collect_lets acc b
-      | SUnwrapBlockK (is_decl, slot, elem, _, errslot, blk) ->
+      | SUnwrapBlockK (is_decl, _, slot, elem, _, errslot, blk) ->
         (* 解包块：目标槽（声明时）与 err 槽（Err struct）都需要入口 alloca；
-           err 槽不登记 RAII（msg 有意泄漏，且槽可复用） *)
+           err 槽不登记 RAII（msg 有意泄漏，且槽可复用）。
+           return 形式成功路径不写槽，目标槽无需 alloca *)
         if is_decl && slot.[0] <> '@' then acc := (slot, elem) :: !acc;
         acc := (errslot, TStruct "Err") :: !acc;
         collect_lets acc blk
@@ -1263,6 +1318,7 @@ let uses_of (i : instr) : string list =
   | MPrintStr _ -> []
   | MPrintVal o -> operand_names o
   | MPrintSeq (o, _, sep) -> operand_names o @ operand_names sep
+  | MPrintSeqNest (o, _, _, sep) -> operand_names o @ operand_names sep
   | MInput (_, _, d) -> operand_names d
   | MSeqAlloc _ -> []
   | MSeqSet (name, _, idx, v, _, _) ->

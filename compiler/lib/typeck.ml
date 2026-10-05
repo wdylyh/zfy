@@ -980,16 +980,16 @@ and check_expr env (e : expr) : texpr =
                         mk (EIndirectCallK (tcallee, targs)) ret
                       | _ ->
                         (* 普通/未知函数调用：走统一实参分派（自动 move/copy/ref） *)
-                        let (targs, modes) = check_args_modes env args in
-                        check_call env p' name targs modes)
+                        let (targs, origs, modes) = check_args_modes env args in
+                        check_call env p' name targs origs modes)
                    | None ->
                      (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
-                     let (targs, modes) = check_args_modes env args in
-                     check_call env p' name targs modes)
+                     let (targs, origs, modes) = check_args_modes env args in
+                     check_call env p' name targs origs modes)
                 | None ->
                  (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
-                 let (targs, modes) = check_args_modes env args in
-                 check_call env p' name targs modes))))
+                 let (targs, origs, modes) = check_args_modes env args in
+                 check_call env p' name targs origs modes))))
      | _ -> terr p' "unsupported callee expression")
   | EIndex (base, idx, p') ->
     let tb = check_expr env base in
@@ -1145,7 +1145,7 @@ and check_expr env (e : expr) : texpr =
        terr p' "? propagation requires the enclosing function to return %s! (current: %s)" (pp_zty elem) (pp_zty rt));
     mk (EPropagateK ta) elem
 
-and check_call env p name0 targs modes =
+and check_call env p name0 targs origs modes =
   let name = ref name0 in
   let sig_ =
     match List.assoc_opt name0 builtin_fns_aux with
@@ -1184,7 +1184,24 @@ and check_call env p name0 targs modes =
           terr p "File parameters are move-only: pass with %s(move x)" !name)
     sig_.params;
   let targs =
-    List.map2 (fun ta pt -> coerce p ta pt) targs sig_.params in
+    List.map2
+      (fun ta (pt, orig) ->
+        match resolve pt, orig with
+        | TFrac w, Some (EBin (Ast.Div, a, b, fp)) when
+            (match a, b with
+             | (EInt _ | EFloat _), (EInt _ | EFloat _) -> true
+             | _ -> false) ->
+          (* frac 字面量实参 `n/d`（w-015 #5 顺带）：期望为 frac 的调用位置，
+             数值字面量除式按分数构造（分子/分母不执行除法、不自动约分），
+             与声明初值语义一致（check_decl TFrac e, EBin (Div, ...)） *)
+          let ta' = check_expr env a and tb' = check_expr env b in
+          let ac = if resolve ta'.ety = w then ta' else { e = ECastK (ta', w); ety = w; epos = ta'.epos } in
+          let bc = if resolve tb'.ety = w then tb' else { e = ECastK (tb', w); ety = w; epos = tb'.epos } in
+          { e = EFracNewK (ac, bc); ety = TFrac w; epos = fp }
+        | _ -> coerce p ta pt)
+      targs
+      (List.combine sig_.params origs)
+  in
   let moves = List.map (fun m -> m = 1) modes in
   { e = ECallK (!name, targs, moves); ety = sig_.ret; epos = p }
 
@@ -1371,22 +1388,26 @@ and check_ref_arg env (e : expr) : texpr =
     terr (pos_of_expr e) "ref can only apply to a variable (pass-by-reference needs an addressable variable)"
 
 (* 实参列表 → (类型化实参, 模式列表)：0=值 1=move（含自动 move） 2=ref 3=copy *)
-and check_args_modes env (args : call_arg list) : texpr list * int list =
-  List.split
-    (List.map
+and check_args_modes env (args : call_arg list) : texpr list * expr option list * int list =
+  let triples =
+    List.map
     (function
       | CPos e ->
         (match e with
          | EVar (n, p) when auto_moveable env n p ->
            (* 自动 move（new2.md #1：最后使用即 move）——免拷贝移交 *)
-           (check_move_arg env e, 1)
-         | _ -> (check_expr env e, 0))
-      | CMove e -> (check_move_arg env e, 1)
-      | CCopy e -> (check_copy_arg env e, 3)
-      | CRef e -> (check_ref_arg env e, 2)
+           (check_move_arg env e, None, 1)
+         | _ -> (check_expr env e, Some e, 0))
+      | CMove e -> (check_move_arg env e, None, 1)
+      | CCopy e -> (check_copy_arg env e, None, 3)
+      | CRef e -> (check_ref_arg env e, None, 2)
       | CNamed (n, e) ->
         terr (pos_of_expr e) "function calls do not support named argument %s=" n)
-    args)
+    args
+  in
+  (List.map (fun (a, _, _) -> a) triples,
+   List.map (fun (_, b, _) -> b) triples,
+   List.map (fun (_, _, c) -> c) triples)
 
 (* ref 参数体内改写（new2.md #1）：ref 参数在体内自动解引用——
    读 x → (x)^、写 x = v → (x)^ = v、x op= / x++ 同理；
@@ -1793,6 +1814,10 @@ and coerce p (te : texpr) (want : zty) : texpr =
       let te2 = coerce p te t in
       { e = EErrOkK te2; ety = want; epos = te.epos }
     | TVar _, _ | _, TVar _ -> unify p te.ety want; te
+    | _, TFrac e when (match te.e with EIntK _ | EFloatK _ -> true | _ -> false) ->
+      (* 数值字面量提升为分数（实参/返回等表达式上下文，与声明初值一致；
+         此前经 TVar 路径静默重打型，标量常量落进 frac 聚合槽致 E4021） *)
+      mk_frac_from te e p
     | (TInt _ | TUint _), (TInt _ | TUint _) ->
       (* new2.md #5：宽化自动、窄化必须显式 cast。
          安全判定：同符号 dst 不窄于 src；u→i 需 dst 更宽（u8→i16 ✓）；
@@ -2232,6 +2257,14 @@ and check_unwrap env p (a : expr) (blk : block) target =
          (l.lslot, l.lty)
        | None -> terr p "undefined variable: %s" name)
     | `Discard -> ("", elem)
+    | `Return ->
+      (* return a ?? 块：函数须返回 T!，块元素与 T! 元素一致 *)
+      (match resolve env.fncur_ret with
+       | TErr rt -> unify p elem rt
+       | rt ->
+         terr p "return a ?? block requires the enclosing function to return T! (current: %s)"
+           (pp_zty rt));
+      ("", elem)
   in
   push_scope env;
   declare env "err" { lconst = true; lty = TStruct "Err"; lslot = ""; lunred = false; lconstp = false };
@@ -2241,6 +2274,12 @@ and check_unwrap env p (a : expr) (blk : block) target =
   let tblk =
     match target, List.rev tblk with
     | `Discard, _ -> tblk
+    | `Return, [] ->
+      terr p "??-block after return requires a final value expression (or an explicit return)"
+    | `Return, { s = SExprK v; spos = vp } :: rest_rev ->
+      (* 块末值经 coerce 包装为函数返回类型（T!），改写为 SReturnK *)
+      let v = coerce vp v env.fncur_ret in
+      List.rev ({ s = SReturnK (Some v); spos = vp } :: rest_rev)
     | _, { s = SExprK v; spos = vp } :: rest_rev ->
       let v = coerce vp v tgt_ty in
       List.rev
@@ -2249,7 +2288,8 @@ and check_unwrap env p (a : expr) (blk : block) target =
     | _, _ -> tblk   (* 块以 return/break/continue/panic 等结束：目标不写 *)
   in
   let is_decl = (match target with `Decl _ -> true | _ -> false) in
-  SUnwrapBlockK (is_decl, slot, elem, ta, errslot, tblk)
+  let is_ret = (match target with `Return -> true | _ -> false) in
+  SUnwrapBlockK (is_decl, is_ret, slot, elem, ta, errslot, tblk)
 
 and check_unwrap_decl env p isconst name ty init =
   match init with
@@ -2706,6 +2746,12 @@ and check_stmt env (st : stmt) : tstmt =
      | None ->
        unify p env.fncur_ret TVoid;
        mk (SReturnK None)
+     | Some (EUnwrap (_, EBlock _, _) as e') ->
+       (* return a ?? 缩进块：成功 → 直接返回成功聚合；失败 → 执行块，
+          块末值 coerce 包装为返回类型后返回（w-015 #4） *)
+       (match e' with
+        | EUnwrap (a, EBlock (blk, wp), _) -> mk (check_unwrap env wp a blk `Return)
+        | _ -> assert false)
      | Some e' ->
        let te = check_expr env e' in
        let te = coerce p te env.fncur_ret in
@@ -2755,24 +2801,42 @@ and check_stmt env (st : stmt) : tstmt =
       (fun (ta : texpr) ->
         match resolve ta.ety with
         | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString | TFrac _ | TVar _ -> ()
-        | TArray (e, _) | TList e ->
-          (* 数组/列表整体打印（w-013）：元素须为可打印标量/string；
-             f16/f128 无打印运行时，i128 列表（8 字节槽放不下）除外 *)
-            let elem_ok (t : zty) =
+        | TArray (_, _) | TList _ ->
+          (* 数组/列表整体打印（w-013；w-015 #6 支持嵌套）：叶元素须为
+             可打印标量/string；f16/f128 无打印运行时；列表的 i128 叶
+             （8 字节槽放不下，定长数组可以）与 struct 叶不支持 *)
+            let rec elem_ok depth (t : zty) =
               match t with
               | TBool | TChar | TString | TVar _ -> true
               | TInt w -> w <= 128
               | TUint w -> w <= 128
               | TFloat w -> w = 32 || w = 64
+              | TArray (e, _) -> depth < 8 && elem_ok (depth + 1) e
+              | TList e ->
+                depth < 8 &&
+                (match resolve e with
+                 | TInt 128 | TUint 128 -> false
+                 | e2 -> elem_ok (depth + 1) e2)
               | _ -> false
             in
-            (match resolve ta.ety, resolve e with
-             | TList _, (TInt 128 | TUint 128) ->
-               terr p "output does not support element type: %s (128-bit list elements are not supported)"
-                 (pp_zty (resolve e))
-             | _, te when elem_ok te -> ()
-             | _, te ->
-               terr p "output does not support element type: %s" (pp_zty te))
+            let rec first_bad depth (t : zty) : zty option =
+              match t with
+              | TBool | TChar | TString | TVar _ -> None
+              | TInt _ | TUint _ | TFloat _ -> None
+              | TArray (e, _) | TList e ->
+                (match resolve e with
+                 | (TInt 128 | TUint 128) when (match t with TList _ -> true | _ -> false) ->
+                   Some (TInt 128)
+                 | e2 -> first_bad (depth + 1) e2)
+              | t2 -> Some t2
+            in
+            if not (elem_ok 0 (resolve ta.ety)) then
+              (match first_bad 0 (resolve ta.ety) with
+               | Some (TInt 128) ->
+                 terr p "output does not support element type: %s (128-bit list elements are not supported)"
+                   (pp_zty (TInt 128))
+               | Some bad -> terr p "output does not support element type: %s" (pp_zty bad)
+               | None -> terr p "output does not support this argument type")
         | t -> terr p "output does not support argument type: %s" (pp_zty t))
       targs;
     (* sep 默认 ""，end 默认 "\n"；非 char/string 值强制转 string *)
@@ -3198,10 +3262,8 @@ let check_program (prog : program) : hir =
       | IDecl (d, _) ->
         (try
            (match d with
-            | SDecl (true, is_frac, is_unred, name, ty, init, p) ->
+            | SDecl (true, false, false, name, ty, init, p) ->
               (* 顶层 const：编译期常量（整数使用处内联，保持原语义） *)
-              if is_frac || is_unred then
-                terr p "top-level const does not support frac/unred";
               if lookup_var env name <> None then
                 terr p "duplicate top-level constant: %s" name;
               let _t : tstmt = { s = check_decl env p true false false name ty init; spos = p } in
@@ -3211,6 +3273,22 @@ let check_program (prog : program) : hir =
                   | TInt _ | TUint _ -> ()
                   | _ -> terr p "top-level const currently supports only integer types, got %s" (pp_zty l.lty))
                | None -> ())
+            | SDecl (true, is_frac, is_unred, name, ty, init, p) ->
+              (* 顶层 const frac/unred（w-015 #5）：按全局常量槽处理——
+                 槽名 @g.<名>、lconst=true（赋值被拒）、ginit 初始化，
+                 不做整数内联。const+frac 在函数内已合法（check_decl 支持） *)
+              if lookup_var env name <> None then
+                terr p "duplicate top-level constant: %s" name;
+              let st = { s = check_decl env p true is_frac is_unred name ty init; spos = p } in
+              let lty = (match lookup_var env name with Some l -> l.lty | None -> assert false) in
+              let slot = "@g." ^ name in
+              set_global_slot name slot;
+              gdeclared := (slot, lty) :: !gdeclared;
+              ginit :=
+                { st with
+                  s = (match st.s with
+                       | SDeclK (c, _, t, e, nn) -> SDeclK (c, slot, t, e, nn)
+                       | s' -> s') } :: !ginit
             | SDecl (is_const, is_frac, is_unred, name, ty, init, p) ->
               (* 非 const 标量（含 frac）：全局可变变量 *)
               if lookup_var env name <> None then
@@ -3284,7 +3362,11 @@ let check_program (prog : program) : hir =
               (* 返回类型非 void 时，要求有 return 或尾表达式 *)
               if (match sig_.ret with TVoid -> false | _ -> true) then begin
                 let has_ret =
-                  List.exists (fun (s : tstmt) -> match s.s with SReturnK _ -> true | _ -> false) tbody
+                  List.exists (fun (s : tstmt) ->
+                    match s.s with
+                    | SReturnK _ -> true
+                    | SUnwrapBlockK (_, true, _, _, _, _, _) -> true   (* return a ?? 块 *)
+                    | _ -> false) tbody
                   ||
                   (match List.rev tbody with
                    | { s = SExprK _; _ } :: _ -> true
@@ -3487,8 +3569,8 @@ let check_program (prog : program) : hir =
         SInputK (List.map (fun t -> { t with tty = subst_ty t.tty }) ts,
                  Option.map fix_texpr d)
       | SReduceK (x, n, st) -> SReduceK (fix_texpr x, fix_texpr n, fix_texpr st)
-      | SUnwrapBlockK (d, n, t, a, es, b) ->
-        SUnwrapBlockK (d, n, subst_ty t, fix_texpr a, es, List.map fix_stmt b)
+      | SUnwrapBlockK (d, r, n, t, a, es, b) ->
+        SUnwrapBlockK (d, r, n, subst_ty t, fix_texpr a, es, List.map fix_stmt b)
       | SFieldSetK (r, idxs, rt, v) ->
         SFieldSetK (fix_texpr r, idxs, subst_ty rt, fix_texpr v)
       | SAugFieldK (n, idxs, rt, op, v) ->

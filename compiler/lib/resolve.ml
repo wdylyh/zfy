@@ -378,7 +378,39 @@ let resolve (main : program) (main_dir : string)
          | Some (BItem flat) -> flat
          | Some (BMod _) -> name   (* 模块名作值：保留，typeck 报错 *)
          | None -> name)           (* 错误已收集；保留避免级联 *)
-      else if String.contains name '.' then name   (* legacy 命名空间/字段路径 *)
+      else if String.contains name '.' then
+        (* 点分名：首段为 use 绑定时展开（w-015 #2 整模块绑定）——
+           BMod 沿剩余段下钻（子模块链 + 末段 item，可见性与 resolve_path
+           同规则）取扁平名；BItem 或未绑定的点分名保留原样
+           （legacy 命名空间/扁平名直查/字段路径） *)
+        (match String.split_on_char '.' name with
+         | hd :: rest when rest <> [] && Hashtbl.mem m.binds hd ->
+           (match Hashtbl.find m.binds hd with
+            | BItem _ -> name
+            | BMod tp ->
+              let rec go cur segs =
+                match segs with
+                | [] -> None
+                | [ last ] ->
+                  (match find_mod root cur with
+                   | Some mm ->
+                     (match local_find mm last with
+                      | Some (_, pub, _) when visible m cur pub ->
+                        Some (flat_prefix cur ^ last)
+                      | _ -> None)
+                   | None -> None)
+                | s2 :: r2 ->
+                  (match find_mod root cur with
+                   | Some mm ->
+                     (match child_opt mm s2 with
+                      | Some c -> go c.mpath r2
+                      | None -> None)
+                   | None -> None)
+              in
+              (match go tp rest with
+               | Some flat -> flat
+               | None -> name))
+         | _ -> name)
       else
         (match local_find m name with
          | Some (_, _, k) when k <> "mod" -> flat_prefix m.mpath ^ name

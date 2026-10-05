@@ -8,9 +8,9 @@ i64 main()
     string t = trim("  pad  ", ' ')
     // split 返回 string[]（分隔符为 char）
     string[] parts = split("a,b,c", ',')
-    // replace 全替换 / 次数限定（char 参数）
-    string r1 = replace("aaa", 'a', 'b')
-    string r2 = replace("aaa", 'a', 'b', 2)
+    // replace(s, 起, 止, "串") 区间替换（两端含；w-015 #1 修正文档）
+    string r1 = replace("banana", 0, 2, "ma")
+    string r2 = replace("hello world", 6, 10, "zfy")
     // 切片：两端含、步长
     string sl = s[0, 4]
     string sl2 = s[0, 9:3]

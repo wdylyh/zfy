@@ -1303,6 +1303,38 @@ void zfy_print_seq(zfy_seq *s, int kind, const char *sep) {
     }
 }
 
+/* 嵌套序列递归打印（w-015 #6）：每个元素槽内是内层 zfy_seq 指针，
+   逐层输出 [ ... ]，元素间以 sep 分隔；depth 为剩余层数（2D 传 1），
+   叶元素类型码 leafkind 由编译器静态传入（运行时头部 kind 无宽度信息） */
+static void zfy_print_seq_nest_rec(zfy_seq *s, int depth, int leafkind, const char *sep) {
+    /* depth = 剩余指针层数：>1 时元素槽内是内层 zfy_seq*，逐层递归；
+       <=1 时当前序列的元素即叶值，整体交给 zfy_print_seq */
+    if (depth <= 1) {
+        zfy_print_char('[');
+        if (s && s->data) zfy_print_seq(s, leafkind, sep);
+        zfy_print_char(']');
+        return;
+    }
+    if (!s || !s->data) {
+        zfy_print_char('[');
+        zfy_print_char(']');
+        return;
+    }
+    const char *base = (const char *)s->data;
+    long long esz = s->elemsz;
+    zfy_print_char('[');
+    for (long long i = 0; i < s->len; i++) {
+        if (i && sep) zfy_print_str(sep);
+        zfy_seq *inner = *(zfy_seq **)(base + i * esz);
+        zfy_print_seq_nest_rec(inner, depth - 1, leafkind, sep);
+    }
+    zfy_print_char(']');
+}
+
+void zfy_print_seq_nest(zfy_seq *s, int depth, int leafkind, const char *sep) {
+    zfy_print_seq_nest_rec(s, depth, leafkind, sep);
+}
+
 /* 列表扩长到 need 个元素：容量按需加倍 realloc，新增槽位填零值 */
 static void seq_grow(zfy_seq *s, long long need) {
     if (need <= s->cap) {
