@@ -1327,6 +1327,15 @@ char *zfy_str_replace_from(const char *s, long long a, const char *rep) {
 }
 
 /* 拼接两个字符串，返回 malloc 新串 */
+/* string 内容比较（== / !=，w-011）：strcmp 封装，返回 0/1 */
+long long zfy_str_eq(const char *a, const char *b) {
+    return strcmp(a, b) == 0;
+}
+
+long long zfy_str_ne(const char *a, const char *b) {
+    return strcmp(a, b) != 0;
+}
+
 char *zfy_str_concat(const char *a, const char *b) {
     size_t la = strlen(a), lb = strlen(b);
     char *buf = (char *)malloc(la + lb + 1);

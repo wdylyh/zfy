@@ -643,7 +643,20 @@ and check_expr env (e : expr) : texpr =
         let res_ty =
           match bop with
           | BEq | BNe | BLt | BGt | BLe | BGe ->
-            if not (is_numeric rl && is_numeric rr) then
+            let ok =
+              if is_numeric rl && is_numeric rr then true
+              else
+                (* ==/!= 额外支持同型 bool / char / string（内容比较）/ 泛型 T；
+                   < <= > >= 仍仅数值 *)
+                (match bop with
+                 | BEq | BNe ->
+                   rl = rr
+                   && (match rl with
+                       | TBool | TChar | TString | TVar _ -> true
+                       | _ -> false)
+                 | _ -> false)
+            in
+            if not ok then
               terr p' "comparison requires numeric types, got %s and %s"
                 (pp_zty tl.ety) (pp_zty tr.ety);
             TBool

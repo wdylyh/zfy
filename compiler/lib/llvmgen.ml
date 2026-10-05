@@ -2051,6 +2051,8 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare ptr @zfy_str_replace(ptr, i64, i64, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_replace_from(ptr, i64, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_concat(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_str_eq(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_str_ne(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_append_n(ptr, ptr, i64)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split(ptr, i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split_str(ptr, ptr)\n";

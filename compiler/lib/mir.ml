@@ -301,6 +301,12 @@ let rec lexpr l (e : texpr) : operand =
        let d = fresh l in
        emit l (MCall (Some d, frac_rt_name b elem, [ oa; ob ], TBool));
        op (OLocal d) TBool
+     | TBool when (b = BEq || b = BNe) && a.ety = TString ->
+       (* string ==/!=：内容比较（strcmp 封装，w-011） *)
+       let fn = if b = BEq then "zfy_str_eq" else "zfy_str_ne" in
+       let d = fresh l in
+       emit l (MCall (Some d, fn, [ oa; ob ], TBool));
+       op (OLocal d) TBool
      | _ ->
        let d = fresh l in
        emit l (MBinop (d, b, oa, ob));

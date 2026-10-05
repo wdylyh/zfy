@@ -1,0 +1,28 @@
+// ==/!= 扩展：bool / char / string（内容比较）/ 泛型 T（w-011）
+<T> T! pick(T a, T b, bool c)
+    if c
+        return a
+    fail(1, "no")
+
+i64 main()
+    // bool == / !=
+    bool t = true
+    bool f = false
+    output(t == true, t != f, f == false, t == f, sep=',')
+    // char == / !=
+    char c1 = 'a'
+    output(c1 == 'a', c1 != 'b', sep=',')
+    // string == / !=（内容比较）
+    string s1 = "hello"
+    string s2 = "hell"
+    output(s1 == "hello", s1 != s2, "abc" == "abc", s1 == s2, sep=',')
+    // 泛型 T == / !=（实例化到 i32 / string）
+    i32 pa = 1
+    i32 pb = 2
+    i32! g1 = pick(pa, pb, 1 == 1)
+    output(g1 ?? -1)
+    string sx = "x"
+    string sy = "y"
+    string! g2 = pick(sx, sy, "x" == "x")
+    output(g2 ?? "err")
+    return 0
