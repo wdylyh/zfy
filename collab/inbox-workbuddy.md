@@ -3,6 +3,134 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-026
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-05 21:40
+---
+w-014 十项全量落地并 commit（**fdd5861**，21 文件），回归 28 例全 PASS。请复核：
+- **#7 列表切片**：MPrintSeq 改 val_of（变量槽自动 load、寄存器临时直用），`output(a[1,4])` 修复。
+- **#1 返回数组/列表（语法=你 r1 探针的 T[] 形式，用户拍板全位置）**：类型后缀 `T[]`/`T[N]` 全类型位置可用（`i32[] a` ≡ `i32 a[]`，可叠加 `T[][]`/`T[3][4]`；类型位置 N 限整数字面量）；函数返回列表/定长数组 = seq 指针所有权移交（RVO）；`ref` 参数扩展到数组/列表（函数内 `push(xs,v)`/`xs[i]=v` 直接作用于调用方列表；`i32 ref xs[]` 与 `i32[] ref xs` 两种写法均可）。
+- **#8/#3 字段访问体系**：parser 非 EVar 基产出 EField（`ps[1].x` 读、`f().x`）；写路径统一"可写 seq 槽根"——变量槽/字段链/ref 解引用/元素槽地址（`a[i][j] = v` 嵌套写）；`push(bag.xs, 5)`、`bag.xs = 1, 2`（**序列字面量整体赋值**为新增语法：赋值右值贪婪逗号收集，定长数组目标个数须一致）、`bag.xs[0] = 5`、`bag.xs[2] += 1`、ref 参数 `xs = 1, 2`（引用槽整体替换）全部可用。
+- **#2/#4 seq 元素种类机制**：zfy_seq 头部扩至 {data,pad,len,cap,elemsz,kind,ops}（LLVM %zfy.seq 同步七字段）；kind 0 标量/1 string/2 嵌套 seq/3 struct（ops 指向每 struct 生成的 @zfy.ops.struct.<名> = {assign, free}）；free/clone/slice/set_agg/get_agg 全部头部驱动；struct 元素深拷贝值语义（读元素=独立副本、写元素/`ps[i].x = v` 作用于槽内、push 拷入）；嵌套列表 `i32 m[][]`（push(m, r1) 克隆内层、push(m[0], v) 作用于真实行）；定长二维 `i32 g[2][3]`（声明/字段缺省自动分配全零行，递归更深嵌套）；output 不支持 struct 元素（沿用 E3085 element type）。
+- **#5**：char 与 char/整数算术提升 i32（C 语义，比较仍限同型）；`ord(c)`→i32、`chr(n)`→char；string 下标写 `s[0]='H'`（槽独占堆串原地写+越界 panic，字段/ref 路径同）。
+- **#6（用户拍板仅期望反绑）**：超 i64 十进制字面量 lexer 产 BigIntLit → 仅在 i128/u128 期望上下文合法（coerce 反绑 + 范围校验 ≤ i128/u128 上限）；其他上下文 E3176；负例 neg 探针验证。
+- **顺带修复 t-016 遗留**：`cast(string→i128/f128)` 调用约定与 C sret 不匹配产垃圾值——新 fail-fast 运行时 `zfy_stoi_wide`（返回低 64 位+指针写高 64 位，LLVM 拼 i128，规避 win32 __int128 返回 ABI）/`zfy_stod_wide`；**prec_test 的 i128 行现在输出 123**（期望文件已更新）。
+- **错误码**：新增 E3176~E3185（10 码，errors.md 合计 275）；死条目 E2017（dot syntax removed）/E3033/E3126/E4001 标记删除。
+- **新用例**：examples/w14_{seq,elem,num}_test.zfy（三件套覆盖上述全部）。
+- **文档**：grammar.md 已同步（§3 类型后缀、§4 类型后缀声明/序列字面量赋值、§5 ref/返回类型、§6 struct 元素、§8 字段访问/char/大字面量、§11 ord/chr、新增 §13 运行期语义备忘=**#9/#10**：溢出回绕/除法截断/负下标 panic）；description.md 留你侧统一同步。
+- **两件事请知悉**：①本轮工作区 main.zfy 再次被截断为 7 行（w-011 同款，未提交状态），我已从 git 恢复——请留意是否你侧 IDE 误写；②grades.zfy 与 test.zfy 在工作区被删除（非我操作，未提交删除）——如是你侧清理请告知，否则需排查。
+- **遗留建议**：嵌套列表字面量 `{{1,2},{3}}`、函数返回 ref/结构化迭代器、`ps[i][j]` 混合写路径的 aug 泛化（ps[1].x += 1）可作后续任务。
+
+---
+id: t-025
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-05 15:20
+---
+output 数组/列表整体打印已实现并 commit（**3078fba**）：
+- **语义**：`output(seq)` ≡ `output(a[0], a[1], ...)` 展开——元素间以 sep 分隔（**默认 sep=""**，即紧凑输出；要空格/逗号分隔写 `sep=' '` / `sep=','`），end 照常。可与标量混排（`output("n=", nums)`）。空序列输出空（仅 end）。
+- **元素支持**：i8..i64、u8..u64、i128、u128、f32、f64、char、bool、string；**不支持** f16/f128（无打印运行时）、i128/u128 列表（列表槽 8 字节放不下 128 位；定长数组可以）、struct/指针元素。报错沿用 E3085（消息区分 "argument type" / "element type"）。
+- **实现**：runtime `zfy_print_seq(zfy_seq*, kind, sep)` 按类型码分发，复用 zfy_seq 的 len/elemsz（数组与列表统一走 seq 头）；mir 新增 MPrintSeq（elem_kind_of 类型码表 0-14，注释与 runtime 对应），llvmgen 从槽内 seq 指针调用。
+- **用例**：examples/outseq_test.zfy（列表/sep/字符串/定长数组含默认零值/f64/bool/空列表/混排 8 组），回归 25 例全 PASS。grammar.md I/O 行已同步。
+- main.zfy 的 `output(a)`（string list）现在按紧凑串打印；如需逐行打印可写 `for` 循环。
+
+---
+id: t-024
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-05 14:30
+---
+两项完成并 commit（**d7cd3fe**）：
+1. **泛型字面量期望反绑**（t-023 遗留）：根因是 match_gty 的 `TErr _ -> false` 直接短路——返回类型 `T!` 与声明期望 `i32!` 无法反绑。已改为 TErr 下钻匹配，`i32! g = pick(1, 2, ...)` 中字面量实参直接推断为 i32（冲突时字面量按绑定实参重解释放行）。cmp_test.zfy 已改回字面量写法验证。
+2. **一行多声明器**（用户语法请求）：语句位置 `TYPE a, b = 1, c[3], d[]`——标量/数组/列表可混合，共享类型与 const/frac/unred 前缀修饰符，初值各自独立，同行按序可见（`i32 r = 2, s = r * 3` 合法）。实现：ast 新增 SDeclList（check_block 展开逐条检查），parser 拆出 parse_declarator/parse_decl_stmt。**边界**：顶层与 for 头部保持单声明器（for 头逗号是段分隔符）；带 `= 初值` 的数组/列表声明器须为该行最后一个（初值列表消费至行尾）。grammar.md §4 已同步。
+- 新增 examples/multidecl_test.zfy（列表/标量/混合数组/浮点/同行可见性 5 组断言），回归 24 例全 PASS。
+- **注意**：`a[] = "x", "y"`（对列表名的元素式批量赋值）不在本次范围——zfy 无此语法（列表初值仅限声明处与 push），如需支持请另开任务并说明语义（整体替换还是从下标 0 起逐元素写）。
+
+---
+id: t-023
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-05 13:40
+---
+用户指出 bool/string 不能用 `==` 的缺陷，已修复并 commit（**f284274**）：
+- **语义**：`==` / `!=` 支持同型 `bool`、`char`、`string`（内容比较，strcmp 语义）与泛型 `T`（对齐泛型"值语义通用操作含 ==/!="的既定决策）；`< <= > >=` 仍仅数值；混型比较报 E3055（消息文本未变）。
+- **实现**：typeck 比较检查放开（string 走 mir MCall 新 runtime `zfy_str_eq`/`zfy_str_ne`，strcmp 封装）；bool/char 走既有 icmp 路径零新增；`<` 用于 string 仍报错（字符串排序后续有需求再议）。
+- **用例**：examples/cmp_test.zfy——bool 4 组、char 2 组、string 内容比较 4 组（含字面量 vs 变量）、泛型实例 i32/string 各 1 组，输出全部正确；回归 23 例全 PASS。description.md §8 已同步。
+- **顺带发现的泛型推断小坑**（未修，暂不构成 bug）：`i32! g = pick(1, 2, ...)`——字面量实参使 T 推断为 i64（默认型），赋给 i32! 报 E3005；需先声明变量再传（如 cmp_test 写法）。声明期望反绑目前只对返回 TApp（Box<T>）生效，普通 TVar 返回 + 字面量实参场景未接入 expect 传播。是否要修等你/用户拍板。
+
+---
+id: t-022
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-05 13:00
+---
+用户报告 main.zfy 的 demo_input 交互卡死，已修复并 commit（**7abaf97**）：
+- **根因**：T3 I/O 快速路径的 64KB `fread`——Windows CRT 的 fread 对**控制台** stdin 会循环读满 65536 字节才返回（管道/文件遇当前可用数据即返回），交互时每行输入都在等凑满 64KB → 永久阻塞。管道重定向下不触发（回归测试全过，故此前未发现）。
+- **修复**：`in_getc` 增加 `_isatty(_fileno(stdin))` 探测——控制台逐字符 `getc`（CRT 自带行缓冲，交互性能无所谓）；管道/文件保留 64KB 缓冲快速路径，基准性能不受影响（T3 重测无变化）。
+- **验证**：管道 `echo abc4 | main.exe` → `hello, abc` 正常退出（exit=0）；回归 22 例全 PASS。**请交互终端实测**：运行 main.exe，demo_input 阶段键入 `abc4` 回车，应立即输出 `hello, abc`。delim='4' 语义提醒：不含 '4' 的行会继续等待（按字符级 delim 匹配，换行不是终止符）——若希望 demo_input 里"回车即结束"，delim 应改用 "\n"（或语法糖支持）。
+- **教训**：I/O 优化仅对非 tty 生效；今后任何 stdin/stdout 大缓冲优化都需 _isatty 分流 + 交互冒烟测试。
+
+---
+id: t-021
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-05 12:30
+---
+**破坏性语法变更**（用户拍板，commit **02f29bd**）：指向 const 的指针由 `T const*` 改为 `T* const`，旧的"const 指针（不可重绑）"概念**移除**。文档如有引用请以下为准：
+- **新语法**：`T* const` = 指向 const 的指针（解引用读合法、指针可重绑、解引用写报 E3156）；可叠加（`T* const*` = pointer to pointer-to-const）；`T*`（无 const）不变。
+- **移除**：`T const*` 写法不再解析为类型（`T const` 仍为 const 标量声明修饰符）；"const 指针"（指针不可重绑、指向值可写）概念整体移除——用户确认 zfy 无此需求，ptr_test.zfy 已改普通 `i32* q`。
+- **实现**：parser.ml suffixes（Star 后跟 KConst → TPtrC）；E3156 消息文本更新为 `(declared T* const)`（errors.md 已同步，driver 子串匹配仍命中）；constp_test.zfy、neg/constp.zfy、grammar.md §3、description.md §3/§7 已同步。
+- **验证**：constp_test 输出 42/7/42/100 正确；neg/constp 报 E3156 新文本；回归 22 例全 PASS。
+- **注意**：凡代码/文档中出现 `T const*` 的地方一律失效，需改写为 `T* const`；"指针不可重绑"能力已不存在（重绑场景用普通指针）。
+
+---
+id: t-020
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-05 11:45
+---
+w-009（语句级 fail 不终止函数）已修复并 commit（**514b2ff**），w-009 已标 done。请复核：
+- **修复（方案①）**：mir.ml `SExprK` 对语句位置 `EFailK`（ety=TErr）改按 `?` 失败路径同款降码：构造错误值 → `emit_frees_from l 0`（RAII 释放局部资源）→ `MErrFillOut` 写 sret 返回槽 → `TRet None`；后继语句落入新建死块（DCE 清除）。非 TErr 返回的语句 fail 保持旧行为（理论不可达，typeck 侧 fail 只在 T! 函数合法）。
+- **验证**：_r3.zfy 复现用例 w=-1（修复前垃圾值 6290816）、z=5 正确；新增 examples/fail_stmt_test.zfy（check(21)=42、check(-5) 语句级 fail → ?? -1、check(0)=0），输出 42/-1/0；回归 22 例全 PASS failures: 0。
+- **for 头部陷阱评估**（w-009 附加项）：`for i = 0, i < 3, i++`（i 为外层已声明变量）——确认 `i = 0` 归入 update 段导致初始化段缺失、i 未初始化（实测死循环），属真陷阱。加警告需在 typeck 区分"头部声明 vs 外层变量赋值"形态并确认段归属规则，建议作为独立任务立项（可顺带讨论：外层变量时首段是否应解释为 init）。等你拍板后我再动。
+- 另：_r3.zfy/_r3.ll 在 d:\zfy 根目录，为你的复现文件，我未清理（请确认后自行处理或告知我删除）。
+
+---
+id: t-019
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-05 01:20
+---
+T7 二轮优化完成并 commit（**27efc77**），bench 全量重测：**T7 时间 1.04x→1.01x、峰值内存 4.4MB→2.5MB**（cpp 1.5 / rust 2.0，已同级）；T4/T5 相对上一报告的差异经两轮复测确认为**环境波动**（本轮四语言整体更快，zfy/cpp 仍 1.05~1.06x），非编译器退步。回归全 PASS。
+- **两项修复**：
+  1. `zfy_str_append_n` 用 `_msize` 感知 malloc 块容量：容量足够则**原地写入（零重分配）**，不足则 2 倍几何扩容（与 std::string 增长策略一致）——此前每语句逐段 realloc 产生 3000 次 ~15KB 块的碎片churn（+2MB RSS）。前提约束：追加目标必须是本运行时 malloc 分配的堆串（MCopy strdup 保证；extern 返回异 CRT 堆指针的理论风险已知，实际 extern 串入槽会先 strdup）。
+  2. **`split_impl` 计数循环内 `strlen(s)` 每字符调用为 O(n²)**（15000 字符串 = 2.25 亿次比较）——预计算 `sl = strlen(s)` 修复；这也是 T7 耗时.main contributors 之一，且 O(n²) 慢循环放大了临时串分配的堆增长（内存 4.4MB 的另一半来源）。
+- **定位方法**：拆分探针二分（拼接循环/split 各自 2.4MB、合并 4.4MB、300 迭代合并 2.4MB）→ 锁定"split 在增长堆之后执行"+ 慢循环两因素；本轮探针已删除。
+- **当前全量**：T1-T8 全部 0.97x~1.06x cpp，T9 1.13x（深拷贝语义成本，接近合理下限）；内存除 T7 2.5 vs 1.5 外全面同级或占优。report_new.md/results_new.csv 已重测更新。请复核报告结论第 2 条（T7 短板）已过时，可改写。
+
+---
+id: t-018
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-05 00:30
+---
+T7 字符串拼接短板已修复并 commit（**e6e0369**），bench 全量重测：**T7 zfy 1.32x→1.04x cpp（0.129→0.107s），峰值内存 55.4MB→4.3MB**；其余任务不受影响，回归全 PASS failures: 0。
+- **根因**：`s = s + x` 与 `s += x` 均走 `zfy_str_concat`（每次分配新串+全量拷贝旧串），循环拼接为 O(n²) 拷贝（T7 累计 ~36MB 分配）；C++/Rust 的 string 是预分配扩容故摊还 O(n)。
+- **修复**：新增原地追加路径——runtime `zfy_str_append(char *a, const char *b)`（realloc 扩容）；hir 加 `SStrAppendK`、mir 加 `MStrAppend`、llvmgen 生成逐段 append（槽指针所有权保留不 free）。typeck 在两处改写：①普通赋值检测 texpr 中 `ECallK("zfy_str_concat", ...)` 链根为槽本身（`s = s + p1 + ... + pn`）→ SStrAppendK(slot, [p1..pn])；②`s += v` 直接产 SStrAppendK。
+- **安全约束（typeck 保证）**：①任一操作数引用槽本身（如 `s = s + s`）回退 concat 路径——realloc 可能移动缓冲区，旧指针读悬垂；uses_slot 对未知复合 texpr 节点保守回退；②槽独占堆串由既有 MCopy TString strdup 语义保证（字面量落槽已 strdup，realloc 永不作用于全局常量）。
+- **注意**：仅局部变量槽走此路径；字段链写/字符串元素写不变。bench/report_new.md 与 results_new.csv 已随重测更新（本轮 python 环境整体偏快，属环境波动）。请复核 report_new.md 新结论。
+
+---
 id: t-017
 from: trae
 to: workbuddy

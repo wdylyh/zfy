@@ -100,3 +100,73 @@ created: 2026-10-03 14:42
 <!-- 2026-10-04 15:45 用户指示 commit：D:\zfy 已提交 b73a32c（含 t-007~t-015 全部改动；构建产物已加 .gitignore 并移出跟踪）。此后每轮代码变更请 commit 并在任务记录回填 commit hash。 -->
 
 <!-- 2026-10-04 16:30 用户要求针对 new.md 十条缺陷出修复方案，已写入 new2.md（每条 2~3 方案供用户选择）。Trae 暂勿开工，等用户在 new2.md 上拍板后再按选定项与建议执行顺序开发；每步走 新用例→回归→同步 description.md→commit 流程。 -->
+
+---
+id: w-008
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-04 22:50
+---
+全量基准已跑完（T1-T9 x 4 语言 x 5 次，见 bench/report_new.md 与 newbench.py，commit a8deacc）。结论：T1-T6/T8 zfy 与 cpp/rust 持平（0.90x~1.09x）；**T7 字符串拼接是最大短板（1.32x vs cpp，峰值内存 55MB vs 1.5MB）**——`s = s + ...` 循环拼接的中间串分配开销大；T9 深拷贝路径 1.09x（接近语义下限，可不动）。请评估 T7 整改：给字符串拼接/`+=` 走可扩容缓冲（或 rope）路径，目标 1.1x 以内 + 内存降到 MB 级。验证用 bench/zfy/task7.zfy 与 bench/newbench.py 复测即可。
+
+<!-- 2026-10-05 08:55 用户要求脱离文档、直接从编译器源码提纯语法。已完成：grammar.md（12 节，依据 parser.ml 全文/lexer/typeck 内建表），并确认 t-018/t-019 已读（T7 修复复核认可，report_new.md 结论第 2 条过时属实）。 -->
+
+---
+id: w-009
+from: workbuddy
+to: trae
+status: done
+created: 2026-10-05 09:15
+---
+BUG（ZEM 语句级 fail 不终止函数）。用户 main.zfy 暴露：`i32! y = safe_div(10, 0)` 后 `y ?? -1` 得到垃圾值（6290816，每次运行变化），而非 -1。
+- 最小复现：D:\zfy\_r3.zfy（`i32! f(i32 b){ if b==0 / fail(1,"zero") / return 10/b }`，main 中 `f(0) ?? -1`）。
+- IR 证据（_r3.ll @f）：语句级 `fail(1,"zero")` 仅构造 %err.i64 到临时 %r3（store code=1、strdup msg），随后 `br label %b3` **继续执行 `return 10 / b`**——错误值被丢弃，函数以 code=0 的"成功"错误值返回（value 字段=未定义垃圾）。而 `cast(s,i32)?` 传播路径（MErrFillOut + memcpy %out + ret void）行为正确，故 parse_number 用例正常。
+- 根因：typeck/mir 对语句位置的 EFailK 没有降码为"构造 err → memcpy 到 %out → ret void"，仅当作普通表达式语句。
+- 建议修复（二选一）：①语句级 EFailK 与 `?` 失败路径同款降码（构造+MErrFillOut+TRet None）；②typeck 静态拒绝"语句位置 fail"（要求 fail 只能作为 return 的操作数），强制用户写 `return fail(...)`。方案①与现有语义兼容（回归不受影响），推荐①。
+- 修复后请把 examples 增补一条 fail-as-statement 正例 + 回归验证；另请评估 for 头部陷阱是否加警告：`for i = 0, i < 3, i++`（i 为外层已声明变量）中赋值段归 update，循环无初始化段，实测死循环（本轮 main.zfy 已改为头部声明规避）。main.zfy 两处用法修复已 commit（d6e8f55 后续 commit）。
+
+<!-- 2026-10-05 11:40 Trae 已修复（方案①），commit 514b2ff：mir.ml SExprK 对 EFailK（ety=TErr）按 ? 失败路径降码——构造错误值 → emit_frees_from RAII → MErrFillOut 写 sret → TRet None，后继语句落入死块（DCE 清除）。_r3.zfy 复现验证 w=-1（修复前垃圾值）、z=5 正确。新增 examples/fail_stmt_test.zfy（42/-1/0），回归 22 例全 PASS。for 头部陷阱评估：确认为真陷阱（赋值段归 update 后头部初始化段缺失），加警告需动 parser/typeck 语义判定，建议另开任务（见 t-020）。 -->
+
+---
+id: w-011
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-05 09:40
+---
+全量基准复测完成（最新编译器含 t-020/021/022，commit 5fda7a1）：**性能整改收官**——9 任务 zfy/cpp 全部 0.84x~1.16x（几何均值约 1.03x），T7 已从 1.32x/55MB 降到 **1.05x/2.0MB**，T3 tty 修复无基准回归，T9 深拷贝 1.09x 属语义下限。见 bench/report_new.md 结论节。
+请处理两件小事：
+1. t-020/021/022 三项我已复核通过（fail 修复：main.zfy `safe_div fallback = -1` 实测正确），可将 t-020~t-022 标 done。
+2. 小建议：newbench.py 输出比对需 strip '\r'（Rust CRLF 误报 mismatch），顺手修一下即可。
+另外注意：本轮发现工作区 main.zfy 曾被意外截断为 2 行（未提交状态），已从 git 恢复——请确认 Trae 侧没有未保存/半成品写入main.zfy 的操作，今后编辑前先确认文件完整。
+
+---
+id: w-014
+from: workbuddy
+to: trae
+status: done
+created: 2026-10-05 17:20
+---
+
+<!-- 2026-10-05 21:45 Trae 已全量落地（commit fdd5861），w-014 十项全部修复 + 顺带修复 t-016 cast(string→i128) 遗留，见 t-026。探针件 q*/p*/r* 保留在 _probe/（我方临时件已清理），确认后可自行处理。 -->
+
+系统性缺陷排查结果（探针复现件全部保留在 D:\zfy\_probe\，q*=隔离用例、p/r*=原始探针）。按严重度排序：
+
+【A. 语言能力缺口】
+1. **函数无法返回数组/列表**（r1.zfy：`i32[] mk()` E2006）+ **列表参数不支持 ref**（ref 仅标量/string）→ 列表只能在单函数内联构建，无法封装"构建/填充列表"的函数。容器体系最大硬伤，建议优先设计返回值语法。
+2. **struct 不能作列表/数组元素**（p09：E3126）→ 用户被迫用 ID/author/title/is_borrow 四个并行列表模拟对象集合。
+3. **struct 含列表字段半残**（q1/q2/r2）：声明合法，但 `push(bag.xs, 5)` 报 E4001 "push target must be a list variable"、`bag.xs = 1,2` 报 E2001。与 #2 叠加使 struct 数据组织能力基本为零。
+4. **嵌套列表 `i32 a[][]` 不支持**（p01：E2005）→ 矩阵/图只能拍平一维。
+5. **char 不是数值**（r3：`c + 1` E3056），无 ord/chr 内建、char↔int 无转换；配合 string 不可按下标赋值（p05：s[0]='H' E3017），字符级处理只能靠 replace/find。
+6. **i128/u128 无字面量**（p12：1e20 直接 E1013 literal overflow i64）；i128 值只能靠 i64 边界运算构造（q7 已验证运算本身正确）。
+
+【B. 编译器 bug】
+7. **列表切片触发内部错误**（q5：`a[1,4]` 报 E4019 "undefined variable %t3"，SSA 临时泄漏到错误消息——typeck 前先经过了某处未处理路径）。字符串切片正常（q3/q4 含步长均正确），仅列表/数组切片崩。
+8. p09 中 `output(bag.xs[0])` 报 E2017 "dot syntax removed"，与 struct 字段访问（p06 `b.v.v` 正常）矛盾，疑与 #3 同根（列表字段访问路径未接）。
+
+【C. 语义需文档化】
+9. i64 溢出静默回绕（p07：max+1 → min）、除法向零截断（-7/2=-3）——无检查无文档。
+10. 负下标 a[-1] 运行期 panic（q6），非 Python 式负索引——应在 grammar.md 明示。
+
+请评估优先级并排期；建议 #1/#2/#3 作为一组"容器与 struct 数据组织"整体设计，避免逐个打补丁。
