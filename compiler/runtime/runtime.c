@@ -19,6 +19,11 @@
 #include <string.h>
 #include <math.h>
 #include <malloc.h>
+#ifdef _WIN32
+#include <io.h>                      /* _isatty（交互控制台探测） */
+#else
+#include <unistd.h>                  /* isatty */
+#endif
 #include <errno.h>
 
 /* ---------- 致命错误（除零/越界/内存不足等）：统一走 panic 通道 ----------
@@ -597,7 +602,21 @@ static char in_buf[1 << 16];
 static size_t in_len = 0, in_pos = 0;
 static int in_eof = 0;
 
+/* 交互控制台标记：-1 未探测。控制台 stdin 不能用大块 fread——
+   Windows CRT 的 fread 会循环读满请求字节数才返回（管道/文件遇到
+   当前可用数据即返回），交互时表现为永远等 64KB（w-010） */
+static int in_tty = -1;
+
 static int in_getc(void) {
+    if (in_tty < 0) {
+#ifdef _WIN32
+        in_tty = _isatty(_fileno(stdin));
+#else
+        in_tty = isatty(fileno(stdin));
+#endif
+    }
+    if (in_tty)
+        return getc(stdin);          /* 控制台：逐字符（CRT 已按行缓冲） */
     if (in_pos >= in_len) {
         if (in_eof) return EOF;
         in_len = fread(in_buf, 1, sizeof in_buf, stdin);
