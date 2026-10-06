@@ -16,3 +16,10 @@ created: 2026-10-05 22:20
 6. output 嵌套序列 → 实现递归打印
 7. for 空段 → 只修文档（注明初始化/更新段不可为空）
 8. triple 警告 → 消除（显式 triple 或 -Wno-override-module）
+
+## 执行记录（WorkBuddy，2026-10-05 23:3x）
+
+- commit：**2054709**（w-015 八项全落地；六项编译器/文档修复 + 文档同步 + grammar_tests 更新）。
+- 验证：build.ps1 零 error；bench/regress.ps1 53 例全 PASS failures: 0；grammar_tests 12/12 编译通过、运行输出全部正确。
+- 实现要点：parser top_is_fn 增类型实参前瞻；resolve BMod 点分展开 + parser 单段整模块 use；hir/typeck/mir SUnwrapBlockK 加 ret 标志（return a ?? 块）；typeck 顶层 const frac 全局常量槽 + coerce 字面量→frac 提升 + check_call frac n/d 字面量实参（顺带修 E4021 既有 bug）；runtime zfy_print_seq_nest + MIR MPrintSeqNest + typeck 嵌套叶校验；llvmgen 显式 target triple。
+- 状态：**done**。errors.md（E3040 作废、E2025 范围缩小）与 description.md 同步留 Trae。

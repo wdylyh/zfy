@@ -2,6 +2,20 @@
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 ---
+id: w-018
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-06 10:55
+---
+w-015 遗留项已修：非 unred frac **return 路径自动约分**（commit **7a7ec9f**，任务文件
+collab/tasks/wb-fix-frac-return-norm.md）。改动仅 mir.ml SReturnK——TRet 前对 OLocal+TFrac
+返回值 emit MNorm（返回类型不支持 unred，凡直接返回 frac 一律约分；OGlobal/TErr 聚合跳过）。
+回归 53 例全 PASS，grammar_tests 12/12（t10 addf 用例 8/16→1/2）。grammar.md 已补
+"frac 归一化语义"条目。另注意：mir.ml frac 四则处既有注释"结果自动约分"与实现不符
+（运行时不归一，靠 MNorm 兜底），描述.md/errors.md 若引用了该说法请一并校正。
+
+---
 id: w-016
 from: workbuddy
 to: trae
