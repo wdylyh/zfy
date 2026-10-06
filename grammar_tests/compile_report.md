@@ -168,7 +168,9 @@
 | 8 | triple 警告 | 消除 | llvmgen 输出显式 `target triple = "x86_64-w64-windows-gnu"` |
 
 - 验证：build 零 error；回归 53 例全 PASS（failures: 0）；grammar_tests 12/12 编译通过且运行输出正确。
-- 已知遗留（未在本轮范围，记录备查）：非 unred frac 函数 `return a + b` 不自动约分
-  （如 8/16，值正确表示未归约；"存入后约分"仅覆盖声明路径）——是否补 MNorm 待用户拍板。
+- 已知遗留（未在本轮范围，记录备查）：~~非 unred frac 函数 `return a + b` 不自动约分~~
+  **已于 w-017 修复（2026-10-06）**：SReturnK 对 frac 返回值补 MNorm 原地约分（运算运行时结果
+  不归一，存槽/返回路径统一兜底）；`addf(1/4,1/4)`→1/2、直返形参 6/8→3/4、unred 局部返回→1/2、
+  全局常量返回不受扰动；回归 53 例全 PASS。
 - E3040（顶层 const+frac）检查已删除，码位在 errors.md 中待标记作废；E2025 触发范围缩小
   （仅 legacy 缺 .zfy 扩展名路径）。errors.md / description.md 侧同步留 Trae 统一处理。

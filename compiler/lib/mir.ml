@@ -945,6 +945,13 @@ and lstmt_inner l (s : tstmt) : unit =
     (* 先求返回值，再释放全部局部资源（RAII）；
        若返回值本身就�?owned 局部变量，跳过其释放（所有权随返回转移）�?       本语句的临时串所有权同样随返回转移，不再释放 *)
     let v = Option.map (lexpr l) e in
+    (* 非 unred frac 返回前原地约分（w-017）：四则运算的运行时结果不经归一，
+       声明/赋值存槽路径有 MNorm 兜底，return 路径此前缺失（产出 8/16 形态）。
+       返回类型不支持 unred 修饰，凡直接返回 frac 一律约分；
+       全局常量（OGlobal）与 TErr 聚合不在其列 *)
+    (match v with
+     | Some ({ o = OLocal n; oty = TFrac _; _ } as vo) -> emit l (MNorm (n, vo.oty))
+     | _ -> ());
     l.stmt_temps <- [];
     let skip =
       match v with
