@@ -2294,6 +2294,7 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare i64 @zfy_stoi_wide(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare x86_fp80 @zfy_stod_wide(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_err_find(ptr, ptr, i8, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_err_find_str(ptr, ptr, ptr, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_i64(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_f64(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_str(ptr, ptr)\n";
@@ -2309,7 +2310,10 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare ptr @zfy_str_trim(ptr, i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_trim_str(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_replace(ptr, i64, i64, ptr)\n";
-  Buffer.add_string g.mbuf "declare ptr @zfy_str_replace_from(ptr, i64, ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_str_cmp(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_utf8_len(ptr)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_utf8_char_at(ptr, i64)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_utf8_sub(ptr, i64, i64)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_concat(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_str_eq(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_str_ne(ptr, ptr)\n";

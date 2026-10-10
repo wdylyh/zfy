@@ -431,6 +431,12 @@ and parse_postfix_rest p e =
          use 命名空间 t.item 共用，typeck 按变量/命名空间分派）
        - 基为其他表达式（ps[1].x / f().x / p^.x）：产出 EField 节点，
          typeck 对基求值后取字段 *)
+    (match e with
+     | EInt _ ->
+       (* `1..3` 会被切成 `1` `.` `.`——用户把 Python/C 切片语法带进来了，
+          提前拦截并给出本语言切片语法（w-020 DX） *)
+       err tp "invalid syntax 'a..b': slice syntax is s[a,b:step] (comma-separated, both ends inclusive)"
+     | _ -> ());
     ignore (next p);
     let seg = expect_ident p "namespace member or field name" in
     (match e with

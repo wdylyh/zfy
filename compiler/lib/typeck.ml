@@ -129,6 +129,12 @@ let builtin_fns_aux : (string * (zty list * zty)) list =
   List.map (fun (n, ps, r) -> (n, (ps, r)))
     [ ("str_len", [ TString ], TInt 64) ]
 
+(* 字符串内建名（EField 误用提示与 ECall 分派共用，w-020 DX）。
+   须定义在下方 let rec 大递归链之前（field_chain 会引用它） *)
+let str_builtin_names =
+  [ "length"; "find"; "trim"; "split"; "replace"; "prec";
+    "utf8_len"; "utf8_char_at"; "utf8_sub" ]
+
 (* 泛型函数调用钩子（check_program 内装配）：按已检查实参（texpr）推断
    实例化后返回 mangled 名；未装配时（不应发生）直接报未定义 *)
 let generic_call_hook
@@ -701,6 +707,16 @@ and check_expr env (e : expr) : texpr =
         let tr = mk (ECastK (tr, ti)) ti in
         mk (EBinK (bop, tl, tr)) ti
       end
+      (* 字符串比较（w-020 用户拍板）：string 与 string/char 可做全部六种
+         比较；char 侧提升为单字符 string（ASCII），逐字符比到第一个
+         不同字符即断（strcmp 语义，mir 侧 zfy_str_eq/ne/cmp） *)
+      else if is_cmp
+         && ((rl = TString && (rr = TString || rr = TChar))
+          || (rr = TString && rl = TChar)) then begin
+        let tl = if rl = TChar then to_string_of tl else tl in
+        let tr = if rr = TChar then to_string_of tr else tr in
+        mk (EBinK (bop, tl, tr)) TBool
+      end
       else
         let res_ty =
           match bop with
@@ -769,7 +785,8 @@ and check_expr env (e : expr) : texpr =
     (match callee with
      | EVar (name, _) ->
        (match name with
-        | "length" | "find" | "trim" | "split" | "replace" | "prec" ->
+        | "length" | "find" | "trim" | "split" | "replace" | "prec"
+        | "utf8_len" | "utf8_char_at" | "utf8_sub" ->
           (* 函数式内建：支持命名参数 count=，位置参数在前 *)
           check_builtin env p' name args
         | "panic_handler" ->
@@ -1026,12 +1043,20 @@ and check_expr env (e : expr) : texpr =
     let tb = check_expr env base in
     (match resolve tb.ety with
      | TString ->
-       (* string 切片：返回新串（两端含，步长默认 1） *)
+       (* string 切片：返回新串（两端含，步长默认 1）。
+          字面量/常量步长 ≤ 0 编译期拒绝（w-020：与 find count 同款检查；
+          变量步长仍由运行时 panic 兜底） *)
        let ta = to_i64 (check_expr env a) and tb' = to_i64 (check_expr env b) in
        let ts =
          match step with
          | None -> { e = EIntK 1L; ety = TInt 64; epos = p' }
-         | Some s -> to_i64 (check_expr env s)
+         | Some s ->
+           let ts = to_i64 (check_expr env s) in
+           (match const_eval env ts with
+            | Some v when Int64.compare v 1L < 0 ->
+              terr p' "slice step must be >= 1, got %Ld" v
+            | _ -> ());
+           ts
        in
        mk (ECallK ("zfy_str_slice", [ tb; ta; tb'; ts ], [])) TString
      | TArray (e, _) | TList e ->
@@ -1040,7 +1065,13 @@ and check_expr env (e : expr) : texpr =
        let ts =
          match step with
          | None -> { e = EIntK 1L; ety = TInt 64; epos = p' }
-         | Some s -> to_i64 (check_expr env s)
+         | Some s ->
+           let ts = to_i64 (check_expr env s) in
+           (match const_eval env ts with
+            | Some v when Int64.compare v 1L < 0 ->
+              terr p' "slice step must be >= 1, got %Ld" v
+            | _ -> ());
+           ts
        in
        mk (ESeqSliceK (tb, ta, tb', ts)) (TList e)
      | t -> terr p' "slicing is only for string/array/list, got %s" (pp_zty t))
@@ -1540,7 +1571,11 @@ and field_chain env p (base : texpr) (segs : string list) : texpr =
        | TPtr (TStruct s) | TStruct s ->
          let (idx, fty) = find_field env p s seg in
          go { e = EFieldK (base, idx); ety = fty; epos = p } fty rest
-       | t -> terr p "type %s does not support field access %s" (pp_zty t) seg)
+       | t ->
+         if List.mem seg str_builtin_names then
+           terr p "type %s does not support field access %s (string builtins are functional: %s(s, ...))"
+             (pp_zty t) seg seg
+         else terr p "type %s does not support field access %s" (pp_zty t) seg)
   in
   go base base.ety segs
 
@@ -1554,7 +1589,11 @@ and chain_fields env p (ty0 : zty) (segs : string list) : int list * zty =
        let (idx, fty) = find_field env p s seg in
        let (r, ft2) = chain_fields env p fty rest in
        (idx :: r, ft2)
-     | t -> terr p "type %s does not support field access %s" (pp_zty t) seg)
+     | t ->
+       if List.mem seg str_builtin_names then
+         terr p "type %s does not support field access %s (string builtins are functional: %s(s, ...))"
+           (pp_zty t) seg seg
+       else terr p "type %s does not support field access %s" (pp_zty t) seg)
 
 (* 可写 seq 槽根（w-014 #3）：把写目标（元素写/push/整体赋值）的基表达式
    求值为"持有 seq 指针的槽"形态 texpr：
@@ -1887,15 +1926,16 @@ and check_builtin env p name (args : call_arg list) =
       terr p "%s expects a string for its %s parameter, got %s" name what (pp_zty t.ety);
     t
   in
-  (* 第二参数：char -> 字符语义；string -> 子串语义；其他类型 -> 强转 string *)
+  (* 第二参数：char -> 字符语义；string -> 子串语义；其他类型报错
+     （w-020：不再走 to_string_of 兜底——trim(s, 65) 这类调用语义含糊，
+     报错文案明确化，与 find 的 char 报错风格统一） *)
   let char_or_str (e : expr) what =
     let t = check_expr env e in
     match resolve t.ety with
     | TChar -> `Char t
     | TString -> `Str t
-    | TFrac _ | TArray _ | TList _ | TVoid ->
-      terr p "%s does not accept type %s for its %s parameter" name what (pp_zty t.ety)
-    | _ -> `Str (to_string_of t)
+    | _ ->
+      terr p "%s's %s must be char or string, got %s" name what (pp_zty t.ety)
   in
   match name, pos_args, named with
   | "length", [ x ], [] ->
@@ -1905,30 +1945,46 @@ and check_builtin env p name (args : call_arg list) =
      | TArray _ | TList _ -> mk (ESeqLenK tx) (TInt 64)
      | t -> terr p "length expects string/array/list, got %s" (pp_zty t))
   | "find", [ s; c ], [] ->
-    (* find(s, 'l')：找第 1 次出现；找不到返回 NOT_FOUND 错误值（T!） *)
-    let ts = str_of s "argument 1" and tc = char_of_expr env c "argument 2" in
+    (* find(s, x)：x 为 char 找第 1 次出现的字符；为 string 找子串
+       （w-020 用户拍板补子串形态）。找不到返回 NOT_FOUND 错误值（T!） *)
+    let ts = str_of s "argument 1" in
     let one = { e = EIntK 1L; ety = TInt 64; epos = p } in
-    { e = EFindK (ts, tc, one); ety = TErr (TInt 64); epos = p }
+    (match char_or_str c "argument 2" with
+     | `Char tc -> { e = EFindK (ts, tc, one); ety = TErr (TInt 64); epos = p }
+     | `Str tx -> { e = EFindK (ts, tx, one); ety = TErr (TInt 64); epos = p })
   | "find", [ s; c ], [ ("count", k) ] ->
-    (* find(s, 'l', count=k)：找第 k 次出现（k 从 1 起）；找不到 = NOT_FOUND（T!） *)
-    let ts = str_of s "argument 1" and tc = char_of_expr env c "argument 2" in
+    (* find(s, x, count=k)：找第 k 次出现（k 从 1 起）；找不到 = NOT_FOUND（T!）；
+       k < 1 编译期拒绝（字面量/常量），运行期 panic（runtime 统一，w-020） *)
+    let ts = str_of s "argument 1" in
     let tk = to_i64 (check_expr env k) in
     (match const_eval env tk with
      | Some v when Int64.compare v 1L < 0 ->
        terr p "find's count must be > 0, got %Ld" v
      | _ -> ());
-    { e = EFindK (ts, tc, tk); ety = TErr (TInt 64); epos = p }
+    (match char_or_str c "argument 2" with
+     | `Char tc -> { e = EFindK (ts, tc, tk); ety = TErr (TInt 64); epos = p }
+     | `Str tx -> { e = EFindK (ts, tx, tk); ety = TErr (TInt 64); epos = p })
   | "trim", [ s; x ], [] ->
     let ts = str_of s "argument 1" in
     (match char_or_str x "argument 2" with
      | `Char tc -> { e = ECallK ("zfy_str_trim", [ ts; tc ], []); ety = TString; epos = p }
      | `Str tx -> { e = ECallK ("zfy_str_trim_str", [ ts; tx ], []); ety = TString; epos = p })
   | "split", [ s; x ], [] ->
-    (* split(s, x)：按分隔符切分，返回 string 列表（一等值，可 length/下标/遍历） *)
+    (* split(s, x)：按分隔符切分，返回 string 列表（一等值，可 length/下标/遍历）。
+       '\0' 分隔符编译期拒绝：C 串无内嵌 NUL，永远匹配不到（w-020） *)
     let ts = str_of s "argument 1" in
     (match char_or_str x "argument 2" with
-     | `Char tc -> { e = ESplitK (ts, tc); ety = TList TString; epos = p }
+     | `Char tc ->
+       (match tc.e with
+        | ECharK '\000' ->
+          terr p "split does not accept '\\000' as the delimiter (a C string can never contain NUL)"
+        | _ -> ());
+       { e = ESplitK (ts, tc); ety = TList TString; epos = p }
      | `Str tx -> { e = ESplitK (ts, tx); ety = TList TString; epos = p })
+  | "replace", [ _; _; _ ], [] ->
+    (* w-020 用户拍板：两参 replace(s, a, rep) 已删除。
+       "替换到串尾"用四参闭区间 replace(s, a, length(s) - 1, rep) 表达 *)
+    terr p "replace requires (s, a, b, rep): replace the closed interval [a, b] with rep; to replace to the end use b = length(s) - 1 (the two-argument form was removed)"
   | "replace", [ s; a; b; rep ], [] ->
     (* replace(s, a, b, rep)：把下标 a..b（两端含）替换为 rep（任意 string 表达式） *)
     let ts = str_of s "argument 1" in
@@ -1939,16 +1995,6 @@ and check_builtin env p name (args : call_arg list) =
       | `Str tx -> tx
     in
     { e = ECallK ("zfy_str_replace", [ ts; ta; tb'; trep ], []); ety = TString; epos = p }
-  | "replace", [ s; a; rep ], [] ->
-    (* replace(s, a, rep)：从下标 a 起替换到串尾 *)
-    let ts = str_of s "argument 1" in
-    let ta = to_i64 (check_expr env a) in
-    let trep =
-      match char_or_str rep "argument 3" with
-      | `Char tc -> to_string_of tc
-      | `Str tx -> tx
-    in
-    { e = ECallK ("zfy_str_replace_from", [ ts; ta; trep ], []); ety = TString; epos = p }
   | "prec", [ v; n ], [] ->
     (* prec(v, n)：输出长度控制（总字符数），返回 string。
        v：string 截断/补空格；其他可打印类型先按输出格式转 string。
@@ -1963,6 +2009,22 @@ and check_builtin env p name (args : call_arg list) =
      | TInt _ | TUint _ | TBool | TChar | TFloat _ | TVar _ -> ()
      | t -> terr p "prec's length parameter must be integer/char/float, got %s" (pp_zty t));
     mk (ECallK ("zfy.prec", [ tv; tn ], [])) TString
+  | "utf8_len", [ s ], [] ->
+    (* utf8_len(s)：码点数（string 底层仍是字节串，length 按字节不变；
+       本组 UTF-8 API 为 w-020 用户拍板扩展集） *)
+    let ts = str_of s "argument 1" in
+    mk (ECallK ("zfy_utf8_len", [ ts ], [])) (TInt 64)
+  | "utf8_char_at", [ s; i ], [] ->
+    (* utf8_char_at(s, i)：第 i 个码点（0 起），返回单码点 string（可能多字节；
+       越界运行期 panic）。返回 string 而非 char：char 是单字节，装不下中文码点 *)
+    let ts = str_of s "argument 1" in
+    let ti = to_i64 (check_expr env i) in
+    mk (ECallK ("zfy_utf8_char_at", [ ts; ti ], [])) TString
+  | "utf8_sub", [ s; a; b ], [] ->
+    (* utf8_sub(s, a, b)：按码点闭区间 [a, b] 切片（两端含），返回新 string *)
+    let ts = str_of s "argument 1" in
+    let ta = to_i64 (check_expr env a) and tb' = to_i64 (check_expr env b) in
+    mk (ECallK ("zfy_utf8_sub", [ ts; ta; tb' ], [])) TString
   | _ ->
     terr p "malformed argument list for builtin %s (positional arguments must precede named ones)" name
 
@@ -2195,7 +2257,17 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           let ti = to_i64 (check_expr env idx) in
           let trhs = check_expr env rhs in
           let grow = (match seqty with TList _ -> true | _ -> false) in
-          let trhs = coerce ip trhs e in
+          (* string 元素 +=（w-020）：只支持拼接，rhs 为 string/char（char 提升）；
+             concat 降码在 mir SAugIndexK（下标仍只求值一次） *)
+          let trhs =
+            if resolve e = TString then begin
+              if bop <> BAdd then
+                terr ap "string elements only support += (concatenation)";
+              (match resolve trhs.ety with
+               | TChar -> to_string_of trhs
+               | TString -> trhs
+               | t -> terr ip "string element concatenation requires string or char, got %s" (pp_zty t))
+            end else coerce ip trhs e in
           SAugIndexK ({ e = EVarK l.lslot; ety = l.lty; epos = ap },
                       e, ti, bop, trhs, grow)
         | TPtr t ->
@@ -2221,7 +2293,16 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
                 | TList _ | TPtr (TList _) -> true | _ -> false) in
     let ti = to_i64 (check_expr env idx) in
     let trhs = check_expr env rhs in
-    let trhs = coerce ip trhs e in
+    (* string 元素 +=（w-020）：同变量元素路径；concat 降码在 mir SAugIndexK *)
+    let trhs =
+      if resolve e = TString then begin
+        if bop <> BAdd then
+          terr ip "string elements only support += (concatenation)";
+        (match resolve trhs.ety with
+         | TChar -> to_string_of trhs
+         | TString -> trhs
+         | t -> terr ip "string element concatenation requires string or char, got %s" (pp_zty t))
+      end else coerce ip trhs e in
     SAugIndexK (root, e, ti, bop, trhs, grow)
   | ESlice (EVar (arr, ap), a, b, step, sp) ->
      (* a[x,y:st] op= v：原地作用于原数组的区间元素（string/frac/f16/f128 不支持） *)
@@ -2263,10 +2344,13 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
        (match resolve l.lty, bop with
         | TString, BAdd ->
           (* s += v：原地追加（T7 优化，realloc 扩容免全量拷贝）；
-             槽独占堆串（MCopy strdup 保证），语义同 s = s + v *)
+             槽独占堆串（MCopy strdup 保证），语义同 s = s + v；
+             rhs 为 char 时提升为单字符 string（w-020） *)
           let trhs = check_expr env rhs in
-          if resolve trhs.ety <> TString then
-            terr p' "string concatenation requires both sides to be string, got %s" (pp_zty trhs.ety);
+          let trhs = (match resolve trhs.ety with
+                      | TChar -> to_string_of trhs
+                      | TString -> trhs
+                      | t -> terr p' "string concatenation requires string or char, got %s" (pp_zty t)) in
           SStrAppendK (slot, [ trhs ])
         | _ ->
           let lty = l.lty in
@@ -2299,16 +2383,30 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
            | None -> terr p' "undefined variable: %s" name)
         | None -> terr p' "undefined variable: %s" name))
   | EDeref (pe, dp) ->
-    (* p* op= v / p*++ / p*--：解引用复合赋值（仅数值标量/指针目标） *)
+    (* p* op= v / p*++ / p*--：解引用复合赋值（仅数值标量/指针目标；
+       string 例外：p^ += v 走 concat + 引用槽整体替换，w-020） *)
     check_constp env pe dp;
     let tp = check_expr env pe in
     (match resolve tp.ety with
      | TPtr t ->
        (match resolve t with
+        | TString when bop = BAdd ->
+          (* p^ += v 改写为 p^ = p^ + v：SDerefSetK 语义 = 释放旧串 +
+             接管新串（引用槽整体替换），与 deref 整体赋值一致 *)
+          let trhs = check_expr env rhs in
+          let trhs = (match resolve trhs.ety with
+                      | TChar -> to_string_of trhs
+                      | TString -> trhs
+                      | t -> terr dp "string concatenation requires string or char, got %s" (pp_zty t)) in
+          let cur = { e = EDerefK tp; ety = TString; epos = dp } in
+          let nv = { e = ECallK ("zfy_str_concat", [ cur; trhs ], []); ety = TString; epos = dp } in
+          SDerefSetK (tp, nv)
         | TInt _ | TUint _ | TFloat _ | TPtr _ ->
           let trhs = check_expr env rhs in
           let trhs = coerce dp trhs t in
           SAugDerefK (tp, bop, trhs)
+        | TString ->
+          terr dp "dereferenced string only supports += (concatenation)"
         | t' ->
           terr dp "dereferenced augmented assignment supports only numeric/pointer types, got %s" (pp_zty t'))
      | t -> terr dp "augmented/inc/dec target must be a pointer dereference, got %s" (pp_zty t))

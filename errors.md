@@ -113,6 +113,7 @@
 | E2039 | `output(1 2)`（output 实参表未闭合） | expected ',' or ')' to end the output argument list |
 | E2040 | `input(x, delim=',', y)`（delim 不居末） | input's delim parameter must come last |
 | E2041 | `input(x 2)`（input 目标表未闭合） | expected ',' or ')' to end the input target list |
+| E2042 | `s[1..3]`（Python/C 风格 `..` 切片写法） | invalid syntax 'a..b': slice syntax is s[a,b:step] (comma-separated, both ends inclusive) |
 
 > 跳号：E2002/E2004/E2009（占位）并入 E2001（同文案"期望表达式"）、E2011 删除（别名映射变更：long=i128 / ulong=u128 为独立类型，long int/long long/ulong int/ulong long 废止——long 后跟类型词报 E2010）、E2016 并入 E2003（声明语法提示）、E2026 并入 E2005（顶层项期望）。
 
@@ -163,7 +164,7 @@
 | E3032 | `a[0] = p`（写 struct 等聚合） | type %s does not support index assignment |
 | E3033 | （已删除：下标写目标泛化为槽根——变量/字段链/ref/元素槽，w-014 #3） | — |
 | E3034 | `*x = 1`（x 非指针，普通赋值） | assignment target must be a pointer dereference, got %s |
-| E3035 | 无法解析的赋值目标 | unsupported assignment target |
+| E3035 | 无法解析的赋值目标；`p^ -= v`（string 解引用仅支持 +=，w-020） | unsupported assignment target；dereferenced string only supports += (concatenation) |
 | E3036 | `move 5` 或 `move f()` | cannot move constant %s |
 | E3037 | `move g`（全局变量） | cannot move global variable %s |
 | E3038 | `string s2 = move s` 两次 | variable %s has already been moved |
@@ -210,16 +211,16 @@
 | E3074 | `*1` | dereference requires a pointer type, got %s |
 | E3075 | `a[1.5]` | an integer type is required, got %s |
 | E3076 | `replace(1, 0, "x")`（目标参数须 string） | %s expects a string for its %s parameter, got %s |
-| E3077 | `trim(1, 'a')`（参数类型不符） | %s does not accept type %s for its %s parameter |
+| E3077 | `trim(1, 'a')`（参数类型不符）；`s += 5`/元素 `+=` 非 string/char（w-020 文案统一） | %s does not accept type %s for its %s parameter；string concatenation requires string or char, got %s；string element concatenation requires string or char, got %s |
 | E3078 | `length(1)` | length expects string/array/list, got %s |
 | E3079 | `find("a", 'a', count=0)` | find's count must be > 0, got %Ld |
 | E3080 | `prec(true, 2)` | prec does not support type %s |
 | E3081 | `prec("a", 1.5)` | prec's length parameter must be integer/char/float, got %s |
 | E3082 | `split(s, sep='a', x=1)` | malformed argument list for builtin %s (positional arguments must precede named ones) |
-| E3083 | `replace(1, 'x')`（旧字符参数须 char） | a char is required (%s), got %s |
+| E3083 | `replace(1, 'x')`（旧字符参数须 char）；`trim(s, 65)` 等第二参非 char/string（w-020 文案统一）；`find(..., count=0)` | a char is required (%s), got %s；%s's %s must be char or string, got %s；find's count must be > 0, got %s；replace requires (s, a, b, rep)（两参形式已删除，w-020） |
 | E3084 | `input(struct_target)` | input target must be string/integer/float/bool/char, got %s |
 | E3085 | `output(Point(1,2))`（struct 直接输出） | output does not support argument type: %s |
-| E3086 | `input(x, delim=1)` | input's delim must be char or string, got %s |
+| E3086 | `input(x, delim=1)`；`split(s, ' ')`（w-020 编译期拒绝） | input's delim must be char or string, got %s；split does not accept ' ' as the delimiter (a C string can never contain NUL) |
 
 ### 3x6 struct
 
@@ -234,7 +235,7 @@
 | E3094 | 顶层 `struct Point` 两次 | duplicate struct definition: %s |
 | E3095 | `struct length`（内建名） | struct name %s conflicts with a builtin, rename it |
 | E3096 | `struct f`（f 已是函数） | %s is already a function and cannot also be a struct name |
-| E3097 | 字段 `i32 a[n]`（n 非字面量） | struct field array length must be a compile-time literal |
+| E3097 | 字段 `i32 a[n]`（n 非字面量）；切片步长 `s[0,4:0]`（w-020 编译期拒绝） | struct field array length must be a compile-time literal；slice step must be >= 1, got %Ld |
 | E3098 | `struct S` 内含 `S s` | struct %s field type cannot be itself (infinite size) |
 | E3099 | `struct S` 内含 `i32! x` | T! cannot be a struct field (error values are aggregates and cannot be loaded as a field) |
 | E3100 | `struct S` 两个 `i32 x` | struct %s has duplicate field %s |

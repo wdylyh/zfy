@@ -52,6 +52,7 @@ let code_of = function
   | `Parse -> fun m ->
     (* expect_ident 的 what 任意（变量名/函数名/...），用形态特征识别 *)
     if has_sub m " (identifier), got " then "E2006"
+    else if has_sub m "invalid syntax 'a..b'" then "E2042"
     else
       code_of_tbl "E2007" [
         ["expected an expression, got "], "E2001";
@@ -241,6 +242,14 @@ let code_of = function
       ["does not accept type "], "E3077";
       ["length expects string/array/list"], "E3078";
       ["'s count must be > 0"], "E3079";
+      ["must be char or string, got "], "E3083";
+      ["replace requires (s, a, b, rep)"], "E3083";
+      ["string element concatenation requires string or char"], "E3077";
+      ["string concatenation requires string or char"], "E3077";
+      ["string elements only support += "], "E3077";
+      ["dereferenced string only supports += "], "E3035";
+      ["slice step must be >= 1"], "E3097";
+      ["split does not accept '\\000'"], "E3086";
       ["prec does not support type "], "E3080";
       ["prec's length parameter must be"], "E3081";
       ["malformed argument list for builtin "], "E3082";

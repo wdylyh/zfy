@@ -380,11 +380,19 @@ let rec lexpr l (e : texpr) : operand =
        let d = fresh l in
        emit l (MCall (Some d, frac_rt_name b elem, [ oa; ob ], TBool));
        op (OLocal d) TBool
-     | TBool when (b = BEq || b = BNe) && a.ety = TString ->
-       (* string ==/!=：内容比较（strcmp 封装，w-011） *)
-       let fn = if b = BEq then "zfy_str_eq" else "zfy_str_ne" in
+     | TBool when a.ety = TString
+                  && List.mem b [ BEq; BNe; BLt; BGt; BLe; BGe ] ->
+       (* string 比较（w-020）：==/!= 内容比较；< <= > >= 走 strcmp 三态
+          与 0 比（逐字符 ASCII，比到第一个不同即断） *)
        let d = fresh l in
-       emit l (MCall (Some d, fn, [ oa; ob ], TBool));
+       if b = BEq || b = BNe then
+         emit l (MCall (Some d, (if b = BEq then "zfy_str_eq" else "zfy_str_ne"),
+                        [ oa; ob ], TBool))
+       else begin
+         let c = fresh l in
+         emit l (MCall (Some c, "zfy_str_cmp", [ oa; ob ], TInt 32));
+         emit l (MBinop (d, b, op (OLocal c) (TInt 32), { o = OInt 0L; oty = TInt 32 }))
+       end;
        op (OLocal d) TBool
      | _ ->
        let d = fresh l in
@@ -688,10 +696,12 @@ let rec lexpr l (e : texpr) : operand =
     emit l (MErrOk (d, e.ety, ov));
     op (OLocal d) e.ety
   | EFindK (s, c, k) ->
-    (* find(s, c, k)：运行时查找，产 TErr i64（sret） *)
+    (* find(s, x, k)：运行时查找，产 TErr i64（sret）。
+       x 为 char 查字符、string 查子串（w-020 补子串形态） *)
     let os = lexpr l s and oc = lexpr l c and ok = lexpr l k in
     let d = fresh l in
-    emit l (MCall (Some d, "zfy_err_find", [ os; oc; ok ], e.ety));
+    let fn = (match oc.oty with TChar -> "zfy_err_find" | _ -> "zfy_err_find_str") in
+    emit l (MCall (Some d, fn, [ os; oc; ok ], e.ety));
     op (OLocal d) e.ety
 
 (* 可写 seq 槽地址（w-014 #3）：非变量槽根（字段链/解引用/元素槽）
@@ -856,7 +866,13 @@ and lstmt_inner l (s : tstmt) : unit =
     emit l (MSeqGet (old, seqop, oi, elem, l.unchecked));
     let ov = lexpr l v in
     let r = fresh l in
-    emit l (MBinop (r, bop, op (OLocal old) elem, ov));
+    if elem = TString && bop = BAdd then
+      (* string 元素 +=（w-020）：old 是槽内堆串指针本身（zfy_seq_get
+         位拷贝语义，不 strdup）——必须 concat 产新串写回（写回路径释放
+         旧串），不可用 zfy_str_append 原地 realloc（会使槽内指针悬空） *)
+      emit l (MCall (Some r, "zfy_str_concat", [ op (OLocal old) elem; ov ], TString))
+    else
+      emit l (MBinop (r, bop, op (OLocal old) elem, ov));
     (match addr with
      | None ->
        (match root.e with

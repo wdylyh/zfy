@@ -166,10 +166,7 @@ long double zfy_stod_wide(const char *s) {
 
 /* find(s, c, k)：第 k 次出现的下标；未找到产 NOT_FOUND 错误 */
 void zfy_err_find(zfy_err *out, const char *s, char c, long long k) {
-    if (k < 1) {
-        err_set(out, ZFY_ENOT_FOUND, "find: count 必须 > 0");
-        return;
-    }
+    if (k < 1) zfy_die("find: count 必须 > 0");   /* w-020：与编译期检查统一为 panic */
     for (long long i = 0, seen = 0; s[i]; i++) {
         if (s[i] == c) {
             seen++;
@@ -180,6 +177,29 @@ void zfy_err_find(zfy_err *out, const char *s, char c, long long k) {
         }
     }
     err_set(out, ZFY_ENOT_FOUND, "find: 未找到字符");
+}
+
+/* 子串版 find：找第 k 次出现（k 从 1 起）；不存在返回 -1；k < 1 panic（w-020） */
+long long zfy_str_find_str(const char *s, const char *sub, long long k) {
+    if (k < 1) zfy_die("find: count 必须 > 0");
+    size_t sl = strlen(sub);
+    if (sl == 0) zfy_die("find: 子串分隔不能为空串");
+    for (long long i = 0, seen = 0; s[i]; i++) {
+        if (strncmp(s + i, sub, sl) == 0) {
+            seen++;
+            if (seen == k) return i;
+        }
+    }
+    return -1;
+}
+
+/* 子串版 find（错误值版，sret）：产 TErr i64 */
+void zfy_err_find_str(zfy_err *out, const char *s, const char *sub, long long k) {
+    long long r = zfy_str_find_str(s, sub, k);
+    if (r < 0)
+        err_set(out, ZFY_ENOT_FOUND, "find: 未找到子串");
+    else
+        err_ok_i(out, r);
 }
 
 /* ---------- 文件 I/O（design_fileio.md） ----------
@@ -542,20 +562,39 @@ char *zfy_tostr_f64(double v) {
 
 /* ---------- prec：输出长度控制 ---------- */
 
-/* 按总字符数 n 截断 / 右补空格；n<=0 得空串。返回 malloc 串（调用者释放） */
+/* 按总码点数 n 截断 / 右补空格；n<=0 得空串。返回 malloc 串（调用者释放）。
+   w-020：UTF-8 感知——宽度按码点数计，截断对齐码点边界，
+   不再产生截半码点的非法 UTF-8 序列；非 UTF-8 字节按 1 码点容错 */
 char *zfy_prec_str(const char *s, long long n) {
     if (n < 0) n = 0;
     size_t len = strlen(s);
-    size_t nn = (size_t)n;
-    char *buf = (char *)malloc(nn + 1);
-    if (!buf) zfy_die("内存分配失败");
-    if (nn <= len) {
-        memcpy(buf, s, nn);
-    } else {
-        memcpy(buf, s, len);
-        memset(buf + len, ' ', nn - len);
+    /* 数前 n 个完整码点的字节宽度 */
+    const unsigned char *p = (const unsigned char *)s;
+    size_t cut = len;               /* 默认 = 全串（码点数 <= n 时） */
+    long long cnt = 0;
+    for (size_t i = 0; i < len; i++) {
+        if ((p[i] & 0xC0) != 0x80) {   /* 码点起点 */
+            if (cnt == n) { cut = i; break; }
+            cnt++;
+        }
     }
-    buf[nn] = '\0';
+    size_t nn = (size_t)n;
+    size_t cp = (size_t)cnt;        /* 全串码点数（截断时 = n） */
+    char *buf;
+    if (nn <= cp) {
+        /* 截断到 n 个码点（cut 已对齐边界；nn==cp 时 cut==len） */
+        buf = (char *)malloc(cut + 1);
+        if (!buf) zfy_die("内存分配失败");
+        memcpy(buf, s, cut);
+        buf[cut] = '\0';
+    } else {
+        /* 右补空格到 n 个码点宽 */
+        buf = (char *)malloc(len + (size_t)(nn - cp) + 1);
+        if (!buf) zfy_die("内存分配失败");
+        memcpy(buf, s, len);
+        memset(buf + len, ' ', (size_t)(nn - cp));
+        buf[len + (nn - cp)] = '\0';
+    }
     return buf;
 }
 
@@ -1661,6 +1700,69 @@ char *zfy_str_slice(const char *s, long long a, long long b, long long step) {
     return buf;
 }
 
+/* ---------- UTF-8 感知 API（w-020，用户拍板扩展集） ----------
+ * string 底层仍是字节串（length/下标/切片不变）；本组函数按码点视图操作。
+ * 非法 UTF-8 字节：len/遍历按 1 字节计 1 码点（容错不 panic）。 */
+
+/* 码点数（区别于 length 的字节数） */
+long long zfy_utf8_len(const char *s) {
+    long long n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if ((*p & 0xC0) != 0x80) n++;   /* 非续字节 = 新码点起点 */
+    return n;
+}
+
+/* 定位第 i 个码点（0 起）的字节区间 [start, end)，越界 panic。
+   内部公共实现：返回码点总数（完整计数），区间经 out_start/out_end 带出 */
+static long long utf8_locate(const char *s, long long i,
+                             long long *out_start, long long *out_end) {
+    const unsigned char *p = (const unsigned char *)s;
+    long long cnt = 0, start = -1, end = -1;
+    long long pos = 0, total = 0;
+    while (p[pos]) {
+        if ((p[pos] & 0xC0) != 0x80) {
+            if (cnt == i) start = pos;
+            else if (cnt == i + 1) end = pos;
+            cnt++;
+        }
+        pos++;
+    }
+    total = cnt;
+    if (start < 0) zfy_die("utf8 下标越界");
+    if (end < 0) end = pos;   /* i 是最后一个码点 */
+    *out_start = start;
+    *out_end = end;
+    return total;
+}
+
+/* 第 i 个码点（0 起）返回 malloc 单码点串（可能多字节；越界 panic） */
+char *zfy_utf8_char_at(const char *s, long long i) {
+    if (i < 0) zfy_die("utf8 下标越界");
+    long long st, en;
+    utf8_locate(s, i, &st, &en);
+    char *buf = (char *)malloc((size_t)(en - st) + 1);
+    if (!buf) zfy_die("utf8_char_at: 内存分配失败");
+    memcpy(buf, s + st, (size_t)(en - st));
+    buf[en - st] = '\0';
+    return buf;
+}
+
+/* 按码点闭区间 [a, b] 切片（两端含，越界/非法 panic），返回 malloc 新串 */
+char *zfy_utf8_sub(const char *s, long long a, long long b) {
+    if (a < 0 || a > b) zfy_die("utf8 切片区间越界");
+    long long st2, en2;
+    long long total = utf8_locate(s, a, &st2, &en2);   /* 顺带校验 a < total */
+    (void)en2;
+    if (b >= total) zfy_die("utf8 切片区间越界");
+    long long st, en;
+    utf8_locate(s, b, &st, &en);
+    char *buf = (char *)malloc((size_t)(en - st2) + 1);
+    if (!buf) zfy_die("utf8_sub: 内存分配失败");
+    memcpy(buf, s + st2, (size_t)(en - st2));
+    buf[en - st2] = '\0';
+    return buf;
+}
+
 /* 找第 k 次出现（k 从 1 起）；不存在返回 -1；k < 1 报运行时错误 */
 long long zfy_str_find(const char *s, char c, long long k) {
     if (k < 1) zfy_die("find: count 必须 > 0");
@@ -1719,19 +1821,8 @@ char *zfy_str_replace(const char *s, long long a, long long b, const char *rep) 
     return buf;
 }
 
-/* 从下标 a 起替换到串尾为 rep，返回 malloc 新串 */
-char *zfy_str_replace_from(const char *s, long long a, const char *rep) {
-    long long n = (long long)strlen(s);
-    if (a < 0 || a > n) zfy_die("replace 区间越界");
-    size_t rl = strlen(rep);
-    char *buf = (char *)malloc((size_t)a + rl + 1);
-    if (!buf) zfy_die("replace: 内存分配失败");
-    long long len = 0;
-    for (long long i = 0; i < a; i++) buf[len++] = s[i];
-    for (size_t i = 0; i < rl; i++) buf[len++] = rep[i];
-    buf[len] = '\0';
-    return buf;
-}
+/* w-020：两参 replace（replace_from）已按用户拍板删除——
+   "替换到串尾"用四参 replace(s, a, n-1, rep) 的闭区间即可表达 */
 
 /* 拼接两个字符串，返回 malloc 新串 */
 /* string 内容比较（== / !=，w-011）：strcmp 封装，返回 0/1 */
@@ -1741,6 +1832,12 @@ long long zfy_str_eq(const char *a, const char *b) {
 
 long long zfy_str_ne(const char *a, const char *b) {
     return strcmp(a, b) != 0;
+}
+
+/* string 字典序比较（w-020）：返回 strcmp 三态（<0 / 0 / >0），
+   逐字符按 ASCII 比到第一个不同字符即断（用户拍板语义） */
+int zfy_str_cmp(const char *a, const char *b) {
+    return strcmp(a, b);
 }
 
 char *zfy_str_concat(const char *a, const char *b) {

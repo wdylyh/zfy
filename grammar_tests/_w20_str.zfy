@@ -1,0 +1,47 @@
+// w-020 字符串操作综合行为测试
+fn main()
+    let s = "hello,world,x"
+    // P0: string 元素 +=
+    let parts = split(s, ',')
+    parts[0] += "!"
+    output(parts[0], "|\n")
+    parts[1] += 'Z'
+    output(parts[1], "|\n")
+    let string a[3] = "x", "y", "z"
+    a[0] += "!"
+    output(a[0], "|\n")
+    let string bag2[] = split("m,n", ',')
+    bag2[1] += "?"
+    output(bag2[1], "|\n")
+    // 变量 += char
+    let t = "abc"
+    t += 'D'
+    output(t, "|\n")
+    // 字典序比较
+    output("abc" < "abd", "|")
+    output("abd" > "abc", "|")
+    output("abc" <= "abc", "|")
+    output("ab" < "abc", "|\n")
+    // string vs char 混合比较
+    output("a" == 'a', "|")
+    output("ab" > 'a', "|\n")
+    // find 子串
+    let i64! f1 = find(s, "world")
+    output(f1 ?? -1, "|")
+    let i64! f2 = find("aaa", "aa", count=2)
+    output(f2 ?? -1, "|\n")
+    let i64! f3 = find(s, "nope")
+    output(f3 ?? -1, "|\n")
+    // utf8 API
+    output(length("中文ab"), "|")
+    output(utf8_len("中文ab"), "|\n")
+    output(utf8_char_at("中文ab", 0), "|")
+    output(utf8_char_at("中文ab", 2), "|\n")
+    output(utf8_sub("中文测试", 1, 2), "|\n")
+    // prec 码点感知
+    output(prec("中文测试", 5), "|\n")
+    output(prec("hello", 8), "|\n")
+    output(prec("hello", 3), "|\n")
+    // replace 四参到尾
+    output(replace(s, 5, length(s) - 1, "!!!"), "|\n")
+    output(s, "|\n")
