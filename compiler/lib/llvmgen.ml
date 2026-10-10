@@ -744,6 +744,13 @@ let gen_input fc name (ty : zty) delim =
       | TString -> ("zfy_input_str", "")
       | TInt 128 -> ("zfy_input_i128", "")
       | TUint 128 -> ("zfy_input_u128", "")
+      | TInt 64 | TUint 64 -> ("zfy_input_i64", "")
+      | TInt 32 -> ("zfy_input_i32", "")
+      | TUint 32 -> ("zfy_input_u32", "")
+      | TInt 16 -> ("zfy_input_i16", "")
+      | TUint 16 -> ("zfy_input_u16", "")
+      | TInt 8 -> ("zfy_input_i8", "")
+      | TUint 8 -> ("zfy_input_u8", "")
       | TInt _ | TUint _ -> ("zfy_input_i64", "")
       | TBool -> ("zfy_input_bool", "")
       | TChar -> ("zfy_input_char", "")
@@ -2269,6 +2276,12 @@ let gen_program (m : mir) : string =
   (* input 运行时函数：EOF/解析失败直接报运行时错误退出 *)
   Buffer.add_string g.mbuf "declare void @zfy_input_str(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_i64(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_i32(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_i16(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_i8(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_u32(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_u16(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_u8(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_i128(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_u128(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_f64(ptr, ptr, i32)\n";

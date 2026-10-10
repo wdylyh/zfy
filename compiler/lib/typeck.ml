@@ -1869,6 +1869,27 @@ and coerce p (te : texpr) (want : zty) : texpr =
       unify p te.ety t;
       let te2 = coerce p te t in
       { e = EErrOkK te2; ety = want; epos = te.epos }
+    | TVar _, TFrac e ->
+      (* 未求解字面量表达式 → frac（return/赋值/实参上下文）：
+         值侧同步改写——n/d 字面量除式按分数构造（分子/分母不除法），
+         其他整数字面量表达式整体标量提升为分数。此前走 unify 仅改类型
+         不改值，OInt 直接落 frac 聚合槽致 E4021 内部错误（w-021） *)
+      (match te.e with
+       | EBinK (BDiv, ta, tb) ->
+         let is_num = function EIntK _ | EFloatK _ -> true | _ -> false in
+         if is_num ta.e && is_num tb.e then begin
+           let ac = { e = ECastK (ta, e); ety = e; epos = ta.epos } in
+           let bc = { e = ECastK (tb, e); ety = e; epos = tb.epos } in
+           { e = EFracNewK (ac, bc); ety = TFrac e; epos = te.epos }
+         end
+         else mk_frac_from te e p
+       | _ -> mk_frac_from te e p)
+    | TVar _, (TList _ | TArray _ | TStruct _ | TFile | TString) ->
+      (* 字面量（ety=TVar）不能落聚合/句柄/串类型：此前 unify 把字面量
+         直接重打型（如 push(ll, 1) 中 1 变 TList → store ptr 1 非法 IR，
+         w-021） *)
+      terr p "a literal value cannot have type %s (build it via a variable or constructor first)"
+        (pp_zty want)
     | TVar _, _ | _, TVar _ -> unify p te.ety want; te
     | _, TFrac e when (match te.e with EIntK _ | EFloatK _ -> true | _ -> false) ->
       (* 数值字面量提升为分数（实参/返回等表达式上下文，与声明初值一致；

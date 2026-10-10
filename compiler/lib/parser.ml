@@ -417,6 +417,9 @@ and parse_postfix_rest p e =
          | (Colon, _) ->
            ignore (next p);
            Some (parse_expr p)
+         | (Comma, tp3) ->
+           (* s[a, b, step] 三参逗号形式不存在（w-021 DX） *)
+           err tp3 "slice takes at most 2 positions: s[a, b] or s[a, b:step] (step uses ':', not a third ',')"
          | _ -> None
        in
        expect p RBracket "]";
@@ -659,6 +662,18 @@ and parse_let_head p =
     | (Keyword KUnreduced, _) -> ignore (next p); true
     | _ -> false
   in
+  (* 修饰符乱序（如 let unred frac x）：头部提前结束会误报 "expected
+     variable name"，这里给出顺序提示（w-021 DX） *)
+  (match peek p with
+   | (Keyword (KFrac | KConst | KUnreduced), tp) ->
+     err tp "declaration modifier order must be: [TYPE] frac const unred (e.g. let i32 frac const unred x)"
+   | (Ident s, tp) when List.mem s p.tynames ->
+     (* let const Outer o：const 在类型前，类型词被当变量名（w-021 DX） *)
+     (match peek2 p with
+      | (Ident _, _) ->
+        err tp "declaration order: the type must come right after 'let' (let [TYPE] frac const unred NAME)"
+      | _ -> ())
+   | _ -> ());
   (ty_opt, is_frac, is_const, is_unred)
 
 (* qpath 类型（m::Point）：Ident '::' Ident 形状且首段非调用（无 '('） *)
@@ -1111,6 +1126,12 @@ and parse_for p tp =
       end
   in
   go ();
+  (* 更新段不可为空（w-021，grammar.md §7 约定）：缺失时条件永不变化，
+     静默死循环——无更新把更新写进块内或改用 while *)
+  (match !updates with
+   | [] ->
+     err tp "for header requires an update segment (e.g. `, i++`): without it the condition never changes (infinite loop); put the update in the body or use while"
+   | _ -> ());
   (* 多个条件用 and 连接；无条件恒真 *)
   let cond =
     match List.rev !conds with

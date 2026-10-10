@@ -968,6 +968,12 @@ static char *read_segment(const char *delim, long long dlen, int *saw_delim) {
             }
         }
     }
+    if (dlen != 0 && !*saw_delim) {
+        /* EOF 结束且未遇到 delim（多目标最后一段/单目标到 EOF）：
+           剥离行尾换行符，避免把 '\n' 读进字符串值（w-021） */
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+            len--;
+    }
     buf[len] = '\0';
     return buf;
 }
@@ -1048,7 +1054,9 @@ void zfy_input_str(void *val, const char *delim) {
     *(char **)val = seg;              /* 缓冲区所有权转移给变量 */
 }
 
-/* 整数目标（≤64 位）：EOF 或解析失败报运行时错误 */
+/* 整数目标（≤64 位）：EOF 或解析失败报运行时错误。
+   i32/i16/i8 单独版本：i64 版按 8 字节写会溢出小宽度 alloca 槽，
+   覆盖相邻变量（w-021）。各宽度解析后按范围校验 */
 void zfy_input_i64(void *val, const char *delim) {
     int no_input = 0;
     char *seg = input_segment(delim, (long long)strlen(delim), &no_input);
@@ -1063,6 +1071,58 @@ void zfy_input_i64(void *val, const char *delim) {
     }
     *(long long *)val = v;
     free(seg);
+}
+
+static void input_int_wide(void *val, const char *delim,
+                           long long lo, unsigned long long hi,
+                           int width, const char *what) {
+    int no_input = 0;
+    char *seg = input_segment(delim, (long long)strlen(delim), &no_input);
+    long long v;
+    if (no_input) {
+        free(seg);
+        zfy_die("input: EOF（无输入可读）");
+    }
+    if (!try_i64(seg, &v) || v < lo || (unsigned long long)v > hi) {
+        free(seg);
+        zfy_die(what);
+    }
+    switch (width) {
+    case 1: *(signed char *)val = (signed char)v; break;
+    case 2: *(short *)val = (short)v; break;
+    default: *(int *)val = (int)v; break;
+    }
+    free(seg);
+}
+
+void zfy_input_i32(void *val, const char *delim) {
+    input_int_wide(val, delim, -2147483648LL, 2147483647LL, 4,
+                   "input: 无法把输入解析为整数");
+}
+
+void zfy_input_i16(void *val, const char *delim) {
+    input_int_wide(val, delim, -32768LL, 32767LL, 2,
+                   "input: 无法把输入解析为整数");
+}
+
+void zfy_input_i8(void *val, const char *delim) {
+    input_int_wide(val, delim, -128LL, 127LL, 1,
+                   "input: 无法把输入解析为整数");
+}
+
+void zfy_input_u32(void *val, const char *delim) {
+    input_int_wide(val, delim, 0, 4294967295LL, 4,
+                   "input: 无法把输入解析为整数");
+}
+
+void zfy_input_u16(void *val, const char *delim) {
+    input_int_wide(val, delim, 0, 65535LL, 2,
+                   "input: 无法把输入解析为整数");
+}
+
+void zfy_input_u8(void *val, const char *delim) {
+    input_int_wide(val, delim, 0, 255LL, 1,
+                   "input: 无法把输入解析为整数");
 }
 
 /* i128 目标 */
