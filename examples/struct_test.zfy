@@ -20,19 +20,19 @@ struct pair64
     i64 a
     i64 b
 
-void bump(Point p)
+fn void bump(let Point p)
     p.x += 100.0
     output(p.x)
 
-Point addp(Point a, Point b)
+fn Point addp(let Point a, let Point b)
     return Point(a.x + b.x, a.y + b.y)
 
-i64 main()
+fn main()
     // 位置构造 / 命名构造 / 缺省字段 / 全默认裸声明
-    Point p = Point(1.0, 2.0)
-    Point q = Point(x=3.5, y=4.5)
-    Point r = Point(5.0)
-    Point s
+    let Point p = Point(1.0, 2.0)
+    let Point q = Point(x=3.5, y=4.5)
+    let Point r = Point(5.0)
+    let Point s
     output(p.x, p.y, q.x, q.y)
     output(r.x, r.y, s.x, s.y)
 
@@ -42,23 +42,23 @@ i64 main()
     output(p.x, p.y)
 
     // 嵌套 struct：命名构造 + 字段链读写/增广
-    Player pl = Player(pos=Point(1.0, 2.0), name="Tom")
+    let Player pl = Player(pos=Point(1.0, 2.0), name="Tom")
     output(pl.hp, pl.name, pl.pos.x, pl.pos.y)
     pl.pos.x += 2.0
     pl.hp -= 55
     output(pl.pos.x, pl.hp)
 
     // 全默认嵌套声明：hp=100，name=""，pos 全零
-    Player pl2
+    let Player pl2
     output(pl2.hp, pl2.pos.x, pl2.name)
 
     // string 字段独立（读字段为借用，赋值时深拷贝）
-    string t = pl.name
+    let string t = pl.name
     t = t + "!"
     output(pl.name, t)
 
     // 整体赋值深拷贝：改副本不影响原件
-    Player cp = pl
+    let Player cp = pl
     cp.hp = 1
     cp.pos.x = 99.0
     output(pl.hp, cp.hp, pl.pos.x, cp.pos.x)
@@ -68,7 +68,7 @@ i64 main()
     output(pl.name, cp.name)
 
     // 数组/列表字段：缺省为空 seq（零值），读取与 length
-    Buf b = Buf()
+    let Buf b = Buf()
     output(b.data[0], b.data[3], length(b.vals))
 
     // 传参值语义：函数内修改的是副本，不影响调用方
@@ -76,12 +76,12 @@ i64 main()
     output(p.x)
 
     // 返回 struct（值语义）
-    Point mid = addp(p, q)
+    let Point mid = addp(p, q)
     output(mid.x, mid.y)
 
     // sizeof/alignof 编译期内建：packed 紧凑布局 vs C 自然布局
     output(sizeof(Header), alignof(Header))
     output(sizeof(pair64), alignof(pair64))
-    Header h = Header(7, 1234)
+    let Header h = Header(7, 1234)
     output(h.tag, h.value)
     return 0

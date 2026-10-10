@@ -1,20 +1,20 @@
 // module system test (new2.md #4): inline mod / nesting / file mod / pub / group use / as rename / :: paths
 
 mod math
-    pub i32 const PI = 3
+    pub let i32 const PI = 3
 
-    pub i32 add(i32 a, i32 b)
+    pub fn i32 add(let i32 a, let i32 b)
         return a + b
 
     pub struct Point
         i32 x
         i32 y
 
-    i32 hidden()
+    fn i32 hidden()
         return 99
 
     mod inner
-        pub i32 triple(i32 x)
+        pub fn i32 triple(let i32 x)
             return x * 3
 
 // file module: loads filem.zfy in this directory
@@ -25,9 +25,9 @@ use math::{Point, PI as PI2}
 use math::inner::triple
 use filem::square
 
-void main()
-    i32 s = math::add(1, 2)
-    Point p = Point(x=1, y=2)
+fn main()
+    let i32 s = math::add(1, 2)
+    let Point p = Point(x=1, y=2)
     output(s, end="\n")
     output(PI2, end="\n")
     output(triple(4), end="\n")

@@ -3,10 +3,10 @@ struct Node
     i32 v = 0
     Node* next = null
 
-i64 main()
-    Node c = Node(3, null)
-    Node b = Node(2, &c)
-    Node a = Node(1, &b)
+fn main()
+    let Node c = Node(3, null)
+    let Node b = Node(2, &c)
+    let Node a = Node(1, &b)
     // 链式读：a.next.v 中间层 TPtr(TStruct) 自动解引用
     output(a.v, a.next.v, a.next.next.v, sep=',')
     // 链式写

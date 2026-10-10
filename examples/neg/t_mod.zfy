@@ -4,7 +4,7 @@ mod math
 
 use math::add;
 
-void main()
+fn main()
     let r = math::add(1, 2)
     output(r)
 

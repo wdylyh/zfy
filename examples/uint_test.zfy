@@ -1,16 +1,16 @@
 // uint 后缀语法：u32 / u128 / u16 等（宽度词在前，uint 在后）
-void main()
-    u32 a = 3000000000
-    u128 b = 1234567890123456789
-    u8 c = 255
-    u16 d = 65535
-    u64 e = 4000000000
+fn main()
+    let u32 a = 3000000000
+    let u128 b = 1234567890123456789
+    let u8 c = 255
+    let u16 d = 65535
+    let u64 e = 4000000000
     output(a, sep='|')
     output(b, sep='|')
     output(c, sep='|')
     output(d, sep='|')
     output(e, sep='|')
-    u32 au[3] = 1, 2, 3
+    let u32 au[3] = 1, 2, 3
     au[2] = 4000000000
     output(au[0], au[1], au[2], sep=',')
     output(cast(a, u64) + cast(au[2], u64))

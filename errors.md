@@ -371,7 +371,7 @@
 | E4009 | `reduce(1,2,2)` | reduce target must be a frac-typed local variable |
 | E4010 | `break`（循环外） | break outside a loop |
 | E4011 | `continue`（循环外） | continue outside a loop |
-| E4012 | `int main()`（返回类型受限，占位 E300-112 并入此处） | main's return type must be void or i64, got %s |
+| E4012 | `int main()`（返回类型受限；new.md 后 main 省略返回类型时隐含 i32，显式写仅允许 void/i32/i64，占位 E300-112 并入此处） | main's return type must be void, i32 or i64, got %s |
 
 ### 4x2 内部一致性兜底（Llvmgen，正常不可触发——前端已拦截）
 

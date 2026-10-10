@@ -4,32 +4,32 @@
 // 3) ref 传引用参数：函数内经引用读写调用方变量
 // 4) copy 显式深拷贝：d 之后仍使用，copy 为显式值语义声明
 
-string take(string s)
+fn string take(let string s)
     return s
 
-void bump(i32 ref x)
+fn void bump(ref let i32 x)
     x = x + 1
     x++
 
-void show(string s)
+fn void show(let string s)
     output(s, end='\n')
 
-i64 main()
-    string a = "hello"
-    string b = "world"
-    string c = take(b)          // b 最后使用：自动 move
+fn main()
+    let string a = "hello"
+    let string b = "world"
+    let string c = take(b)          // b 最后使用：自动 move
     output(a, c, sep=' ', end='\n')
 
-    i32 xs[3] = 1, 2, 3
-    i32 ys[3]
+    let i32 xs[3] = 1, 2, 3
+    let i32 ys[3]
     ys = xs                     // xs 最后使用：自动 move 赋值
     output(ys[2], end='\n')
 
-    i32 v = 10
+    let i32 v = 10
     bump(ref v)                 // 传引用：v 被函数内改为 12
     output(v, end='\n')
 
-    string d = "abc"
+    let string d = "abc"
     show(copy d)                // 显式 copy：d 之后仍使用，深拷贝
     output(d, end='\n')
     return 0

@@ -1,15 +1,15 @@
 // 标量声明省略初值：填类型零值；const 必须带初值
-void main()
-    i32 x
-    f64 d
-    bool b
-    char c
-    string s
+fn main()
+    let i32 x
+    let f64 d
+    let bool b
+    let char c
+    let string s
     output(x, d, b, c, s, sep='|')   // 期望 0|0|false||（char 零值不可见）
-    i32 y
+    let i32 y
     y = 5
     output(y)                        // 期望 5
-    i32 lst[]
+    let i32 lst[]
     push(lst, x)
     push(lst, y)
     output(lst[0], lst[1], sep=',')  // 期望 0,5

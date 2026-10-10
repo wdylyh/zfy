@@ -105,53 +105,19 @@ let rec qpath_extend p s =
 
 (* ---------- 类型 ---------- *)
 
-(* 类型别名关键词（多词序列的组成词） *)
-let is_alias_kw = function
-  | KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad -> true
-  | _ -> false
-
-(* 传统多词类型别名 → 内部宽度名（new.md：与传统宽度名并存，两者皆合法）。
-   贪婪匹配最长合法序列；返回 (归一化名, 消耗词数)。
-   long=i128、ulong=u128（用户拍板：long int/long long/ulong int/ulong long
-   已废止——long 后跟另一类型词由 check_no_dup_ty 报"类型重复"）：
-   short=i8 short int=i16 int=i32 long=i128
-   ushort=u8 ushort int=u16 uint=u32 ulong=u128
-   half=f16 float=f32 double=f64 quad=f128 *)
-let alias_ty (toks : (token * pos) list) : (string * int) option =
-  match toks with
-  | (Keyword KShort, _) :: (Keyword KInt, _) :: _ -> Some ("i16", 2)
-  | (Keyword KShort, _) :: _ -> Some ("i8", 1)
-  | (Keyword KLong, _) :: _ -> Some ("i128", 1)
-  | (Keyword KUshort, _) :: (Keyword KInt, _) :: _ -> Some ("u16", 2)
-  | (Keyword KUshort, _) :: _ -> Some ("u8", 1)
-  | (Keyword KUlong, _) :: _ -> Some ("u128", 1)
-  | (Keyword KInt, _) :: _ -> Some ("i32", 1)
-  | (Keyword KUint, _) :: _ -> Some ("u32", 1)
-  | (Keyword KHalf, _) :: _ -> Some ("f16", 1)
-  | (Keyword KFloat, _) :: _ -> Some ("f32", 1)
-  | (Keyword KDouble, _) :: _ -> Some ("f64", 1)
-  | (Keyword KQuad, _) :: _ -> Some ("f128", 1)
-  | _ -> None
-
-(* 类型词长度（0 = 不是类型开头）。类型为：
-   - 单词 Ident：内建宽度类型或用户 struct 名（后者由 typeck 校验）
-   - 多词 Keyword 序列：short int 等传统别名（贪婪最长匹配） *)
+(* 类型词长度（0 = 不是类型开头）。类型为单词 Ident：
+   内建宽度类型或用户 struct/type 名（后者由 typeck 校验）。
+   （new.md 2026-10-10：int/long/short 等传统别名关键词已全部删除） *)
 let ty_kws_len (toks : (token * pos) list) : int =
   match toks with
   | (Ident _, _) :: _ -> 1
-  | (Keyword k, _) :: _ when is_alias_kw k ->
-    (match alias_ty toks with
-     | Some (_, n) -> n
-     | None -> 1)   (* 防御：当前全部别名词均有映射，不可达 *)
   | _ -> 0
 
-(* 类型词后紧跟另一类型词：重复/混写报错（如 int int、i32 int） *)
+(* 类型词后紧跟另一类型词：重复报错（如 i32 i32） *)
 let check_no_dup_ty p =
   match peek p with
-  | (Keyword k, tp) when is_alias_kw k ->
-    err tp "duplicate base type: a declaration has exactly one base type (alias and width names cannot be mixed)"
   | (Ident s, tp) when List.mem s type_names ->
-    err tp "duplicate base type: a declaration has exactly one base type (alias and width names cannot be mixed)"
+    err tp "duplicate base type: a declaration has exactly one base type"
   | _ -> ()
 
 (* token 层跳过类型后缀：* 指针、!、T* const、const/frac/unred/ref 修饰、
@@ -265,14 +231,6 @@ let rec parse_ty ?(allow_fun = false) p =
       | _ -> TNamed (s, tp)
     in
     suffixes base
-  | Keyword k when is_alias_kw k ->
-    (* 传统类型别名：归一化为内部宽度名（short int→i16 等，零后端改动） *)
-    (match alias_ty p.toks with
-     | Some (name, n) ->
-       for _ = 1 to n do ignore (next p) done;
-       check_no_dup_ty p;
-       suffixes (TNamed (name, tp))
-     | None -> err tp "expected a type")
   | Keyword (KArray | KList) ->
     err tp "'array'/'list' keywords removed: arrays are written T a[N], lists T a[]"
   | Star ->
@@ -292,7 +250,11 @@ and parse_tparams p =
     | (Gt, _) -> ignore (next p); List.rev acc
     | (_, tp) -> err tp "expected ',' or '>' to end the type parameter list"
   in
-  go []
+  let tps = go [] in
+  (* 泛型参数注册为已知类型名：fn <T> 的返回类型/参数/函数体内 let T 声明、
+     struct Box<T> 的字段类型都按类型名识别 *)
+  p.tynames <- tps @ p.tynames;
+  tps
 
 (* 泛型实参列表 <i32, T*>：类型位置 T 后跟 <（仅类型位置无歧义，表达式
    比较不受影响） *)
@@ -647,7 +609,7 @@ and parse_seq_inits p =
   | _ -> []  (* 无初始化：全部填零值 *)
 
 (* 解析 const/frac/unred/ref 修饰（可任意顺序，位于类型后名字前）；
-   ref 仅函数参数合法（其他位置由调用方报错） *)
+   仅 extern "C" 行（C 签名）仍用旧式；zfy 声明/参数一律走 parse_let_head *)
 and parse_modifiers p =
   let is_const = ref false and is_frac = ref false and is_unred = ref false
   and is_ref = ref false in
@@ -666,6 +628,44 @@ and parse_modifiers p =
   go ();
   (!is_const, !is_frac, !is_unred, !is_ref)
 
+(* let 声明头（new.md 2026-10-10）：let (类型)? (frac)? (const)? (unred)? 名字。
+   固定顺序：类型 → frac → const → unred；类型可省（由初值推断，
+   或 frac 修饰隐含 i32 基）；返回 (类型, is_frac, is_const, is_unred) *)
+and parse_let_head p =
+  let ty_opt =
+    match peek p with
+    | (Ident s, _) when List.mem s p.tynames -> Some (parse_ty ~allow_fun:true p)
+    | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty ~allow_fun:true p)
+    | _ -> None
+  in
+  let is_frac =
+    match peek p with
+    | (Keyword KFrac, _) -> ignore (next p); true
+    | _ -> false
+  in
+  let is_const =
+    match peek p with
+    | (Keyword KConst, _) -> ignore (next p); true
+    | _ -> false
+  in
+  let is_unred =
+    match peek p with
+    | (Keyword KUnreduced, _) -> ignore (next p); true
+    | _ -> false
+  in
+  (ty_opt, is_frac, is_const, is_unred)
+
+(* qpath 类型（m::Point）：Ident '::' Ident 形状且首段非调用（无 '('） *)
+and looks_like_ty_path p =
+  if is_qpath_start p.toks then
+    let (_segs, rest) = scan_qpath p.toks in
+    match rest with
+    | (LParen, _) :: _ -> false
+    | (Ident _, _) :: _ -> true
+    | (Star, _) :: _ | (Bang, _) :: _ | (LBracket, _) :: _ -> true
+    | _ -> false
+  else false
+
 (* 类型侧中括号组收集（w-014 #1）：TSeq/TSeqN 包装逐层剥出，
    返回 (基础类型, 组列表)（组按从外到内序；None = []，Some len = [len]） *)
 and collect_ty_groups (ty : ty) : ty * (expr option list) =
@@ -681,20 +681,27 @@ and wrap_ty_group (g : expr option) (b : ty) : ty =
   | None -> TSeq (b, { file = ""; line = 0; col = 0 })
   | Some len -> TSeqN (b, len, { file = ""; line = 0; col = 0 })
 
-(* 声明语法：
-   标量：<类型> (const)? (frac)? 名字 [= 初值]
-   数组：<类型> (const)? 名字[长度] (= 值1,值2,...)?
-   列表：<类型> (const)? 名字[] (= 值1,值2,...)?（中括号必须为空）
-   类型后缀形式（w-014 #1）：<类型>[][]/[N] 与名字侧组可混用叠加，
-   总组数 = 类型侧组 ++ 名字侧组；最外组为变量维度，其余折进元素类型 *)
-and parse_decl p tp =
-  let ty = parse_ty p in
-  (* 顶层 / for 头部：单声明器（不消费逗号，避免 for 头逗号段冲突） *)
-  let (is_const, is_frac, is_unred, is_ref) = parse_modifiers p in
-  if is_ref then err tp "ref is only allowed on function parameters";
-  let st = parse_declarator p tp ty is_const is_frac is_unred in
+(* 声明语法（new.md 2026-10-10，let 形式）：
+   标量：let (类型)? (frac)? (const)? (unred)? 名字 (= 初值)?
+   数组：let 类型 (frac)? (const)? (unred)? 名字[长度] (= 值1,值2,...)?
+   列表：let 类型 (frac)? (const)? (unred)? 名字[] (= 值1,值2,...)?
+   类型后缀（T[] x）与名字侧组（x[3][]）可混用叠加；
+   类型省略仅标量合法（由初值推断） *)
+and parse_let_stmt p tp =
+  ignore (next p);   (* 消费 let *)
+  let (ty_opt, is_frac, is_const, is_unred) = parse_let_head p in
+  let rec go acc =
+    let st = parse_declarator p tp ty_opt is_const is_frac is_unred in
+    let acc = st :: acc in
+    match peek p with
+    | (Comma, _) -> ignore (next p); go acc
+    | _ -> List.rev acc
+  in
+  let stmts = go [] in
   end_of_stmt p;
-  st
+  (match stmts with
+   | [ st ] -> st
+   | _ -> SDeclList stmts)
 
 (* 声明器的数组/列表形状归一：总组数列表（外->内）、变量维度、元素类型 *)
 and decl_shape (base : ty) (groups : expr option list) :
@@ -721,9 +728,14 @@ and parse_name_groups p : expr option list =
   | _ -> []
 
 (* 单个声明器：名字 + 数组/列表组（类型侧+名字侧可叠加）+ 可选初值。
-   修饰符（const/frac/unred）由调用方解析并对每个声明器生效 *)
-and parse_declarator p tp ty is_const is_frac is_unred =
-  let (base_ty, tgroups) = collect_ty_groups ty in
+   类型可省（推断路径，仅标量）；frac 数组/列表合法（new.md：
+   let f64 frac y[128]），元素存入后自动约分（unred 数组不约分） *)
+and parse_declarator p tp ty_opt is_const is_frac is_unred =
+  let (base_ty, tgroups) =
+    match ty_opt with
+    | Some ty -> collect_ty_groups ty
+    | None -> (TNamed ("i32", tp), [])   (* 推断路径仅标量：seq 形状在下方报错 *)
+  in
   let name = expect_ident p "variable name" in
   let groups = tgroups @ parse_name_groups p in
   match decl_shape base_ty groups with
@@ -731,16 +743,21 @@ and parse_declarator p tp ty is_const is_frac is_unred =
     err tp "nested array/list declarations do not support initializers yet"
   | (ety, len, true, _) ->
     (* 列表：[]（变量维度为动态） *)
-    if is_frac then err tp "lists do not support the frac modifier";
+    (match ty_opt with
+     | None -> err tp "let without a type only supports scalar declarations"
+     | Some _ -> ());
     let inits = parse_seq_inits p in
-    SSeqDecl (is_const, name, ety, None, true, inits, tp)
+    SSeqDecl (is_const, is_frac, is_unred, name, ety, None, true, inits, tp)
   | (ety, Some len, false, _) ->
     (* 定长数组：[长度]（变量维度为定长） *)
-    if is_frac then err tp "arrays do not support the frac modifier";
+    (match ty_opt with
+     | None -> err tp "let without a type only supports scalar declarations"
+     | Some _ -> ());
     let inits = parse_seq_inits p in
-    SSeqDecl (is_const, name, ety, Some len, false, inits, tp)
+    SSeqDecl (is_const, is_frac, is_unred, name, ety, Some len, false, inits, tp)
   | (ety, None, false, []) ->
-    (* 标量：初值可省略（省略时填零值）；const 必须带初值 *)
+    (* 标量：类型与初值二选一或都写（都无时 frac 修饰可顶替类型，
+       由 typeck 校验）；初值可省略（省略时填零值）；const 必须带初值 *)
     let init =
       (match p.toks with
        | (Assign, _) :: _ ->
@@ -751,35 +768,14 @@ and parse_declarator p tp ty is_const is_frac is_unred =
     (match is_const, init with
      | true, None -> err tp "const requires an initializer"
      | _ -> ());
-    SDecl (is_const, is_frac, is_unred, name, ety, init, tp)
+    SDecl (is_const, is_frac, is_unred, name, ty_opt, init, tp)
 
-(* 语句位置声明：一行多声明器（w-012）——T a, b = 1, c[3], d[]，逗号分隔，
+(* 语句位置 let 声明：一行多声明器——let i32 a, b = 1, c[3], d[]，逗号分隔，
    共享类型与前缀修饰符，初值各自独立 *)
-and parse_decl_stmt p tp =
-  let ty = parse_ty p in
-  let (is_const, is_frac, is_unred, is_ref) = parse_modifiers p in
-  if is_ref then err tp "ref is only allowed on function parameters";
-  let rec go acc =
-    let st = parse_declarator p tp ty is_const is_frac is_unred in
-    let acc = st :: acc in
-    match peek p with
-    | (Comma, _) -> ignore (next p); go acc
-    | _ -> List.rev acc
-  in
-  let stmts = go [] in
-  end_of_stmt p;
-  (match stmts with
-   | [ st ] -> st
-   | _ -> SDeclList stmts)
+and parse_decl_stmt p tp = parse_let_stmt p tp
 
-(* 判断当前是否为声明语句开头：类型词 + 名字/const/frac/unred/类型侧[]组。
-   类型位后跟 *（指针声明 T* p 与乘法 x * y 形状相同）：仅当类型位是
-   已知类型名（内建/本文件 struct/type 别名）才视为指针声明。
-   类型位后跟 [：类型后缀数组/列表声明（T[N] a / T[] a；类型词不能开始
-   表达式，无歧义）。
-   模块路径类型 m::Point p：qpath 后（跳过 */!/[]组/修饰）跟标识符（非调用
-   形状）即声明；数组/列表声明 m::Point arr[8] 与下标表达式 m::arr[0]
-   无法句法区分，取表达式（用 type 别名绕过） *)
+(* 判断当前是否为旧式声明形状（类型词开头）——仅用于给出"声明须以 let 开头"
+   的迁移提示错误；let 形式的声明由 parse_stmt 的 KLet 分支直接分发 *)
 and looks_like_decl p =
   if is_qpath_start p.toks then begin
     let (_segs, rest) = scan_qpath p.toks in
@@ -797,7 +793,6 @@ and looks_like_decl p =
     let tyname_ok =
       match drop (n - 1) p.toks with
       | (Ident s, _) :: _ -> List.mem s p.tynames
-      | (Keyword _, _) :: _ -> true   (* 多词别名（short int 等）：必为类型 *)
       | _ -> false
     in
     (match after_ty with
@@ -811,14 +806,18 @@ and looks_like_decl p =
      | (Ident _, _) :: _ -> true
      | (Keyword (KConst | KFrac | KUnreduced | KRef), _) :: _ -> true
      | _ -> false)
-(* for 头部声明（const/frac/unred 允许，无 variable） *)
+
+(* for 头部 let 声明（const/frac/unred 允许；类型可省时由初值推断） *)
 and parse_for_decl p tp =
-  let ty = parse_ty p in
-  (match ty with
-   | TSeq _ | TSeqN _ ->
+  (* 消费 for 头声明段的 let 关键字（for let i32 i = 0, ...） *)
+  (match peek p with
+   | (Keyword KLet, _) -> ignore (next p)
+   | _ -> ());
+  let (ty_opt, is_frac, is_const, is_unred) = parse_let_head p in
+  (match ty_opt with
+   | Some (TSeq _ | TSeqN _) ->
      err tp "for header declarations do not support arrays/lists"
    | _ -> ());
-  let (is_const, _is_frac, _is_unred, _is_ref) = parse_modifiers p in
   let name = expect_ident p "variable name" in
   let init =
     (match p.toks with
@@ -830,36 +829,32 @@ and parse_for_decl p tp =
   (match is_const, init with
    | true, None -> err tp "const requires an initializer"
    | _ -> ());
-  FIDecl (is_const, name, ty, init, tp)
+  FIDecl (is_const, is_frac, is_unred, name, ty_opt, init, tp)
 
 (* 判断是否为"裸声明"形状错误（类型名开头但后续不构成合法声明） *)
 and check_bare_decl p =
-  (* 类型词后紧跟另一类型词：重复/混写（int int、i32 int）单独提示 *)
   let second_ty =
     match peek2 p with
-    | (Keyword k, _) -> is_alias_kw k
     | (Ident s, _) -> List.mem s type_names
     | _ -> false
   in
   match p.toks with
   | (_, tp) :: _ when second_ty ->
-    err tp "duplicate base type: a declaration has exactly one base type (alias and width names cannot be mixed)"
+    err tp "duplicate base type: a declaration has exactly one base type"
   | (Ident s, tp) :: _ when List.mem s type_names && s <> "void" ->
     err tp (Printf.sprintf
-              "declaration syntax: TYPE (const)? (frac)? NAME [= init] (e.g. %s x = 1 / %s x / %s const k = 2 / %s arr[8] = 1,2 / %s lst[])"
+              "declaration syntax: let TYPE (frac)? (const)? (unred)? NAME [= init] (e.g. let %s x = 1 / let %s x / let %s const k = 2 / let %s arr[8] = 1,2 / let %s lst[])"
               s s s s s)
-  | (Keyword (KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad), tp) :: _ ->
-    err tp (Printf.sprintf
-              "declaration syntax: TYPE (const)? (frac)? NAME [= init] (e.g. int x = 1 / short k / long const frac r = 1/2 / double arr[8] = 1,2 / uint lst[])")
   | _ -> ()
 
 and parse_stmt p =
   let (tk, tp) = peek p in
   match tk with
-  | Ident _ when looks_like_decl p -> parse_decl_stmt p tp
-  | Keyword k when is_alias_kw k && looks_like_decl p -> parse_decl_stmt p tp
-  | Keyword k when is_alias_kw k ->
-    check_bare_decl p; parse_expr_stmt p
+  | Keyword KLet -> parse_let_stmt p tp
+  | Ident _ when looks_like_decl p ->
+    err tp "declaration syntax: let TYPE (frac)? (const)? (unred)? NAME [= init] (declarations must start with 'let')"
+  | Keyword (KConst | KFrac | KUnreduced) when looks_like_decl p ->
+    err tp "declaration syntax: let TYPE (frac)? (const)? (unred)? NAME [= init] (declarations must start with 'let')"
   | Keyword KReturn ->
     ignore (next p);
     (match peek p with
@@ -1026,8 +1021,19 @@ and parse_input p tp =
        | (_, tp') -> err tp' "input's delim parameter must come last")
     | _ ->
       let t =
-        if looks_like_decl p then begin
-          let ty = parse_ty p in
+        if is_kw p KLet then begin
+          ignore (next p);
+          (* input 新声明目标：let TYPE 名（类型必须显式给出） *)
+          let ty_opt =
+            match peek p with
+            | (Ident s, _) when List.mem s p.tynames -> Some (parse_ty p)
+            | _ -> None
+          in
+          let ty =
+            match ty_opt with
+            | Some ty -> ty
+            | None -> err tp "input target declaration requires a type (let TYPE NAME)"
+          in
           let (_c, _f, _u, _r) = parse_modifiers p in
           let name = expect_ident p "variable name" in
           InNew (name, ty, tp)
@@ -1055,14 +1061,16 @@ and parse_for p tp =
   let rec go () =
     match peek p with
     | (Newline, _) | (Indent, _) | (Dedent, _) | (Eof, _) -> ()
+    | (Keyword KLet, ltp) ->
+      let item = parse_for_decl p ltp in
+      inits := item :: !inits;
+      (match peek p with
+       | (Comma, _) -> ignore (next p); go ()
+       | _ -> ())
     | _ ->
-      if looks_like_decl p then begin
-        let item = parse_for_decl p tp in
-        inits := item :: !inits;
-        (match peek p with
-         | (Comma, _) -> ignore (next p); go ()
-         | _ -> ())
-      end
+      if looks_like_decl p then
+        err (snd (peek p))
+          "for header declaration syntax: for let TYPE (frac)? (const)? (unred)? NAME = init, ..."
       else begin
         let lhs = parse_expr p in
         let item_or_cond =
@@ -1127,63 +1135,54 @@ and parse_if p tp =
 
 (* ---------- 顶层项 ---------- *)
 
-(* 顶层项是函数定义还是声明：类型词后（可跳过 * 指针后缀、类型侧 []/[N] 组
-   与 const/frac/unred 修饰）跟标识符，标识符后是 '(' 为函数定义
-   （i32 f(...) / i32[] f(...)），否则为声明。
-   模块路径返回类型 m::Point f(...)：qpath + 修饰 + 名字 + '(' *)
-let top_is_fn p =
-  if is_qpath_start p.toks then begin
-    let (_segs, rest) = scan_qpath p.toks in
-    match skip_ty_lookahead_toks rest with
-    | (Ident _, _) :: (LParen, _) :: _ -> true
-    | _ -> false
-  end
-  else
-  let toks = p.toks in
-  let n = ty_kws_len toks in
-  if n = 0 then false
-  else begin
-    let rec drop k l = if k <= 0 then l else match l with _ :: r -> drop (k - 1) r | [] -> [] in
-    let tyname_ok =
-      match drop (n - 1) toks with
-      | (Ident s, _) :: _ -> List.mem s p.tynames
-      | (Keyword _, _) :: _ -> true   (* 多词别名（short int 等）：必为类型 *)
-      | _ -> false
-    in
-    tyname_ok &&
-    (match skip_ty_lookahead_toks (drop n toks) with
-     | (Ident _, _) :: (LParen, _) :: _ -> true
-     | _ -> false)
-  end
-
-(* 函数参数：
-   标量：<类型> (frac)? 名字
-   数组：<类型> 名字[长度]（长度为字面量或之前的参数名）
-   列表：<类型> 名字[]（中括号必须为空）
-   类型后缀形式（w-014 #1）：<类型>[]/[N] 与名字侧组可叠加；
-   ref 支持标量/string/数组/列表（w-014 #1：列表 ref 参数） *)
+(* 函数参数（new.md 2026-10-10，let 形式）：
+   (ref)? let (类型)? (frac)? (const)? (unred)? 名字 (名字侧 [N]/[]组)?
+   类型可省但须有 frac（隐含 i32 基），否则报错（参数无初值可推断）；
+   move/copy 是调用点修饰，参数处非法；ref 支持标量/string/数组/列表 *)
 let parse_param p =
-  let (tk0, tp0) = peek p in
-  (* 函数类型允许作参数类型（new2.md 9a）：i32(i32,i32) g *)
-  let pt0 = parse_ty ~allow_fun:true p in
-  let (base_ty, tgroups) = collect_ty_groups pt0 in
-  let (isc, is_frac, is_unred, is_ref) = parse_modifiers p in
-  if isc then err tp0 "parameters do not support const";
-  if is_unred then err tp0 "parameters do not support unred";
-  if is_ref && is_frac then err tp0 "ref parameters do not support the frac modifier";
+  let (_tk0, tp0) = peek p in
+  let is_ref =
+    match peek p with
+    | (Keyword KRef, _) -> ignore (next p); true
+    | (Keyword (KMove | KCopy), pp) ->
+      err pp "move/copy are call-site argument modifiers, not parameter modifiers"
+    | _ -> false
+  in
+  (match peek p with
+   | (Keyword KLet, _) -> ignore (next p)
+   | (_, tp) ->
+     err tp "parameter syntax: (ref)? let (TYPE)? (frac)? (const)? (unred)? NAME (e.g. let i32 x / let frac y / ref let string s)")
+  ;
+  let (ty_opt, is_frac, is_const, is_unred) = parse_let_head p in
+  if is_ref && is_frac then
+    err tp0 "ref parameters do not support the frac modifier";
+  let ty =
+    match ty_opt with
+    | Some ty -> ty
+    | None when is_frac -> TNamed ("i32", tp0)   (* let frac y → i32 frac *)
+    | None ->
+      err tp0 "parameter requires a type (or the frac modifier: let frac y)"
+  in
+  let (base_ty, tgroups) = collect_ty_groups ty in
   let name = expect_ident p "parameter name" in
   let groups = tgroups @ parse_name_groups p in
   match decl_shape base_ty groups with
   | (pty, None, false, []) ->
-    { pname = name; pty; pfrac = is_frac; pseq = PScalar; pref = is_ref; ppos = tp0 }
+    { pname = name; pty; pfrac = is_frac; pseq = PScalar;
+      pconst = is_const; punred = is_unred; pref = is_ref; ppos = tp0 }
   | (pty, None, true, _) ->
     (* 列表参数 *)
     if is_frac then err tp0 "array/list parameters do not support the frac modifier";
-    { pname = name; pty; pfrac = false; pseq = PList; pref = is_ref; ppos = tp0 }
+    if is_const || is_unred then err tp0 "array/list parameters do not support const/unred";
+    { pname = name; pty; pfrac = false; pseq = PList;
+      pconst = false; punred = false; pref = is_ref; ppos = tp0 }
   | (pty, Some len, false, _) ->
     (* 定长数组参数 *)
     if is_frac then err tp0 "array/list parameters do not support the frac modifier";
-    { pname = name; pty; pfrac = false; pseq = PArray len; pref = is_ref; ppos = tp0 }
+    if is_const || is_unred then err tp0 "array/list parameters do not support const/unred";
+    { pname = name; pty; pfrac = false; pseq = PArray len;
+      pconst = false; punred = false; pref = is_ref; ppos = tp0 }
+  | (_, _, _, _ :: _) -> err tp0 "unsupported parameter shape"
 
 (* struct 字段块：每行一个字段；块以 DEDENT 结束 *)
 let rec parse_struct_fields p acc =
@@ -1192,10 +1191,9 @@ let rec parse_struct_fields p acc =
   | (Indent, _) -> ignore (next p); parse_struct_fields p acc
   | (Dedent, _) -> ignore (next p); List.rev acc
   | (Eof, _) -> List.rev acc
-  | (Ident _, ftp)
-  | (Keyword (KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad), ftp) ->
-    (* 字段类型：任意标识符（基础宽度类型或已声明 struct 名，typeck 校验）
-       或多词传统别名（short int 等），可带 * 指针后缀与类型侧 []/[N] 组；
+  | (Ident _, ftp) ->
+    (* 字段类型：任意标识符（基础宽度类型或已声明 struct 名，typeck 校验），
+       可带 * 指针后缀与类型侧 []/[N] 组；
        函数类型允许（9a）；名字侧组可叠加（i32 m[3][4] 字段） *)
     let fty0 = parse_ty ~allow_fun:true p in
     let (base_ty, tgroups) = collect_ty_groups fty0 in
@@ -1268,30 +1266,9 @@ and parse_item p =
   let (tk, tp) = peek p in
   match tk with
   | Lt ->
-    (* 泛型函数：<T, U> ret name(params) 块（仅函数，非函数报错） *)
-    let tparams = parse_tparams p in
-    (match peek p with
-     | (Ident _, _) | (Keyword _, _) ->
-       let ty0 = parse_ty p in
-       let (_c, rf, _u, _r3) = parse_modifiers p in
-       let name = expect_ident p "function name" in
-       expect p LParen "(";
-       let params =
-         let rec go acc =
-           match peek p with
-           | (RParen, _) -> ignore (next p); List.rev acc
-           | _ ->
-             let pd = parse_param p in
-             (match peek p with
-              | (Comma, _) -> ignore (next p); go (pd :: acc)
-              | (RParen, _) -> ignore (next p); List.rev (pd :: acc)
-              | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
-         in
-         go []
-       in
-       let body = parse_block p in
-       IFn { name; params; ret = Some ty0; rfrac = rf; body; pos = tp; tparams }
-     | (_, tp') -> err tp' "expected a function after generic parameters (<T> ret name(params))")
+    (* 旧泛型函数形式 <T> ret name(...) 已废止（new.md 2026-10-10）：
+       泛型函数写作 fn <T, U> ret name(...) *)
+    err tp "generic function syntax: fn <T, U> RET name(params) (the old '<T> ret name(...)' form was removed)"
   | Keyword KPub ->
     (* pub 修饰：仅模块内顶层合法（root 顶层 pub 由 resolve 忽略并告警容忍） *)
     ignore (next p);
@@ -1500,35 +1477,82 @@ and parse_item p =
     end_of_stmt p;
     p.tynames <- name :: p.tynames;
     ITypeAlias { name; ty = t; pos = tp }
-  | Ident _ | Keyword (KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad | KFrac | KConst | KUnreduced) ->
-    if top_is_fn p then begin
-      (* 函数定义：类型 (frac)? 名字(参数) 块 *)
-      let ty0 = parse_ty p in
-      let (_c, rf, _u, _r3) = parse_modifiers p in
-      let name = expect_ident p "function name" in
-      expect p LParen "(";
-      let params =
-        let rec go acc =
-          match peek p with
-          | (RParen, _) -> ignore (next p); List.rev acc
-          | _ ->
-            let pd = parse_param p in
-            (match peek p with
-             | (Comma, _) -> ignore (next p); go (pd :: acc)
-             | (RParen, _) -> ignore (next p); List.rev (pd :: acc)
-             | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
-        in
-        go []
+  | Keyword KLet ->
+    (* 顶层 let 声明（new.md：代码顶部可写任意变量/数组/列表声明） *)
+    let d = parse_let_stmt p tp in
+    IDecl (d, tp)
+  | Keyword KFn ->
+    (* fn 函数定义（new.md 2026-10-10）：
+       fn (返回类型)? (frac)? (const)? (unred)? 名字(参数) 块
+       main 特例：fn main()——不给返回类型（隐含 i32）、无参数、return 可省 *)
+    ignore (next p);
+    let tparams =
+      match peek p with
+      | (Lt, _) -> parse_tparams p
+      | _ -> []
+    in
+    let ty_opt =
+      match peek p with
+      | (Ident s, _) when List.mem s p.tynames -> Some (parse_ty p)
+      | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty p)
+      | _ -> None
+    in
+    let is_frac =
+      match peek p with
+      | (Keyword KFrac, _) -> ignore (next p); true
+      | _ -> false
+    in
+    let is_const =
+      match peek p with
+      | (Keyword KConst, cp) ->
+        err cp "const is not a valid return-type modifier"
+      | _ -> false
+    in
+    let is_unred =
+      match peek p with
+      | (Keyword KUnreduced, _) -> ignore (next p); true
+      | _ -> false
+    in
+    let name = expect_ident p "function name" in
+    if name = "main" then begin
+      if ty_opt <> None then
+        err tp "main must not declare a return type (fn main() — implicitly i32)";
+      if is_frac || is_unred then
+        err tp "main must not have frac/unred modifiers"
+    end;
+    expect p LParen "(";
+    let params =
+      let rec go acc =
+        match peek p with
+        | (RParen, _) -> ignore (next p); List.rev acc
+        | _ ->
+          let pd = parse_param p in
+          (match peek p with
+           | (Comma, _) -> ignore (next p); go (pd :: acc)
+           | (RParen, _) -> ignore (next p); List.rev (pd :: acc)
+           | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
       in
-      let body = parse_block p in
-      IFn { name; params; ret = Some ty0; rfrac = rf; body; pos = tp; tparams = [] }
-    end
-    else begin
-      (* 顶层声明：const/frac/unred 标量、数组、列表均可 *)
-      let d = parse_decl p tp in
-      IDecl (d, tp)
-    end
-  | _ -> err tp (Printf.sprintf "expected a top-level item (function/use/declaration), got %s" (pp_token tk))
+      go []
+    in
+    if name = "main" && params <> [] then
+      err tp "main takes no parameters";
+    let body = parse_block p in
+    let ret =
+      match ty_opt with
+      | Some ty -> Some ty
+      | None when name = "main" -> Some (TNamed ("i32", tp))   (* main 隐含 i32 *)
+      | None -> err tp "function declaration requires a return type (or use void)"
+    in
+    IFn { name; params; ret; rfrac = is_frac; runred = is_unred;
+          body; pos = tp; tparams }
+  | Ident _ ->
+    if looks_like_decl p then
+      err tp "declaration syntax: let TYPE (frac)? (const)? (unred)? NAME [= init] (declarations must start with 'let')"
+    else
+      err tp (Printf.sprintf "expected a top-level item (fn/use/let/struct/mod), got %s" (pp_token tk))
+  | _ ->
+    (* 顶层不允许出现语句关键字等（原为此处 Match_failure 崩溃，改为报错） *)
+    err tp (Printf.sprintf "expected a top-level item (fn/use/let/struct/mod), got %s" (pp_token tk))
 
 let parse_program p =
   let rec go acc =

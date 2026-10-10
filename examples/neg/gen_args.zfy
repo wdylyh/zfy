@@ -2,7 +2,7 @@
 struct Box<T>
     T v = null
 
-i64 main()
-    Box<i32, f64> b = Box(1)
+fn main()
+    let Box<i32, f64> b = Box(1)
     output(b.v)
     return 0

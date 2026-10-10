@@ -1,9 +1,9 @@
 // input 目标为 T!（i64!）：读取/解析失败产错误值，程序继续（ZEM 新语义）
 // 运行：echo notanumber | input_fail_test.exe（无 stdin / 非法输入均产 INPUT 错误值）
 // 预期：input 失败 -> a 为错误值 -> ?? 解包默认值 -1，输出 [-1] 与 continued，exit 0
-void main()
-    i64! a = 0
+fn main()
+    let i64! a = 0
     input(a)
-    i64 v = a ?? -1
+    let i64 v = a ?? -1
     output("[", v, "]", end='\n')
     output("continued", end='\n')

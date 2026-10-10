@@ -3,45 +3,45 @@
 // ② 显式 move：f(move s) 所有权移交，s 之后不可再用；重新赋值后恢复
 // ③ 普通单次使用变量不再被自动 move：传参后仍可用（值语义克隆）
 // ④ 循环内单次使用不再 move：循环体中反复传参、循环后仍可用
-void take(string s)
+fn void take(let string s)
     output("take:", s)
 
-void takea(i32 a[3])
+fn void takea(let i32 a[3])
     output("takea:", end="")
     output(a[0], a[1], a[2], sep=",")
 
-void main()
+fn main()
     // ---- ① 临时转移：split 产生的临时直接移交 ----
-    string n = "a,b,c"
-    string parts[]
+    let string n = "a,b,c"
+    let string parts[]
     parts = split(n, ',')                           // split 临时移交 parts（免克隆）
     output(parts[0], parts[1], parts[2], sep="|")   // 期望 a|b|c
     take(n[0,1])                                    // 切片临时 "a," 移交 take
     take(n)                                         // n 未被 move，仍可用：期望 a,b,c
 
     // ---- ③ 普通单次使用：传参后仍可用（不再自动 move，值语义克隆） ----
-    string q = "keepme"
+    let string q = "keepme"
     take(q)                                         // 单次使用：克隆传值（旧版会自动 move）
     take(q)                                         // q 仍可用（克隆语义）
     output("q ok:", q)                              // 期望 q ok: keepme
 
     // ---- ② 显式 move：移交后原变量清槽，重新赋值恢复 ----
-    string p = "ownme"
+    let string p = "ownme"
     take(move p)                                    // 显式移交（免克隆）
     p = "reborn"                                    // 重新赋值：move 状态解除
     take(p)                                         // 期望 reborn
     take(move p)                                    // 再次显式移交
 
     // ---- ② 数组显式 move ----
-    i32 a[3] = 7,8,9
+    let i32 a[3] = 7,8,9
     takea(move a)                                   // 数组所有权移交：期望 7,8,9
-    i32 b[3] = 4,5,6
+    let i32 b[3] = 4,5,6
     takea(b)                                        // 普通传值（克隆）：期望 4,5,6
     takea(b)                                        // b 仍可用：期望 4,5,6
 
     // ---- ④ 循环内单次使用：不再 move，循环后仍可用 ----
-    string z = "loop"
-    for i32 i = 0, i < 3, i++
+    let string z = "loop"
+    for let i32 i = 0,   i < 3, i++
         take(z)                                     // 每轮克隆传值：期望 loop ×3
     output("z after loop:", z)                      // 期望 z after loop: loop
     output("done")

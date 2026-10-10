@@ -1,8 +1,8 @@
 // 负例：ref 参数未以 ref 实参调用
-void g(i32 ref x)
+fn void g(ref let i32 x)
     x++
 
-i64 main()
-    i32 v = 1
+fn main()
+    let i32 v = 1
     g(v)
     return 0

@@ -1,14 +1,14 @@
 // 顶层 const 测试：函数外声明编译期常量，使用处内联
-i32 const MAX = 100
-i64 const BIG = 5000000000
+let i32 const MAX = 100
+let i64 const BIG = 5000000000
 
-void main()
-    i32 arr[MAX]
+fn main()
+    let i32 arr[MAX]
     output("len=", length(arr), end='\n')
     // 混算：i32 变量与顶层 const（i64）自动宽化
-    i64 h2 = BIG / 2
+    let i64 h2 = BIG / 2
     output("h2=", h2, end='\n')
-    i32 x = MAX - 1
+    let i32 x = MAX - 1
     output("x=", x, end='\n')
-    bool lt = x < MAX
+    let bool lt = x < MAX
     output("lt=", lt, end='\n')

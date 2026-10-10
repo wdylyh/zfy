@@ -1,0 +1,44 @@
+// 文件 I/O 第二阶段：read_lines -> string[]
+fn main()
+    // 准备数据文件
+    let File! fw = open("_rl.txt", "w")
+    let File w = fw ?? panic("open w failed")
+    writeln(w, "alpha")
+    writeln(w, "beta")
+    writeln(w, "gamma")
+    close(w)
+
+    // read_lines：一次读入全部行
+    let File! fr = open("_rl.txt", "r")
+    let File r = fr ?? panic("open r failed")
+    let string lines[] = read_lines(r)
+    output("n=", length(lines))
+    output("first=", lines[0])
+    output("second=", lines[1])
+    output("last=", lines[length(lines) - 1])
+
+    // 遍历求总字符数
+    let i64 total = 0
+    for let i64 k = 0,    k < length(lines), k++
+        total += length(lines[k])
+    output("total=", total)
+
+    // 空行保留（连续换行产生空串元素）
+    let File! fw2 = open("_rl2.txt", "w")
+    let File w2 = fw2 ?? panic("open w2 failed")
+    writeln(w2, "a")
+    writeln(w2, "")
+    writeln(w2, "b")
+    close(w2)
+    let File! fr2 = open("_rl2.txt", "r")
+    let File r2 = fr2 ?? panic("open r2 failed")
+    let string ls[] = read_lines(r2)
+    output("empty-case n=", length(ls), " mid-empty=", ls[1] == "")
+
+    // move 传参给用户函数（RAII 在函数退出时自动 close）
+    output("counted=", count_lines(move r))
+    return 0
+
+fn i64 count_lines(let File f)
+    let string xs[] = read_lines(f)
+    return length(xs)

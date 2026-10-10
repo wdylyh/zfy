@@ -1,23 +1,23 @@
 // 指针功能测试：T* 声明 / & 取地址 / p^ 解引用 / null / 自动解引用（字段与下标）/
 // unsafe 指针算术 / extern "C" / type 别名 / 函数指针 / T* const
 extern "C"
-    void* malloc(u64 n)
-    void free(void* p)
+    void* malloc(let u64 n)
+    void free(let void* p)
 
 type IntPtr = i32*
 type Callback = i32(i32, i32)
 
-i32 add(i32 a, i32 b)
+fn i32 add(let i32 a, let i32 b)
     return a + b
 
 struct Pair
     i32 x = 0
     i32 y = 0
 
-i64 main()
+fn main()
     // 基础：取地址 / 解引用读 / 解引用写 / 复合赋值
-    i32 a = 10
-    i32* p = &a
+    let i32 a = 10
+    let i32* p = &a
     output(p^)
     p^ = 20
     output(a)
@@ -26,57 +26,57 @@ i64 main()
 
     // 普通指针：可重绑、指向值可写（const 指针概念已移除；
     // T* const 现表示指向 const 的指针，见 constp_test）
-    i32 b = 1
-    i32* q = &a
+    let i32 b = 1
+    let i32* q = &a
     q^ = 30
     output(a)
 
     // null 与比较
-    i32* n = null
+    let i32* n = null
     output(n == null)
     output(p != null)
     output(p == &a)
 
     // 自动解引用：struct 字段（rp.x 等同于先解引用再取字段）
-    Pair r = Pair(7, 8)
-    Pair* rp = &r
+    let Pair r = Pair(7, 8)
+    let Pair* rp = &r
     output(rp.x, rp.y)
     rp.x = 70
     rp.y += 2
     output(r.x, r.y)
 
     // 自动解引用：p[i] 下标 与 &arr[i] 元素地址（p[i] 强制 unsafe，new2.md #8）
-    i32 arr[4] = 1, 2, 3, 4
-    i32* ap = &arr[0]
+    let i32 arr[4] = 1, 2, 3, 4
+    let i32* ap = &arr[0]
     unsafe
         output(ap[0], ap[2])
         ap[1] = 22
     output(arr[1])
-    i32* mid = &arr[2]
+    let i32* mid = &arr[2]
     output(mid^)
 
     // type 别名
-    IntPtr ip = &b
+    let IntPtr ip = &b
     ip^ = 99
     output(b)
 
     // 函数指针
-    Callback f = add
+    let Callback f = add
     output(f(3, 4))
 
     // unsafe 块：指针算术（p+n / p-n / p-q）
     unsafe
-        i32* e = ap + 3
+        let i32* e = ap + 3
         e^ = 44
         output(arr[3])
-        i64 span = e - ap
+        let i64 span = e - ap
         output(span)
-        i32* back = e - 2
+        let i32* back = e - 2
         output(back^)
 
     // extern "C"：malloc/free + 指针间 cast
-    void* raw = malloc(16)
-    i32* nums = cast(raw, i32*)
+    let void* raw = malloc(16)
+    let i32* nums = cast(raw, i32*)
     unsafe
         nums[0] = 123
         nums[1] = 456

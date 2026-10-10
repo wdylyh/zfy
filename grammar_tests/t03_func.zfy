@@ -1,47 +1,47 @@
 // t03: 函数——ref 参数（标量/string/数组/列表）、返回 T[]/T[N]、函数类型参数（grammar.md §5）
 type Fun = i32(i32)
 
-void bump(i32 ref x)
+fn void bump(ref let i32 x)
     x += 10
 
-void wrap(string ref s)
+fn void wrap(ref let string s)
     s = s + "!"
 
-void fill(i32 ref xs[])
+fn void fill(ref let i32 xs[])
     push(xs, 10)
     push(xs, 20)
     xs[0] = 99
 
-void fill2(i32[] ref xs)
+fn void fill2(ref let i32[] xs)
     push(xs, 1)
 
-i32[] upto(i32 n)
-    i32 a[]
-    for i32 i = 0, i < n, i++
+fn i32[] upto(let i32 n)
+    let i32 a[]
+    for let i32 i = 0,   i < n, i++
         push(a, i)
     return a
 
-i32[3] triple()
-    i32 a[3] = 1, 2, 3
+fn i32[3] triple()
+    let i32 a[3] = 1, 2, 3
     return a
 
-i32 apply(Fun f, i32 v)
+fn i32 apply(let Fun f, let i32 v)
     return f(v)
 
-i32 inc(i32 x)
+fn i32 inc(let i32 x)
     return x + 1
 
-i64 main()
-    i32 v = 5
+fn main()
+    let i32 v = 5
     bump(ref v)
-    string s = "a"
+    let string s = "a"
     wrap(ref s)
-    i32 e[]
+    let i32 e[]
     fill(ref e)
-    i32 e2[]
+    let i32 e2[]
     fill2(ref e2)
-    i32[] a = upto(5)
-    i32[3] t = triple()
+    let i32[] a = upto(5)
+    let i32[3] t = triple()
     output(v, s, e, e2, a, t)
     output(apply(inc, 41))
     return 0

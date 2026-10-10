@@ -1,18 +1,18 @@
 // output(数组/列表)（w-013）：整体打印，元素间以 sep 分隔
-i64 main()
-    i32 nums[] = 1, 2, 3
+fn main()
+    let i32 nums[] = 1, 2, 3
     output(nums)
     output(nums, sep=',')
-    string words[] = "a", "b", "c"
+    let string words[] = "a", "b", "c"
     output(words)
-    i32 arr[3]
+    let i32 arr[3]
     arr[1] = 5
     output(arr)
-    f64 fs[] = 1.5, 2.5
+    let f64 fs[] = 1.5, 2.5
     output(fs, sep='|')
-    bool bs[] = true, false, true
+    let bool bs[] = true, false, true
     output(bs)
-    i32 empty[]
+    let i32 empty[]
     output(empty, end='.')
     output("done")
     // 与标量混排

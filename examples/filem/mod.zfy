@@ -1,8 +1,8 @@
 // file module body: loaded by "mod filem;" (examples/filem.zfy)
-pub i32 square(i32 x)
+pub fn i32 square(let i32 x)
     return x * x
 
-i32 const SECRET = 7
+let i32 const SECRET = 7
 
-pub i32 secret_sum(i32 x)
+pub fn i32 secret_sum(let i32 x)
     return x + SECRET

@@ -1,9 +1,9 @@
 // negative: unresolved use path -> E5008
 mod math
-    pub i32 add(i32 a, i32 b)
+    pub fn i32 add(let i32 a, let i32 b)
         return a + b
 
 use math::nope
 
-void main()
+fn main()
     output(math::add(1, 2))

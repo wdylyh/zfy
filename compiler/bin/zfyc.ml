@@ -42,7 +42,7 @@ let cmd_hir path =
       let ps =
         String.concat ", "
           (List.map
-             (fun (_, n, t) -> Printf.sprintf "%s: %s" n (Hir.pp_zty t))
+             (fun (_, n, t, _) -> Printf.sprintf "%s: %s" n (Hir.pp_zty t))
              f.fparams)
       in
       Printf.printf "fn %s(%s) -> %s\n" f.fname ps (Hir.pp_zty f.fret))

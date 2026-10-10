@@ -1,33 +1,33 @@
 // frac 分数类型与 reduce 验证
 // 规则：字面量/初值不自动约分；运算结果（如 a*b）自动约分到最简
-void main()
-    i32 frac j = 23/34
+fn main()
+    let i32 frac j = 23/34
     output(j)
-    i64 frac x = 6/216
+    let i64 frac x = 6/216
     reduce(x, 1, 2)
     output(x)
-    i64 frac y = 6/216
+    let i64 frac y = 6/216
     reduce(y, 2, 2)
     output(y)
     // 分数四则：运算结果自动约分到最简
-    i32 frac a = 1/2
-    i32 frac b = 1/3
-    i32 frac c = a + b
+    let i32 frac a = 1/2
+    let i32 frac b = 1/3
+    let i32 frac c = a + b
     output(c)
-    i32 frac m = a * b
+    let i32 frac m = a * b
     output(m)
-    i32 frac d = a / b
+    let i32 frac d = a / b
     output(d)
     // 标量提升：整数转分数
-    i32 frac e = a + 1
+    let i32 frac e = a + 1
     output(e)
     // 小数分子分母：乘 10^n 化整后按分数规则运算（初值不自动约分）
-    f64 frac k = 34.3434/34.3434
-    f64 frac k2 = k + 1
+    let f64 frac k = 34.3434/34.3434
+    let f64 frac k2 = k + 1
     output(k)
     output(k2)
     // 比较
     if a < b
         output(1)
-    i32 const frac pi2 = 22/7
+    let i32 frac const pi2 = 22/7
     output(pi2)

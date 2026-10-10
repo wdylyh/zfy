@@ -1,5 +1,5 @@
-void main()
-    File! fo = open("a.txt", "rw+")
-    File f = fo ?? panic("no")
+fn main()
+    let File! fo = open("a.txt", "rw+")
+    let File f = fo ?? panic("no")
     close(f)
     return

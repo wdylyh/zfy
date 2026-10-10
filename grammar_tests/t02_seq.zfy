@@ -1,22 +1,22 @@
 // t02: 数组/列表——声明、序列字面量整体赋值、push/remove、嵌套列表、定长二维（grammar.md §4/§8/§11）
-i64 main()
+fn main()
     // 列表声明 + 初值
-    i32 a[] = 1, 2, 3
+    let i32 a[] = 1, 2, 3
     // 序列字面量整体赋值（w-014 #3）
     a = 4, 5, 6
     // 定长数组：个数须与长度一致
-    i32 b[3]
+    let i32 b[3]
     b = 7, 8, 9
     // 类型后缀形式
-    i32[] c = 10, 20
+    let i32[] c = 10, 20
     // 嵌套列表：push 构建
-    i32[][] m
-    i32 row[] = 1, 2, 3
+    let i32[][] m
+    let i32 row[] = 1, 2, 3
     push(m, row)
     push(m[0], 4)
     push(m, c)
     // 定长二维自动分配全零行
-    i32 g[2][3]
+    let i32 g[2][3]
     g[1][2] = 5
     // 元素读写
     a[0] = 100
@@ -25,10 +25,10 @@ i64 main()
     push(a, 7)
     remove(a, 0)
     // 切片：两端含，可带步长
-    i32[] sl = a[0, 2]
-    i32[] sl2 = a[0, 2:2]
+    let i32[] sl = a[0, 2]
+    let i32[] sl2 = a[0, 2:2]
     // 长度
-    i64 n = length(a)
+    let i64 n = length(a)
     // output 整体打印（w-013）
     output(a, sep=",")
     output(b)
@@ -38,7 +38,7 @@ i64 main()
     output(sl2)
     output(n)
     // string 字段式下标写
-    string s = "hello"
+    let string s = "hello"
     s[0] = 'H'
     output(s)
     return 0

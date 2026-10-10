@@ -1,16 +1,16 @@
-void task1()
+fn void task1()
     // 构建 0..199999，筛选偶数，求和 + 计数
-    i32 src[]
-    for i32 i = 0, i < 200000, i++
+    let i32 src[]
+    for let i32 i = 0,   i < 200000, i++
         src[length(src)] = i
-    i32 evens[]
-    for i64 i = 0, i < length(src), i++
+    let i32 evens[]
+    for let i64 i = 0,   i < length(src), i++
         if src[i] % 2 == 0
             evens[length(evens)] = src[i]
-    i64 s = 0
-    for i64 i = 0, i < length(evens), i++
+    let i64 s = 0
+    for let i64 i = 0,   i < length(evens), i++
         s += cast(evens[i], i64)
     output("T1 sum=", s, " count=", length(evens))
 
-void main()
+fn main()
     task1()

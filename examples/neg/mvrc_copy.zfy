@@ -1,9 +1,9 @@
 // 负例：copy 与自动 move 冲突——b 最后使用，编译器判定应 move，显式 copy 报错
-string take(string s)
+fn string take(let string s)
     return s
 
-i64 main()
-    string b = "world"
-    string c = take(copy b)
+fn main()
+    let string b = "world"
+    let string c = take(copy b)
     output(c, end='\n')
     return 0

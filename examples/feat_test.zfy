@@ -1,5 +1,5 @@
 // 新特性测试：转义字符 / 声明与零值槽位 / cast 显式转换 / RAII return 路径
-void main()
+fn main()
     // ---- 转义字符（char 与 string 统一 \n \t \\ \' \"） ----
     output("a\tb")               // 期望 a<TAB>b
     output("引:\"q\" 反斜:\\")   // 期望 引:"q" 反斜:\
@@ -8,30 +8,30 @@ void main()
     output("")
 
     // ---- 声明必带初值；数组未初始化槽位为零值 ----
-    i64 m = 42
+    let i64 m = 42
     output("[", m, "]", end='\n')   // 期望 [42]
-    i32 n[4] = 1,2
+    let i32 n[4] = 1,2
     m = cast(n[2], i64)             // 未初始化槽位零值 -> 0（跨宽度读也需显式 cast）
     output("[", m, "]", end='\n')   // 期望 [0]
-    i64 m2 = m + 1
+    let i64 m2 = m + 1
     output("[", m2, "]", end='\n')  // 期望 [1]
-    i64 m3 = m
+    let i64 m3 = m
     output("[", m3, "]", end='\n')  // 期望 [0]
     m = cast(n[0], i64)             // 恢复为 1
     output("[", m, "]", end='\n')   // 期望 [1]
 
     // ---- cast 显式转换（宽化/窄化/浮点都必须写 cast） ----
-    i32 a = 100
-    i64 b = cast(a, i64)
-    f64 d = cast(a, f64)
+    let i32 a = 100
+    let i64 b = cast(a, i64)
+    let f64 d = cast(a, f64)
     output(b, d, sep=",", end='\n')        // 期望 100,100.000000
-    f32 f = cast(d, f32)
+    let f32 f = cast(d, f32)
     output(cast(f, f64), end='\n')         // 期望 100.000000（经 f64 打印）
-    f64 dd = 3.99
+    let f64 dd = 3.99
     output(cast(dd, i32), end='\n')        // 期望 3（向零截断）
-    f64 dn = -3.99
+    let f64 dn = -3.99
     output(cast(dn, i32), end='\n')        // 期望 -3（向零截断）
-    i64 big = 300
+    let i64 big = 300
     output(cast(big, i32), end='\n')       // 期望 300（窄化显式）
 
     // ---- RAII：return 路径的释放与所有权转移 ----
@@ -39,8 +39,8 @@ void main()
     output(pick(false), end='\n')   // 期望 lit（字面量返回 strdup 副本）
 
 // 提前 return：跳过返回值变量的释放；字面量返回走 strdup
-string pick(bool c)
-    string s = "from-var"
+fn string pick(let bool c)
+    let string s = "from-var"
     if c
         return s
     return "lit"

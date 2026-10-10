@@ -53,13 +53,16 @@ and expr =
   | EPropagate of expr * pos               (* a?：错误传播（函数返回类型须 T!） *)
 
 and stmt =
-  | SDecl of bool * bool * bool * string * ty * expr option * pos
-    (* 标量声明：(is_const, is_frac, is_unred, 名, 类型, 初值(可省略, 省略时填零值))；
-       const/frac/unred 在类型后名字前；const 必须带初值；
-       is_frac 时初值 a/b 解释为分数字面量 *)
-  | SSeqDecl of bool * string * ty * expr option * bool * expr list * pos
-    (* 数组/列表声明：(is_const, 名, 元素类型, 长度表达式(列表为 None, 可用 const
-       变量), 是否列表, 初始元素)；未给出的槽位填零值 *)
+  | SDecl of bool * bool * bool * string * ty option * expr option * pos
+    (* 标量声明（new.md 2026-10-10）：let (类型)? (frac)? (const)? (unred)? 名 (= 初值)?;
+       类型可省（由初值推断：整数字面量→i32、浮点→f64、n/d 字面量除式→i32 frac、
+       string/char/bool 按字面量；其他表达式取自身类型）；类型与初值二选一或都写，
+       不能都无（frac 修饰视同给出类型 i32 frac）；有类型无初值=零值；
+       const 必须带初值；is_frac 时初值 a/b 解释为分数字面量 *)
+  | SSeqDecl of bool * bool * bool * string * ty * expr option * bool * expr list * pos
+    (* 数组/列表声明（let 形式）：(is_const, is_frac, is_unred, 名, 元素类型,
+       长度表达式(列表为 None, 可用 const 变量), 是否列表, 初始元素)；
+       未给出的槽位填零值；frac 数组/列表元素存入后自动约分（unred 数组不约分） *)
   | SDeclList of stmt list
     (* 一行多声明器（w-012）：T a, b = 1, c[3], d[]——各声明器共享类型与前缀
        修饰符（const/frac/unred），初值各自独立；仅语句位置（顶层与 for
@@ -87,10 +90,12 @@ and stmt =
   | SUnsafe of block * pos
     (* unsafe 块：允许指针算术（p+n / p-n / p2-p1）；其余语义与普通块一致 *)
 
-(* for 头部初始化项：新声明（类型 [const] [frac] [unred] 名 = 值）
-   或占位表达式（孤立变量名，如 for i, i<5, i++ 的 i，执行一次，无效果） *)
+(* for 头部初始化项：let 声明（let (类型)? (frac)? (const)? (unred)? 名 = 值，
+   类型可省时由初值推断）或占位表达式（孤立变量名，如 for i, i<5, i++ 的 i，
+   执行一次，无效果） *)
 and for_init =
-  | FIDecl of bool * string * ty * expr option * pos  (* (is_const, 名, 类型, 初值(可省略)) *)
+  | FIDecl of bool * bool * bool * string * ty option * expr option * pos
+    (* (is_const, is_frac, is_unred, 名, 类型(可省), 初值(可省略)) *)
   | FIExpr of expr * pos
 
 (* for 头部更新项：x = e / x op= e / x++ / x-- *)
@@ -121,9 +126,12 @@ type pseq_kind =
   | PList
 
 type param = { pname : string; pty : ty; pfrac : bool; pseq : pseq_kind;
-               pref : bool; ppos : pos }
-  (* pref：ref 参数（new2.md #1）——`i32 ref x`，调用方 f(ref y) 传地址，
-     函数体内自动解引用读写（仅标量/string，extern/函数指针不支持） *)
+               pconst : bool; punred : bool; pref : bool; ppos : pos }
+  (* let 形式参数（new.md 2026-10-10）：let (类型)? (frac)? (const)? (unred)? 名；
+     类型可省但须有 frac（隐含 i32 frac），否则报错（参数无初值可推断）；
+     pref：ref 参数——`ref let i32 x`，调用方 f(ref y) 传地址，
+     函数体内自动解引用读写（仅标量/string，extern/函数指针不支持）；
+     pconst：函数体内不可赋值；punred：入口不做 frac 归一 *)
 
 (* extern "C" 块内的单个 C 函数声明 *)
 type extern_fn =
@@ -145,9 +153,10 @@ type item =
        use a::b::{x, y as z}; binds=[("x", [...;"x"]); ("z", [...;"y"])]
        use a::b as m;       binds=[("m", ["a";"b"])]（绑定模块） *)
   | IFn of { name : string; params : param list; ret : ty option; rfrac : bool;
-             body : block; pos : pos; tparams : string list }
-    (* rfrac：返回类型带 frac 修饰（返回 TFrac）；
-       tparams：泛型类型参数（<T, U> ret name(params)），空 = 普通函数 *)
+             runred : bool; body : block; pos : pos; tparams : string list }
+    (* fn 前缀函数（new.md 2026-10-10）：fn (类型)? (frac)? (const)? (unred)? 名(参数)；
+       ret=None 仅限 main（隐含 i32，return 可省）；runred：返回类型带 unred
+       （返回值不做 frac 归一）；tparams：泛型类型参数（fn <T, U> ...），空 = 普通 *)
   | IStruct of { name : string; packed : bool; fields : sfield list; pos : pos;
                  tparams : string list }
     (* tparams：泛型类型参数（struct Box<T, U>），空 = 普通 struct *)

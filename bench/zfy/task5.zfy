@@ -1,27 +1,27 @@
-void task5()
+fn void task5()
     // 256x256 矩阵乘（一维展开）+ i128 LCG 哈希循环
-    i128 const M1 = 6364136223846793005
-    i128 const M2 = 1442695040888963407
-    i128 const MOD7 = 9223372036854775807
-    f64 a[65536]
-    f64 b[65536]
-    f64 c[65536]
-    for i32 i = 0, i < 256, i++
-        for i32 j = 0, j < 256, j++
+    let i128 const M1 = 6364136223846793005
+    let i128 const M2 = 1442695040888963407
+    let i128 const MOD7 = 9223372036854775807
+    let f64 a[65536]
+    let f64 b[65536]
+    let f64 c[65536]
+    for let i32 i = 0,   i < 256, i++
+        for let i32 j = 0,   j < 256, j++
             a[i * 256 + j] = cast((i * 256 + j) % 97, f64) * 0.5
             b[i * 256 + j] = cast((i + j) % 89, f64) * 0.25
-    for i32 i = 0, i < 256, i++
-        for i32 k = 0, k < 256, k++
-            f64 aik = a[i * 256 + k]
-            for i32 j = 0, j < 256, j++
+    for let i32 i = 0,   i < 256, i++
+        for let i32 k = 0,   k < 256, k++
+            let f64 aik = a[i * 256 + k]
+            for let i32 j = 0,   j < 256, j++
                 c[i * 256 + j] += aik * b[k * 256 + j]
-    f64 tr = 0.0
-    for i32 i = 0, i < 256, i++
+    let f64 tr = 0.0
+    for let i32 i = 0,   i < 256, i++
         tr += c[i * 256 + i]
-    i128 hs = 7
-    for i32 k = 0, k < 5000000, k++
+    let i128 hs = 7
+    for let i32 k = 0,   k < 5000000, k++
         hs = (hs * M1 + M2) % MOD7
     output("T5 trace=", prec(tr, 17), " hash=", hs)
 
-void main()
+fn main()
     task5()

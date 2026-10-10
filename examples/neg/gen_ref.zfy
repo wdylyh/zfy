@@ -1,8 +1,8 @@
 // negative: generic functions do not support ref parameters -> E3173
-<T> void bump(T ref x)
+fn <T> void bump(ref let T x)
     return
 
-i64 main()
-    i64 v = 1
+fn main()
+    let i64 v = 1
     bump(ref v)
     return 0

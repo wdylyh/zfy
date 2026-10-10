@@ -2,45 +2,45 @@
 // 覆盖：length/find/trim/split/replace 函数式调用、
 //       数组与列表切片 n[a,b] / n[a,b:step]（返回同元素类型序列、深拷贝）、
 //       切片结果赋给数组/列表变量、切片作为 length 参数、切片区间越界运行时报错
-void main()
+fn main()
     // ---- 数组切片 ----
-    i32 n[8] = 1,2,3,4,5,6
-    i32 sub[8]
+    let i32 n[8] = 1,2,3,4,5,6
+    let i32 sub[8]
     sub = n[1,4]                    // 切片 [2,3,4,5] 赋给数组变量（深拷贝）
     output(length(sub), sep=' ')    // 期望 4
     output(sub[0], sub[1], sub[2], sub[3], sep=",")   // 期望 2,3,4,5
     sub[0] = 99
     output(n[1])                    // 期望 2（切片是拷贝，不影响源数组）
-    i32 stepped[8]
+    let i32 stepped[8]
     stepped = n[0,5:2]              // 步长 2 切片
     output(stepped[0], stepped[1], stepped[2], sep=",")   // 期望 1,3,5
     output(length(n[2,6]))          // 切片作 length 参数：期望 5
 
     // ---- 列表切片 ----
-    f64 big[] = 10.5,20.5,30.5,40.5,50.5
-    f64 hf[]
+    let f64 big[] = 10.5,20.5,30.5,40.5,50.5
+    let f64 hf[]
     hf = big[1,3]                 // 期望 20.5,30.5,40.5
     output(length(hf), end=": ")
     output(hf[0], hf[1], hf[2], sep=",")
-    f64 stepped2[]
+    let f64 stepped2[]
     stepped2 = big[0,4:2]           // 步长 2 切片
     output(stepped2[0], stepped2[1], stepped2[2], sep=",")   // 期望 10.5,30.5,50.5
 
     // ---- string 列表切片（元素串深拷贝） ----
-    string names[] = "aa","bb","cc","dd"
-    string picked[]
+    let string names[] = "aa","bb","cc","dd"
+    let string picked[]
     picked = names[1,3]
     picked[0] = "XX"
     output(picked[0], picked[1], picked[2], sep=",")   // 期望 XX,cc,dd
     output(names[1])                // 期望 bb（源列表元素不受影响）
 
     // ---- find/trim/split/replace 函数式 ----
-    string s = "banana"
+    let string s = "banana"
     output(find(s, 'a') ?? -1, find(s, 'a', count=2) ?? -1, find(s, 'a', count=3) ?? -1, sep=",")
     // 期望 1,3,5（find 未找到产错误值，?? 解包为 -1）
     output(find(s, 'z') ?? -1)      // 期望 -1
     output(trim(s, 'a'))            // 期望 bnn
-    string parts[]
+    let string parts[]
     parts = split(s, 'a')
     output(length(parts), end=": ") // 期望 4:（b,n,n, 三空段+尾段）
     output(parts[0], parts[1], parts[2], parts[3], sep="|")

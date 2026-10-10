@@ -1,13 +1,13 @@
 // new2.md #5: widening stays implicit, narrowing requires explicit cast
-void take64(i64 x)
+fn void take64(let i64 x)
     output(x)
 
-void main()
-    i32 a = 7
-    i64 b = a            // widening i32 -> i64 implicit
-    u32 u = 300
-    i64 c = u            // widening u32 -> i64 implicit
+fn main()
+    let i32 a = 7
+    let i64 b = a            // widening i32 -> i64 implicit
+    let u32 u = 300
+    let i64 c = u            // widening u32 -> i64 implicit
     take64(a)            // argument widening implicit
     output(b, c)
-    i32 d = cast(b, i32) // narrowing explicit
+    let i32 d = cast(b, i32) // narrowing explicit
     output(d)

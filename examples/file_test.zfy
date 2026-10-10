@@ -2,12 +2,12 @@
 // open/read_all/read_line/write/writeln/close/exists/read_file/write_file
 // File move-only 句柄：作用域退出自动 close、move 传参、失效/关闭后使用 panic
 
-i64 count_lines(File f)
-    i64 n = 0
-    i64 go = 1
+fn i64 count_lines(let File f)
+    let i64 n = 0
+    let i64 go = 1
     while go == 1
-        string! lr = read_line(f)
-        string line = lr ??
+        let string! lr = read_line(f)
+        let string line = lr ??
             if err.code == 7
                 go = 0
             ""
@@ -15,25 +15,25 @@ i64 count_lines(File f)
             n = n + 1
     return n
 
-i64 main()
+fn main()
     // 一步式写/读
-    i64! wn = write_file("_ft1.txt", "hello file\nsecond line\nthird")
+    let i64! wn = write_file("_ft1.txt", "hello file\nsecond line\nthird")
     output("written: ", wn ?? -1)
-    string! ra = read_file("_ft1.txt")
+    let string! ra = read_file("_ft1.txt")
     output("read_file: ", ra ?? "FAIL")
 
     // 句柄写 + 显式 close
-    File! fw = open("_ft2.txt", "w")
-    File w = fw ?? panic("open w failed")
+    let File! fw = open("_ft2.txt", "w")
+    let File w = fw ?? panic("open w failed")
     write(w, "line1")
     writeln(w, "")
     writeln(w, "line2")
     close(w)
 
     // 句柄读：read_line / move 传参（helper 内 RAII 关闭）
-    File! fr = open("_ft2.txt", "r")
-    File r = fr ?? panic("open r failed")
-    string! l1 = read_line(r)
+    let File! fr = open("_ft2.txt", "r")
+    let File r = fr ?? panic("open r failed")
+    let string! l1 = read_line(r)
     output("l1: ", l1 ?? "<eof>")
     output("count: ", count_lines(move r))
 
@@ -42,16 +42,16 @@ i64 main()
     output("exists-no: ", exists("_ft_no_such_file.xyz"))
 
     // 追加模式
-    File! fa = open("_ft2.txt", "a")
-    File a = fa ?? panic("open a failed")
+    let File! fa = open("_ft2.txt", "a")
+    let File a = fa ?? panic("open a failed")
     writeln(a, "appended")
     close(a)
-    string! rb = read_file("_ft2.txt")
-    string body = rb ?? ""
+    let string! rb = read_file("_ft2.txt")
+    let string body = rb ?? ""
     output("has-appended: ", find(body, 'p') ?? -1)
 
     // 作用域退出自动 close：块内打开不显式 close，随函数退出关闭
-    File! fz = open("_ft1.txt", "r")
-    File z = fz ?? panic("open z failed")
+    let File! fz = open("_ft1.txt", "r")
+    let File z = fz ?? panic("open z failed")
     output("z-first: ", read_line(z) ?? "<eof>")
     return 0

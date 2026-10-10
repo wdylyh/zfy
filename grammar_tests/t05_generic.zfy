@@ -2,26 +2,26 @@
 struct Box<T>
     T v
 
-<T> T first(T a, T b)
+fn <T> T first(let T a, let T b)
     return a
 
-<T> T pick(T a, T b, T c)
+fn <T> T pick(let T a, let T b, let T c)
     return c
 
-Box<i32> make_box(i32 x)
+fn Box<i32> make_box(let i32 x)
     return Box(x)
 
-i64 main()
-    Box<i32> b = Box(7)
-    Box<i32> c = make_box(11)
+fn main()
+    let Box<i32> b = Box(7)
+    let Box<i32> c = make_box(11)
     b.v += 3
     output(b.v, c.v)
     // 嵌套实例
-    Box<Box<i32>> n = Box(Box(4))
+    let Box<Box<i32>> n = Box(Box(4))
     output(n.v.v)
     // 泛型函数推断
-    i32 f1 = first(1, 2)
-    string f2 = first("a", "b")
-    i32 p = pick(1, 2, 3)
+    let i32 f1 = first(1, 2)
+    let string f2 = first("a", "b")
+    let i32 p = pick(1, 2, 3)
     output(f1, f2, p)
     return 0

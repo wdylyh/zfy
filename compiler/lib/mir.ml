@@ -55,6 +55,7 @@ type instr =
   | MAlloca of string * zty                      (* 变量槽（入口块统一分配�?*)
   | MFracNew of string * zty * operand * operand (* 分数字面量：�? frac 类型, 分子, 分母 *)
   | MNorm of string * zty                        (* frac 槽约分：调用 zfy_frac_norm_<suf> *)
+  | MTempAlloca of string * zty                  (* 归一用临时聚合槽（llvmgen 入口块 alloca） *)
   | MSeqRemove of string * zty * operand * bool  (* remove：槽, 元素类型, 下标, 是否列表 *)
   | MAugSlice of string * zty * operand * operand * operand * binop * operand
     (* a[x,y:st] op= v：槽, 元素类型, 起点, 终点, 步长, 运算, 右值（逐元素原地） *)
@@ -143,6 +144,8 @@ type lctx = {
   mutable scopes : (string * zty) list ref list;  (* RAII 作用域栈：每层收集需释放变量 *)
   mutable stmt_temps : (string * free_kind) list;  (* 当前语句拥有的临时：(名, 释放类别) *)
   mutable unchecked : bool;  (* unsafe 块内：下标读写关闭越界检查（new2.md #3/@unchecked） *)
+  mutable frunred : bool;    (* 当前函数返回类型带 unred：return 不做 frac 归一（new.md） *)
+  unreds : (string, bool) Hashtbl.t;  (* unred frac 数组/列表槽名集合：元素存入不归一 *)
 }
 
 let new_block l =
@@ -172,6 +175,26 @@ let declare_owned l name ty =
     match l.scopes with
     | top :: _ -> top := (name, ty) :: !top
     | [] -> ()
+
+(* frac 存储归一（new.md 2026-10-10）：存入非 unred frac 位置的值先约分。
+   临时槽（%）原地归一；变量/全局源先拷贝到临时再归一（源不变，
+   如 unred 变量赋给非 unred 目标：目标得最简形态、源保持 4/8）。
+   全局常量（ginit 已归一）与寄存器值不动 *)
+let norm_frac_val l (v : operand) (ty : zty) : operand =
+  match ty with
+  | TFrac _ ->
+    (match v.o with
+     | OLocal n when n.[0] = '%' ->
+       emit l (MNorm (n, ty)); v
+     | OLocal _ ->
+       (* 变量/全局槽源：拷贝到临时后归一（源不变） *)
+       let t = fresh l in
+       emit l (MTempAlloca (t, ty));
+       emit l (MCopy (t, v, ty));
+       emit l (MNorm (t, ty));
+       op (OLocal t) ty
+     | _ -> v)
+  | _ -> v
 
 (* 登记本语句产生的临时（语句末统一释放） *)
 let add_temp l name kind =
@@ -426,6 +449,7 @@ let rec lexpr l (e : texpr) : operand =
      | Some d' ->
        (match e.ety with
         | TStruct _ -> add_temp l d' (FStruct e.ety)
+        | TList TString -> add_temp l d' (FSeq true)  (* read_lines 等运行时返回列表 *)
         | _ -> ())
      | _ -> ());
     (match d with
@@ -490,6 +514,13 @@ let rec lexpr l (e : texpr) : operand =
        let dl = fresh l in
        emit l (MSeqLen (dl, op (OLocal name) base.ety));
        let ov = lexpr l v in
+       (* frac 列表 push：值归一（unred 列表豁免） *)
+       let ov =
+         match elem, base.e with
+         | TFrac _, EVarK name when Hashtbl.find_opt l.unreds name = Some true -> ov
+         | TFrac _, _ -> norm_frac_val l ov elem
+         | _ -> ov
+       in
        emit l (MSeqSet (name, elem, op (OLocal dl) (TInt 64), ov, true, l.unchecked));
        op (OInt 0L) TVoid
      | _ ->
@@ -499,6 +530,7 @@ let rec lexpr l (e : texpr) : operand =
        let dl = fresh l in
        emit l (MSeqLen (dl, op (OLocal sp) (TList elem)));
        let ov = lexpr l v in
+       let ov = (match elem with TFrac _ -> norm_frac_val l ov elem | _ -> ov) in
        emit l (MSeqSetAt (addr, elem, op (OLocal dl) (TInt 64), ov, true, l.unchecked));
        op (OInt 0L) TVoid)
   | EStructNewK (_, fields) ->
@@ -726,15 +758,20 @@ and lstmt_inner l (s : tstmt) : unit =
       emit l (MCopy (name, v, ty));
       if nn then emit l (MNorm (name, ty))
     end
-  | SSeqDeclK (_, name, elem, len, is_list, inits) ->
-    (* 数组/列表：先分配（未初始化槽位为全零位模式），再逐个写入初始元素 *)
+  | SSeqDeclK (_, name, elem, len, is_list, inits, enn) ->
+    (* 数组/列表：先分配（未初始化槽位为全零位模式），再逐个写入初始元素。
+       frac 元素（enn）：初值与后续存入均自动约分；unred 数组不归一 *)
     declare_owned l name
       (if is_list then TList elem
        else TArray (elem, Int64.to_int len));
+    (match elem with
+     | TFrac _ when not enn -> Hashtbl.replace l.unreds name true
+     | _ -> ());
     emit l (MSeqAlloc (name, elem, len, is_list));
     List.iteri
       (fun i t ->
         let v = lexpr l t in
+        let v = if enn then norm_frac_val l v elem else v in
         emit l (MSeqSet (name, elem, op (OInt (Int64.of_int i)) (TInt 64),
                          v, is_list, false)))
       inits
@@ -837,13 +874,21 @@ and lstmt_inner l (s : tstmt) : unit =
     if nn then emit l (MNorm (name, ty))
   | SSeqSetK (root, elem, idx, v, grow) ->
     (* 元素写入：元素类型决定写入宽度；grow 允许列表扩长。
-       槽根分派（w-014 #3）：变量槽直写；字段链/ref 解引用/元素槽经槽地址 *)
+       槽根分派（w-014 #3）：变量槽直写；字段链/ref 解引用/元素槽经槽地址。
+       frac 元素存入自动约分（unred 数组豁免，new.md 2026-10-10） *)
+    let v = lexpr l v in
+    let v =
+      match elem, root.e with
+      | TFrac _, EVarK name when Hashtbl.find_opt l.unreds name = Some true -> v
+      | TFrac _, _ -> norm_frac_val l v elem
+      | _ -> v
+    in
     (match root.e with
      | EVarK name ->
-       emit l (MSeqSet (name, elem, lexpr l idx, lexpr l v, grow, l.unchecked))
+       emit l (MSeqSet (name, elem, lexpr l idx, v, grow, l.unchecked))
      | _ ->
        let addr = seq_slot_addr l root elem in
-       emit l (MSeqSetAt (addr, elem, lexpr l idx, lexpr l v, grow, l.unchecked)))
+       emit l (MSeqSetAt (addr, elem, lexpr l idx, v, grow, l.unchecked)))
   | SStrSetK (root, idx, v) ->
     (* string 下标写（w-014 #5）：槽内堆串原地写（槽独占由 MCopy strdup
        保证），越界运行时报错。变量槽 load 串指针；字段/ref 路径
@@ -950,7 +995,8 @@ and lstmt_inner l (s : tstmt) : unit =
        返回类型不支持 unred 修饰，凡直接返回 frac 一律约分；
        全局常量（OGlobal）与 TErr 聚合不在其列 *)
     (match v with
-     | Some ({ o = OLocal n; oty = TFrac _; _ } as vo) -> emit l (MNorm (n, vo.oty))
+     | Some ({ o = OLocal n; oty = TFrac _; _ } as vo) when not l.frunred ->
+       emit l (MNorm (n, vo.oty))
      | _ -> ());
     l.stmt_temps <- [];
     let skip =
@@ -1140,7 +1186,7 @@ let rec collect_lets acc (stmts : tblock) =
       match s.s with
       | SDeclK (_, n, t, _, _) ->
         if n.[0] <> '@' then acc := (n, t) :: !acc
-      | SSeqDeclK (_, n, elem, len, is_list, _) ->
+      | SSeqDeclK (_, n, elem, len, is_list, _, _) ->
         (* 数组/列表槽：槽内是指向 zfy_seq 的指针（LLVM 层为 ptr） *)
         if n.[0] <> '@' then begin
           let t = if is_list then TList elem
@@ -1171,7 +1217,7 @@ let rec collect_lets acc (stmts : tblock) =
             match s.s with
             | SDeclK (_, n, t, _, _) ->
               if n.[0] <> '@' then acc := (n, t) :: !acc
-            | SSeqDeclK (_, n, elem, len, is_list, _) ->
+            | SSeqDeclK (_, n, elem, len, is_list, _, _) ->
               if n.[0] <> '@' then begin
                 let t = if is_list then TList elem
                         else TArray (elem, Int64.to_int len) in
@@ -1193,7 +1239,8 @@ let rec collect_lets acc (stmts : tblock) =
 let lower_fn (h : hir) (f : tfn) : mfn =
   let l =
     { blocks = Hashtbl.create 8; nb = 0; nt = 0; cur = Obj.magic 0;
-      loops = []; scopes = []; stmt_temps = []; unchecked = false }
+      loops = []; scopes = []; stmt_temps = []; unchecked = false;
+      frunred = f.frunred; unreds = Hashtbl.create 8 }
   in
   let entry = new_block l in
   l.cur <- entry;
@@ -1215,7 +1262,14 @@ let lower_fn (h : hir) (f : tfn) : mfn =
      在入口 clone（一律拷贝语义，gen_fn 落槽），参数槽登记为 owned 以便函数退出时释放 *)
   l.scopes <- ref [] :: l.scopes;
   List.iter
-    (fun (_, n, t) -> declare_owned l n t)
+    (fun (_, n, t, u) ->
+      declare_owned l n t;
+      (* 非 unred frac 参数入口归一（new.md：传参也要自动约分）。
+         参数在 llvmgen 入口已值拷贝（memcpy 语义），此处原地归一
+         只影响本函数的参数副本，调用方源槽不变 *)
+      (match t with
+       | TFrac _ when not u -> emit l (MNorm (n, t))
+       | _ -> ()))
     f.fparams;
   lblock l f.fbody;
   if l.cur.term = None then begin
@@ -1233,7 +1287,7 @@ let lower_fn (h : hir) (f : tfn) : mfn =
   in
   let blocks = List.sort (fun a b -> compare a.bid b.bid) blocks in
   { mname = f.fname;
-    mparams = List.map (fun (_, n, t) -> (n, t)) f.fparams;
+    mparams = List.map (fun (_, n, t, _) -> (n, t)) f.fparams;
     mret = f.fret;
     mentry = entry.bid; mblocks = blocks }
 
@@ -1318,6 +1372,7 @@ let uses_of (i : instr) : string list =
   | MAlloca _ -> []
   | MFracNew (_, _, a, b) -> operand_names a @ operand_names b
   | MNorm _ -> []
+  | MTempAlloca _ -> []
   | MSeqRemove (_, _, idx, _) -> operand_names idx
   | MAugSlice (_, _, a, b, st, _, v) ->
     operand_names a @ operand_names b @ operand_names st @ operand_names v
@@ -1421,7 +1476,8 @@ let lower (h : hir) : mir =
   (* 全局初始化块 -> 隐藏函数 zfy.globals（main 包装最先调用；
      空 ginit 也生成，保证符号存在） *)
   let gfn : tfn =
-    { fname = "zfy.globals"; fparams = []; fret = TVoid; fbody = h.ginit }
+    { fname = "zfy.globals"; fparams = []; fret = TVoid; frunred = false;
+      fbody = h.ginit }
   in
   let mfns =
     List.map (fun (f : tfn) -> cleanup_fn (fold_fn (lower_fn h f))) (gfn :: h.hfns)

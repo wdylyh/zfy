@@ -1,7 +1,7 @@
-void usef(File f)
+fn void usef(let File f)
     write(f, "x")
-void main()
-    File! fo = open("a.txt", "r")
-    File f = fo ?? panic("no")
+fn main()
+    let File! fo = open("a.txt", "r")
+    let File f = fo ?? panic("no")
     usef(f)
     return

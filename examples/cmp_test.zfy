@@ -1,24 +1,24 @@
 // ==/!= 扩展：bool / char / string（内容比较）/ 泛型 T（w-011）
-<T> T! pick(T a, T b, bool c)
+fn <T> T! pick(let T a, let T b, let bool c)
     if c
         return a
     fail(1, "no")
 
-i64 main()
+fn main()
     // bool == / !=
-    bool t = true
-    bool f = false
+    let bool t = true
+    let bool f = false
     output(t == true, t != f, f == false, t == f, sep=',')
     // char == / !=
-    char c1 = 'a'
+    let char c1 = 'a'
     output(c1 == 'a', c1 != 'b', sep=',')
     // string == / !=（内容比较）
-    string s1 = "hello"
-    string s2 = "hell"
+    let string s1 = "hello"
+    let string s2 = "hell"
     output(s1 == "hello", s1 != s2, "abc" == "abc", s1 == s2, sep=',')
     // 泛型 T == / !=（声明期望反绑：字面量实参直接推断为 i32 / string）
-    i32! g1 = pick(1, 2, 1 == 1)
+    let i32! g1 = pick(1, 2, 1 == 1)
     output(g1 ?? -1)
-    string! g2 = pick("x", "y", "x" == "x")
+    let string! g2 = pick("x", "y", "x" == "x")
     output(g2 ?? "err")
     return 0

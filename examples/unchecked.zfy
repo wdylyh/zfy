@@ -1,10 +1,10 @@
 // new2.md #3: unsafe block doubles as @unchecked — no bounds check inside
-i32 a[3] = 10, 20, 30
+let i32 a[3] = 10, 20, 30
 
-void main()
-    i32 s = 0
+fn main()
+    let i32 s = 0
     unsafe
-        for i32 i = 0, i < 3, i++
+        for let i32 i = 0,   i < 3, i++
             s += a[i]
     output(s)
     unsafe

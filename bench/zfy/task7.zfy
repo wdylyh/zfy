@@ -1,16 +1,16 @@
 // T7: 字符串处理（拼接构建、split、find、长度统计）
-i64 main()
-    string s = ""
-    i32 i = 0
+fn main()
+    let string s = ""
+    let i32 i = 0
     while i < 3000
         s = s + "w" + cast(i % 10, string) + "ab "
         i++
-    string toks[] = split(s, " ")
-    i64 cnt = 0
-    i64 total = 0
-    for i64 k = 0, k < length(toks), k++
+    let string toks[] = split(s, " ")
+    let i64 cnt = 0
+    let i64 total = 0
+    for let i64 k = 0,   k < length(toks), k++
         total += length(toks[k])
-        i64 idx = find(toks[k], 'a') ?? -1
+        let i64 idx = find(toks[k], 'a') ?? -1
         if idx >= 0
             cnt++
     output("T7 total=", total, " cnt=", cnt, " slen=", length(s))

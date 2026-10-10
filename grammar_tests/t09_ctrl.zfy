@@ -1,7 +1,7 @@
 // t09: 控制流与 I/O——for 多段头、while、if 链、break/continue、output sep/end、input（grammar.md §7）
-i64 main()
+fn main()
     // if / else if / else 链
-    i32 x = 5
+    let i32 x = 5
     if x > 10
         output("big")
     else if x > 3
@@ -11,7 +11,7 @@ i64 main()
     // 单语句块同行
     if x == 5  output("five")
     // while + break/continue
-    i32 i = 0
+    let i32 i = 0
     while true
         i += 1
         if i > 100
@@ -19,19 +19,19 @@ i64 main()
         if i % 2 == 0
             continue
     // for：声明 / 条件 / 更新三段
-    for i32 j = 0, j < 5, j++
+    for let i32 j = 0,   j < 5, j++
         output(j, end=" ")
     output("")
     // for 多段（逗号分隔，双声明 + 条件 + 双更新）
-    for i32 a = 0, i32 b = 10, a < b, a++, b--
+    for let i32 a = 0,   let i32 b = 10,   a < b, a++, b--
         output(a, b, sep="-")
     // output 命名参数
     output(1, 2, 3, sep=",", end="\n")
     // not / and / or、?? 值形式
-    bool t = not (x == 3) and (x > 1 or x < 0)
+    let bool t = not (x == 3) and (x > 1 or x < 0)
     output(t, i)
     // input：新声明目标 + delim
-    input(i32 iv, delim=" ")
-    input(string sv, delim="\n")
+    input(let i32 iv,   delim=" ")
+    input(let string sv,   delim="\n")
     output(iv, sv)
     return 0

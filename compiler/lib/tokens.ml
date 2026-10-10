@@ -9,7 +9,7 @@ type keyword =
   | KRemove | KImport | KAs | KSep | KEnd | KDelim
   | KFail | KPanic | KErr
   | KStruct | KPacked | KMove | KCopy | KRef | KNull | KUnsafe | KExtern | KType
-  | KShort | KLong | KUshort | KUlong | KInt | KUint | KHalf | KFloat | KDouble | KQuad
+  | KLet | KFn
 
 let keyword_table =
   [ "if", KIf; "else", KElse;
@@ -28,9 +28,7 @@ let keyword_table =
     "struct", KStruct; "packed", KPacked; "move", KMove; "copy", KCopy;
     "ref", KRef; "null", KNull;
     "unsafe", KUnsafe; "extern", KExtern; "type", KType;
-    "short", KShort; "long", KLong; "ushort", KUshort; "ulong", KUlong;
-    "int", KInt; "uint", KUint;
-    "half", KHalf; "float", KFloat; "double", KDouble; "quad", KQuad ]
+    "let", KLet; "fn", KFn ]
 
 type token =
   | IntLit of int64
@@ -76,10 +74,7 @@ let pp_keyword = function
   | KAnd -> "and" | KOr -> "or" | KNot -> "not"
   | KCast -> "cast"
   | KArray -> "array" | KList -> "list"
-  | KShort -> "short" | KLong -> "long" | KUshort -> "ushort" | KUlong -> "ulong"
-  | KInt -> "int"
-  | KUint -> "uint" | KHalf -> "half" | KFloat -> "float" | KDouble -> "double"
-  | KQuad -> "quad"
+  | KLet -> "let" | KFn -> "fn"
 
 let pp_token = function
   | IntLit n -> Printf.sprintf "Int %Ld" n

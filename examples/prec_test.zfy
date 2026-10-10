@@ -1,12 +1,12 @@
 // prec 输出长度控制 + string cast 冒烟测试
-void main()
-    f128 x = 3.14159265358
+fn main()
+    let f128 x = 3.14159265358
     output(prec(x, 5))                       // 期望 3.141
-    i32 y = 6
+    let i32 y = 6
     output(prec(x, y))                       // 期望 3.1415
-    char cy = '6'
+    let char cy = '6'
     output(prec(x, cy))                      // 期望 3.1415
-    string s = "hello_zfy"
+    let string s = "hello_zfy"
     output(prec(s, 2))                       // 期望 he
     output(prec(s, 20), end="|\n")           // 期望 hello_zfy + 11 空格
     output(prec(x, 1))                       // 期望 3
@@ -14,27 +14,27 @@ void main()
     output("nothing")                        // 无 prec 全输出
     output(x, end="|\n")                     // 浮点默认全输出
     // cast string -> 数值（解析失败产错误值，?? 解包；128 位目标保留 fail-fast）
-    string n1 = "123"
-    string n2 = "3.14abc"
-    i32 i1 = cast(n1, i32) ?? 0
-    f64 d1 = cast(n2, f64) ?? 0.0
+    let string n1 = "123"
+    let string n2 = "3.14abc"
+    let i32 i1 = cast(n1, i32) ?? 0
+    let f64 d1 = cast(n2, f64) ?? 0.0
     output(i1, d1)                           // 期望 123 3.140000
-    i128 big = cast(n1, i128)
+    let i128 big = cast(n1, i128)
     output(big)                              // 123
     // cast 数值 -> string
-    i32 q = 42
-    string sq = cast(q, string)
+    let i32 q = 42
+    let string sq = cast(q, string)
     output(sq, end="|\n")                    // 42
-    f64 dq = 2.5
+    let f64 dq = 2.5
     output(cast(dq, string), end="|\n")      // 2.500000
     // cast -> bool
-    i32 nz = 7
-    bool b1 = cast(nz, bool)
-    i32 zero = 0
-    bool b2 = cast(zero, bool)
-    string es = ""
-    bool b3 = cast(es, bool) ?? false
+    let i32 nz = 7
+    let bool b1 = cast(nz, bool)
+    let i32 zero = 0
+    let bool b2 = cast(zero, bool)
+    let string es = ""
+    let bool b3 = cast(es, bool) ?? false
     output(b1, b2, b3)                       // true false false
     // prec 与 frac
-    i32 frac f = 6/48
+    let i32 frac f = 6/48
     output(prec(f, 3), end="|\n")            // 1/8 截 3 -> 1/8（恰4字符截3 -> "1/8"？1/8 是3字符）

@@ -1,0 +1,42 @@
+let i32 a = 5
+let x = 10
+let y = 2.5
+let s = "hi"
+let c = 'z'
+let b = true
+let nd = 6/8
+let i64 z64
+let f64 frac fr
+let frac fr2 = 4/16
+let string s2
+let unred ux = 4/8
+let frac unred uy
+let f64 frac fa[2] = 4/8, 1/2
+let i32 lst[] = 1, 2, 3
+
+fn f64 frac addf(let f64 frac p, let f64 frac q)
+    return p + q
+
+fn void show(let f64 frac v)
+    output(v)
+
+fn i32 frac unred raw(let i32 frac unred v)
+    return v
+
+fn i32 frac half(let i32 frac unred v)
+    let i32 frac r = v
+    return r
+
+fn main()
+    output(a, x, y, s, c, b, sep="|")
+    output(nd)
+    output(z64, fr, fr2, s2, sep="|")
+    output(ux, uy, sep="|")
+    output(fa[0], fa[1], sep="|")
+    let l2 = lst
+    push(l2, 9)
+    output(l2)
+    show(addf(1/4, 1/4))
+    output(raw(ux))
+    output(half(ux))
+    return 0

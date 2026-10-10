@@ -1,6 +1,6 @@
 # zfy 语法全表（直接从编译器源码提纯）
 
-> 依据：compiler/lib/{tokens,lexer,parser}.ml 全文 + typeck.ml 内建/错误码表（2026-10-05，commit 27efc77）。非转录旧文档，逐条对应解析器产生式。
+> 依据：compiler/lib/{tokens,lexer,parser}.ml 全文 + typeck.ml 内建/错误码表（2026-10-05，commit 27efc77；2026-10-10 按 new.md 更新 let/fn 声明与函数形式、删除类型别名、扩展 frac 全存储位归一）。非转录旧文档，逐条对应解析器产生式。
 
 ## 1. 词法规则
 
@@ -12,51 +12,57 @@
 - 字符：单引号单字符，同样转义集。
 - 运算符：`== != <= >= += -= *= /= %= ++ -- => -> ??` 与单字符 `( ) [ ] { } , ; : = + - * & / % < > . ? ! ^`。
 
-## 2. 关键字（34 个）
+## 2. 关键字（44 个）
 
-`if else while for return true false pub mod use break continue const frac unred reduce and or not output input cast array list remove import as sep end delim fail panic err struct packed move copy ref null unsafe extern type short long ushort ulong int uint half float double quad`
-（`array`/`list` 仅保留用于报错提示：旧语法已删除；`sep`/`end`/`delim`/`err` 是命名参数/块内变量标记）
+`if else while for return true false pub mod use break continue const frac unred reduce and or not output input cast array list remove import as fail panic err sep end delim struct packed move copy ref null unsafe extern type let fn`
+（`array`/`list` 仅保留用于报错提示：旧数组/列表关键字语法已删除；`extern`/`type`/`import` 服务于 extern 块/type 别名/旧 use；`sep`/`end`/`delim`/`err` 是命名参数/块内变量标记；`let` 声明、`fn` 函数定义）
 
 ## 3. 类型
 
 - **宽度名**：`bool char string void i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f16 f32 f64 f128`。
-- **传统别名**（归一化到宽度名）：`short=i8 short int=i16 int=i32 long=i128 ushort=u8 ushort int=u16 uint=u32 ulong=u128 half=f16 float=f32 double=f64 quad=f128`。类型词重复/别名与宽度名混写报错（`int int`、`i32 int`）。
+  传统多词别名（short/long/int/double/quad 等 10 词）已全部删除（new.md 2026-10-10）：作为类型名使用报 E2003 迁移提示，改用对应宽度名（short=i8、short int=i16、int=i32、long=i128、ushort=u8、ushort int=u16、uint=u32、ulong=u128、half=f16、float=f32、double=f64、quad=f128）。类型词重复报错（`i32 i32`）。
 - **后缀**（可叠加）：`T*` 指针；`T* const` 指向 const 的指针；`T!` 错误值类型（ZEM）；`T[]` 动态数组/列表、`T[N]` 定长数组（类型后缀形式，w-014 #1——可叠加 `T[][]` 列表的列表、`T[3][4]` 定长二维；类型位置 N 须整数字面量）。
 - **函数类型**：`T(参数类型列表)` —— 仅在 `type` 别名、函数参数位、struct 字段位允许。
 - **泛型实例化**：`Box<i32>`、`Box<Box<i32>>`（仅类型位置；表达式比较不受影响）。
 - **模块路径类型**：`m::Point`。
 - type 别名：`type 名 = 类型`（可含指针/函数类型）。
 
-## 4. 声明语句
+## 4. 声明语句（let 形式，new.md 2026-10-10）
 
 ```
-标量：TYPE (const|frac|unred)* 名字 [= 初值]        # 初值可省略（填零值）；const 必须带初值
-数组：TYPE 名字[长度] (= 值1, 值2, ...)?             # 长度为表达式；未给出的槽位填零值
-列表：TYPE 名字[] (= 值1, 值2, ...)?                # 中括号必须为空，长度由初值决定
+标量：let (TYPE)? (frac)? (const)? (unred)? 名字 [= 初值]     # 修饰符固定顺序：类型→frac→const→unred
+数组：let TYPE (frac)? (const)? (unred)? 名字[长度] (= 值1, 值2, ...)?   # 长度为表达式
+列表：let TYPE (frac)? (const)? (unred)? 名字[] (= 值1, 值2, ...)?      # 中括号必须为空
 ```
-- 修饰符可任意顺序、位于类型后名字前：`long const frac r = 1/2`。
-- **顶层 const + frac/unred 合法**（w-015 #5）：编译为全局分数常量槽（ginit 初始化，const 不可赋值；不做整数 const 的使用处内联）。
-- `frac` 不可修饰数组/列表；`ref` 仅函数参数合法。
-- 顶层声明 = 全局变量（非 const 也可赋值）。
-- **一行多声明器**（w-012）：语句位置可用逗号声明多个，共享类型与前缀修饰符，初值各自独立（`i32 a, b = 1`、`string a[], b[]`、`i32 arr1[3], arr2[2] = 7, 8`）；同行后续声明器/语句可见前面的名字。顶层与 for 头部保持单声明器（for 头逗号是段分隔符）。带 `= 初值` 的数组/列表声明器须为该行最后一个（初值列表消费至行尾）。
-- **类型后缀声明**（w-014 #1）：`i32[] a` ≡ `i32 a[]`、`i32[3] b` ≡ `i32 b[3]`；两种写法可叠加（`i32[3][4] m` 定长二维、`i32[][] n` 列表的列表）。嵌套（组数 > 1）声明不支持 `= 初值`（空声明 + push 构建；定长二维自动分配全零行）。
+- **类型/初值二选一或都写，不能都无**；类型可省时由初值推断：整数字面量→i32、浮点字面量→f64、`n/d` 字面量除式→i32 frac、string/char/bool 按字面量；其他表达式取表达式自身类型。
+- **有类型无初值 = 零值初始化**（0/0.0/false/'\0'/""/分数 0/1）；`const` 必须带初值；`let frac 名`（frac 修饰视同给出类型）= `let i32 frac 名`。
+- **unred 校验**：`unred` 须有 `frac` 修饰或 `n/d` 形态初值，否则报错。
+- 修饰符可省略；`frac` 可修饰数组/列表元素（元素存入自动约分，unred 数组/列表不约分）；`ref` 仅函数参数合法。
+- 顶层 let 声明 = 全局变量（非 const 也可赋值），无数量限制。
+- **顶层 const + frac/unred 合法**（w-015 #5）：编译为全局分数常量槽（ginit 初始化，const 不可赋值）。
+- **一行多声明器**（w-012）：语句位置可用逗号声明多个，共享类型与前缀修饰符，初值各自独立（`let i32 a, b = 1`、`let string a[], b[]`、`let i32 arr1[3], arr2[2] = 7, 8`）；同行后续声明器/语句可见前面的名字。顶层与 for 头部保持单声明器（for 头逗号是段分隔符）。带 `= 初值` 的数组/列表声明器须为该行最后一个（初值列表消费至行尾）。
+- **类型后缀声明**（w-014 #1）：`let i32[] a` ≡ `let i32 a[]`、`let i32[3] b` ≡ `let i32 b[3]`；两种写法可叠加（`let i32[3][4] m` 定长二维、`let i32[][] n` 列表的列表）。嵌套（组数 > 1）声明不支持 `= 初值`（空声明 + push 构建；定长二维自动分配全零行）。
 - **序列字面量整体赋值**（w-014 #3）：`a = 1, 2, 3` / `bag.xs = 1, 2`——目标须为数组/列表槽（变量、字段链、ref 参数）；定长数组目标要求字面量个数与长度一致。
+- 旧省略 let 的声明形式（`i32 x = 1`）已删除：报 E2003 迁移提示。
 
-## 5. 函数
+## 5. 函数（fn 形式，new.md 2026-10-10）
 
 ```
-TYPE (frac)? 名字(参数列表) 缩进块          # 顶层函数；无 fn 关键字
-<T, U> TYPE (frac)? 名字(参数列表) 缩进块    # 泛型函数
+fn (TYPE|void)? (frac)? (unred)? 名字(参数列表) 缩进块          # 修饰符固定顺序：返回类型→frac→unred
+fn <T, U> (TYPE|void)? (frac)? (unred)? 名字(参数列表) 缩进块    # 泛型函数（tparams 在返回类型前）
+fn main() 缩进块                                              # 入口特例
 ```
-- 参数四种形状：
-  - 标量 `TYPE (frac)? (ref)? 名字`（`ref` 仅标量/string）
-  - 数组 `TYPE 名字[长度]`（长度为字面量或之前的参数名）
-  - 列表 `TYPE 名字[]`
-  - 函数类型参数 `TYPE(参数类型) 名字`
-- 参数不支持 const/unred；数组/列表参数不支持 frac。
-- **ref 参数**（w-014 #1 扩展）：标量/string/数组/列表均可 `ref`（列表 ref 使函数内 `push(xs, v)` / `xs[i] = v` 直接作用于调用方列表；类型后缀形式 `i32 ref xs[]` 或 `i32[] ref xs`）。
+- **main 特例**：必须写 `fn main()`（括号必须有）；不给返回类型（隐含 i32）、不给参数、不给 frac/unred；`return` 可写可不写，裸 `return` 等价 `return 0`，落到函数末尾隐式返回 0。
+- 非 main 函数返回类型必写（`void` 或类型）；`frac` 可修饰返回类型（`fn i32 frac f(...)`）；返回类型不支持 const/unred 修饰（unred 语义：非 unred 函数 return 归一，见 §8）。
+- 参数一律 let 形式：`(ref)? let (TYPE)? (frac)? (const)? (unred)? 名字`——
+  - 标量 `let TYPE 名字`（类型可省须有 frac：`let frac y` ≡ `let i32 frac y`；可 const/unred）
+  - 数组 `let TYPE 名字[长度]`（长度为字面量或之前的参数名）；列表 `let TYPE 名字[]`；类型后缀形式 `let TYPE[] 名字` 等价
+  - 函数类型参数 `let TYPE(参数类型) 名字`
+  - `ref` 置于 let 前（`ref let i32 x`）；**ref 参数不支持 frac**；数组/列表参数不支持 const/unred/frac
+- **ref 参数**（w-14 #1 扩展）：标量/string/数组/列表均可 `ref`（列表 ref 使函数内 `push(xs, v)` / `xs[i] = v` 直接作用于调用方列表；类型后缀形式 `ref let i32[] xs`）。
 - **返回类型**（w-014 #1）：可为 `T[]`（列表/动态数组，返回即所有权移交免克隆）与 `T[N]`（定长数组，同为 seq 指针移交）；extern 不支持序列返回。
-- 返回类型必写；`rfrac` 允许 `TYPE frac f(...)` 形式返回分数。
+- 实参入口归一（new.md）：非 unred frac 参数在进入函数时对参数副本自动约分（值拷贝语义，调用方源槽不变）；unred frac 参数不归一。
+- 旧省略 fn 的函数形式（`TYPE 名(...)`）与旧 `<T> ret 名(...)` 泛型形式已删除：报迁移提示错误。
 
 ## 6. struct
 
@@ -83,11 +89,11 @@ struct [packed] 名字<T, U>? 缩进块
 | 表达式语句 | `expr` |
 | 条件 | `if cond 块` / `else` / `else if`（可链） |
 | while | `while cond 块` |
-| for | `for 项, 项, ... 块`（逗号化多段头部，按形状分类：声明→初始化、布尔表达式→条件（多项 and 连接，可无）、赋值/复合赋值/自增自减→更新；孤立变量名进初始化段；头部声明不支持数组/列表。**初始化段与更新段不可为空**——无初值时在头部前声明、无更新时把更新写进块内或改用 while；条件段可省（其位置留空）） |
-| 返回 | `return` / `return expr`（expr 可为列表/数组——所有权移交） |
+| for | `for 项, 项, ... 块`（逗号化多段头部，按形状分类：`let` 声明→初始化（`for let i32 i = 0`，类型可省由初值推断）、布尔表达式→条件（多项 and 连接，可无）、赋值/复合赋值/自增自减→更新；孤立变量名进初始化段；头部声明不支持数组/列表。**初始化段与更新段不可为空**——无初值时在头部前声明、无更新时把更新写进块内或改用 while；条件段可省（其位置留空）） |
+| 返回 | `return` / `return expr`（expr 可为列表/数组——所有权移交；main 内裸 `return` 等价 `return 0`） |
 | break/continue | `break` / `continue` |
 | 输出 | `output(参数..., sep=?, end=?)`（命名参数必须最后；sep 默认 ""，end 默认 "\n"）；参数可为数组/列表（整体按元素打印，元素间以 sep 分隔，w-013）。**嵌套列表/定长二维及以上**递归输出：每层包 `[` `]`，如 `i32[2][3]` → `[[000][005]]`；叶元素须为可打印标量/string（struct 叶不支持，w-015 #6） |
-| 输入 | `input(目标..., delim=?)`（目标为 `TYPE 名` 新声明或已有 `名`） |
+| 输入 | `input(目标..., delim=?)`（目标为 `let TYPE 名` 新声明——类型必须显式——或已有 `名`；delim 必须最后） |
 | unsafe 块 | `unsafe 块`（指针算术、p[i] 必须） |
 | reduce | `reduce(x, 次数, 起始除数)`（手动约分 frac） |
 | remove | `remove(数组或列表名, 下标)` |
@@ -119,7 +125,7 @@ not       一元（比较高于 not：not y==1 == not(y==1)）
 - **整数语义**（w-014 #9）：i64 及以下整数溢出静默回绕（`max + 1 → min`）；`/` 与 `%` 向零截断（`-7 / 2 = -3`）；整数除零为硬件异常不可捕获。
 - 实参修饰：`f(move p)` 所有权移交 / `f(copy p)` 显式深拷贝 / `f(ref y)` 传引用 / `f(name=v)` 命名实参；位置在前命名在后。
 - **frac 字面量实参**（w-015 #5 顺带）：期望类型为 frac 的位置（实参/返回/赋值右值），数值字面量自动提升为分数；`n/d` 形式的数值字面量除式按分数构造（分子/分母不执行除法、不自动约分），与声明初值语义一致（如 `addf(1/4, 1/4)` = 1/2，非 unred 存入后约分）。
-- **frac 归一化语义**（w-017）：非 unred frac 值在**存入变量（声明/赋值）与 return 返回**时自动约分到最简；四则运算的运行时结果本身不经归一（如 1/4+1/4 的中间态为 8/16，存入或返回时约分为 1/2）；`unred` 修饰的变量存储不做自动约分（返回时仍按返回类型归一——返回类型不支持 unred 修饰）。
+- **frac 归一化语义**（w-017 扩展，new.md 2026-10-10 全存储位归一）：非 unred frac 值在**所有存储位**自动约分到最简——①存入变量（声明/赋值）、②return 返回、③**实参传入**（进入函数时对参数副本归一，调用方源槽不变）、④**struct 字段存入与数组/列表元素存入**（含 push）。四则运算的运行时结果本身不经归一（如 1/4+1/4 的中间态为 8/16，存入或返回时约分为 1/2）；`unred` 修饰的变量/参数/数组存储不做自动约分（函数返回时仍按返回类型归一——返回类型不支持 unred 修饰；unred 函数 return 不归一）。
 - 主表达式：整/浮/串/字面量、`true` `false` `null` `err`、`fail(code, msg)`、`panic(msg)` / `panic(code, msg)`、`cast(expr, 目标类型)`、标识符（可 `m::x` 路径）、括号表达式。
 - 模块路径：`Ident (:: Ident)+` 在表达式、类型、调用处均合法。
 
@@ -127,16 +133,16 @@ not       一元（比较高于 not：not y==1 == not(y==1)）
 
 | 项 | 语法 |
 |---|---|
-| 函数 | `TYPE (frac)? 名字(参数) 块` / 泛型 `<T, U> TYPE ...` |
+| 函数 | `fn (TYPE\|void)? (frac)? (unred)? 名(参数) 块` / 泛型 `fn <T, U> ...` |
 | struct | `struct [packed] 名<T,U>? 块` |
 | type 别名 | `type 名 = 类型` |
-| 顶层声明 | 标量/数组/列表（含 const/frac/unred） |
+| 顶层声明 | `let` 标量/数组/列表（含 const/frac/unred，无限制） |
 | 模块（文件） | `mod 名字;` —— body 在 `名字.zfy` 或 `名字/mod.zfy` |
 | 模块（内联） | `mod 名字` + 缩进块（块内为顶层项，可嵌套） |
 | 导出 | `pub` 修饰任意顶层项（仅模块内合法；root 顶层 pub 容忍并告警） |
 | use（新路径） | `use a::b::item [as x]`；分组 `use a::b::{x, y as z}`；整模块 `use a::b [as m]`；单段整模块 `use 模块名 [as 别名]`（w-015 #2：整模块绑定命名空间，成员以 `别名.成员名` 访问，仅 pub 可见） |
 | use（旧文件，legacy） | `use 名字.zfy [import 模块名] [as 别名]`；支持 `./`、`../` 前缀 |
-| extern | `extern "C"` + 缩进块（每行一个 C 函数声明：`TYPE (frac)? 名(参数)`） |
+| extern | `extern "C"` + 缩进块（每行一个 C 函数声明：`TYPE (frac)? 名(参数)`；参数用 let 形式） |
 
 ## 10. ZEM 错误值
 
@@ -164,6 +170,9 @@ not       一元（比较高于 not：not y==1 == not(y==1)）
 - `[]T` / `[T;N]` 类型。
 - ~~`.` 字段访问~~（已恢复：w-014 #8 起点号为 struct 字段访问；use 命名空间仍走 dotted 名编码）。
 - `long long` / `long int` / `ulong long` / `ulong int` 多词别名（报 E2010 duplicate base type）。
+- **10 个传统类型别名**（new.md 2026-10-10 删除）：`short long ushort ulong int uint half float double quad` 不再是关键字，作类型名使用报 E2003 迁移提示（对应宽度名见 §3）。
+- **省略 let 的旧声明形式** `TYPE (mods)* 名 = 初值`：报 E2003 迁移提示（现为 `let` 形式，§4）。
+- **省略 fn 的旧函数形式** `TYPE 名(...)` 与旧泛型 `<T> ret 名(...)`：报迁移提示错误（现为 `fn` 形式，§5）。
 - string 下标赋值（旧报错"s[0]='H' 不支持"→ 现已支持原地写，w-014 #5）。
 
 ## 13. 运行期语义备忘（w-014 #9/#10）

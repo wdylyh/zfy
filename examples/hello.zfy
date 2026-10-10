@@ -1,30 +1,30 @@
 // zfy 端到端测试程序（output/input + 逻辑单词 + cast 显式转换 + C 风格 for）
-i32 add(i32 a, i32 b)
+fn i32 add(let i32 a, let i32 b)
     return a + b
 
-void main()
+fn main()
     // 注释仅支持 // 单行（块注释已删除）
-    i32 x = 42
-    i32 y = x + add(1, 2)
+    let i32 x = 42
+    let i32 y = x + add(1, 2)
     if y > 2 and not false
         y = y - 1
     else
         y = y + 1
     while y > 0
         y = y - 1
-    for i64 i = 0, i < 3, i++
+    for let i64 i = 0,   i < 3, i++
         output(i)
-    for i64 i = 0, i64 j = 10, i < 5 and j > 5, i++, j--
+    for let i64 i = 0,   let i64 j = 10,   i < 5 and j > 5,   i++,   j--
         output(i + j, sep=',', end=';')
     output("")
     output("y=", y)
-    string msg = "hello"
-    char c = 'z'
+    let string msg = "hello"
+    let char c = 'z'
     output(msg, c, sep='-', end='\n')
-    bool flag = false
+    let bool flag = false
     output(flag)
     // 复合赋值与自增
-    i32 acc = 10
+    let i32 acc = 10
     acc += 5
     acc *= 2
     acc -= 3

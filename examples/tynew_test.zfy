@@ -1,25 +1,25 @@
 // 新类型语法冒烟：i32/u8/f64 单词类型 + 数组 T a[N] + 列表 T a[]
-i32 a = 123
-f64 b = 12.5
-u8 c = 255
-i128 big = 9999999999
-i32 arr[4] = 1, 2
-f64 lst[] = 12.1, 32.33
-i32 empty[]
+let i32 a = 123
+let f64 b = 12.5
+let u8 c = 255
+let i128 big = 9999999999
+let i32 arr[4] = 1, 2
+let f64 lst[] = 12.1, 32.33
+let i32 empty[]
 
-i32 add(i32 x, i32 y)
+fn i32 add(let i32 x, let i32 y)
     return x + y
 
-void show(i32 v[4])
+fn void show(let i32 v[4])
     output(v[0], v[1])
 
-i32 sum(f64 xs[])
-    i32 s = 0
-    for i32 i = 0, i < length(xs), i++
+fn i32 sum(let f64 xs[])
+    let i32 s = 0
+    for let i32 i = 0,   i < length(xs), i++
         s += cast(xs[i], i32)
     return s
 
-void main()
+fn main()
     push(empty, 7)
     push(empty, 8)
     output(a, b, c, big)

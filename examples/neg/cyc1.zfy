@@ -1,4 +1,4 @@
 // negative: circular module dependency -> E5006
 mod ca;
-void main()
+fn main()
     output(1)

@@ -1,7 +1,7 @@
-void main()
-    File! fo = open("a.txt", "r")
-    File a = fo ?? panic("no")
-    File b = a
+fn main()
+    let File! fo = open("a.txt", "r")
+    let File a = fo ?? panic("no")
+    let File b = a
     close(b)
     close(a)
     return

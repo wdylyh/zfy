@@ -1,5 +1,5 @@
 // new2.md #3: OOB is panic channel — handler path, exit 101 (no handler = print + exit)
-i32 a[3] = 1, 2, 3
+let i32 a[3] = 1, 2, 3
 
-void main()
+fn main()
     output(a[5])

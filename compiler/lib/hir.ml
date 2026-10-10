@@ -76,9 +76,10 @@ and tstmt_kind =
   | SDeclK of bool * string * zty * texpr * bool
     (* 标量声明：(is_const, 槽位名, 类型, 值, 需自动约分)——变量永远有值，必有初值；
        需约分 = frac 且非 unred（存入后调用 zfy_frac_norm 约分） *)
-  | SSeqDeclK of bool * string * zty * int64 * bool * texpr list
+  | SSeqDeclK of bool * string * zty * int64 * bool * texpr list * bool
     (* 数组/列表声明：(is_const, 槽位名, 元素类型, 长度(列表为编译期求得的初始
-       槽位数，可为 0), 是否列表, 初始元素) *)
+       槽位数，可为 0), 是否列表, 初始元素, 元素需归一 enn——frac 且非 unred，
+       初值元素与后续元素存入均自动约分) *)
   | SSeqCopyK of bool * string * zty * int64 * texpr * bool
     (* (is_const, 槽, 元素类型, 长度(列表忽略), 源, 是否列表) *)
     (* 数组整体初值：T array b[N] = 源（源为数组/列表，深拷贝） *)
@@ -148,8 +149,9 @@ and tin_target = { tname : string; tnew : bool; tty : zty }
 
 type tfn = {
   fname : string;
-  fparams : (bool * string * zty) list;   (* (is_mut, 槽位名, 类型) *)
+  fparams : (bool * string * zty * bool) list;   (* (is_mut, 槽位名, 类型, 参数 unred) *)
   fret : zty;
+  frunred : bool;                         (* 返回类型带 unred：返回值不做 frac 归一 *)
   fbody : tblock;
 }
 

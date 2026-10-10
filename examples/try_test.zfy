@@ -2,34 +2,34 @@
 // 覆盖：fail 构造、? 传播链（返回类型显式 T!）、?? 默认值/块解包、
 //       err 结构化错误（code/msg）、panic_handler 注册、
 //       用户函数传 string/数组（值语义：调用方克隆）
-i32! parse_i32(string s)
+fn i32! parse_i32(let string s)
     if length(s) == 0
         return fail(ErrCode.CUSTOM, "empty string")
-    i32 n = cast(s, i32)?
+    let i32 n = cast(s, i32)?
     return n
 
-i32! parse_double(string s)
-    i32 n = parse_i32(s)?
+fn i32! parse_double(let string s)
+    let i32 n = parse_i32(s)?
     return n * 2
 
-string pick(string s)
+fn string pick(let string s)
     return s
 
-void show(i32 a[2])
+fn void show(let i32 a[2])
     output(a[0], a[1], sep=",")
 
-void on_panic(i32 code, string msg)
+fn void on_panic(let i32 code, let string msg)
     output("[handler] code=", code, " msg=", msg)
 
-void main()
+fn main()
     // ---- ? 传播链：失败逐层向上，顶层 ?? 兜底 ----
-    i32 a = parse_double("21") ?? -1
+    let i32 a = parse_double("21") ?? -1
     output(a)                        // 期望 42
-    i32 b = parse_double("") ?? -1
+    let i32 b = parse_double("") ?? -1
     output(b)                        // 期望 -1（CUSTOM 空串错误传播到顶层）
 
     // ---- ?? 块解包 + err 结构化错误 ----
-    i32 c = parse_double("abc") ??
+    let i32 c = parse_double("abc") ??
         output("cast failed: code=", err.code)   // 期望 cast failed: code=5（CAST）
         -1
     output(c)                        // 期望 -1
@@ -39,12 +39,12 @@ void main()
     output("handler registered")
 
     // ---- 所有权传参：值语义（调用方克隆，源变量仍可用） ----
-    string s = "hello"
-    string r = pick(s)               // s 非 move -> 克隆传参
+    let string s = "hello"
+    let string r = pick(s)               // s 非 move -> 克隆传参
     output(r, s, sep="|")            // 期望 hello|hello
 
     // ---- 数组传参仍为值语义 ----
-    i32 arr[2] = 1,2
+    let i32 arr[2] = 1,2
     show(arr)                        // 期望 1,2
     arr[0] = 9
     show(arr)                        // 期望 9,2（show 拿到的是克隆）

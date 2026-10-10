@@ -1,30 +1,30 @@
 // t08: 字符串——find/trim/split/replace/切片/ord/chr/下标读写/拼接（grammar.md §8/§11）
-i64 main()
-    string s = "hello, world"
+fn main()
+    let string s = "hello, world"
     // find 产 T!（第二参为 char，§11）
-    i64 i1 = find(s, 'o') ?? -1
-    i64 i2 = find(s, 'o', count=2) ?? -1
+    let i64 i1 = find(s, 'o') ?? -1
+    let i64 i2 = find(s, 'o', count=2) ?? -1
     // trim
-    string t = trim("  pad  ", ' ')
+    let string t = trim("  pad  ", ' ')
     // split 返回 string[]（分隔符为 char）
-    string[] parts = split("a,b,c", ',')
+    let string[] parts = split("a,b,c", ',')
     // replace(s, 起, 止, "串") 区间替换（两端含；w-015 #1 修正文档）
-    string r1 = replace("banana", 0, 2, "ma")
-    string r2 = replace("hello world", 6, 10, "zfy")
+    let string r1 = replace("banana", 0, 2, "ma")
+    let string r2 = replace("hello world", 6, 10, "zfy")
     // 切片：两端含、步长
-    string sl = s[0, 4]
-    string sl2 = s[0, 9:3]
+    let string sl = s[0, 4]
+    let string sl2 = s[0, 9:3]
     // 下标读 / 下标写（w-014 #5）
-    char c0 = s[0]
+    let char c0 = s[0]
     s[0] = 'H'
     // char 数值化（w-014 #5）
-    char ch = 'A'
-    i32 code = ord(ch)
-    char back = chr(66)
-    i32 promoted = ch + 1
-    bool eq = ch == 'A'
+    let char ch = 'A'
+    let i32 code = ord(ch)
+    let char back = chr(66)
+    let i32 promoted = ch + 1
+    let bool eq = ch == 'A'
     // 拼接
-    string cat = s + "!"
+    let string cat = s + "!"
     cat += "??"
     output(i1, i2, t)
     output(parts)

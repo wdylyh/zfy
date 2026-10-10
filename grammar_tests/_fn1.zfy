@@ -1,0 +1,23 @@
+fn f64 frac addf(let f64 frac a, let f64 frac b)
+    return a + b
+
+fn f64 frac idf(let f64 frac x)
+    return x
+
+fn f64 frac unred_src()
+    let f64 frac unred u = 8/16
+    return u
+
+let f64 frac hl = 1/2
+let i128 frac const third = 1/3
+
+fn f64 frac via_global()
+    return hl
+
+fn main()
+    output(addf(1/4, 1/4))
+    output(idf(6/8))
+    output(unred_src())
+    output(via_global())
+    output(hl, third)
+    return 0

@@ -33,6 +33,14 @@
 
 void zfy_panic(int32_t code, char *msg); /* 前向声明（定义在 ZEM 段后） */
 
+/* ---- 前向声明：seq 基础设施（定义在 seq 段，read_lines 提前使用） ---- */
+typedef struct zfy_seq zfy_seq;
+typedef struct zfy_ops zfy_ops;
+zfy_seq *zfy_seq_new_k(long long count, long long cap, long long elemsz,
+                       int kind, zfy_ops *ops);
+void zfy_seq_set_str(zfy_seq *s, long long idx, const char *str,
+                     unsigned char grow);
+
 static void zfy_die(const char *msg) {
     zfy_panic(0, (char *)msg);
 }
@@ -333,7 +341,44 @@ void zfy_file_read_file_err(zfy_err *out, const char *path) {
     out->value.p = s;
 }
 
-/* 一步式覆盖写：open("w") + 写全部 + close；成功返回写入字节数 */
+/* read_lines：读全部行（去行尾 \r\n/\n），EOF 正常结束返回列表；
+   IO 错误 panic（与 write/close 一致）。元素为 string（kind=1） */
+zfy_seq *zfy_file_read_lines(zfy_file_t *h) {
+    zfy_file_check(h);
+    zfy_seq *out = zfy_seq_new_k(0, 8, 8, 1, NULL);
+    size_t cap = 128;
+    char *buf = (char *)malloc(cap);
+    if (!buf) zfy_die("内存分配失败");
+    long long idx = 0;
+    for (;;) {
+        int c;
+        size_t len = 0;
+        int hit_eof = 0;
+        while ((c = fgetc(h->fp)) != EOF) {
+            if (c == '\n') break;
+            if (len + 2 > cap) {
+                cap *= 2;
+                char *nb = (char *)realloc(buf, cap);
+                if (!nb) zfy_die("内存分配失败");
+                buf = nb;
+            }
+            buf[len++] = (char)c;
+        }
+        if (c == EOF && len == 0) {
+            hit_eof = 1;
+        } else {
+            while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == '\n'))
+                len--;
+            buf[len] = '\0';
+            zfy_seq_set_str(out, idx++, buf, 1);
+        }
+        if (hit_eof) break;
+    }
+    free(buf);
+    if (ferror(h->fp))
+        zfy_die("read_lines: 读取失败");
+    return out;
+}
 void zfy_file_write_file_err(zfy_err *out, const char *path, const char *s) {
     FILE *fp = fopen(path, "w");
     if (!fp) {

@@ -477,9 +477,9 @@ let resolve (main : program) (main_dir : string)
     and rw_stmt m (s : stmt) : stmt =
       match s with
       | SDecl (a, b, c, n, t, ie, p) ->
-        SDecl (a, b, c, n, rw_ty m t, Option.map (rw_expr m) ie, p)
-      | SSeqDecl (a, n, t, len, isl, inits, p) ->
-        SSeqDecl (a, n, rw_ty m t, Option.map (rw_expr m) len, isl,
+        SDecl (a, b, c, n, Option.map (rw_ty m) t, Option.map (rw_expr m) ie, p)
+      | SSeqDecl (a, f2, u2, n, t, len, isl, inits, p) ->
+        SSeqDecl (a, f2, u2, n, rw_ty m t, Option.map (rw_expr m) len, isl,
                   List.map (rw_expr m) inits, p)
       | SDeclList ss -> SDeclList (List.map (rw_stmt m) ss)
       | SAssign (l, r, p) -> SAssign (rw_expr m l, rw_expr m r, p)
@@ -497,7 +497,8 @@ let resolve (main : program) (main_dir : string)
         SFor
           (List.map
              (function
-               | FIDecl (a, n, t, ie, p) -> FIDecl (a, n, rw_ty m t, Option.map (rw_expr m) ie, p)
+               | FIDecl (a, f2, u2, n, t, ie, p) ->
+                 FIDecl (a, f2, u2, n, Option.map (rw_ty m) t, Option.map (rw_expr m) ie, p)
                | FIExpr (x, p) -> FIExpr (rw_expr m x, p))
              inits,
            rw_expr m c,
@@ -540,6 +541,7 @@ let resolve (main : program) (main_dir : string)
                      params = List.map (rw_param m) f.params;
                      ret = Option.map (rw_ty m) f.ret;
                      rfrac = f.rfrac;
+                     runred = f.runred;
                      body = rw_block m f.body;
                      pos = f.pos;
                      tparams = f.tparams } :: !out
@@ -554,7 +556,7 @@ let resolve (main : program) (main_dir : string)
       | IDecl (SDecl (a, b, c, n, t, ie, p), pd) ->
         (* 顶层 const：名字也要扁平化（与引用处的 resolve_name 对齐） *)
         out := IDecl
-                 (SDecl (a, b, c, flat_prefix m.mpath ^ n, rw_ty m t,
+                 (SDecl (a, b, c, flat_prefix m.mpath ^ n, Option.map (rw_ty m) t,
                          Option.map (rw_expr m) ie, p),
                  pd) :: !out
       | IDecl (d, p) -> out := IDecl (rw_stmt m d, p) :: !out

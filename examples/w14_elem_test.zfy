@@ -4,10 +4,10 @@ struct P
     string name
 struct Bag
     i32 xs[]
-void main()
-    P a = P(x=1, name="a")
-    P b = P(x=2, name="b")
-    P ps[]
+fn main()
+    let P a = P(x=1, name="a")
+    let P b = P(x=2, name="b")
+    let P ps[]
     push(ps, a)
     push(ps, b)
     a.x = 100
@@ -16,7 +16,7 @@ void main()
     ps[0].x = 77
     output(a.x)
     output(ps[0].x)
-    Bag bag
+    let Bag bag
     push(bag.xs, 5)
     push(bag.xs, 7)
     output(bag.xs)
@@ -28,8 +28,8 @@ void main()
     bag.xs[2] += 1
     output(bag.xs)
     // 嵌套列表：列表的列表
-    i32 m[][]
-    i32 r1[]
+    let i32 m[][]
+    let i32 r1[]
     push(r1, 1)
     push(r1, 2)
     push(m, r1)
@@ -37,7 +37,7 @@ void main()
     output(m[0])
     output(m[0][2])
     // 定长二维数组
-    i32 g[2][3]
+    let i32 g[2][3]
     g[1][2] = 9
     output(g[1])
     output(g[1][2])

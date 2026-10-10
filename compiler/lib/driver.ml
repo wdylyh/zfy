@@ -292,7 +292,7 @@ let code_of = function
     ]
   | `Llvm ->
     code_of_tbl "E4000" [
-      ["main's return type must be void or i64"], "E4012";
+      ["main's return type must be void, i32 or i64"], "E4012";
       ["unsupported float width f"], "E4013";
       ["error value element type does not support 128-bit width"], "E4002";
       ["invalid error value element type"], "E4003";
@@ -474,8 +474,8 @@ let expand_uses (main : program) (main_dir : string)
   and rw_stmt m (s : stmt) : stmt =
     match s with
     | SDecl (a, b, c, n, t, e, p) -> SDecl (a, b, c, n, t, Option.map (rw_expr m) e, p)
-    | SSeqDecl (a, n, t, len, isl, inits, p) ->
-      SSeqDecl (a, n, t, Option.map (rw_expr m) len, isl,
+    | SSeqDecl (a, f2, u2, n, t, len, isl, inits, p) ->
+      SSeqDecl (a, f2, u2, n, t, Option.map (rw_expr m) len, isl,
                 List.map (rw_expr m) inits, p)
     | SDeclList ss -> SDeclList (List.map (rw_stmt m) ss)
     | SAssign (l, r, p) -> SAssign (rw_expr m l, rw_expr m r, p)
@@ -491,7 +491,8 @@ let expand_uses (main : program) (main_dir : string)
       SFor
         (List.map
            (function
-             | FIDecl (a, n, t, e, p) -> FIDecl (a, n, t, Option.map (rw_expr m) e, p)
+             | FIDecl (a, f2, u2, n, t, e, p) ->
+               FIDecl (a, f2, u2, n, t, Option.map (rw_expr m) e, p)
              | FIExpr (e, p) -> FIExpr (rw_expr m e, p))
            inits,
          rw_expr m c,
@@ -550,7 +551,8 @@ let expand_uses (main : program) (main_dir : string)
     let emit_fn name fpos fparams fret fbody =
       reg name fpos;
       out := IFn { name; params = fparams; ret = fret; rfrac = false;
-                  body = rw_block m fbody; pos = fpos; tparams = [] } :: !out
+                  runred = false; body = rw_block m fbody; pos = fpos;
+                  tparams = [] } :: !out
     in
     let rec go_mod ns_mod mname its2 =
       List.iter

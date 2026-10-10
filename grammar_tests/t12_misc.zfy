@@ -1,19 +1,19 @@
 // t12: 混合边界——表达式优先级、错误传播链、复合赋值、自增自减、panic、unsafe（grammar.md §7/§8/§10）
-i32! parse_num(string s)
-    i32 v = cast(s, i32)?
+fn i32! parse_num(let string s)
+    let i32 v = cast(s, i32)?
     return v
 
-i32! chain2(string s)
-    i32 v = parse_num(s)?
+fn i32! chain2(let string s)
+    let i32 v = parse_num(s)?
     return v * 2
 
-i64 main()
+fn main()
     // 优先级：not 低于比较
-    i32 y = 1
-    bool b1 = not y == 1
-    bool b2 = not (y == 1)
+    let i32 y = 1
+    let bool b1 = not y == 1
+    let bool b2 = not (y == 1)
     // 复合赋值与自增自减
-    i32 n = 10
+    let i32 n = 10
     n += 5
     n -= 3
     n *= 2
@@ -22,11 +22,11 @@ i64 main()
     n++
     n--
     // 三元式 ?? 值形式嵌套错误传播
-    i32 a = chain2("21") ?? -1
+    let i32 a = chain2("21") ?? -1
     output(b1, b2, n, a)
     // cast 内建
-    f64 d = cast(3, f64)
-    i64 back = cast(2.75, i64)
+    let f64 d = cast(3, f64)
+    let i64 back = cast(2.75, i64)
     output(d, back)
     // panic 单参与双参（编译检查）
     if a < 0

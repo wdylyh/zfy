@@ -1,25 +1,25 @@
-void task2()
+fn void task2()
     // 筛法：100000 以内素数个数
-    i64 const LCG_A = 1103515245
-    i64 const LCG_C = 12345
-    i64 const LCG_MOD = 2147483647
-    bool comp[100001]
-    i64 cnt = 0
-    for i64 i = 2, i <= 100000, i++
+    let i64 const LCG_A = 1103515245
+    let i64 const LCG_C = 12345
+    let i64 const LCG_MOD = 2147483647
+    let bool comp[100001]
+    let i64 cnt = 0
+    for let i64 i = 2,   i <= 100000, i++
         if not comp[i]
             cnt++
-            i64 j = i * i
-            for j, j <= 100000, j += i
+            let i64 j = i * i
+            for j,   j <= 100000, j += i
                 comp[j] = true
     // LCG 伪随机 + 插入排序
-    i64 arr[2000]
-    i64 state = 42
-    for i32 k = 0, k < 2000, k++
+    let i64 arr[2000]
+    let i64 state = 42
+    for let i32 k = 0,   k < 2000, k++
         state = (state * LCG_A + LCG_C) % LCG_MOD
         arr[k] = state
-    for i32 i = 1, i < 2000, i++
-        i64 key = arr[i]
-        i64 j = cast(i, i64) - 1
+    for let i32 i = 1,   i < 2000, i++
+        let i64 key = arr[i]
+        let i64 j = cast(i, i64) - 1
         // 限制记录：and/or 不短路，arr[-1] 会先求值越界，只能改写循环
         while j >= 0
             if arr[j] > key
@@ -30,5 +30,5 @@ void task2()
         arr[j + 1] = key
     output("T2 primes=", cnt, " first=", arr[0], " last=", arr[1999])
 
-void main()
+fn main()
     task2()

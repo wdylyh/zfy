@@ -1,4 +1,4 @@
 struct Bad
     File f
-void main()
+fn main()
     return

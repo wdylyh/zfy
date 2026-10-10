@@ -1505,6 +1505,11 @@ let gen_instr fc (i : instr) : unit =
     let dp = gen_gep fc addr fty 1 in
     let (dv, dt) = val_of fc den in
     emitf fc "  store %s %s, ptr %s" dt dv dp
+  | MTempAlloca (name, ty) ->
+    (* 归一用临时聚合槽：入口块 alloca（循环内不重复分配栈空间） *)
+    let addr = Printf.sprintf "%%v%s" (String.sub name 1 (String.length name - 1)) in
+    emitf_entry fc "  %s = alloca %s" addr (ll_ty ty);
+    Hashtbl.replace fc.allocas name (addr, ty)
   | MNorm (name, ty) ->
     (* 非 unred frac 槽存入后自动约分 *)
     let elem = (match ty with TFrac e -> e | _ -> lerr None "norm type error") in
@@ -2364,6 +2369,8 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf
     "declare void @zfy_file_read_file_err(ptr sret(%err.str), ptr)\n";
   Buffer.add_string g.mbuf
+    "declare ptr @zfy_file_read_lines(ptr)\n";
+  Buffer.add_string g.mbuf
     "declare void @zfy_file_write_file_err(ptr sret(%err.i64), ptr, ptr)\n";
   (* 函数 *)
   let fbuf = Buffer.create 4096 in
@@ -2427,11 +2434,16 @@ let gen_program (m : mir) : string =
    | Some TVoid ->
      Buffer.add_string fbuf
        "define i32 @main() {\n  call void @zfy.globals()\n  call void @zfy.main()\n  ret i32 0\n}\n"
+   | Some (TInt 32 as rt) ->
+     Buffer.add_string fbuf
+       (Printf.sprintf
+          "define i32 @main() {\n  call void @zfy.globals()\n  %%r = call %s @zfy.main()\n  ret i32 %%r\n}\n"
+          (ll_ty rt))
    | Some (TInt 64 as rt) ->
      Buffer.add_string fbuf
        (Printf.sprintf
           "define i32 @main() {\n  call void @zfy.globals()\n  %%r = call i64 @zfy.main()\n  %%t = trunc i64 %%r to i32\n  ret i32 %%t\n}\n")
    | Some rt ->
-     lerr None "main's return type must be void or i64, got %s" (Hir.pp_zty rt)
+     lerr None "main's return type must be void, i32 or i64, got %s" (Hir.pp_zty rt)
    | None -> ());
   Buffer.contents g.mbuf ^ Buffer.contents fbuf

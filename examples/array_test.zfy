@@ -3,21 +3,21 @@
 //       表达式下标、列表动态扩长、string 列表、bool/char 数组
 // 语义：数值转换（含宽化）必须显式 cast；数组读越界运行时报错，列表写越界自动扩长；
 //       未初始化槽位填零值（0/false/'\0'/""）
-void main()
+fn main()
     // ---- 定长数组 ----
-    i32 n[8] = 3,4,5,6
+    let i32 n[8] = 3,4,5,6
     output(n[0], n[1], n[2], n[3], sep=",")   // 期望 3,4,5,6
     output("[", n[4], "]", end='\n')          // 未初始化槽位零值 -> [0]
     n[4] = 7
     output(n[4])                              // 期望 7（写入后再读）
-    i64 m = cast(n[2], i64)                   // 宽化也必须显式 cast
+    let i64 m = cast(n[2], i64)                   // 宽化也必须显式 cast
     output(m)                                 // 期望 5
-    i32 i = 1
+    let i32 i = 1
     output(n[i + 1])                          // 表达式下标，n[2]=5 -> 期望 5
     output(n[1 + 2])                          // 常量表达式下标，n[3]=6 -> 期望 6
 
     // ---- 列表（完全动态，不写长度） ----
-    f64 big[] = 23.34,34.45,4545.45555
+    let f64 big[] = 23.34,34.45,4545.45555
     output(length(big))                       // 期望 3（初值个数）
     output(big[0], big[1], big[2], sep=";")   // 期望 23.340000;34.450000;4545.455550
     big[length(big)] = 34.4                   // 下标 3 == 长度，扩长到 4
@@ -30,7 +30,7 @@ void main()
     output(big[256])                          // 期望 1.500000
 
     // ---- 全空 string 列表 ----
-    string w[]
+    let string w[]
     output(length(w))                         // 期望 0（无初值列表为空）
     w[0] = "abc"                              // 写入自动扩长
     w[2] = "xyz"
@@ -38,9 +38,9 @@ void main()
     output(w[0], w[1], w[2], sep="|")         // 期望 abc||xyz（w[1] 零值空串输出空）
 
     // ---- bool / char 数组 ----
-    bool flags[4] = true,false,true
+    let bool flags[4] = true,false,true
     output(flags[0], flags[1], flags[2], flags[3], sep=",")
     // 期望 true,false,true,false（最后槽位零值）
     output("")
-    char cs[3] = 'a','b'
+    let char cs[3] = 'a','b'
     output(cs[0], cs[1], cs[2], sep=",")      // 期望 a,b,（最后槽位零值 '\0'）

@@ -1,114 +1,115 @@
-// n1 传统多词类型别名 + n2 顶层普通变量声明 冒烟测试
-// 别名映射：short=i8 short int=i16 int=i32 long=i128
-//           ushort=u8 ushort int=u16 uint=u32 ulong=u128
-//           half=f16 float=f32 double=f64 quad=f128（char/bool/string 两种写法相同）
-// 注：long int/long long/ulong int/ulong long 已废止（long 后跟类型词报"类型重复"）
+// n2 顶层普通变量声明 + 宽度类型全 family 冒烟测试
+// （new.md 2026-10-10：传统多词类型别名已全部删除，只保留单词宽度名
+//   i8..i128 / u8..u128 / f16..f128；本文件由旧别名测试机械替换而来，
+//   别名->宽度名一一对应：short=i8 short int=i16 int=i32 long=i128
+//   ushort=u8 ushort int=u16 uint=u32 ulong=u128
+//   half=f16 float=f32 double=f64 quad=f128）
 // 注：frac 仅支持 i8..i128 / u8..u128 / f32 / f64（f16/f128 frac 不支持）
 
 // n2：顶层非 const 全局变量（标量/数组/列表/字符串，带或不带初值）
-int g = 10
-long gbignum
-short garr[3] = 1, 2, 3
-double glst[] = 1.5, 2.5
-string gs = "global"
-uint gu
+let i32 g = 10
+let i128 gbignum
+let i8 garr[3] = 1, 2, 3
+let f64 glst[] = 1.5, 2.5
+let string gs = "global"
+let u32 gu
 
 struct Data
-    short int v = 0
-    uint w = 0
-    double x = 0.0
+    i16 v = 0
+    u32 w = 0
+    f64 x = 0.0
 
-int sum(short x, i64 y)
-    return cast(x, int) + cast(y, int)
+fn i32 sum(let i8 x, let i64 y)
+    return cast(x, i32) + cast(y, i32)
 
-void main()
+fn main()
     // ① 有符号别名等价性：别名与宽度名同值同宽
-    int a = 7
-    i32 a2 = 7
-    short b = 127
-    i8 b2 = 127
-    short int c = 300
-    i16 c2 = 300
-    i64 d = 4000000000
-    i64 d2 = 4000000000
-    long e = 1234567890123456789
-    i128 e2 = 1234567890123456789
+    let i32 a = 7
+    let i32 a2 = 7
+    let i8 b = 127
+    let i8 b2 = 127
+    let i16 c = 300
+    let i16 c2 = 300
+    let i64 d = 4000000000
+    let i64 d2 = 4000000000
+    let i128 e = 1234567890123456789
+    let i128 e2 = 1234567890123456789
     output(a == a2, b == b2, c == c2, d == d2, e == e2, sep=',')
 
     // ② 无符号别名等价性
-    ushort f = 255
-    u8 f2 = 255
-    ushort int g2 = 65535
-    u16 f3 = 65535
-    uint h = 3000000000
-    u32 h2 = 3000000000
-    u64 i = 4000000000
-    u64 i2 = 4000000000
-    ulong j = 1234567890123456789
-    u128 j2 = 1234567890123456789
+    let u8 f = 255
+    let u8 f2 = 255
+    let u16 g2 = 65535
+    let u16 f3 = 65535
+    let u32 h = 3000000000
+    let u32 h2 = 3000000000
+    let u64 i = 4000000000
+    let u64 i2 = 4000000000
+    let u128 j = 1234567890123456789
+    let u128 j2 = 1234567890123456789
     output(f == f2, g2 == f3, h == h2, i == i2, j == j2, sep=',')
 
     // ③ 浮点别名等价性（half/quad 标量可用；frac 不支持 f16/f128）
-    float k = 1.5
-    f32 k2 = 1.5
-    double l = 2.25
-    f64 l2 = 2.25
-    quad m = 1.5
-    f128 m2 = 1.5
-    half n = 1.0
-    f16 n2 = 1.0
+    let f32 k = 1.5
+    let f32 k2 = 1.5
+    let f64 l = 2.25
+    let f64 l2 = 2.25
+    let f128 m = 1.5
+    let f128 m2 = 1.5
+    let f16 n = 1.0
+    let f16 n2 = 1.0
     output(k == k2, l == l2, m == m2, n == n2, sep=',')
 
     // ④ frac + 别名组合（约分/不约分；quad 与 f128 等价且都合法）
-    i32 frac r = 6/48
+    let i32 frac r = 6/48
     output(r, end=' ')                       // 期望 1/8（自动约分）
     output("")
-    double const frac unred ur = 1.2/4.8
+    let f64 frac const unred ur = 1.2/4.8
     output(ur, end=' ')                      // 期望 1.2/4.8（不约分）
     output("")
-    double const frac rd = 1.2/4.8
+    let f64 frac const rd = 1.2/4.8
     output(rd)                               // 期望 0.25（约分 1/4）
-    quad const frac unred qb = 1.2/4.8
-    output(qb, end=' ')                      // quad=f128 frac，期望 1.2/4.8
+    let f128 frac const unred qb = 1.2/4.8
+    output(qb, end=' ')                      // f128=f128 frac，期望 1.2/4.8
     output("")
-    f128 const frac qr = 2.4/4.8
+    let f128 frac const qr = 2.4/4.8
     output(qr)                               // 期望 0.5（约分 1/2）
 
     // ⑤ 数组/列表用别名
-    short sa[3] = 1, 2, 3
+    let i8 sa[3] = 1, 2, 3
     sa[1] = 100
     output(sa[0], sa[1], sa[2], sep=',')     // 期望 1,100,3
-    uint lst[] = 10, 20, 30
+    let u32 lst[] = 10, 20, 30
     push(lst, 40)
     output(lst[0], lst[1], lst[2], lst[3], sep=',')   // 期望 10,20,30,40
     output(length(lst))                      // 期望 4
-    ulong la[2] = 5, 6
+    let u128 la[2] = 5, 6
     output(la[0] + la[1])                    // 期望 11
 
     // ⑥ struct 字段用别名
-    Data dt = Data(v=1000, w=42, x=1.25)
+    let Data dt = Data(v=1000, w=42, x=1.25)
     output(dt.v, dt.w, dt.x, sep=',')        // 期望 1000,42,1.250000
 
     // ⑦ 参数/返回类型用别名
     output(sum(10, 20))                      // 期望 30
-    ushort x = 100
-    i64 y = 22
-    output(sum(cast(x, short), y))           // 期望 122（u8→i8 显式 cast，new2.md #5）
+    let u8 x = 100
+    let i64 y = 22
+    output(sum(cast(x, i8), y))           // 期望 122（u8→i8 显式 cast，new2.md #5）
 
     // ⑧ cast 用别名（语句重绑定 + 表达式）
-    double pi = 3.75
-    cast(pi, int)
+    let f64 pi = 3.75
+    cast(pi, i32)
     output(pi)                               // 期望 3
-    long big = cast(300, long)
+    let i128 big = cast(300, i128)
     output(big)                              // 期望 300
-    uint u = cast(65, uint)
+    let u32 u = cast(65, u32)
     output(u)                                // 期望 65
 
     // ⑨ for 头部用别名
-    for int i = 0, i < 3, i++
+    for let i32 i = 0,  i < 3, i++
         output(i, end=' ')                   // 期望 0 1 2
     output("")
-    for ushort int k = 0, k < 2, k++
+    for let u16 k = 0,  k < 2, k++
         output(k, end=' ')                   // 期望 0 1
     output("")
 
@@ -130,6 +131,6 @@ void main()
     output(sum(5, cast(g, i64)))             // 全局传参：期望 30
 
     // ⑪ 全局数组深拷贝语义：局部拷贝修改不影响全局
-    short gcopy[3] = garr
+    let i8 gcopy[3] = garr
     gcopy[0] = 99
     output(garr[0], gcopy[0], sep=',')       // 期望 1,99

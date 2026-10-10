@@ -1,28 +1,28 @@
 // t07: 指针——取地址/解引用 p^/T* const/null/unsafe/函数指针（grammar.md §3/§7/§8）
 type Callback = i32(i32)
 
-i32 inc(i32 x)
+fn i32 inc(let i32 x)
     return x + 1
 
-i64 main()
-    i32 a = 5
-    i32* p = &a
+fn main()
+    let i32 a = 5
+    let i32* p = &a
     p^ = 10
-    i64 v = p^
+    let i64 v = p^
     // 指向 const 的指针（w-014 前置 t-021）
-    i32* const cp = &a
-    i64 rv = cp^
+    let i32* const cp = &a
+    let i64 rv = cp^
     // null
-    i32* q = null
+    let i32* q = null
     q = &a
     // unsafe 指针算术与 p[i]（§7：指针算术、p[i] 须在 unsafe 内）
     unsafe
         p[0] = 7
-        i32* r = p + 1
-        i64 diff = r - p
+        let i32* r = p + 1
+        let i64 diff = r - p
         output(diff)
     // 函数指针
-    Callback f = inc
-    i32 c = f(41)
+    let Callback f = inc
+    let i32 c = f(41)
     output(a, v, rv, c)
     return 0

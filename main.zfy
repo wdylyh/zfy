@@ -3,38 +3,38 @@ struct Student
     i32 score
 
 // 打印一个学生
-void print_student(Student s)
+fn void print_student(let Student s)
     output(s.name, ": ", s.score)
 
 // 打印学生列表
-void print_students(Student[] xs)
+fn void print_students(let Student[] xs)
     if length(xs) == 0
         output("(empty)")
 
-    i32 i = 0
+    let i32 i = 0
     while i < length(xs)
         print_student(xs[i])
         i++
 
 // 按分数从高到低排序（简单选择排序）
-void sort_students(Student[] xs)
-    i32 i = 0
+fn void sort_students(let Student[] xs)
+    let i32 i = 0
     while i < length(xs)
-        i32 best = i
-        i32 j = i + 1
+        let i32 best = i
+        let i32 j = i + 1
         while j < length(xs)
             if xs[j].score > xs[best].score
                 best = j
             j++
         if best != i
-            Student tmp = xs[i]
+            let Student tmp = xs[i]
             xs[i] = xs[best]
             xs[best] = tmp
         i++
 
 // 查找学生，找不到返回错误值
-i32! find_student(Student[] xs, string name)
-    i32 i = 0
+fn i32! find_student(let Student[] xs, let string name)
+    let i32 i = 0
     while i < length(xs)
         if xs[i].name == name
             return i
@@ -42,18 +42,18 @@ i32! find_student(Student[] xs, string name)
     return fail(ErrCode.NOT_FOUND, "student not found")
 
 // 计算平均分
-f32 average(Student[] xs)
+fn f32 average(let Student[] xs)
     if length(xs) == 0
         return 0.0
-    i32 sum = 0
-    i32 i = 0
+    let i32 sum = 0
+    let i32 i = 0
     while i < length(xs)
         sum += xs[i].score
         i++
     return cast(sum, f32) / cast(length(xs), f32)
 
 // 分数转等级
-char grade(i32 score)
+fn char grade(let i32 score)
     if score >= 90
         return 'A'
     if score >= 80
@@ -65,9 +65,9 @@ char grade(i32 score)
     return 'F'
 
 // 演示 ?? 值形式与错误传播
-void demo_error_handling(Student[] xs)
-    i32! maybe = find_student(xs, "Bob")
-    i32 idx = maybe ?? -1
+fn void demo_error_handling(let Student[] xs)
+    let i32! maybe = find_student(xs, "Bob")
+    let i32 idx = maybe ?? -1
     if idx >= 0
         output("Bob found at index ", idx)
     else
@@ -76,13 +76,13 @@ void demo_error_handling(Student[] xs)
     // 使用 ? 传播：函数返回类型必须显式 T!
     // 这里为了演示，单独写一个函数调用。
 
-i32! score_of(Student[] xs, string name)
-    i32 idx = find_student(xs, name)?
+fn i32! score_of(let Student[] xs, let string name)
+    let i32 idx = find_student(xs, name)?
     return xs[idx].score
 
 // 主函数
-void main()
-    Student[] xs
+fn main()
+    let Student[] xs
     push(xs, Student("Alice", 92))
     push(xs, Student("Bob", 78))
     push(xs, Student("Cara", 85))
@@ -102,7 +102,7 @@ void main()
 
     output("")
     output("=== grades ===")
-    i32 i = 0
+    let i32 i = 0
     while i < length(xs)
         output(xs[i].name, " -> ", grade(xs[i].score))
         i++
@@ -111,39 +111,39 @@ void main()
     output("=== error demo ===")
     demo_error_handling(xs)
 
-    i32! s = score_of(xs, "Cara")
+    let i32! s = score_of(xs, "Cara")
     output("Cara score = ", s ?? -1)
 
     output("")
     output("=== remove Bob ===")
-    i32! bob = find_student(xs, "Bob")
+    let i32! bob = find_student(xs, "Bob")
     if (bob ?? -1) >= 0
         remove(xs, bob ?? -1)
     print_students(xs)
 
     output("")
     output("=== string builtins ===")
-    string text = "  hello,world,hello  "
-    string t = trim(text, ' ')
+    let string text = "  hello,world,hello  "
+    let string t = trim(text, ' ')
     output("trimmed = [", t, "]")
-    string[] parts = split(t, ',')
+    let string[] parts = split(t, ',')
     output("split count = ", length(parts))
-    i32 k = 0
+    let i32 k = 0
     while k < length(parts)
         output("part ", k, " = ", parts[k])
         k++
-    string r = replace(t, 0, 4, "hi")
+    let string r = replace(t, 0, 4, "hi")
     output("replace = ", r)
 
     output("")
     output("=== char builtins ===")
-    char c = 'A'
+    let char c = 'A'
     output("ord('A') = ", ord(c))
     output("chr(66) = ", chr(66))
 
     output("")
     output("=== frac demo ===")
-    i32 frac f = 3 / 4
+    let i32 frac f = 3 / 4
     output("frac 3/4 = ", f)
 
     return 0

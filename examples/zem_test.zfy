@@ -4,80 +4,80 @@
 //       ErrCode 常量、err 结构化错误、面值自动包装、panic_handler 注册、
 //       panic 守卫路径（不触发，exit 101 行为由 panic_handler 演示承担）、
 //       内建产 T!（find / cast string→数值 / input 目标 T!）
-i32! safe_div(i32 a, i32 b)
+fn i32! safe_div(let i32 a, let i32 b)
     if b == 0
         return fail(ErrCode.DIV_ZERO, "division by zero")
     return a / b
 
-i32! parse_i32(string s)
+fn i32! parse_i32(let string s)
     if length(s) == 0
         return fail(ErrCode.CUSTOM, "empty string")
-    i32 n = cast(s, i32)?
+    let i32 n = cast(s, i32)?
     return n
 
-i32! double_of(string s)
-    i32 n = parse_i32(s)?
+fn i32! double_of(let string s)
+    let i32 n = parse_i32(s)?
     return n * 2
 
-void on_panic(i32 code, string msg)
+fn void on_panic(let i32 code, let string msg)
     output("[panic-handler] code=", code, " msg=", msg)
 
-void main()
+fn main()
     // ---- 1. fail + ?? 默认值解包 ----
-    i32! e1 = fail(ErrCode.DIV_ZERO, "div")
+    let i32! e1 = fail(ErrCode.DIV_ZERO, "div")
     output("e1: ", e1 ?? -1)                 // 期望 e1: -1
 
     // ---- 2. 面值自动包装（成功值）----
-    i32! s1 = 7
+    let i32! s1 = 7
     output("s1: ", s1 ?? 0)                  // 期望 s1: 7
 
     // ---- 3. T! 一等值：函数返回 T!，不解包先持有 ----
-    i32! raw = double_of("5")
+    let i32! raw = double_of("5")
     output("raw: ", raw ?? 0)                // 期望 raw: 10
 
     // ---- 4. ? 传播链 ----
-    i32 d1 = double_of("21") ?? -1
+    let i32 d1 = double_of("21") ?? -1
     output("d1: ", d1)                       // 期望 d1: 42
-    i32 d2 = double_of("abc") ?? -1
+    let i32 d2 = double_of("abc") ?? -1
     output("d2: ", d2)                       // 期望 d2: -1（CAST 错误逐层传播）
 
     // ---- 5. ?? 块形式：err 结构化错误 ----
-    i32 d3 = double_of("") ??
+    let i32 d3 = double_of("") ??
         output("block: code=", err.code, " msg=", err.msg)   // code=100 empty string
         -7
     output("d3: ", d3)                       // 期望 d3: -7
 
     // ---- 6. 自定义错误码（>=100 直接写字面量）----
-    i32! cust = fail(100, "custom failure")
+    let i32! cust = fail(100, "custom failure")
     output("cust: ", cust ?? -100)           // 期望 cust: -100
 
     // ---- 7. 内建 find 产 T! ----
-    string s = "banana"
+    let string s = "banana"
     output("find: ", find(s, 'a') ?? -1, " ", find(s, 'z') ?? -1)   // 期望 find: 1 -1
 
     // ---- 8. 内建 cast 产 T! ----
-    i32 n = cast("123", i32) ?? 0
-    f64 f = cast("3.14abc", f64) ?? 0.0
+    let i32 n = cast("123", i32) ?? 0
+    let f64 f = cast("3.14abc", f64) ?? 0.0
     output("cast: ", n, " ", f)              // 期望 cast: 123 3.140000
 
     // ---- 9. input 目标 T!（stdin 来自 zem_test.in，内容 "5"）----
-    i64! iv
+    let i64! iv
     input(iv)
     output("input: ", iv ?? -1)              // 期望 input: 5
 
     // ---- 10. safe_div 成功路径 ----
-    i32 q = safe_div(10, 2) ?? 0
+    let i32 q = safe_div(10, 2) ?? 0
     output("div: ", q)                       // 期望 div: 5
 
     // ---- 11. panic_handler 注册 + panic 守卫路径（不触发）----
     panic_handler(on_panic)
-    bool boom = false
+    let bool boom = false
     if boom
         panic(ErrCode.CUSTOM, "never happens")
     output("done, no panic")                 // 期望 done, no panic
 
     // ---- 12. string! 与 f64! ----
-    string! sr = fail(ErrCode.IO, "io error")
+    let string! sr = fail(ErrCode.IO, "io error")
     output("sr: ", sr ?? "fallback")         // 期望 sr: fallback
-    f64! fr = 2.5
+    let f64! fr = 2.5
     output("fr: ", fr ?? 0.0)                // 期望 fr: 2.500000

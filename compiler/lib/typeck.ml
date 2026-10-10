@@ -86,9 +86,10 @@ let widen_target (a : zty) (b : zty) : zty =
 
 (* ---------- 环境 ---------- *)
 
-type fn_sig = { params : zty list; prefs : bool list; ret : zty }
+type fn_sig = { params : zty list; prefs : bool list; ret : zty; runred : bool }
   (* prefs：各参数是否为 ref（传引用，new2.md #1）——ref 参数的 params 元素
-     已降为 TPtr（调用方 f(ref y) 传地址，函数体内自动解引用） *)
+     已降为 TPtr（调用方 f(ref y) 传地址，函数体内自动解引用）；
+     runred：返回类型带 unred（返回值不做 frac 归一，new.md 2026-10-10） *)
 
 (* struct 声明信息（字段 default 为 AST 表达式，构造时检查） *)
 type sdefk = { spacked : bool; sfields : (string * zty * expr option) list }
@@ -820,6 +821,18 @@ and check_expr env (e : expr) : texpr =
                           else "zfy_file_read_line_err"), [ tf ], []))
                (TErr TString)
            | _ -> terr p' "%s takes one argument: %s(f)" name name)
+        | "read_lines" ->
+          (* read_lines(f) -> string[]：读全部行（去行尾换行），EOF 正常结束；
+             IO 错误 panic（与 write/close 一致，design_fileio.md 第二阶段）。
+             结果为运行时新分配 seq：ECallK 临时所有权由 mir 登记接管 *)
+          (match args with
+           | [ CPos f ] ->
+             let tf = check_expr env f in
+             (match resolve tf.ety with
+              | TFile -> ()
+              | t -> terr p' "read_lines expects a File, got %s" (pp_zty t));
+             mk (ECallK ("zfy_file_read_lines", [ tf ], [])) (TList TString)
+           | _ -> terr p' "read_lines takes one argument: read_lines(f)")
         | "write" | "writeln" ->
           (* write(f, s) / writeln(f, s)：写失败 panic（不产 T!，design_fileio.md）；
              writeln = write + '\n'（nl 标志） *)
@@ -1149,7 +1162,7 @@ and check_call env p name0 targs origs modes =
   let name = ref name0 in
   let sig_ =
     match List.assoc_opt name0 builtin_fns_aux with
-    | Some (ptys, ret) -> { params = ptys; prefs = List.map (fun _ -> false) ptys; ret }
+    | Some (ptys, ret) -> { params = ptys; prefs = List.map (fun _ -> false) ptys; ret; runred = false }
     | None ->
       (match Hashtbl.find_opt env.g.fns name0 with
        | Some s -> s
@@ -1280,7 +1293,7 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
   match s with
   | SDecl (_, _, _, _, _, init, _) ->
     (match init with Some e -> uses_of_expr acc e | None -> acc)
-  | SSeqDecl (_, _, _, len, _, inits, _) ->
+  | SSeqDecl (_, _, _, _, _, len, _, inits, _) ->
     let acc = (match len with Some e -> uses_of_expr acc e | None -> acc) in
     List.fold_left uses_of_expr acc inits
   | SDeclList ss -> List.fold_left uses_of_stmt acc ss
@@ -1301,7 +1314,7 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
       List.fold_left
         (fun acc (fi : for_init) ->
           match fi with
-          | FIDecl (_, _, _, e, _) ->
+          | FIDecl (_, _, _, _, _, e, _) ->
             (match e with Some e -> uses_of_expr acc e | None -> acc)
           | FIExpr (e, _) -> uses_of_expr acc e)
         acc inits
@@ -1467,9 +1480,11 @@ and deref_refs (refs : string list) (body : block) : block =
     | SAug (o, l, r, p) -> SAug (o, lhs l, re r, p)
     | SInc (l, p) -> SInc (lhs l, p)
     | SDec (l, p) -> SDec (lhs l, p)
-    | SDecl (c, f, u, n, t, init, p) -> SDecl (c, f, u, n, t, (match init with Some e -> Some (re e) | None -> None), p)
-    | SSeqDecl (c, n, t, len, isl, inits, p) ->
-      SSeqDecl (c, n, t, (match len with Some e -> Some (re e) | None -> None), isl,
+    | SDecl (c, f, u, n, t, init, p) ->
+      (* deref_refs 不改类型（仅解引用改写），ty option 原样透传 *)
+      SDecl (c, f, u, n, t, (match init with Some e -> Some (re e) | None -> None), p)
+    | SSeqDecl (c, f2, u2, n, t, len, isl, inits, p) ->
+      SSeqDecl (c, f2, u2, n, t, (match len with Some e -> Some (re e) | None -> None), isl,
                 List.map re inits, p)
     | SDeclList ss -> SDeclList (List.map rs ss)
     | SExpr e -> SExpr (re e)
@@ -1481,8 +1496,9 @@ and deref_refs (refs : string list) (body : block) : block =
     | SFor (inits, c, ups, b, p) ->
       SFor (List.map
               (function
-                | FIDecl (ic, n2, t, e, fp) ->
-                  FIDecl (ic, n2, t, (match e with Some e -> Some (re e) | None -> None), fp)
+                | FIDecl (ic, f2, u2, n2, t, e, fp) ->
+                  FIDecl (ic, f2, u2, n2, t,
+                          (match e with Some e -> Some (re e) | None -> None), fp)
                 | FIExpr (e, fp) -> FIExpr (re e, fp))
               inits,
             re c,
@@ -1689,7 +1705,8 @@ and check_struct_new_generic env p name (args : call_arg list) : texpr =
   let match_field (sf : sfield) z =
     match_param env.g gs.gtp p
       { pname = sf.fname; pty = sf.fty; pfrac = false;
-        pseq = sf.fseq; pref = false; ppos = sf.fpos } z mref
+        pseq = sf.fseq; pconst = false; punred = false; pref = false;
+        ppos = sf.fpos } z mref
   in
   let pos_args =
     List.filter_map
@@ -1969,7 +1986,72 @@ let rec check_input_ty p = function
 let is_unwrap_block (e : expr) =
   match e with EUnwrap (_, EBlock _, _) -> true | _ -> false
 
-let rec check_decl env p isconst is_frac is_unred name ty init =
+(* zty → ast ty（let 无类型推断用；无法用 ast 类型表达的返回 None） *)
+exception ZtyToAstFail
+let rec zty_to_ast (p : pos) (t : Hir.zty) : ty =
+  let open Hir in
+  let named w () = TNamed (w, p) in
+  match t with
+  | TInt 8 -> named "i8" () | TInt 16 -> named "i16" () | TInt 32 -> named "i32" ()
+  | TInt 64 -> named "i64" () | TInt 128 -> named "i128" ()
+  | TUint 8 -> named "u8" () | TUint 16 -> named "u16" () | TUint 32 -> named "u32" ()
+  | TUint 64 -> named "u64" () | TUint 128 -> named "u128" ()
+  | TFloat 16 -> named "f16" () | TFloat 32 -> named "f32" ()
+  | TFloat 64 -> named "f64" () | TFloat 128 -> named "f128" ()
+  | TBool -> named "bool" () | TString -> named "string" () | TChar -> named "char" ()
+  | TStruct s -> named s () | TFile -> named "File" ()
+  | TPtr t -> TPtr (zty_to_ast p t, p)
+  | TErr t -> TErr (zty_to_ast p t, p)
+  | TArray (e, n) -> TSeqN (zty_to_ast p e, EInt (Int64.of_int n, p), p)
+  | TList e -> TSeq (zty_to_ast p e, p)
+  | _ -> raise ZtyToAstFail
+
+let rec check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
+  (* ---- let 类型省略推断（new.md 2026-10-10）----
+     字面量形式直接定型：整数字面量→i32（超 i64 十进制→i128）、浮点→f64、
+     n/d 数值字面量除式→i32 frac（分数字面量语义）、string/char/bool 按字面量；
+     frac 修饰无类型 → 基类型 i32；非字面量：check_expr 一次取表达式自身类型
+     （结果经 checked 透传，避免二次检查重复标记 move 等副作用）；
+     类型与初值都无（且无 frac 修饰）报错。unred 须 frac（修饰或 n/d 推断） *)
+  let is_frac, ty, checked =
+    match ty_opt with
+    | Some ty -> is_frac0, ty, None
+    | None ->
+      let rec lit_ty = function
+        | EInt _ -> Some ("i32", false)
+        | EBigInt _ -> Some ("i128", false)
+        | EFloat _ -> Some ("f64", false)
+        | EStr _ -> Some ("string", false)
+        | EChar _ -> Some ("char", false)
+        | EBool _ -> Some ("bool", false)
+        | EUn (Ast.Neg, e1, _) -> lit_ty e1
+        | EBin (Ast.Div, (EInt _ | EFloat _), (EInt _ | EFloat _), _) -> Some ("i32", true)
+        | _ -> None
+      in
+      (match init with
+       | None when is_frac0 -> is_frac0, TNamed ("i32", p), None
+       | None ->
+         terr p "let declaration requires a type or an initializer (let TYPE x / let x = v / let frac x)"
+       | Some e ->
+         (match lit_ty e with
+          | Some (b, nd) -> (nd || is_frac0), TNamed (b, p), None
+          | None ->
+            let t = check_expr env e in
+            (match resolve t.ety with
+             | TVar _ ->
+               terr p "cannot infer the declaration type from this initializer; give an explicit type"
+             | _ when is_frac0 ->
+               (* frac 修饰 + 表达式初值：基类型按修饰（i32），表达式走
+                  常规 frac 提升/校验路径 *)
+               (true, TNamed ("i32", p), Some t)
+             | ety ->
+               (match (try Some (zty_to_ast p ety) with ZtyToAstFail -> None) with
+                | Some aty -> (false, aty, Some t)
+                | None ->
+                  terr p "cannot infer the declaration type from this initializer; give an explicit type"))))
+  in
+  if is_unred && not is_frac then
+    terr p "unred requires the frac modifier or a n/d literal initializer (let unred x = 0/1)";
   let base = conv_ty env.g p ty in
   let want =
     if is_frac then begin
@@ -1999,7 +2081,7 @@ let rec check_decl env p isconst is_frac is_unred name ty init =
       check_expr env init
     | TBool, _ ->
       (* 布尔表达式初值：比较、and/or 等结果本就是 TBool *)
-      let t = check_expr env init in
+      let t = (match checked with Some t -> t | None -> check_expr env init) in
       if resolve t.ety <> TBool then
         terr p "bool can only be initialized with true/false, 0/1, or a boolean expression";
       t
@@ -2026,21 +2108,26 @@ let rec check_decl env p isconst is_frac is_unred name ty init =
       end
     | TFrac _, _ ->
       (* 单表达式初值：标量提升为分数（不约分） *)
-      let t = check_expr env init in
+      let t = (match checked with Some t -> t | None -> check_expr env init) in
       (match resolve t.ety with
        | TFrac e2 when resolve want = TFrac e2 -> t
        | TFrac _ -> terr p "mismatched frac element types"
        | TInt _ | TUint _ | TFloat _ | TVar _ -> mk_frac_from t (match resolve want with TFrac e -> e | _ -> assert false) p
        | _ -> terr p "cannot initialize %s as frac" (pp_zty t.ety))
     | _, ECall (EVar (n, _), _, _)
-        when Hashtbl.mem env.g.gstructs n || Hashtbl.mem env.g.gfns n ->
+        when checked = None
+             && (Hashtbl.mem env.g.gstructs n || Hashtbl.mem env.g.gfns n) ->
       (* 泛型构造/泛型函数调用在声明上下文：把声明类型作为期望提示
-         传给推断（字面量实参按期望落型，而非默认 i64/f64） *)
+         传给推断（字面量实参按期望落型，而非默认 i64/f64）；
+         let 无类型推断路径已预检查（checked），不再重复 *)
       expect_hint := Some want;
       let t = check_expr env init in
       expect_hint := None;
       t
-    | _, _ -> check_expr env init)
+    | _, _ ->
+      (match checked with
+       | Some t -> t
+       | None -> check_expr env init))
   in
   let tinit = coerce p tinit want in
   declare env name { lconst = isconst; lty = want; lslot = ""; lunred = is_unred;
@@ -2320,13 +2407,31 @@ and check_block env (stmts : stmt list) : tblock =
   in
   List.filter_map recover (List.concat_map expand stmts)
 
-(* 数组/列表声明检查（不含 split 初值特判）：返回语句种类 *)
-and check_seq_decl env p isconst name e len is_list inits =
+(* 数组/列表声明检查（不含 split 初值特判）：返回语句种类。
+   frac 数组/列表（new.md）：元素初值/存入自动约分（unred 数组不约分，
+   enn 透传给 mir 做元素归一） *)
+and check_seq_decl env p isconst is_frac is_unred name e len is_list inits =
   (match resolve e with
-   | TFrac _ -> terr p "frac arrays/lists are not yet supported"
+   | TFrac _ -> ()   (* frac 元素合法（new.md 2026-10-10）：存入自动约分 *)
    | TErr _ -> terr p "T! cannot be an array/list element (error values are aggregates and cannot be loaded by index)"
    | TFile -> terr p "File cannot be an array/list element (move-only handle)"
    | _ -> ());   (* struct/嵌套 seq 元素合法（w-014 #2/#4），运行时按头部 kind 深拷贝 *)
+  let enn = is_frac && not is_unred in   (* 元素需归一（存入/初值） *)
+  (* frac 元素初值：n/d 字面量按分数构造（不除法），其他走 coerce 提升 *)
+  let check_elem (ie : expr) : texpr =
+    match resolve e, ie with
+    | TFrac w, EBin (Ast.Div, a, b, fp)
+      when (match a, b with
+            | (EInt _ | EFloat _), (EInt _ | EFloat _) -> true
+            | _ -> false) ->
+      let ta' = check_expr env a and tb' = check_expr env b in
+      let ac = if resolve ta'.ety = w then ta' else { e = ECastK (ta', w); ety = w; epos = ta'.epos } in
+      let bc = if resolve tb'.ety = w then tb' else { e = ECastK (tb', w); ety = w; epos = tb'.epos } in
+      { e = EFracNewK (ac, bc); ety = TFrac w; epos = fp }
+    | _ ->
+      let ti2 = check_expr env ie in
+      coerce p ti2 e
+  in
   let vlen =
     match len, is_list with
     | None, true -> 0L
@@ -2350,7 +2455,7 @@ and check_seq_decl env p isconst name e len is_list inits =
      let ti = check_expr env ie in
      let copy_list () =
        declare env name
-         { lconst = isconst; lty = TList e; lslot = ""; lunred = false; lconstp = false };
+         { lconst = isconst; lty = TList e; lslot = ""; lunred = is_unred; lconstp = false };
        let slot =
          (match lookup_var env name with
           | Some l -> l.lslot
@@ -2363,17 +2468,11 @@ and check_seq_decl env p isconst name e len is_list inits =
       | TArray (e2, _) when resolve e2 = resolve e -> copy_list ()
       | _ ->
         (* 回退：逐元素初值 *)
-        let tinits =
-          List.map
-            (fun ie2 ->
-              let ti2 = check_expr env ie2 in
-              coerce p ti2 e)
-            inits
-        in
+        let tinits = List.map check_elem inits in
         declare env name
-          { lconst = isconst; lty = TList e; lslot = ""; lunred = false; lconstp = false };
+          { lconst = isconst; lty = TList e; lslot = ""; lunred = is_unred; lconstp = false };
         let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
-        SSeqDeclK (isconst, slot, e, 0L, true, tinits))
+        SSeqDeclK (isconst, slot, e, 0L, true, tinits, enn))
   (* 数组整体初值：T array b[N] = 源（源为同元素类型数组/列表 → 深拷贝） *)
    | [ ie ], false ->
      let ti = check_expr env ie in
@@ -2381,7 +2480,7 @@ and check_seq_decl env p isconst name e len is_list inits =
       | TArray (e2, n2) when resolve e2 = resolve e && n2 = Int64.to_int vlen ->
         declare env name
           { lconst = isconst; lty = TArray (e, Int64.to_int vlen);
-            lslot = ""; lunred = false; lconstp = false };
+            lslot = ""; lunred = is_unred; lconstp = false };
         let slot =
           (match lookup_var env name with
            | Some l -> l.lslot
@@ -2391,7 +2490,7 @@ and check_seq_decl env p isconst name e len is_list inits =
       | TList e2 when resolve e2 = resolve e ->
         declare env name
           { lconst = isconst; lty = TList e;
-            lslot = ""; lunred = false; lconstp = false };
+            lslot = ""; lunred = is_unred; lconstp = false };
         let slot =
           (match lookup_var env name with
            | Some l -> l.lslot
@@ -2399,46 +2498,39 @@ and check_seq_decl env p isconst name e len is_list inits =
         in
         SSeqCopyK (isconst, slot, e, vlen, ti, true)
       | _ ->
-        let tinits =
-          List.map
-            (fun ie2 ->
-              let ti2 = check_expr env ie2 in
-              coerce p ti2 e)
-            inits
-        in
+        let tinits = List.map check_elem inits in
         declare env name
           { lconst = isconst;
             lty = TArray (e, Int64.to_int vlen);
-            lslot = ""; lunred = false; lconstp = false };
+            lslot = ""; lunred = is_unred; lconstp = false };
         let slot =
           (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
-        SSeqDeclK (isconst, slot, e, vlen, is_list, tinits))
+        SSeqDeclK (isconst, slot, e, vlen, is_list, tinits, enn))
    | _ ->
-     let tinits =
-       List.map
-         (fun ie ->
-           let ti = check_expr env ie in
-           coerce p ti e)
-         inits
+     let tinits = List.map check_elem inits
      in
      declare env name
        { lconst = isconst;
          lty = if is_list then TList e else TArray (e, Int64.to_int vlen);
-         lslot = ""; lunred = false; lconstp = false };
+         lslot = ""; lunred = is_unred; lconstp = false };
      let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
-     SSeqDeclK (isconst, slot, e, vlen, is_list, tinits))
+     SSeqDeclK (isconst, slot, e, vlen, is_list, tinits, enn))
 
 and check_stmt env (st : stmt) : tstmt =
   let mk k = { s = k; spos = pos_of_stmt st } in
   match st with
-  | SDecl (isconst, is_frac, is_unred, name, ty, init, p) when init <> None && is_unwrap_block (Option.get init) ->
-    if is_frac || is_unred then
-      terr p "frac/unred does not support ??-block initialization";
-    mk (check_unwrap_decl env p isconst name ty (Option.get init))
-  | SDecl (isconst, is_frac, is_unred, name, ty, init, p) ->
-    mk (check_decl env p isconst is_frac is_unred name ty init)
-  | SSeqDecl (isconst, name, ety, len, is_list, inits, p) ->
-    mk (check_seq_decl env p isconst name (conv_ty env.g p ety) len is_list inits)
+  | SDecl (isconst, is_frac, is_unred, name, ty_opt, init, p) when init <> None && is_unwrap_block (Option.get init) ->
+    (match ty_opt with
+     | Some ty ->
+       if is_frac || is_unred then
+         terr p "frac/unred does not support ??-block initialization";
+       mk (check_unwrap_decl env p isconst name ty (Option.get init))
+     | None ->
+       terr p "??-block initialization requires an explicit type (let T x = a ?? ...)")
+  | SDecl (isconst, is_frac, is_unred, name, ty_opt, init, p) ->
+    mk (check_decl env p isconst is_frac is_unred name ty_opt init)
+  | SSeqDecl (isconst, is_frac, is_unred, name, ety, len, is_list, inits, p) ->
+    mk (check_seq_decl env p isconst is_frac is_unred name (conv_ty env.g p ety) len is_list inits)
   | SAssign (lhs, rhs, p) when is_unwrap_block rhs ->
     (* x = a ?? 缩进块 *)
     (match lhs, rhs with
@@ -2785,8 +2877,8 @@ and check_stmt env (st : stmt) : tstmt =
     let init_stmts =
       List.map
         (function
-          | FIDecl (isc, name, ty, e, p') ->
-            { s = check_decl env p' isc false false name ty e; spos = p' }
+          | FIDecl (isc, f2, u2, name, ty_opt, e, p') ->
+            { s = check_decl env p' isc f2 u2 name ty_opt e; spos = p' }
           | FIExpr (e, p') -> { s = SExprK (check_expr env e); spos = p' })
         inits
     in
@@ -2951,7 +3043,7 @@ and pos_of_stmt = function
   | SWhile (_, _, p) | SFor (_, _, _, _, p) | SReduce (_, _, _, p)
   | SRemove (_, _, p)
   | SOutput (_, _, _, p) | SInput (_, _, p)
-  | SSeqDecl (_, _, _, _, _, _, p)
+  | SSeqDecl (_, _, _, _, _, _, _, _, p)
   | SUnsafe (_, p)
   | SBreak p
   | SContinue p -> p
@@ -2981,7 +3073,7 @@ let rec subst_ty (t : zty) : zty =
 (* 函数式内建名（用户自定义函数不得与之冲突） *)
 let builtin_names = [ "length"; "find"; "trim"; "split"; "replace"; "prec";
                       "open"; "read_all"; "read_line"; "write"; "writeln";
-                      "close"; "exists"; "read_file"; "write_file" ]
+                      "close"; "exists"; "read_file"; "write_file"; "read_lines" ]
 
 (* 参数 -> zty：
    - 标量：可带 frac 修饰
@@ -3137,7 +3229,7 @@ let check_program (prog : program) : hir =
   (* 第一遍 B：收集函数签名（参数含数组/列表/frac） *)
   List.iter
     (function
-      | IFn { name; params; ret; rfrac; pos; body; tparams } ->
+      | IFn { name; params; ret; rfrac; runred; pos; body; tparams } ->
         if List.mem name builtin_names then
           terr pos "function name %s conflicts with a builtin, rename it" name;
         if tparams <> [] then begin
@@ -3148,6 +3240,8 @@ let check_program (prog : program) : hir =
             terr pos "duplicate function definition: %s" name;
           if List.length (List.sort_uniq compare tparams) <> List.length tparams then
             terr pos "duplicate type parameter in %s" name;
+          if runred then
+            terr pos "generic functions do not support an unred return type";
           List.iter
             (fun (pd : param) ->
               if pd.pref then
@@ -3199,7 +3293,7 @@ let check_program (prog : program) : hir =
               TFrac base
             end else base
         in
-        Hashtbl.replace g.fns name { params = ptys; prefs; ret = rty }
+        Hashtbl.replace g.fns name { params = ptys; prefs; ret = rty; runred }
         end
       | IExtern { funcs; pos = _ } ->
         (* extern "C"：登记签名（调用直通 LLVM 符号，与 C 链接一致） *)
@@ -3230,7 +3324,7 @@ let check_program (prog : program) : hir =
                terr f.epos "extern functions do not support array/list return types (zfy seq is not a C type)"
              | _ -> ());
             Hashtbl.replace g.fns f.ename
-              { params = ptys; prefs = List.map (fun _ -> false) ptys; ret = rty };
+              { params = ptys; prefs = List.map (fun _ -> false) ptys; ret = rty; runred = false };
             (* 9d：登记 extern 名单——llvmgen 对 i128 参数/返回值做 ABI 适配 *)
             Hashtbl.replace extern_fns f.ename ())
           funcs
@@ -3303,13 +3397,13 @@ let check_program (prog : program) : hir =
                   s = (match st.s with
                        | SDeclK (c, _, t, e, nn) -> SDeclK (c, slot, t, e, nn)
                        | s' -> s') } :: !ginit
-            | SSeqDecl (isconst, name, ety, len, is_list, inits, p) ->
+            | SSeqDecl (isconst, is_frac, is_unred, name, ety, len, is_list, inits, p) ->
               (* 顶层数组/列表：全局可变变量（const 也可，元素修改受 const 约束） *)
               if lookup_var env name <> None then
                 terr p "duplicate top-level variable: %s" name;
               let st =
-                { s = check_seq_decl env p isconst name (conv_ty env.g p ety) len
-                          is_list inits; spos = p } in
+                { s = check_seq_decl env p isconst is_frac is_unred name
+                          (conv_ty env.g p ety) len is_list inits; spos = p } in
               let lty = (match lookup_var env name with Some l -> l.lty | None -> assert false) in
               let slot = "@g." ^ name in
               set_global_slot name slot;
@@ -3317,7 +3411,7 @@ let check_program (prog : program) : hir =
               ginit :=
                 { st with
                   s = (match st.s with
-                       | SSeqDeclK (c, _, t, l2, isl, inits') -> SSeqDeclK (c, slot, t, l2, isl, inits')
+                       | SSeqDeclK (c, _, t, l2, isl, inits', enn) -> SSeqDeclK (c, slot, t, l2, isl, inits', enn)
                        | SSeqCopyK (c, _, t, l2, src, isl) -> SSeqCopyK (c, slot, t, l2, src, isl)
                        | s' -> s') } :: !ginit
             | _ -> ())
@@ -3344,23 +3438,36 @@ let check_program (prog : program) : hir =
                 List.map2
                   (fun (pd : param) pty ->
                     declare env pd.pname
-                      { lconst = false; lty = pty; lslot = ""; lunred = false;
+                      { lconst = pd.pconst; lty = pty; lslot = "";
+                        lunred = pd.punred;
                         lconstp = (match pd.pty with TPtrC _ -> true | _ -> false) };
                     let slot = (match lookup_var env pd.pname with
                                 | Some l -> l.lslot | None -> assert false) in
-                    (false, slot, pty))
+                    (false, slot, pty, pd.punred))
                   params sig_.params
               in
               let refnames =
                 List.filter_map (fun (pd : param) -> if pd.pref then Some pd.pname else None) params in
-              let body' =
+              let body1 =
                 if refnames = [] then body else deref_refs refnames body in
+              (* main 特例（new.md）：返回类型隐含 i32，裸 return 等价 return 0，
+                 落到函数末尾由 MIR 隐式 TRet None → ret i32 0 *)
+              let body' =
+                if name = "main" then
+                  List.map
+                    (function
+                      | SReturn (None, p) -> SReturn (Some (EInt (0L, p)), p)
+                      | st -> st)
+                    body1
+                else body1 in
               (* 自动 move 判定数据：函数体内全部变量出现位置（new2.md #1） *)
               env.uses <- List.rev (List.fold_left uses_of_stmt [] body');
               let tbody = check_block env body' in
               pop_scope env;
-              (* 返回类型非 void 时，要求有 return 或尾表达式 *)
-              if (match sig_.ret with TVoid -> false | _ -> true) then begin
+              (* 返回类型非 void 时，要求有 return 或尾表达式（main 豁免：
+                 隐式 return 0） *)
+              if name <> "main" &&
+                 (match sig_.ret with TVoid -> false | _ -> true) then begin
                 let has_ret =
                   List.exists (fun (s : tstmt) ->
                     match s.s with
@@ -3376,7 +3483,8 @@ let check_program (prog : program) : hir =
                   terr pos "function %s declares return type %s but may not return a value"
                     name (pp_zty sig_.ret)
               end;
-              Some { fname = name; fparams = tparams; fret = sig_.ret; fbody = tbody }
+              Some { fname = name; fparams = tparams; fret = sig_.ret;
+                     frunred = sig_.runred; fbody = tbody }
             with TypeError (p, m) ->
               collected := (p, m) :: !collected;
               None
@@ -3463,7 +3571,8 @@ let check_program (prog : program) : hir =
             end else base
         in
         Hashtbl.replace g.fns mangle
-          { params = ptys; prefs = List.map (fun _ -> false) ptys; ret = rty };
+          { params = ptys; prefs = List.map (fun _ -> false) ptys; ret = rty;
+            runred = false };
         (match check_one_fn mangle iparams gf.gbody gf.gpos with
          | Some tf -> generic_fns_acc := !generic_fns_acc @ [ tf ]
          | None -> ())
@@ -3539,8 +3648,8 @@ let check_program (prog : program) : hir =
       match s.s with
       | SDeclK (c, n, t, e, nn) ->
         SDeclK (c, n, subst_ty t, fix_texpr e, nn)
-      | SSeqDeclK (c, n, t, len, isl, inits) ->
-        SSeqDeclK (c, n, subst_ty t, len, isl, List.map fix_texpr inits)
+      | SSeqDeclK (c, n, t, len, isl, inits, enn) ->
+        SSeqDeclK (c, n, subst_ty t, len, isl, List.map fix_texpr inits, enn)
       | SSeqCopyK (c, n, t, len, src, isl) ->
         SSeqCopyK (c, n, subst_ty t, len, fix_texpr src, isl)
       | SAssignK (a, b, nn, mv) -> SAssignK (fix_texpr a, fix_texpr b, nn, mv)
@@ -3587,7 +3696,7 @@ let check_program (prog : program) : hir =
     List.map
       (fun (f : tfn) ->
         { f with
-          fparams = List.map (fun (m, n, t) -> (m, n, subst_ty t)) f.fparams;
+          fparams = List.map (fun (m, n, t, u) -> (m, n, subst_ty t, u)) f.fparams;
           fret = subst_ty f.fret;
           fbody = List.map fix_stmt f.fbody })
       (hfns @ !generic_fns_acc)

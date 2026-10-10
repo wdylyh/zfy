@@ -1,11 +1,11 @@
 // negative: cross-branch private access -> E5007
 mod a
-    i32 hidden()
+    fn i32 hidden()
         return 99
 
 mod b
-    i32 go()
+    fn i32 go()
         return a::hidden()
 
-void main()
+fn main()
     output(b::go())
