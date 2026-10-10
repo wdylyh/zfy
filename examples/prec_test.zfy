@@ -13,13 +13,13 @@ fn main()
     output(prec(x, 2))                       // 期望 3.
     output("nothing")                        // 无 prec 全输出
     output(x, end="|\n")                     // 浮点默认全输出
-    // cast string -> 数值（解析失败产错误值，?? 解包；128 位目标保留 fail-fast）
+    // cast string -> 数值（解析失败产错误值，?? 解包；128 位目标同样产错误值）
     let string n1 = "123"
     let string n2 = "3.14abc"
     let i32 i1 = cast(n1, i32) ?? 0
     let f64 d1 = cast(n2, f64) ?? 0.0
     output(i1, d1)                           // 期望 123 3.140000
-    let i128 big = cast(n1, i128)
+    let i128 big = cast(n1, i128) ?? 0
     output(big)                              // 123
     // cast 数值 -> string
     let i32 q = 42

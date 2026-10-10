@@ -216,6 +216,58 @@ let rec skip_line_noise l =
       skip_line_noise l
     | _ -> ()
 
+(* 循环小数字面量匹配（new.md 2026-10-11）：游标在 '(' 上时尝试匹配
+ *   ( [-] 数字+ . 数字* , 数字+ , )
+ * 两个逗号把循环节包在中间，如 (0.,1,)=1/9、(45.34,78,)=45.347878…。
+ * 匹配成功返回 (num, den, 消耗字符数)：num = int(前缀数字并上循环节) - int(前缀数字)
+ * （含符号），den = 10^(小数位+循环节长) - 10^小数位；den 恒为正。
+ * 总有效位数限 18（i64 安全范围）；失败返回 None（按普通括号处理） *)
+let match_rdec l : (int64 * int64 * int) option =
+  let len = String.length l.src in
+  let j0 = l.i in
+  let j = ref (j0 + 1) in                 (* 跳过 '(' *)
+  let neg = ref false in
+  let digit_run () =
+    let s = !j in
+    while !j < len && is_digit l.src.[!j] do incr j done;
+    String.sub l.src s (!j - s)
+  in
+  if !j < len && l.src.[!j] = '-' then begin neg := true; incr j end;
+  let ip = digit_run () in
+  if ip = "" then None
+  else if !j >= len || l.src.[!j] <> '.' then None
+  else begin
+    incr j;
+    let fp = digit_run () in
+    if !j >= len || l.src.[!j] <> ',' then None
+    else begin
+      incr j;
+      let cy = digit_run () in
+      if cy = "" then None
+      else if !j >= len || l.src.[!j] <> ',' then None
+      else begin
+        incr j;
+        if !j >= len || l.src.[!j] <> ')' then None
+        else begin
+          incr j;
+          let p = String.length fp and c = String.length cy in
+          (* 位数上限：int(前缀数字+循环节) 与 10^(p+c) 均须在 i64 内 *)
+          if String.length ip + p + c > 18 || p + c > 18 then None
+          else
+            match Int64.of_string_opt (ip ^ fp ^ cy) with
+            | None -> None
+            | Some b ->
+              let a = Int64.of_string (ip ^ fp) in
+              let rec pow10 k = if k = 0 then 1L else Int64.mul 10L (pow10 (k - 1)) in
+              let num = Int64.sub b a in
+              let den = Int64.sub (pow10 (p + c)) (pow10 p) in
+              let num = if !neg then Int64.neg num else num in
+              Some (num, den, !j - j0)
+        end
+      end
+    end
+  end
+
 (* ---------- 主入口 ---------- *)
 
 let keyword_lookup s = List.assoc_opt s Tokens.keyword_table
@@ -321,32 +373,49 @@ let tokenize ?(file = "") src =
            | None -> push (Ident s) p);
           loop ()
         | _ ->
-          (* 算符/标点 *)
-          let two = String.sub l.src l.i (min 2 (String.length l.src - l.i)) in
-          (match List.assoc_opt two punct2 with
-           | Some t ->
-             let p = pos l in
-             advance l 2;
-             (match t with
-              | LParen | LBracket -> l.paren_depth <- l.paren_depth + 1
-              | RParen | RBracket -> l.paren_depth <- max 0 (l.paren_depth - 1)
-              | _ -> ());
-             push t p
-           | None ->
-             (match List.assoc_opt l.src.[l.i] punct1 with
-              | Some t ->
-                let p = pos l in
-                advance l 1;
-                (match t with
-                 | LParen | LBracket -> l.paren_depth <- l.paren_depth + 1
-                 | RParen | RBracket -> l.paren_depth <- max 0 (l.paren_depth - 1)
-                 | _ -> ());
-                push t p
-              | None ->
-                let c = l.src.[l.i] in
-                err (pos l)
-                  (Printf.sprintf "illegal character '%c' (0x%02X)" c (Char.code c))));
-          loop ()
+          if l.src.[l.i] = '(' then begin
+            (* 循环小数字面量：(前缀,循环节,) —— 优先于普通 '(' 识别 *)
+            match match_rdec l with
+            | Some (num, den, adv) ->
+              let p = pos l in
+              advance l adv;
+              push (RDecLit (num, den)) p;
+              loop ()
+            | None ->
+              let p = pos l in
+              advance l 1;
+              l.paren_depth <- l.paren_depth + 1;
+              push LParen p;
+              loop ()
+          end
+          else begin
+            (* 算符/标点 *)
+            let two = String.sub l.src l.i (min 2 (String.length l.src - l.i)) in
+            (match List.assoc_opt two punct2 with
+             | Some t ->
+               let p = pos l in
+               advance l 2;
+               (match t with
+                | LParen | LBracket -> l.paren_depth <- l.paren_depth + 1
+                | RParen | RBracket -> l.paren_depth <- max 0 (l.paren_depth - 1)
+                | _ -> ());
+               push t p
+             | None ->
+               (match List.assoc_opt l.src.[l.i] punct1 with
+                | Some t ->
+                  let p = pos l in
+                  advance l 1;
+                  (match t with
+                   | LParen | LBracket -> l.paren_depth <- l.paren_depth + 1
+                   | RParen | RBracket -> l.paren_depth <- max 0 (l.paren_depth - 1)
+                   | _ -> ());
+                  push t p
+                | None ->
+                  let c = l.src.[l.i] in
+                  err (pos l)
+                    (Printf.sprintf "illegal character '%c' (0x%02X)" c (Char.code c))));
+            loop ()
+          end
     end
   in
   (try loop () with

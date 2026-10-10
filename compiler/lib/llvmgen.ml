@@ -28,12 +28,14 @@ let rec ll_ty (t : zty) : string =
   | TPtr _ | TFunSig _ -> "ptr"      (* 指针/函数指针：裸地址 *)
   | TErr e ->
     (* T! 错误值聚合：%err.<elem> = { i32 code; ptr msg; <value 容器> }。
-       value 容器统一 8 字节：整数/bool/char → i64，浮点 → double（C 端
-       zfy_stod_err 按 double 写），string/指针 → ptr（与 C 端 zfy_err
-       { int32_t; char*; union {int64_t; double; void*} } 布局一致） *)
+       ≤64 位元素容器统一 8 字节（整数/bool/char → i64，浮点 → double，
+       string/指针 → ptr，与 C 端 zfy_err 布局一致）；128 位整数容器为
+       i128（32 字节，与 C 端 zfy_err_wide 布局一致，new.md 2026-10-11） *)
     (match e with
-     | TInt 128 | TUint 128 | TFloat 128 ->
-       lerr None "error value element type does not support 128-bit width (T! is limited to <=64-bit scalars/string/pointers)"
+     | TFloat 128 ->
+       lerr None "f128 does not support T! wrapping (128-bit integers do; use f64! or cast stepwise)"
+     | TInt 128 -> "%err.i128"
+     | TUint 128 -> "%err.u128"
      | TFloat w -> Printf.sprintf "%%err.f%d" w
      | TInt w -> Printf.sprintf "%%err.i%d" w
      | TUint w -> Printf.sprintf "%%err.u%d" w
@@ -80,7 +82,8 @@ let rec size_of g (t : zty) : int =
   | TPtr _ | TFunSig _ -> 8
   | TFrac e -> 2 * size_of g e
   | TArray _ | TList _ -> 8        (* 槽：seq 指针 *)
-  | TErr _ -> 24                   (* { i32 code; ptr msg; 8 字节 value 容器 } *)
+  | TErr e ->
+    (match e with TInt 128 | TUint 128 -> 32 | _ -> 24)   (* { i32; ptr; value 容器 } *)
   | TStruct s ->
     (match find_struct g s with
      | Some sd -> fst (Hir.struct_size_align g.structs sd)
@@ -593,7 +596,7 @@ let gen_cast fc d (a : operand) (t : zty) =
 (* ---------- output / input ---------- *)
 
 (* 数组/列表元素的存储宽度（字节）：bool/char/i8/u8/f16 1-2、i32/f32 4、
-   i64/f64/string 8、i128/u128/f128 16 *)
+   i64/f64/string 8、i128/u128/f128 16、T! 24（128 位元素 32） *)
 let elem_width (g : gctx) (e : zty) : int =
   match e with
   | TInt 8 | TUint 8 | TBool | TChar -> 1
@@ -601,6 +604,7 @@ let elem_width (g : gctx) (e : zty) : int =
   | TInt 32 | TUint 32 | TFloat 32 -> 4
   | TInt 64 | TUint 64 | TFloat 64 | TString -> 8
   | TInt 128 | TUint 128 | TFloat 128 -> 16
+  | TErr ee -> (match ee with TInt 128 | TUint 128 -> 32 | _ -> 24)
   | TList _ | TArray _ -> 8   (* 嵌套 seq：元素为内层 seq 指针（w-014 #4） *)
   | TStruct _ ->              (* struct 元素：按 C 布局大小整块存储（w-014 #2） *)
     (match e with
@@ -613,12 +617,15 @@ let elem_width (g : gctx) (e : zty) : int =
 
 (* 元素存储种类（w-014 #2/#4）：随 zfy_seq_new_k 写入 seq 头部，
    运行时 free/clone/slice/set/get 按头部驱动：
-   0=标量 1=string 2=嵌套 seq 3=struct（ops 指向深拷贝/释放函数对） *)
+   0=标量 1=string 2=嵌套 seq 3=struct（ops 指向深拷贝/释放函数对）
+   4=T!（new.md 2026-10-11：24/32 字节聚合，clone=memcpy、free=no-op——
+   msg 按 strdup 泄漏约定不释放，浅拷无悬垂） *)
 let elem_kind_ops (e : zty) : int * string option =
   match e with
   | TString -> (1, None)
   | TList _ | TArray _ -> (2, None)
   | TStruct s -> (3, Some ("@zfy.ops.struct." ^ s))
+  | TErr _ -> (4, None)
   | _ -> (0, None)
 
 (* 元素读出时的扩展方式：有符号整数符号扩展，其余零扩展 *)
@@ -759,8 +766,10 @@ let gen_input fc name (ty : zty) delim =
       | TFloat 64 -> ("zfy_input_f64", ", i32 0")
       | TFloat 128 -> ("zfy_input_f64", ", i32 3")
       | TErr e ->
-        (* T! 目标：失败不退出，写错误值（code=INPUT, msg=原因）；value 容器按元素 *)
+        (* T! 目标：失败不退出，写错误值（code=INPUT, msg=原因）；value 容器按元素；
+           128 位整数用 32 字节 zfy_err_wide 容器（new.md 2026-10-11） *)
         (match e with
+         | TInt 128 | TUint 128 -> ("zfy_input_err_i128", "")
          | TInt _ | TUint _ -> ("zfy_input_err_i64", "")
          | TFloat 16 | TFloat 32 | TFloat 64 -> ("zfy_input_err_f64", "")
          | TString -> ("zfy_input_err_str", "")
@@ -1067,12 +1076,12 @@ let gen_seq_set fc seqp (elem : zty) (idx : operand) (v : operand) grow unchecke
     emitf fc
       "  call void @zfy_seq_set_str(ptr %s, i64 %s, ptr %s, i8 %d)"
       seqp iv sv (if grow then 1 else 0)
-  | (TStruct _ | TList _ | TArray _), _ ->
-    (* 聚合元素（struct 深拷贝 / 嵌套 seq clone，w-014 #2/#4）：
-       值以指针传递——alloca 槽 load 出指针（struct 槽即槽地址、
-       seq 槽 load 出内层 seq 指针），寄存器临时（切片结果）已是
-       seq 指针值直接使用；运行时按头部 kind/ops 深拷贝进槽位
-       （先释放旧元素），扩长与边界检查同在运行时完成 *)
+  | (TStruct _ | TList _ | TArray _ | TErr _), _ ->
+    (* 聚合元素（struct 深拷贝 / 嵌套 seq clone / T! 整块 memcpy，w-014
+       #2/#4、new.md 2026-10-11）：值以指针传递——alloca 槽 load 出指针
+       （struct/err 槽即槽地址、seq 槽 load 出内层 seq 指针），寄存器临时
+       （切片结果）已是 seq 指针值直接使用；运行时按头部 kind/ops 深拷贝
+       进槽位（先释放旧元素），扩长与边界检查同在运行时完成 *)
     let sv =
       match v.o with
       | OLocal n when Hashtbl.mem fc.allocas n -> fst (ptr_of fc v)
@@ -1358,6 +1367,12 @@ let gen_instr fc (i : instr) : unit =
        let z = fresh_r fc in
        emitf fc "  %s = zext i8 %s to i64" z cv2;
        emitf fc "  store i64 %s, ptr %s" z vp
+     | TInt 128 | TUint 128 ->
+       (* 128 位容器：i128 直接存取（new.md 2026-10-11） *)
+       let (iv, it) = val_of fc v in
+       if it <> "i128" then
+         lerr None "128-bit error value container expects i128, got %s" it;
+       emitf fc "  store i128 %s, ptr %s" iv vp
      | TUint _ ->
        let (iv, it) = val_of fc v in
        let z =
@@ -1422,6 +1437,11 @@ let gen_instr fc (i : instr) : unit =
        emitf fc "  %s = load i64, ptr %s" raw vp;
        let r = fresh_r fc in
        emitf fc "  %s = trunc i64 %s to i8" r raw;
+       Hashtbl.replace fc.regs d r
+     | TInt 128 | TUint 128 ->
+       (* 128 位容器：直接 load i128（new.md 2026-10-11） *)
+       let r = fresh_r fc in
+       emitf fc "  %s = load i128, ptr %s" r vp;
        Hashtbl.replace fc.regs d r
      | TUint w ->
        let raw = fresh_r fc in
@@ -1737,12 +1757,12 @@ let gen_instr fc (i : instr) : unit =
        非 string 标量走内联路径：边界检查 + 直接 load 元素位模式，
        再按元素类型还原（窄整数截断/位转换）；string 仍走运行时。 *)
     (match elem with
-     | TStruct _ | TList _ | TArray _ ->
+     | TStruct _ | TList _ | TArray _ | TErr _ ->
        let (seqp, _) = val_of fc base in
        let (iv, _) = val_of fc idx in
        let dst_addr = fresh_r fc in
        (match elem with
-        | TStruct _ ->
+        | TStruct _ | TErr _ ->
           emitf_entry fc "  %s = alloca %s" dst_addr (ll_ty elem);
           Hashtbl.replace fc.allocas d (dst_addr, elem);
           emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty elem) dst_addr
@@ -2219,6 +2239,7 @@ let gen_program (m : mir) : string =
   let err_defs =
     [ "i8", "i64"; "i16", "i64"; "i32", "i64"; "i64", "i64";
       "u8", "i64"; "u16", "i64"; "u32", "i64"; "u64", "i64";
+      "i128", "i128"; "u128", "i128";
       "f16", "double"; "f32", "double"; "f64", "double";
       "bool", "i64"; "char", "i64"; "str", "ptr"; "ptr", "ptr" ]
   in
@@ -2304,11 +2325,13 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_set_panic_handler(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_stoi_err(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_stod_err(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_stoi_wide_err(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_stoi_wide(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare x86_fp80 @zfy_stod_wide(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_err_find(ptr, ptr, i8, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_err_find_str(ptr, ptr, ptr, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_i64(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_input_err_i128(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_f64(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_str(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_input_err_bool(ptr, ptr)\n";

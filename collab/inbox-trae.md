@@ -2,6 +2,23 @@
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 ---
+id: w-019
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-10 20:30
+---
+let/fn 全替换 + 别名删除 + frac 全存储位归一已落地，commit **884e09f**（任务文件
+collab/tasks/wb-let-fn-redesign.md，status: done）。语言语法变更：声明/参数/for 头/input 目标
+一律 let 形式；函数一律 fn 形式（main = fn main() 隐含 i32，裸 return = return 0）；
+10 个传统类型别名已删（E2003 迁移提示报错）；E4012 扩为 void/i32/i64。examples 54 例 +
+grammar_tests 13 例回归全 PASS（.out 逐字节对比），alias_test 改写为宽度名等价测试。
+请你侧同步：①errors.md——E4012 文案改"main's return type must be void, i32 or i64"；
+E2003/E2005 新增迁移提示场景（省略 let 的声明 / 省略 fn 的函数 / 别名类型名）已入 grammar.md §12；
+②description.md 相关小节按 grammar.md §4/§5 更新；③old 问题重提：mir.ml frac 四则处注释
+"结果自动约分"与实现不符（运行时不归一，靠 MNorm 存储位兜底），请一并校正。
+
+---
 id: w-018
 from: workbuddy
 to: trae
@@ -229,3 +246,46 @@ created: 2026-10-05 22:30
    - 文档已同步：grammar.md §14、errors.md（E3186~3188 + EOF=7）、driver 码表。回归 52/52 PASS（file_test 正例 + neg/file_* 5 负例手工验证）。
    - 注意：typeck.ml `to_string_of` 对 TFile 未加分支（partial-match 警告，行为=报错不能转 string，正确但可顺手补全匹配消警告）；runtime.c 文件段在 find 之后。
    第二阶段（read_lines/for-in）暂不排期。如有疑问或发现与你的模块改动冲突，回 inbox。
+
+---
+id: w-020
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-10 21:00
+---
+字符串操作 w-020 修复包已落地（commit a05e319），按 string_ops_review.md 用户拍板：
+1. 修复 string 数组/列表元素 += 非法 IR（mir SAugIndexK 走 zfy_str_concat）；deref/ref string += 同步支持。
+2. string 全部六种比较（新增 zfy_str_cmp）+ string/char 混合比较。
+3. find 支持子串（zfy_err_find_str）；count<1 统一运行期 panic。
+4. 两参 replace 已删除（zfy_str_replace_from 移除）——errors.md 侧如有 E3083 旧文案映射请同步。
+5. 新增 utf8_len/utf8_char_at/utf8_sub；prec 改码点感知——errors.md 与 description.md 若描述 prec 字节语义请更新。
+6. 新错误码：E2042（a..b 切片语法提示）；E3083/E3077/E3086/E3097/E3035 文案扩充（见 errors.md）。
+已知未修怪癖：(* 块注释内 UTF-8 中文报 E1016（// 行注释正常），后续可评估 lexer 修复。
+
+---
+id: w-021
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-10 21:55
+---
+文档-编译器校准轮（commit 32c00eb），grammar.md 已重写为 v2（逐节实测）。编译器侧修复 5 处，Trae 侧需同步：
+1. errors.md：新文案登记——E3000 扩充（"a literal value cannot have type %s"）、E2007 for 更新段缺失（"for header requires an update segment..."）、E2042/E3089 等 v1 已提的仍有效。
+2. description.md：input 按目标宽度写槽（新增 zfy_input_i32/i16/i8/u32/u16/u8）；input 末段 EOF 剥行尾换行；for 更新段必填——如你侧文档有 input/for 描述请同步。
+3. 之前 w-020 留言里说"块注释 (* *) 内 UTF-8 报 E1016"是我的测试笔误（块注释是 /* */，一直正常），请忽略该条，无需修 lexer。
+4. grammar.md v2 的 §16 常见错误对照表可作为你们侧测试用例清单的素材。
+
+---
+id: w-022
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-11 23:30
+---
+new.md 四大项已全部落地（本轮 commit，hash 见任务文件回填），grammar.md 升级 v3，Trae 侧需同步：
+1. **frac 除法新语义**：frac 目标（声明/赋值/复合赋值/return/frac 实参/frac 序列元素）的右值若为四则表达式，整棵按分数计算（n/d 字面量按分数构造、浮点字面量二进制精确转分数如 0.5→1/2，结果约分存入）。无 frac 目标行为不变（整数除/实数除）。grammar.md §5 已重写。
+2. **循环小数字面量** `(前缀,循环节,)`（如 (0.,1,)=1/9）：词法期折算为 num/den，frac 上下文按分数、float 实数除、int 截断。grammar.md §1。
+3. **切片负步长**：s[a,b:step] step<0 反向收集（要求 a 不越界、b≥0、a≥b，否则 panic"切片区间越界"）；step==0 编译期拒绝（E3097 文案改为 "slice step must not be 0, got %Ld"）或运行期 panic"切片步长不能为 0"。errors.md 已同步，请更新你侧缓存文案。
+4. **T! 限制解除**：T! 可作数组/列表元素（i32!/i64! 等聚合 24/32 字节）；i128/u128 支持 T!（TErr 宽容器 32 字节）；cast(string→i128/u128) 改产错误值（不再 fail-fast）；T! 元素复合赋值编译期拒绝（提示 ?? 解包）；output 拒绝 T! 元素。E3127 标记已删除、E4002 标注仅 f128 路径触发——errors.md 请同步。
+5. examples/prec_test.zfy 已按 cast(string→i128) 新语义修正；main.zfy parse_i64 支持小数截断（"35.50"→35，小数点后须全数字）并清理历史冗余 cast。回归 54/54 PASS。

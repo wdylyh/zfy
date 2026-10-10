@@ -404,23 +404,28 @@ let rec lexpr l (e : texpr) : operand =
     emit l (MUnop (d, u, oa));
     op (OLocal d) e.ety
   | ECastK (a, t) when a.ety = TString ->
-    (* string → 数值 cast。128 位目标走 fail-fast 独立通道（w-014 顺带修
-       t-016 遗留：TErr 无 128 位容器，原实现经 zfy_stoi_err 时调用约定
-       与 C sret 不匹配产出垃圾值）；其余错误值路径（失败产 TErr，code=CAST）：
-       zfy_stoi_err / zfy_stod_err 以 sret 写 TErr 聚合 *)
+    (* string → 数值 cast：错误值路径（e.ety 为 TErr）以 sret 写 TErr 聚合，
+       失败产 CAST 错误值；128 位整数目标用 32 字节 zfy_err_wide 容器
+       （new.md 2026-10-11，用户拍板改为产错误值）；f128 保持 fail-fast
+       （zfy_stod_wide，无 T! 包装）。窄整数走 zfy_stoi_err（24 字节容器） *)
     let oa = lexpr l a in
-    let wide = match t with TInt 128 | TUint 128 | TFloat 128 -> true | _ -> false in
-    if wide then begin
-      let fn = match t with TFloat 128 -> "zfy_stod_wide" | _ -> "zfy_stoi_wide" in
-      let d = fresh l in
-      emit l (MCall (Some d, fn, [ oa ], t));
-      op (OLocal d) e.ety
-    end else begin
-      let fn = match t with TFloat _ -> "zfy_stod_err" | _ -> "zfy_stoi_err" in
-      let d = fresh l in
-      emit l (MCall (Some d, fn, [ oa ], e.ety));
-      op (OLocal d) e.ety
-    end
+    (match e.ety with
+     | TErr _ ->
+       let fn =
+         match t with
+         | TInt 128 | TUint 128 -> "zfy_stoi_wide_err"
+         | TFloat _ -> "zfy_stod_err"
+         | _ -> "zfy_stoi_err"
+       in
+       let d = fresh l in
+       emit l (MCall (Some d, fn, [ oa ], e.ety));
+       op (OLocal d) e.ety
+     | _ ->
+       (* fail-fast 宽通道（f128 / 非 TErr 上下文的 128 位目标） *)
+       let fn = match t with TFloat 128 -> "zfy_stod_wide" | _ -> "zfy_stoi_wide" in
+       let d = fresh l in
+       emit l (MCall (Some d, fn, [ oa ], t));
+       op (OLocal d) e.ety)
   | ECastK (a, t) ->
     let oa = lexpr l a in
     let d = fresh l in
@@ -882,12 +887,21 @@ and lstmt_inner l (s : tstmt) : unit =
      | Some a ->
        emit l (MSeqSetAt (a, elem, oi, op (OLocal r) elem, grow, l.unchecked)))
   | SAugVarK (name, ty, bop, v, nn) ->
-    (* x op= v：load + op + store 同一槽位 *)
+    (* x op= v：load + op + store 同一槽位；frac 槽走运行时分数四则
+       （sret，聚合不可直接 MBinop） *)
     let ov = lexpr l v in
-    let r = fresh l in
-    emit l (MBinop (r, bop, op (OLocal name) ty, ov));
-    emit l (MCopy (name, op (OLocal r) ty, ty));
-    if nn then emit l (MNorm (name, ty))
+    (match ty with
+     | TFrac elem ->
+       let d = fresh l in
+       emit l (MCall (Some d, frac_rt_name bop elem,
+                      [ op (OLocal name) ty; ov ], ty));
+       emit l (MCopy (name, op (OLocal d) ty, ty));
+       if nn then emit l (MNorm (name, ty))
+     | _ ->
+       let r = fresh l in
+       emit l (MBinop (r, bop, op (OLocal name) ty, ov));
+       emit l (MCopy (name, op (OLocal r) ty, ty));
+       if nn then emit l (MNorm (name, ty)))
   | SSeqSetK (root, elem, idx, v, grow) ->
     (* 元素写入：元素类型决定写入宽度；grow 允许列表扩长。
        槽根分派（w-014 #3）：变量槽直写；字段链/ref 解引用/元素槽经槽地址。

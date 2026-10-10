@@ -34,6 +34,11 @@ type token =
   | IntLit of int64
   | BigIntLit of string   (* 超出 i64 的十进制整数字面量（w-014 #6）：十进制数字串，
                               仅在 i128/u128 期望上下文合法 *)
+  | RDecLit of int64 * int64  (* 循环小数字面量 (前缀,循环节,)（new.md 2026-10-11）：
+                                 已折算为分数 num/den（num 含符号，den > 0）。
+                                 由词法直接识别，parser 降为 EBin(Div, num, den)——
+                                 frac 上下文按分数构造、float 上下文实数除、
+                                 int 上下文整数除（截断，恰好符合"不四舍五入"） *)
   | FloatLit of float
   | StrLit of string
   | CharLit of char
@@ -79,6 +84,7 @@ let pp_keyword = function
 let pp_token = function
   | IntLit n -> Printf.sprintf "Int %Ld" n
   | BigIntLit s -> Printf.sprintf "Big %s" s
+  | RDecLit (a, b) -> Printf.sprintf "RDec %Ld/%Ld" a b
   | FloatLit f -> Printf.sprintf "Float %g" f
   | StrLit s -> Printf.sprintf "Str \"%s\"" (String.escaped s)
   | CharLit c -> Printf.sprintf "Char '%c'" c

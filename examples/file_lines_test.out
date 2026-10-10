@@ -1,0 +1,7 @@
+n=3
+first=alpha
+second=beta
+last=gamma
+total=14
+empty-case n=3 mid-empty=true
+counted=0

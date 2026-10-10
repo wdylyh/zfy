@@ -516,6 +516,12 @@ and parse_primary p =
   match tk with
   | IntLit n -> ignore (next p); EInt (n, tp)
   | BigIntLit s -> ignore (next p); EBigInt (s, tp)
+  | RDecLit (num, den) ->
+    (* 循环小数字面量 (前缀,循节,)：词法已折算为分数 num/den，
+       降为 n/d 除式——frac 上下文按分数构造（EFracNewK）、float 上下文
+       实数除、int 上下文整数除（截断，即"按目标宽度截取不四舍五入"） *)
+    ignore (next p);
+    EBin (Ast.Div, EInt (num, tp), EInt (den, tp), tp)
   | FloatLit f -> ignore (next p); EFloat (f, tp)
   | StrLit s -> ignore (next p); EStr (s, tp)
   | CharLit c -> ignore (next p); EChar (c, tp)

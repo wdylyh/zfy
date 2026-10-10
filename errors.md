@@ -235,7 +235,7 @@
 | E3094 | 顶层 `struct Point` 两次 | duplicate struct definition: %s |
 | E3095 | `struct length`（内建名） | struct name %s conflicts with a builtin, rename it |
 | E3096 | `struct f`（f 已是函数） | %s is already a function and cannot also be a struct name |
-| E3097 | 字段 `i32 a[n]`（n 非字面量）；切片步长 `s[0,4:0]`（w-020 编译期拒绝） | struct field array length must be a compile-time literal；slice step must be >= 1, got %Ld |
+| E3097 | 字段 `i32 a[n]`（n 非字面量）；切片步长 `s[0,4:0]`（w-020 编译期拒绝） | struct field array length must be a compile-time literal；slice step must not be 0, got %Ld |
 | E3098 | `struct S` 内含 `S s` | struct %s field type cannot be itself (infinite size) |
 | E3099 | `struct S` 内含 `i32! x` | T! cannot be a struct field (error values are aggregates and cannot be loaded as a field) |
 | E3100 | `struct S` 两个 `i32 x` | struct %s has duplicate field %s |
@@ -280,7 +280,7 @@
 | 码 | 触发示例 | 文案 |
 |---|---|---|
 | E3126 | （已删除：struct 作数组/列表元素已支持，w-014 #2——运行时按 seq 头部 kind/ops 深拷贝） | — |
-| E3127 | `i32! xs[]` | T! cannot be an array/list element (error values are aggregates and cannot be loaded by index) |
+| E3127 | `i32! xs[]` | （已删除，v3 2026-10-11：T! 允许作数组/列表元素）T! cannot be an array/list element (error values are aggregates and cannot be loaded by index) |
 | E3128 | `i32 a["n"]` | array length must be an integer, got %s |
 | E3129 | `i32 a[x]`（x 非 const） | array length must be a compile-time constant (a literal or const integer variable) |
 | E3130 | `i32 a[3]`（列表写法带了长度） | lists take no length |
@@ -362,7 +362,7 @@
 | 码 | 触发示例 | 文案 |
 |---|---|---|
 | E4001 | （已删除：push 目标泛化为槽根——变量/字段链/ref/元素槽，w-014 #3） | — |
-| E4002 | `f()!`（TErr 元素为 f128 等 128 位类型） | error value element type does not support 128-bit width (T! is limited to <=64-bit scalars/string/pointers) |
+| E4002 | `f()!`（TErr 元素为 f128 等 128 位类型） | （仅剩 f128 窄/宽 TErr 路径触发，i128/u128 已支持，v3 2026-10-11）error value element type does not support 128-bit width (T! is limited to <=64-bit scalars/string/pointers) |
 | E4003 | TErr 元素为聚合 | invalid error value element type (scalar/string/pointer only)（无括号短形态同码） |
 | E4004 | — | unsupported frac operation |
 | E4005 | `1.x = 2`（字段目标） | unsupported field-access target |
@@ -442,7 +442,7 @@
 
 - 内存：内存分配失败 / input: 内存分配失败 / 数组: 内存分配失败 / 列表扩长: 内存分配失败 / 数组赋值: 内存分配失败
 - frac：frac 除以零 / frac 加法溢出 / frac 减法溢出 / frac 乘法溢出 / frac 除法溢出 / frac 运算溢出 <后缀> / frac: 小数化整后溢出 i64 / frac: 分子/分母无法化整（十进制精度超限）
-- 下标/切片：数组/列表下标不能为负 / 数组下标越界 / 数组/列表下标越界 / remove: 数组下标越界 / remove: 列表下标越界 / 切片区间越界 / 切片步长必须 >= 1 / 数组/列表长度非法
+- 下标/切片：数组/列表下标不能为负 / 数组下标越界 / 数组/列表下标越界 / remove: 数组下标越界 / remove: 列表下标越界 / 切片区间越界 / 切片步长不能为 0 / 数组/列表长度非法（负步长反向切片：起始不越界、b ≥ 0、a ≥ b，否则"切片区间越界"）
 - cast：cast：无法把 string 解析为整数 / cast：无法把 string 解析为浮点数 / prec 长度参数：char 必须是数字字符 '0'-'9'
 - input：input: EOF（无输入可读）/ input: 无法把输入解析为整数 / 解析为小数 / 解析为布尔值
 - 运算：除以零（浮点/整数除）/ 取模除零 / 浮点不支持取模

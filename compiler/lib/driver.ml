@@ -248,7 +248,7 @@ let code_of = function
       ["string concatenation requires string or char"], "E3077";
       ["string elements only support += "], "E3077";
       ["dereferenced string only supports += "], "E3035";
-      ["slice step must be >= 1"], "E3097";
+      ["slice step must be >= 1"; "slice step must not be 0"], "E3097";
       ["split does not accept '\\000'"], "E3086";
       ["prec does not support type "], "E3080";
       ["prec's length parameter must be"], "E3081";

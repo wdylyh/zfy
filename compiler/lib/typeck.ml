@@ -505,6 +505,134 @@ and mk_frac_from (x : texpr) (e : zty) (p : pos) : texpr =
   let one = { e = EIntK 1L; ety = e; epos = p } in
   { e = EFracNewK (xc, one); ety = TFrac e; epos = p }
 
+(* float 字面量精确转整数元素 frac（new.md 2026-10-11 用户拍板"把 0.5 改存为
+   1/2"）：二进制分解 v = m·2^k（frexp），奇化后 v = n/d——0.5→1/2、
+   0.75→3/4。den 超 i64（如 0.1 的二进制表示）或 n/d 超出目标宽度报错：
+   提示改用 f64 frac 或 n/d/循环小数字面量 *)
+and frac_of_float_lit (v : float) (elem : zty) (p : pos) : texpr =
+  if not (Float.is_finite v) then
+    terr p "float literal is not finite and cannot become a frac";
+  let neg = v < 0.0 in
+  let a = Float.abs v in
+  let num_pos, den =
+    if a = 0.0 then (0L, 1L)
+    else begin
+      let (m0, k0) = frexp a in                        (* a = m0 * 2^k0 *)
+      let m = ref (Int64.of_float (m0 *. 9007199254740992.0)) in (* *2^53 取整 *)
+      let k = ref (k0 - 53) in
+      while !k < 0 && Int64.equal (Int64.logand !m 1L) 0L do
+        m := Int64.shift_right !m 1;
+        incr k
+      done;                                            (* 奇化：v = m * 2^k *)
+      if !k >= 0 then begin
+        if !k >= 63
+           || Int64.equal !m 0L
+           || Int64.compare (Int64.shift_right (Int64.shift_left !m !k) !k) !m <> 0 then
+          terr p
+            "float literal %h does not fit a 64-bit frac numerator (use f64 frac or write n/d)" v;
+        (Int64.shift_left !m !k, 1L)
+      end
+      else begin
+        if - !k >= 63 then
+          terr p
+            "float literal %h is not exactly representable as an integer frac (use f64 frac, n/d, or a repeating decimal literal)" v;
+        (!m, Int64.shift_left 1L (- !k))
+      end
+    end
+  in
+  let num = if neg then Int64.neg num_pos else num_pos in
+  let width = (match elem with TInt w | TUint w -> w | _ -> 0) in
+  let fits_signed w x =
+    match w with
+    | 8 -> Int64.compare x 127L <= 0 && Int64.compare x (-128L) >= 0
+    | 16 -> Int64.compare x 32767L <= 0 && Int64.compare x (-32768L) >= 0
+    | 32 -> Int64.compare x 2147483647L <= 0 && Int64.compare x (-2147483648L) >= 0
+    | _ -> true in
+  let fits_unsigned w x =
+    match w with
+    | 8 -> Int64.compare x 255L <= 0
+    | 16 -> Int64.compare x 65535L <= 0
+    | 32 -> Int64.compare x 4294967295L <= 0
+    | _ -> true in
+  let ok =
+    match elem with
+    | TInt w -> fits_signed w num && fits_signed w den
+    | TUint w -> fits_unsigned w num && fits_unsigned w den
+    | _ -> true
+  in
+  if not ok then
+    terr p "float literal %h overflows %s frac (use a wider frac or write n/d)" v (pp_zty (TFrac elem));
+  let np = { e = EIntK num; ety = elem; epos = p } in
+  let dp = { e = EIntK den; ety = elem; epos = p } in
+  { e = EFracNewK (np, dp); ety = TFrac elem; epos = p }
+
+(* 判断 AST 是否为 frac 期望适用的算术形态（含 / 的四则或取负） *)
+and is_frac_arith (e : expr) : bool =
+  match e with
+  | EBin ((Ast.Add | Ast.Sub | Ast.Mul | Ast.Div), _, _, _) -> true
+  | EUn (Ast.Neg, _, _) -> true
+  | _ -> false
+
+(* frac 期望表达式（new.md 2026-10-11 用户拍板：frac 上下文里只要是有
+   / 号都直接用分数）：整棵算术表达式按分数计算——
+   - n/d 字面量形式仍按分数构造（不执行除法，unred 声明保留原分子分母）
+   - 其余除法两侧转 frac 走运行时分数除法（结果自动约分）
+   - 整数字面量/标量表达式自动提升为分数（x → x/1）
+   - float 字面量在整数 frac 中精确转二进制分数（0.5 → 1/2）
+   非 frac 目标路径完全不经过此函数（i32 目标整数除法、f64 目标实数除法
+   维持现状）。 *)
+and check_frac_expr env (e : expr) (elem : zty) : texpr =
+  let p = pos_of_expr e in
+  match e with
+  | EBin (Ast.Div, a, b, p')
+    when (match a, b with
+          | (EInt _ | EFloat _), (EInt _ | EFloat _) -> true
+          | _ -> false) ->
+    (* n/d 字面量：按分数构造，不执行除法（与既有声明/实参语义一致） *)
+    let ta = check_expr env a and tb = check_expr env b in
+    let conv (x : expr) (t : texpr) =
+      match x, elem with
+      | EFloat (v, _), (TInt _ | TUint _) -> frac_of_float_lit v elem p'
+      | _ ->
+        if resolve t.ety = elem then t
+        else { e = ECastK (t, elem); ety = elem; epos = t.epos }
+    in
+    { e = EFracNewK (conv a ta, conv b tb); ety = TFrac elem; epos = p' }
+  | EBin ((Ast.Add | Ast.Sub | Ast.Mul | Ast.Div) as op, a, b, p') ->
+    let ta = check_frac_expr env a elem in
+    let tb = check_frac_expr env b elem in
+    let bop =
+      match op with
+      | Ast.Add -> BAdd | Ast.Sub -> BSub | Ast.Mul -> BMul | _ -> BDiv
+    in
+    (match resolve ta.ety, resolve tb.ety with
+     | TFrac e1, TFrac e2 ->
+       if e1 = e2 then { e = EBinK (bop, ta, tb); ety = TFrac e1; epos = p' }
+       else
+         terr p' "mismatched frac element types: %s vs %s"
+           (pp_zty (TFrac e1)) (pp_zty (TFrac e2))
+     | _ -> assert false)
+  | EUn (Ast.Neg, a, _) ->
+    let t = check_frac_expr env a elem in
+    (match resolve t.ety with
+     | TFrac e2 ->
+       let zero = mk_frac_from { e = EIntK 0L; ety = e2; epos = p } e2 p in
+       { e = EBinK (BSub, zero, t); ety = TFrac e2; epos = p }
+     | _ -> t)
+  | _ ->
+    (* 叶子/其他表达式：正常检查后标量提升为分数 *)
+    let t = check_expr env e in
+    (match resolve t.ety, t.e with
+     | TFrac e2, _ when e2 = elem -> t
+     | TFrac _, _ -> terr p "mismatched frac element types"
+     | _, EFloatK v when (match elem with TInt _ | TUint _ -> true | _ -> false) ->
+       (* float 字面量精确转整数 frac（ety 可能为 TVar，先看节点形态） *)
+       frac_of_float_lit v elem p
+     | (TInt _ | TUint _ | TFloat _ | TVar _), _ -> mk_frac_from t elem p
+     | _ ->
+       terr p "cannot use %s in a frac expression" (pp_zty t.ety))
+
+
 (* 任意可打印值 -> string（sep/end/delim/内建参数的强转） *)
 and to_string_of (t : texpr) : texpr =
   let p = t.epos in
@@ -1053,8 +1181,8 @@ and check_expr env (e : expr) : texpr =
          | Some s ->
            let ts = to_i64 (check_expr env s) in
            (match const_eval env ts with
-            | Some v when Int64.compare v 1L < 0 ->
-              terr p' "slice step must be >= 1, got %Ld" v
+            | Some v when Int64.equal v 0L ->
+              terr p' "slice step must not be 0, got %Ld" v
             | _ -> ());
            ts
        in
@@ -1068,8 +1196,8 @@ and check_expr env (e : expr) : texpr =
          | Some s ->
            let ts = to_i64 (check_expr env s) in
            (match const_eval env ts with
-            | Some v when Int64.compare v 1L < 0 ->
-              terr p' "slice step must be >= 1, got %Ld" v
+            | Some v when Int64.equal v 0L ->
+              terr p' "slice step must not be 0, got %Ld" v
             | _ -> ());
            ts
        in
@@ -1135,9 +1263,10 @@ and check_expr env (e : expr) : texpr =
       terr p' "unsupported cast: %s -> %s"
         (pp_zty a) (pp_zty b);
     (* string -> 数值：运行时解析可能失败，结果为 T!（错误值）；
-       128 位目标无 8 字节 value 容器，保留旧 fail-fast 语义 *)
-    let wide = match b with TInt 128 | TUint 128 | TFloat 128 -> true | _ -> false in
-    if a = TString && b <> TString && num b && not wide then
+       128 位整数目标同样产错误值（32 字节宽容器，new.md 2026-10-11 用户
+       拍板）；f128 无 T! 包装，保持 fail-fast 语义 *)
+    let wide128 = match b with TFloat 128 -> true | _ -> false in
+    if a = TString && b <> TString && num b && not wide128 then
       mk (ECastK (t1, t')) (TErr t')
     else mk (ECastK (t1, t')) t'
   | EBlock (_, p') -> terr p' "block expressions are not supported here"
@@ -1231,17 +1360,10 @@ and check_call env p name0 targs origs modes =
     List.map2
       (fun ta (pt, orig) ->
         match resolve pt, orig with
-        | TFrac w, Some (EBin (Ast.Div, a, b, fp)) when
-            (match a, b with
-             | (EInt _ | EFloat _), (EInt _ | EFloat _) -> true
-             | _ -> false) ->
-          (* frac 字面量实参 `n/d`（w-015 #5 顺带）：期望为 frac 的调用位置，
-             数值字面量除式按分数构造（分子/分母不执行除法、不自动约分），
-             与声明初值语义一致（check_decl TFrac e, EBin (Div, ...)） *)
-          let ta' = check_expr env a and tb' = check_expr env b in
-          let ac = if resolve ta'.ety = w then ta' else { e = ECastK (ta', w); ety = w; epos = ta'.epos } in
-          let bc = if resolve tb'.ety = w then tb' else { e = ECastK (tb', w); ety = w; epos = tb'.epos } in
-          { e = EFracNewK (ac, bc); ety = TFrac w; epos = fp }
+        | TFrac w, Some rhs when is_frac_arith rhs ->
+          (* frac 参数位置含 / 的算术实参（new.md 2026-10-11）：整棵按分数算
+             （n/d 字面量形式仍按分数构造，与既有语义一致） *)
+          check_frac_expr env rhs w
         | _ -> coerce p ta pt)
       targs
       (List.combine sig_.params origs)
@@ -2168,35 +2290,50 @@ let rec check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) ini
       if resolve t.ety <> TBool then
         terr p "bool can only be initialized with true/false, 0/1, or a boolean expression";
       t
-    | TFrac e, EBin (Div, a, b, _) ->
-      (* frac 字面量：分子 / 分母（不执行除法、不自动约分）；
-         但若两侧本身已是 frac，则按普通分数除法处理（结果自动约分） *)
+    | TFrac e, EBin (Div, a, b, _)
+      when (match a, b with
+            | (EInt _ | EFloat _), (EInt _ | EFloat _) -> true
+            | _ -> false) ->
+      (* frac 字面量：分子 / 分母（不执行除法、不自动约分） *)
       let ta = check_expr env a and tb = check_expr env b in
-      let ta_is_frac =
-        (match resolve ta.ety with TFrac _ -> true | _ -> false) in
-      if ta_is_frac then begin
-        unify p tb.ety ta.ety;
-        { e = EBinK (BDiv, ta, tb); ety = resolve ta.ety; epos = p }
-      end
-      else begin
-        let ac =
-          if resolve ta.ety = e then ta
-          else { e = ECastK (ta, e); ety = e; epos = ta.epos }
-        in
-        let bc =
-          if resolve tb.ety = e then tb
-          else { e = ECastK (tb, e); ety = e; epos = tb.epos }
-        in
-        { e = EFracNewK (ac, bc); ety = TFrac e; epos = p }
-      end
+      let ac =
+        if resolve ta.ety = e then ta
+        else { e = ECastK (ta, e); ety = e; epos = ta.epos }
+      in
+      let bc =
+        if resolve tb.ety = e then tb
+        else { e = ECastK (tb, e); ety = e; epos = tb.epos }
+      in
+      { e = EFracNewK (ac, bc); ety = TFrac e; epos = p }
+    | TFrac e, EBin (Ast.Div, a, b, _)
+      when is_frac_arith a || is_frac_arith b ->
+      (* 非 n/d 形式的除式（new.md 2026-10-11）：两侧按 frac 期望检查——
+         含变量的除法按分数除法执行（运行时自动约分），已 frac 侧保持 *)
+      let ta = check_frac_expr env a e in
+      let tb = check_frac_expr env b e in
+      (match resolve ta.ety, resolve tb.ety with
+       | TFrac e1, TFrac e2 when e1 = e2 ->
+         { e = EBinK (BDiv, ta, tb); ety = TFrac e1; epos = p }
+       | _ -> terr p "mismatched frac element types in division")
     | TFrac _, _ ->
-      (* 单表达式初值：标量提升为分数（不约分） *)
-      let t = (match checked with Some t -> t | None -> check_expr env init) in
-      (match resolve t.ety with
-       | TFrac e2 when resolve want = TFrac e2 -> t
-       | TFrac _ -> terr p "mismatched frac element types"
-       | TInt _ | TUint _ | TFloat _ | TVar _ -> mk_frac_from t (match resolve want with TFrac e -> e | _ -> assert false) p
-       | _ -> terr p "cannot initialize %s as frac" (pp_zty t.ety))
+      (* 单表达式初值：含 / 的算术整棵按分数算（check_frac_expr）；
+         其他表达式标量提升为分数（不约分） *)
+      (match checked with
+       | Some t ->
+         (match resolve t.ety with
+          | TFrac e2 when resolve want = TFrac e2 -> t
+          | TFrac _ -> terr p "mismatched frac element types"
+          | TInt _ | TUint _ | TFloat _ | TVar _ -> mk_frac_from t (match resolve want with TFrac e -> e | _ -> assert false) p
+          | _ -> terr p "cannot initialize %s as frac" (pp_zty t.ety))
+       | None ->
+         if is_frac_arith init then check_frac_expr env init (match resolve want with TFrac e -> e | _ -> assert false)
+         else
+           let t = check_expr env init in
+           (match resolve t.ety with
+            | TFrac e2 when resolve want = TFrac e2 -> t
+            | TFrac _ -> terr p "mismatched frac element types"
+            | TInt _ | TUint _ | TFloat _ | TVar _ -> mk_frac_from t (match resolve want with TFrac e -> e | _ -> assert false) p
+            | _ -> terr p "cannot initialize %s as frac" (pp_zty t.ety)))
     | _, ECall (EVar (n, _), _, _)
         when checked = None
              && (Hashtbl.mem env.g.gstructs n || Hashtbl.mem env.g.gfns n) ->
@@ -2288,7 +2425,10 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
                | TChar -> to_string_of trhs
                | TString -> trhs
                | t -> terr ip "string element concatenation requires string or char, got %s" (pp_zty t))
-            end else coerce ip trhs e in
+            end
+            else if (match resolve e with TErr _ -> true | _ -> false) then
+              terr ip "T! elements do not support augmented assignment (unwrap with ?? then reassign)"
+            else coerce ip trhs e in
           SAugIndexK ({ e = EVarK l.lslot; ety = l.lty; epos = ap },
                       e, ti, bop, trhs, grow)
         | TPtr t ->
@@ -2323,7 +2463,10 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
          | TChar -> to_string_of trhs
          | TString -> trhs
          | t -> terr ip "string element concatenation requires string or char, got %s" (pp_zty t))
-      end else coerce ip trhs e in
+      end
+      else if (match resolve e with TErr _ -> true | _ -> false) then
+        terr ip "T! elements do not support augmented assignment (unwrap with ?? then reassign)"
+      else coerce ip trhs e in
     SAugIndexK (root, e, ti, bop, trhs, grow)
   | ESlice (EVar (arr, ap), a, b, step, sp) ->
      (* a[x,y:st] op= v：原地作用于原数组的区间元素（string/frac/f16/f128 不支持） *)
@@ -2375,7 +2518,13 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           SStrAppendK (slot, [ trhs ])
         | _ ->
           let lty = l.lty in
-          let trhs = check_expr env rhs in
+          let trhs =
+            (match resolve lty with
+             | TFrac e when is_frac_arith rhs ->
+               (* frac 变量复合赋值含 / 的算术（new.md 2026-10-11）：按分数算 *)
+               check_frac_expr env rhs e
+             | _ -> check_expr env rhs)
+          in
           let needs_norm =
             (match resolve lty with TFrac _ -> not l.lunred | _ -> false) in
           let trhs = coerce p' trhs lty in
@@ -2532,21 +2681,18 @@ and check_block env (stmts : stmt list) : tblock =
 and check_seq_decl env p isconst is_frac is_unred name e len is_list inits =
   (match resolve e with
    | TFrac _ -> ()   (* frac 元素合法（new.md 2026-10-10）：存入自动约分 *)
-   | TErr _ -> terr p "T! cannot be an array/list element (error values are aggregates and cannot be loaded by index)"
+   | TErr _ -> ()    (* T! 元素合法（new.md 2026-10-11）：24/32 字节聚合槽，
+                        clone=memcpy、free=no-op（msg 按 strdup 泄漏约定） *)
    | TFile -> terr p "File cannot be an array/list element (move-only handle)"
    | _ -> ());   (* struct/嵌套 seq 元素合法（w-014 #2/#4），运行时按头部 kind 深拷贝 *)
   let enn = is_frac && not is_unred in   (* 元素需归一（存入/初值） *)
   (* frac 元素初值：n/d 字面量按分数构造（不除法），其他走 coerce 提升 *)
   let check_elem (ie : expr) : texpr =
     match resolve e, ie with
-    | TFrac w, EBin (Ast.Div, a, b, fp)
-      when (match a, b with
-            | (EInt _ | EFloat _), (EInt _ | EFloat _) -> true
-            | _ -> false) ->
-      let ta' = check_expr env a and tb' = check_expr env b in
-      let ac = if resolve ta'.ety = w then ta' else { e = ECastK (ta', w); ety = w; epos = ta'.epos } in
-      let bc = if resolve tb'.ety = w then tb' else { e = ECastK (tb', w); ety = w; epos = tb'.epos } in
-      { e = EFracNewK (ac, bc); ety = TFrac w; epos = fp }
+    | TFrac w, _ when is_frac_arith ie ->
+      (* frac 元素初值含 / 的算术（new.md 2026-10-11）：整棵按分数算
+         （n/d 字面量形式仍按分数构造不除法，存入时按 enn 归一） *)
+      check_frac_expr env ie w
     | _ ->
       let ti2 = check_expr env ie in
       coerce p ti2 e
@@ -2789,7 +2935,14 @@ and check_stmt env (st : stmt) : tstmt =
              mk (SAssignK ({ e = EVarK slot; ety = lty; epos = p' },
                            { e = EVarK src_slot; ety = lty; epos = p2 }, false, true))
            | _ ->
-             let trhs = check_expr env rhs' in
+             let lty = l.lty in
+             let trhs =
+               (match resolve lty with
+                | TFrac e when is_frac_arith rhs' ->
+                  (* frac 变量赋值含 / 的算术（new.md 2026-10-11）：整棵按分数算 *)
+                  check_frac_expr env rhs' e
+                | _ -> check_expr env rhs')
+             in
              let needs_norm =
                (match resolve lty with TFrac _ -> not l.lunred | _ -> false) in
              (match resolve trhs.ety, resolve lty with
@@ -2964,7 +3117,13 @@ and check_stmt env (st : stmt) : tstmt =
         | EUnwrap (a, EBlock (blk, wp), _) -> mk (check_unwrap env wp a blk `Return)
         | _ -> assert false)
      | Some e' ->
-       let te = check_expr env e' in
+       let te =
+         (match resolve env.fncur_ret with
+          | TFrac e when is_frac_arith e' ->
+            (* frac 函数 return 含 / 的算术（new.md 2026-10-11）：按分数算 *)
+            check_frac_expr env e' e
+          | _ -> check_expr env e')
+       in
        let te = coerce p te env.fncur_ret in
        mk (SReturnK (Some te)))
   | SIf (cond, then_b, else_b, p) ->
@@ -3046,6 +3205,8 @@ and check_stmt env (st : stmt) : tstmt =
                | Some (TInt 128) ->
                  terr p "output does not support element type: %s (128-bit list elements are not supported)"
                    (pp_zty (TInt 128))
+               | Some (TErr _) ->
+                 terr p "output does not support element type: T! (error values are not printable)"
                | Some bad -> terr p "output does not support element type: %s" (pp_zty bad)
                | None -> terr p "output does not support this argument type")
         | t -> terr p "output does not support argument type: %s" (pp_zty t))

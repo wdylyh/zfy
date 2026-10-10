@@ -115,6 +115,57 @@ void zfy_stoi_err(zfy_err *out, const char *s) {
     }
 }
 
+/* 128 位整数错误值容器（new.md 2026-10-11）：32 字节，与 LLVM
+ * %err.i128 = { i32, ptr, i128 } 布局一致（x64：4+4pad+8+16） */
+typedef struct zfy_err_wide {
+    int32_t code;
+    char *msg;
+    __int128 value;
+} zfy_err_wide;
+
+static void err_wide_set(zfy_err_wide *out, int32_t code, const char *msg) {
+    out->code = code;
+    out->msg = zfy_strdup(msg);
+    out->value = 0;
+}
+
+/* string -> 128 位整数（错误值版）：解析失败/越界产 CAST 错误（不终止）。
+ * u128 目标复用本函数（负号按位模式回绕，与 fail-fast 通道一致） */
+void zfy_stoi_wide_err(zfy_err_wide *out, const char *s) {
+    unsigned __int128 v = 0;
+    const char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    int neg = 0;
+    if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+    if (*p < '0' || *p > '9') {
+        err_wide_set(out, ZFY_ECAST, "cast：无法把 string 解析为整数");
+        return;
+    }
+    for (; *p >= '0' && *p <= '9'; p++) {
+        unsigned d = (unsigned)(*p - '0');
+        if (v > ((~(unsigned __int128)0) - d) / 10) {
+            err_wide_set(out, ZFY_ECAST, "cast：整数超出 128 位范围");
+            return;
+        }
+        v = v * 10 + d;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\0') {
+        err_wide_set(out, ZFY_ECAST, "cast：无法把 string 解析为整数（尾随字符）");
+        return;
+    }
+    if (neg) {
+        if (v > (unsigned __int128)1 << 127) {
+            err_wide_set(out, ZFY_ECAST, "cast：整数超出 128 位范围");
+            return;
+        }
+        v = (unsigned __int128)0 - v;
+    }
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value = (__int128)v;
+}
+
 /* string -> 浮点（错误值版） */
 void zfy_stod_err(zfy_err *out, const char *s) {
     char *end;
@@ -1241,6 +1292,48 @@ void zfy_input_err_i64(zfy_err *out, const char *delim) {
     err_ok_i(out, v);
 }
 
+/* i128/u128 T! 目标（new.md 2026-10-11）：32 字节宽错误值容器 */
+void zfy_input_err_i128(zfy_err_wide *out, const char *delim) {
+    int no_input = 0;
+    char *seg = input_segment(delim, (long long)strlen(delim), &no_input);
+    if (no_input) {
+        free(seg);
+        err_wide_set(out, ZFY_EINPUT, "input: EOF（无输入可读）");
+        return;
+    }
+    unsigned __int128 v = 0;
+    const char *p = seg;
+    while (*p == ' ' || *p == '\t') p++;
+    int neg = 0;
+    if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+    int ok = (*p >= '0' && *p <= '9');
+    for (; ok && *p >= '0' && *p <= '9'; p++) {
+        unsigned d = (unsigned)(*p - '0');
+        if (v > ((~(unsigned __int128)0) - d) / 10) { ok = 0; break; }
+        v = v * 10 + d;
+    }
+    if (ok) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '\0') ok = 0;
+    }
+    if (!ok) {
+        free(seg);
+        err_wide_set(out, ZFY_EINPUT, "input: 无法把输入解析为整数");
+        return;
+    }
+    free(seg);
+    if (neg) {
+        if (v > (unsigned __int128)1 << 127) {
+            err_wide_set(out, ZFY_EINPUT, "input: 整数超出 128 位范围");
+            return;
+        }
+        v = (unsigned __int128)0 - v;
+    }
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value = (__int128)v;
+}
+
 void zfy_input_err_f64(zfy_err *out, const char *delim) {
     int no_input = 0;
     char *seg = input_segment(delim, (long long)strlen(delim), &no_input);
@@ -1621,9 +1714,14 @@ void zfy_seq_aug_range(zfy_seq *s, long long a, long long b, long long step,
                        int op, const void *val, int width, int sgn,
                        int is_float) {
     if (!s) zfy_die("复合赋值: 源为空");
-    if (step < 1) zfy_die("切片步长必须 >= 1");
-    if (a < 0 || b >= s->len || a > b) zfy_die("切片区间越界");
-    for (long long i = a; i <= b; i += step) {
+    if (step == 0) zfy_die("切片步长不能为 0");
+    if (step > 0) {
+        if (a < 0 || b >= s->len || a > b) zfy_die("切片区间越界");
+    } else {
+        /* 反向区间（new.md 2026-10-11）：a 递减到 b（闭区间），要求 a >= b */
+        if (a >= s->len || b < 0 || a < b) zfy_die("切片区间越界");
+    }
+    for (long long i = a; (step > 0 ? i <= b : i >= b); i += step) {
         void *slot = seq_at(s, i);
         if (is_float) {
             if (width == 4) {
@@ -1715,16 +1813,22 @@ void zfy_seq_aug_range(zfy_seq *s, long long a, long long b, long long step,
 }
 
 /* 切片 base[a..b]（两端含，步长 step）：越界报错退出；返回新 seq。
- * 元素按头部 kind/ops 逐个深拷贝，保证切片独占堆资源（w-014 #2/#4） */
+ * 元素按头部 kind/ops 逐个深拷贝，保证切片独占堆资源（w-014 #2/#4）。
+ * step<0 反向切片（new.md 2026-10-11）：从 a 递减收集到 b（闭区间），
+ * 要求 a >= b；a < b 时区间非法报错。step=0 报错 */
 zfy_seq *zfy_seq_slice(const zfy_seq *s, long long a, long long b,
                        long long step) {
     if (!s) zfy_die("切片: 源为空");
-    if (step < 1) zfy_die("切片步长必须 >= 1");
-    if (a < 0 || b >= s->len || a > b) zfy_die("切片区间越界");
-    long long n = (b - a) / step + 1;
+    if (step == 0) zfy_die("切片步长不能为 0");
+    if (step > 0) {
+        if (a < 0 || b >= s->len || a > b) zfy_die("切片区间越界");
+    } else {
+        if (a >= s->len || b < 0 || a < b) zfy_die("切片区间越界");
+    }
+    long long n = (step > 0 ? (b - a) / step : (a - b) / (-step)) + 1;
     zfy_seq *r = zfy_seq_new_k(n, n, s->elemsz, s->kind, s->ops);
     long long j = 0;
-    for (long long i = a; i <= b; i += step, j++)
+    for (long long i = a; (step > 0 ? i <= b : i >= b); i += step, j++)
         elem_init(seq_at(r, j), seq_at(s, i), s->kind, s->ops, s->elemsz);
     return r;
 }
@@ -1747,15 +1851,23 @@ void zfy_str_set(char *s, long long idx, char c) {
     s[idx] = c;
 }
 
-/* s[a..b]（两端含），按步长 step 收集字符，返回 malloc 新串 */
+/* s[a..b]（两端含），按步长 step 收集字符，返回 malloc 新串。
+ * step<0 反向切片（new.md 2026-10-11）：从 a 递减收集到 b（闭区间），
+ * 要求 a >= b；a < b 时区间非法报错。step=0 报错 */
 char *zfy_str_slice(const char *s, long long a, long long b, long long step) {
     long long n = (long long)strlen(s);
-    if (step < 1) zfy_die("字符串切片步长必须 >= 1");
-    if (a < 0 || b >= n || a > b) zfy_die("字符串切片区间越界");
-    char *buf = (char *)malloc((size_t)((b - a) / step) + 2);
+    if (step == 0) zfy_die("字符串切片步长不能为 0");
+    if (step > 0) {
+        if (a < 0 || b >= n || a > b) zfy_die("字符串切片区间越界");
+    } else {
+        if (a >= n || b < 0 || a < b) zfy_die("字符串切片区间越界");
+    }
+    long long cnt = (step > 0 ? (b - a) / step : (a - b) / (-step)) + 1;
+    char *buf = (char *)malloc((size_t)cnt + 1);
     if (!buf) zfy_die("字符串切片: 内存分配失败");
     long long len = 0;
-    for (long long i = a; i <= b; i += step) buf[len++] = s[i];
+    for (long long i = a; (step > 0 ? i <= b : i >= b); i += step)
+        buf[len++] = s[i];
     buf[len] = '\0';
     return buf;
 }
