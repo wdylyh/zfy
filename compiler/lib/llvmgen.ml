@@ -151,19 +151,103 @@ let double_to_fp80_bits (f : float) : int * Int64.t =
     (hi, lo)
   end
 
+(* double -> 最近 f32 的 double 位型（round-to-nearest-even，v3.3.1）。
+   返回值是一个"恰好等于该 f32 值"的 double 的 64 位位型——f32 值必为
+   double 子集，直接把 52 位尾数低 29 位清零（正规域）即可表示 *)
+let f32_as_double_bits (f : float) : Int64.t =
+  let bits = Int64.bits_of_float f in
+  let sgn = Int64.logand (Int64.shift_right_logical bits 63) 1L in
+  let e = Int64.to_int (Int64.logand (Int64.shift_right_logical bits 52) 0x7FFL) in
+  let m = Int64.logand bits 0xFFFFFFFFFFFFFL in
+  let with_sign b = Int64.logor (Int64.shift_left sgn 63) b in
+  if e = 0x7FF then
+    (* inf/nan：按 f32 特值发（LLVM 接受 double 位型特值落 float 槽） *)
+    if m = 0L then with_sign 0x7FF0000000000000L
+    else with_sign 0x7FF8000000000000L
+  else if e = 0 then
+    (* |f| < 2^-1022 << f32 最小次正规 2^-149 → 零 *)
+    with_sign 0L
+  else begin
+    let ed = e - 1023 in
+    (* round-to-nearest-even：丢低 sh 位 *)
+    let round_sh (v : Int64.t) (sh : int) : Int64.t =
+      let hi = Int64.shift_right_logical v sh in
+      let rem = Int64.logand v (Int64.sub (Int64.shift_left 1L sh) 1L) in
+      let half = Int64.shift_left 1L (sh - 1) in
+      if Int64.unsigned_compare rem half > 0
+      || (Int64.compare rem half = 0 && Int64.logand hi 1L = 1L)
+      then Int64.add hi 1L
+      else hi
+    in
+    if ed > 127 then with_sign 0x7FF0000000000000L      (* 溢出 -> inf *)
+    else if ed >= -126 then begin
+      (* f32 正规：53 位有效位丢低 29 位得 24 位 *)
+      let m24 = round_sh (Int64.logor m 0x10000000000000L) 29 in
+      let m24, ed =
+        if Int64.compare m24 0x1000000L >= 0            (* 24 位进位 *)
+        then (Int64.shift_right_logical m24 1, ed + 1)
+        else (m24, ed)
+      in
+      if ed > 127 then with_sign 0x7FF0000000000000L
+      else
+        with_sign
+          (Int64.logor
+             (Int64.shift_left (Int64.of_int (ed + 1023)) 52)
+             (Int64.shift_left (Int64.logand m24 0x7FFFFFL) 29))
+    end
+    else begin
+      (* f32 次正规：value = sig x 2^(ed-52) = k x 2^-149，
+         k = sig >> (29 + (-126 - ed))（含隐含位一起舍入） *)
+      let sh = 29 + (-126 - ed) in
+      let k = round_sh (Int64.logor m 0x10000000000000L) sh in
+      if Int64.compare k 0L = 0 then with_sign 0L
+      else if Int64.compare k 0x800000L >= 0 then
+        (* 舍入进位到最小正规 2^-126 *)
+        with_sign (Int64.shift_left 897L 52)
+      else begin
+        (* 值 = k x 2^-149，k 最高位在第 kt-1 位（kt = 1..23） *)
+        let rec topbit v i = if Int64.logand v (Int64.shift_left 1L i) <> 0L then i else topbit v (i - 1) in
+        let kt = topbit k 22 in
+        with_sign
+          (Int64.logor
+             (Int64.shift_left (Int64.of_int (kt + 874)) 52)
+             (Int64.shift_left (Int64.sub k (Int64.shift_left 1L kt)) (52 - kt)))
+      end
+    end
+  end
+
 (* 浮点字面量 -> LLVM 常量文本 *)
 let float_const (t : zty) (f : float) : string =
+  (* 十进制形式：clang 要求带小数点——"1e+40" 这类无点指数形被
+     "integer constant must have integer type" 拒绝 → 插 .0 *)
+  let dec () =
+    let s = Printf.sprintf "%.17g" f in
+    if String.contains s '.' then s
+    else if String.contains s 'e' then begin
+      match String.index_opt s 'e' with
+      | Some i ->
+        String.sub s 0 i ^ ".0" ^ String.sub s i (String.length s - i)
+      | None -> s ^ ".0"
+    end
+    else s ^ ".0"
+  in
   match t with
   | TFloat 16 -> Printf.sprintf "0xH%04X" (double_to_half_bits f)
   | TFloat 128 ->
     let (hi, lo) = double_to_fp80_bits f in
     Printf.sprintf "0xK%04X%016LX" hi lo
-  | _ ->
-    let s = Printf.sprintf "%.17g" f in
-    (* LLVM 要求浮点常量带小数点/指数 *)
-    if String.contains s '.' || String.contains s 'e' || String.contains s 'n'
-    then s
-    else s ^ ".0"
+  | TFloat 32 ->
+    (* LLVM 要求 float 十进制常量在 f32 精度下精确可表示（0.1/2.249
+       均非，报 "floating point constant invalid for type"）。53 位尾数
+       低 29 位已清零且在 f32 正规域 → 十进制精确，按原样发；否则按
+       最近 f32 位型发 double hex（clang 同款 0x%016LX 形式） *)
+    let bits = Int64.bits_of_float f in
+    let e = Int64.to_int (Int64.logand (Int64.shift_right_logical bits 52) 0x7FFL) in
+    let m = Int64.logand bits 0xFFFFFFFFFFFFFL in
+    if e <> 0 && e <> 0x7FF && e - 1023 >= -126 && e - 1023 <= 127
+       && Int64.logand m 0x1FFFFFFFL = 0L then dec ()
+    else Printf.sprintf "0x%016LX" (f32_as_double_bits f)
+  | _ -> dec ()
 
 (* ---------- 函数上下文 ---------- *)
 

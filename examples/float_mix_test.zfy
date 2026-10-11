@@ -1,0 +1,75 @@
+// v3.3.1 浮点/整数混算修复回归：
+// ① 混合字面量树整树按浮点（此前 f64/i64 混算坏 IR）
+// ② 浮点字面量与整数变量混算 / 落整数槽报 E3190（负例经独立文件回归）
+// ③ f32 常量按最近位型发射（0.1/2.249 此前必产坏 IR）
+// ④ 科学计数法字面量正确解析（1e40 此前被错读为 1.4）
+fn main()
+    let i32 bad = 0
+
+    // ① 混合字面量树 → 浮点
+    let f64 a = 2.5 + 1
+    if a != 3.5
+        bad++
+    let f64 b = 1 + 2.5 * 2
+    if b != 6.0
+        bad++
+    let f64 c = 2 * 3 + 0.5
+    if c != 6.5
+        bad++
+    // 比较混型：2.0==3 应为 false、2.5<3 应为 true、3.0==4 应为 false
+    if (2.0 == 3) or (not (2.5 < 3)) or (3.0 == 4)
+        bad++
+    // 一元负号
+    let f64 d = -2.5 - 1.5
+    if d != -4.0
+        bad++
+    // 上下文绑定不被破坏
+    let f64 z = 3
+    if z != 3.0
+        bad++
+    let f32 g = 1.5 * 2
+    let f64 gd = cast(g, f64)
+    if gd < 2.999 or gd > 3.001
+        bad++
+    // 浮点变量与整数字面量
+    let f64 y = 2.0
+    let f64 e = y * 3
+    if e != 6.0
+        bad++
+
+    // ③ f32 非精确常量
+    let f32 f1 = 0.1
+    let f32 f2 = 2.249
+    let f32 f3 = 1e-45
+    let f32 f4 = 1e40
+    if not (f1 == f1) or not (f2 == f2)
+        bad++
+    let f32 f5 = 2.249
+    if not (f2 == f5)
+        bad++
+    // f4 溢出为 inf：inf != 任何有限值
+    if f4 == f1
+        bad++
+    // f3 次正规：> 0
+    if not (f3 > 0.0)
+        bad++
+
+    // ④ 科学计数法
+    let f64 s1 = 1e2
+    if s1 != 100.0
+        bad++
+    let f64 s2 = 2.5e3
+    if s2 != 2500.0
+        bad++
+    let f64 s3 = 1.5e-2
+    if s3 < 0.0149 or s3 > 0.0151
+        bad++
+    // 负指数不为既有 bug 的 1.0-45=-44
+    let f64 s4 = 1e-3
+    if s4 != 0.001
+        bad++
+
+    if bad != 0
+        return 1
+    output("float_mix_test OK\n")
+    return 0

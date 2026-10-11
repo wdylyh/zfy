@@ -441,6 +441,15 @@ let errcode_const = function
 
 (* ---------- 表达式检查 ---------- *)
 
+(* 子树是否含浮点字面量（EFloatK 叶子；v3.3.1 混合字面量修复）：
+   含 EFloatK 的未定 TVar 子树只能整体按浮点定型，绝不能落整数型 *)
+let rec floaty_texpr (x : texpr) : bool =
+  match x.e with
+  | EFloatK _ -> true
+  | EUnK (_, u) -> floaty_texpr u
+  | EBinK (_, a, b) -> floaty_texpr a || floaty_texpr b
+  | _ -> false
+
 (* 类型零值表达式（声明省略初值时使用；struct 递归为全字段零值/default 构造） *)
 let rec zero_of (env : env) (p : pos) (t : zty) : texpr =
   let t = resolve t in
@@ -971,7 +980,29 @@ and check_expr env (e : expr) : texpr =
         let tr = if rr = TChar then to_string_of tr else tr in
         mk (EBinK (bop, tl, tr)) TBool
       end
-      else
+      else begin
+        (* v3.3.1：含浮点字面量的未定子树（ety=TVar）与具体整数/char 混算
+           → 报错。zfy 无 int→float 隐式转换；此前 unify 把浮点字面量
+           静默绑成整数型，fix_texpr 再翻 f64 产 f64/i64 混算坏 IR
+           （2.0 * x、2.5 < q） *)
+        let floaty_side t x =
+          match resolve t with
+          | TFloat _ -> true
+          | TVar _ -> floaty_texpr x
+          | _ -> false
+        in
+        let other_int t =
+          match t with TInt _ | TUint _ | TChar -> true | _ -> false in
+        (if (floaty_side rl tl && other_int rr)
+        || (floaty_side rr tr && other_int rl) then begin
+          let show t x =
+            match resolve t with
+            | TVar _ when floaty_texpr x -> "f64"  (* 未定浮点字面量子树 *)
+            | t -> pp_zty t
+          in
+          terr p' "floating-point and integer operands cannot be mixed without an explicit cast, got %s and %s"
+            (show rl tl) (show rr tr)
+        end);
         let res_ty =
           match bop with
           | BEq | BNe | BLt | BGt | BLe | BGe ->
@@ -1019,6 +1050,7 @@ and check_expr env (e : expr) : texpr =
             (tl, tr, res_ty)
         in
         mk (EBinK (bop, tl, tr)) res_ty
+      end
   | EUn (op, e1, p') ->
     let t1 = check_expr env e1 in
     (match op with
@@ -2294,6 +2326,12 @@ and coerce p (te : texpr) (want : zty) : texpr =
          w-021） *)
       terr p "a literal value cannot have type %s (build it via a variable or constructor first)"
         (pp_zty want)
+    | TVar _, ((TInt _ | TUint _ | TChar) as tgt) when floaty_texpr te ->
+      (* v3.3.1：浮点字面量子树不可隐式落整数/char——此前静默 unify 绑成
+         整数型，fix_texpr 再把 EFloatK 叶子翻 f64，产 f64/i64 混算坏 IR
+         （x += 2.5 落整型槽、2.5 作 i64 实参等） *)
+      terr p "floating-point literal cannot be used as %s (explicit cast required)"
+        (pp_zty tgt)
     | TVar _, _ | _, TVar _ -> unify p te.ety want; te
     | _, TFrac e when (match te.e with EIntK _ | EFloatK _ -> true | _ -> false) ->
       (* 数值字面量提升为分数（实参/返回等表达式上下文，与声明初值一致；
@@ -4148,6 +4186,25 @@ let check_program (prog : program) : hir =
   Hashtbl.reset finished;
   Hashtbl.iter (fun name _ -> visit name) g.structs;
   (* 类型变量求解落地 *)
+  let is_fl = function TFloat _ -> true | _ -> false in
+  let is_ii = function TInt _ | TUint _ | TChar -> true | _ -> false in
+  let flw = function TFloat w -> w | _ -> 64 in
+  (* 把整型字面量子树重打为 w 位浮点：子树仅含字面量节点（typeck 已保证
+     变量侧不会与浮点混算），重打型安全——后端按 ety 发对应常量 *)
+  let rec floatify (w : int) (x : texpr) : texpr =
+    let x' =
+      match x.e with
+      | EBinK (op, a, b) -> EBinK (op, floatify w a, floatify w b)
+      | EUnK (op, u) -> EUnK (op, floatify w u)
+      | _ -> x.e
+    in
+    let ety =
+      match subst_ty x.ety with
+      | TFloat _ -> x.ety
+      | _ -> TFloat w
+    in
+    { x with e = x'; ety }
+  in
   let rec fix_texpr (e : texpr) : texpr =
     let ety0 = subst_ty e.ety in
     (* 浮点字面量未被上下文约束时，默认应为 f64 而非 i64 *)
@@ -4156,42 +4213,65 @@ let check_program (prog : program) : hir =
       | EFloatK _, TInt 64 -> TFloat 64
       | _, _ -> ety0
     in
-    let e' =
+    let e', ety =
       match e.e with
       | EBigK d ->
         (* 大字面量（w-014 #6）：期望上下文未落到 i128/u128（如裸表达式
            语句/算术操作数）即报错；合法时保留由后端按 i128 字面量发射 *)
-        (match ety with
-         | TInt 128 | TUint 128 -> EBigK d
-         | _ ->
-           terr e.epos "large integer literal %s requires an i128/u128 context" d)
-      | EBinK (op, a, b) -> EBinK (op, fix_texpr a, fix_texpr b)
-      | EUnK (op, a) -> EUnK (op, fix_texpr a)
-      | ECallK (c, args, moves) -> ECallK (c, List.map fix_texpr args, moves)
-      | ECastK (a, t) -> ECastK (fix_texpr a, subst_ty t)
-      | EFracNewK (a, b) -> EFracNewK (fix_texpr a, fix_texpr b)
-      | ESeqGetK (a, i) -> ESeqGetK (fix_texpr a, fix_texpr i)
-      | ESeqLenK a -> ESeqLenK (fix_texpr a)
+        let e' =
+          (match ety with
+           | TInt 128 | TUint 128 -> EBigK d
+           | _ ->
+             terr e.epos "large integer literal %s requires an i128/u128 context" d)
+        in
+        (e', ety)
+      | EBinK (op, a, b) ->
+        (* v3.3.1：子节点混浮点/整型（typeck 已保证整型侧必为字面量子树）
+           → 整型侧重打浮点；节点自身落默认整数型（未约束 TVar 组：
+           output 实参/裸表达式语句等无约束上下文）时提升为同宽浮点，
+           消除 f64/i64 混算坏 IR *)
+        let a' = fix_texpr a and b' = fix_texpr b in
+        let lift t = match ety with TInt _ | TUint _ -> t | _ -> ety in
+        if is_fl a'.ety && is_ii b'.ety then
+          let w = flw a'.ety in
+          (EBinK (op, a', floatify w b'), lift (TFloat w))
+        else if is_ii a'.ety && is_fl b'.ety then
+          let w = flw b'.ety in
+          (EBinK (op, floatify w a', b'), lift (TFloat w))
+        else if is_fl a'.ety && is_fl b'.ety then
+          (EBinK (op, a', b'), lift a'.ety)
+        else (EBinK (op, a', b'), ety)
+      | EUnK (op, u) ->
+        (* 一元负号同理：子节点浮点而节点落默认整数型 → 节点提升浮点 *)
+        let u' = fix_texpr u in
+        if is_fl u'.ety && (match ety with TInt _ | TUint _ -> true | _ -> false)
+        then (EUnK (op, u'), u'.ety)
+        else (EUnK (op, u'), ety)
+      | ECallK (c, args, moves) -> (ECallK (c, List.map fix_texpr args, moves), ety)
+      | ECastK (a, t) -> (ECastK (fix_texpr a, subst_ty t), ety)
+      | EFracNewK (a, b) -> (EFracNewK (fix_texpr a, fix_texpr b), ety)
+      | ESeqGetK (a, i) -> (ESeqGetK (fix_texpr a, fix_texpr i), ety)
+      | ESeqLenK a -> (ESeqLenK (fix_texpr a), ety)
       | ESeqSliceK (a, b, c, d) ->
-        ESeqSliceK (fix_texpr a, fix_texpr b, fix_texpr c, fix_texpr d)
-      | ESplitK (a, c) -> ESplitK (fix_texpr a, fix_texpr c)
-      | ESeqLitK (t, es) -> ESeqLitK (subst_ty t, List.map fix_texpr es)
-      | EPushK (a, v) -> EPushK (fix_texpr a, fix_texpr v)
-      | ERemoveK (a, i, isl) -> ERemoveK (fix_texpr a, fix_texpr i, isl)
-      | EStructNewK (s, args) -> EStructNewK (s, List.map fix_texpr args)
-      | EFieldK (b, i) -> EFieldK (fix_texpr b, i)
-      | ENullK -> ENullK
-      | EAddrOfK a -> EAddrOfK (fix_texpr a)
-      | EDerefK a -> EDerefK (fix_texpr a)
+        (ESeqSliceK (fix_texpr a, fix_texpr b, fix_texpr c, fix_texpr d), ety)
+      | ESplitK (a, c) -> (ESplitK (fix_texpr a, fix_texpr c), ety)
+      | ESeqLitK (t, es) -> (ESeqLitK (subst_ty t, List.map fix_texpr es), ety)
+      | EPushK (a, v) -> (EPushK (fix_texpr a, fix_texpr v), ety)
+      | ERemoveK (a, i, isl) -> (ERemoveK (fix_texpr a, fix_texpr i, isl), ety)
+      | EStructNewK (s, args) -> (EStructNewK (s, List.map fix_texpr args), ety)
+      | EFieldK (b, i) -> (EFieldK (fix_texpr b, i), ety)
+      | ENullK -> (ENullK, ety)
+      | EAddrOfK a -> (EAddrOfK (fix_texpr a), ety)
+      | EDerefK a -> (EDerefK (fix_texpr a), ety)
       | EIndirectCallK (f, args) ->
-        EIndirectCallK (fix_texpr f, List.map fix_texpr args)
-      | EFailK (c, m) -> EFailK (fix_texpr c, fix_texpr m)
-      | EPanicK (c, m) -> EPanicK (Option.map fix_texpr c, fix_texpr m)
-      | EUnwrapK (a, b) -> EUnwrapK (fix_texpr a, fix_texpr b)
-      | EPropagateK a -> EPropagateK (fix_texpr a)
-      | EErrOkK a -> EErrOkK (fix_texpr a)
-      | EFindK (s, c, k) -> EFindK (fix_texpr s, fix_texpr c, fix_texpr k)
-      | k -> k
+        (EIndirectCallK (fix_texpr f, List.map fix_texpr args), ety)
+      | EFailK (c, m) -> (EFailK (fix_texpr c, fix_texpr m), ety)
+      | EPanicK (c, m) -> (EPanicK (Option.map fix_texpr c, fix_texpr m), ety)
+      | EUnwrapK (a, b) -> (EUnwrapK (fix_texpr a, fix_texpr b), ety)
+      | EPropagateK a -> (EPropagateK (fix_texpr a), ety)
+      | EErrOkK a -> (EErrOkK (fix_texpr a), ety)
+      | EFindK (s, c, k) -> (EFindK (fix_texpr s, fix_texpr c, fix_texpr k), ety)
+      | k -> (k, ety)
     in
     { e = e'; ety; epos = e.epos }
   in

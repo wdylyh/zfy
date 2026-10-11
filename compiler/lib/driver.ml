@@ -258,6 +258,9 @@ let code_of = function
       ["output does not support argument type: "], "E3085";
       ["input's delim must be char or string"], "E3086";
       ["statement discards a value of type "], "E3189";
+      (* v3.3.1 浮点字面量混合修复（E3190） *)
+      ["floating-point literal cannot be used as "], "E3190";
+      ["floating-point and integer operands cannot be mixed"], "E3190";
       ["strings do not support index assignment"], "E3017";
       ["dereference assignment supports only scalar/pointer types"], "E3031";
       ["does not support index assignment"], "E3032";

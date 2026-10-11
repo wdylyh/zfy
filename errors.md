@@ -8,7 +8,7 @@
 >
 > **跳号说明**：号段不连续是条目合并的结果（同一错误多处触发 / 同文案合并同码），各节末尾列出。已删除两条占位交叉引用：E300-112（main 返回类型检查实际由 LLVM 阶段报，归 E4012）、E300-143（TErr 元素非法由 E4002 承担）。
 >
-> 统计：词法 14 码 / 语法 35 码 / 类型语义 170 码 / 代码生成 50 码 / 驱动配置 8 码，**合计 277 码**；另有 4 个兜底码（E1000 / E3000 / E4000 / E5000，错误消息未命中映射表时回退，正常不触发）。运行期 die（不入 EXXX 码体系，附录 A）38 类。
+> 统计：词法 14 码 / 语法 35 码 / 类型语义 170 码 / 代码生成 50 码 / 驱动配置 8 码，**合计 278 码**；另有 4 个兜底码（E1000 / E3000 / E4000 / E5000，错误消息未命中映射表时回退，正常不触发）。运行期 die（不入 EXXX 码体系，附录 A）38 类。
 
 格式说明：
 - 「触发」列给最小触发示例（`…` 表示任意合法代码）；「文案」列为编译器当前输出原文。
@@ -454,6 +454,7 @@
 | 错误码 | 消息前缀 | 触发场景 |
 |---|---|---|
 | E3189 | `statement discards a value of type T (cast/find/push/remove and user functions return values; assign it to a variable: x = f(...))` | 裸语句丢弃产值：push/remove/find/length/cast/prec 等产值内建与用户函数返回值不能单独成句。例外：fail/panic（非局部退出）、?? 解包块内的表达式（块末兜底值） |
+| E3190 | `floating-point literal cannot be used as i64 (explicit cast required)` / `floating-point and integer operands cannot be mixed without an explicit cast, got f64 and i64` | 浮点字面量与整数混用（v3.3.1）：浮点字面量子树落整数/char 槽（`let i64 x = 2.5`、`x += 2.5`）或与具体整数操作数混算（`2.0 * x`）。此前产 f64/i64 混算坏 IR。纯字面量混合树（`2.5 + 1`）合法，整树按浮点 |
 
 同批变更（2026-10-11 v3.1）：裸 cast 语句重绑定特例删除（原 cast(a, T) 单独成句把 a 重绑定为 T 槽，现按 E3189 报错）；push 返回列表、remove 返回被删元素副本；cast(e, frac) 支持（int/bool/char→n/1，float 字面量二进制精确转分数，0.5→1/2）；bool→整数 cast 由 sext 改 zext（true=1，不再是 -1）。
 

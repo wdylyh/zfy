@@ -151,10 +151,15 @@ let scan_number l =
                 || ((peek l 1 = '+' || peek l 1 = '-') && is_digit (peek l 2)))))
   in
   if is_float then begin
-    Buffer.add_char buf '.'; advance l 1;
-    while l.i < String.length l.src && is_digit l.src.[l.i] do
-      Buffer.add_char buf l.src.[l.i]; advance l 1
-    done;
+    (* v3.3.1 修复：小数点与指数是两种形态——此前无条件把 peek0 当
+       '.' 吞掉，裸指数字面量 1e40 被错读成 1.40=1.4、1e-45 被拆成
+       1.0-45=-44（既有 bug，f32 hex 常量验证时暴露） *)
+    if peek l 0 = '.' then begin
+      Buffer.add_char buf '.'; advance l 1;
+      while l.i < String.length l.src && is_digit l.src.[l.i] do
+        Buffer.add_char buf l.src.[l.i]; advance l 1
+      done
+    end;
     (* 指数部分 *)
     if peek l 0 = 'e' || peek l 0 = 'E' then begin
       Buffer.add_char buf 'e'; advance l 1;
