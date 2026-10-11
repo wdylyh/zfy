@@ -587,7 +587,9 @@ let gen_cast fc d (a : operand) (t : zty) =
       let wa = width_of a.oty and wb = width_of t in
       if wa = wb then emitf fc "  %s = bitcast %s %s to %s" d ta va tb
       else if wa < wb then begin
-        if is_unsigned a.oty then emitf fc "  %s = zext %s %s to %s" d ta va tb
+        (* bool 存 i1：零扩展（true=1，不随符号位扩散成 -1） *)
+        if is_unsigned a.oty || a.oty = TBool then
+          emitf fc "  %s = zext %s %s to %s" d ta va tb
         else emitf fc "  %s = sext %s %s to %s" d ta va tb
       end
       else emitf fc "  %s = trunc %s %s to %s" d ta va tb
@@ -1035,27 +1037,30 @@ let rec gen_field_path fc (p : string) (ty : zty) (idxs : int list) : string =
 
 (* 字段写入（值语义：深拷贝新值；free_old 时先释放旧资源） *)
 let gen_field_store ~(free_old : bool) fc (fp : string) (v : operand) : unit =
+  (* 注意顺序：先深拷贝新值、后释放旧值——右值可能就是旧字段本身
+     （bag.x = bag.x 类自引用，或 push 原地修改后返回的头部），先释放
+     会立刻悬垂 *)
   match v.oty with
   | TString ->
+    let (sv, _) = val_of fc v in
+    let r = fresh_r fc in
+    emitf fc "  %s = call ptr @zfy_strdup(ptr %s)" r sv;
     if free_old then begin
       let old = fresh_r fc in
       emitf fc "  %s = load ptr, ptr %s" old fp;
       emitf fc "  call void @zfy_free_str(ptr %s)" old
     end;
-    let (sv, _) = val_of fc v in
-    let r = fresh_r fc in
-    emitf fc "  %s = call ptr @zfy_strdup(ptr %s)" r sv;
     emitf fc "  store ptr %s, ptr %s" r fp
   | TArray _ | TList _ ->
     let fe = (match v.oty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
+    let (sv, _) = val_of fc v in
+    let r = fresh_r fc in
+    emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" r sv fe;
     if free_old then begin
       let old = fresh_r fc in
       emitf fc "  %s = load ptr, ptr %s" old fp;
       emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" old fe
     end;
-    let (sv, _) = val_of fc v in
-    let r = fresh_r fc in
-    emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" r sv fe;
     emitf fc "  store ptr %s, ptr %s" r fp
   | TStruct s ->
     let (sp, _) = ptr_of fc v in
@@ -1160,18 +1165,8 @@ let gen_instr fc (i : instr) : unit =
     end
     else begin
       let (dstp, _) = ptr_of fc (operand_of_name name ty) in
-      (* 先释放槽中旧资源：string 旧堆串、数组/列表旧 seq（string 元素一并释放） *)
-      (match ty with
-       | TString ->
-         let ov = fresh_r fc in
-         emitf fc "  %s = load ptr, ptr %s" ov dstp;
-         emitf fc "  call void @zfy_free_str(ptr %s)" ov
-       | TArray _ | TList _ ->
-         let ov = fresh_r fc in
-         emitf fc "  %s = load ptr, ptr %s" ov dstp;
-         let fe = (match ty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
-         emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" ov fe
-       | _ -> ());
+      (* 先深拷贝新值、后释放槽中旧资源（顺序敏感：右值可能引用旧槽，
+         如 xs = push(xs, v) 特判未命中的兜底路径——先释放会悬垂） *)
       (match ty with
        | TArray _ | TList _ ->
          (* 深拷贝 seq：避免两个变量共享同一资源导致双重释放 *)
@@ -1180,12 +1175,18 @@ let gen_instr fc (i : instr) : unit =
          let (sv, _) = val_of fc v in
          let r = fresh_r fc in
          emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" r sv is_str;
+         let ov = fresh_r fc in
+         emitf fc "  %s = load ptr, ptr %s" ov dstp;
+         emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" ov is_str;
          emitf fc "  store ptr %s, ptr %s" r dstp
        | TString ->
          (* 深拷贝语义：槽内恒持有独立堆串（字面量为全局常量，需 strdup） *)
          let (sv, _) = val_of fc v in
          let r = fresh_r fc in
          emitf fc "  %s = call ptr @zfy_strdup(ptr %s)" r sv;
+         let ov = fresh_r fc in
+         emitf fc "  %s = load ptr, ptr %s" ov dstp;
+         emitf fc "  call void @zfy_free_str(ptr %s)" ov;
          emitf fc "  store ptr %s, ptr %s" r dstp
        | TFrac _ ->
          (* frac 聚合：memcpy *)
@@ -1544,14 +1545,34 @@ let gen_instr fc (i : instr) : unit =
      | Some (p, _) ->
        emitf fc "  call void @zfy_frac_norm_%s(ptr %s)" (Hir.suffix_of elem) p
      | None -> lerr None "undefined variable %s" name)
-  | MSeqRemove (name, elem, idx, is_list) ->
-    (* remove：数组=槽位填零值（元素资源按头部释放）；列表=删除并左移 *)
-    let (seqp, _) = val_of fc (operand_of_name name (TList (TInt 64))) in
+  | MSeqRemove (d, base, idx, elem, is_list) ->
+    (* remove 表达式（v3 2026-10-11）：runtime 原子地"读出被删元素到 out +
+       删除"。数组=槽位填零（长度不变）；列表=删除并左移。
+       被删元素为深拷贝副本（elem_init 出独立值） *)
+    let (seqp, _) = val_of fc base in
     let (iv, _) = val_of fc idx in
+    let out = fresh_r fc in
+    (match elem with
+     | TStruct _ | TErr _ ->
+       emitf_entry fc "  %s = alloca %s" out (ll_ty elem);
+       Hashtbl.replace fc.allocas d (out, elem);
+       emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty elem) out
+     | TList _ | TArray _ ->
+       emitf_entry fc "  %s = alloca ptr" out;
+       Hashtbl.replace fc.allocas d (out, TList (TInt 64))
+     | _ ->
+       emitf_entry fc "  %s = alloca i128" out);
     if is_list then
-      emitf fc "  call void @zfy_seq_remove(ptr %s, i64 %s)" seqp iv
+      emitf fc "  call void @zfy_seq_remove(ptr %s, i64 %s, ptr %s)" seqp iv out
     else
-      emitf fc "  call void @zfy_seq_zero(ptr %s, i64 %s)" seqp iv
+      emitf fc "  call void @zfy_seq_zero(ptr %s, i64 %s, ptr %s)" seqp iv out;
+    (match elem with
+     | TStruct _ | TErr _ | TList _ | TArray _ -> ()  (* 槽即结果（allocas 已登记） *)
+     | _ ->
+       let raw = fresh_r fc in
+       emitf fc "  %s = load i128, ptr %s" raw out;
+       let (v, _) = from_bits fc raw elem in
+       Hashtbl.replace fc.regs d v)
   | MAugSlice (name, elem, a, b, st, bop, v) ->
     (* a[x,y:st] op= v：运行时逐元素原地运算（值经 i128 位模式缓冲传递） *)
     let (seqp, _) = val_of fc (operand_of_name name (TList (TInt 64))) in
@@ -2168,7 +2189,8 @@ let gen_struct_free_fn (sd : sdef) : string =
   Buffer.contents b
 
 (* 生成 @zfy_struct_assign_<名>(ptr dst, ptr src)：逐字段深拷贝
-   （string strdup / seq clone / 嵌套 struct 递归 assign），先释放 dst 旧资源。
+   （string strdup / seq clone / 嵌套 struct 递归 assign）。顺序：先拷贝
+   新值、后释放 dst 旧资源（src 可能引用 dst 自身字段，先释放会悬垂）。
    运行时 free/strdup/clone 均 NULL 安全，无需判空分支 *)
 let gen_struct_assign_fn (sd : sdef) : string =
   let b = Buffer.create 256 in
@@ -2187,10 +2209,10 @@ let gen_struct_assign_fn (sd : sdef) : string =
         let old = Printf.sprintf "%%o%d" i in
         let nv = Printf.sprintf "%%n%d" i in
         let cp = Printf.sprintf "%%c%d" i in
-        emit "  %s = load ptr, ptr %s" old dp;
-        emit "  call void @zfy_free_str(ptr %s)" old;
         emit "  %s = load ptr, ptr %s" nv sp;
         emit "  %s = call ptr @zfy_strdup(ptr %s)" cp nv;
+        emit "  %s = load ptr, ptr %s" old dp;
+        emit "  call void @zfy_free_str(ptr %s)" old;
         emit "  store ptr %s, ptr %s" cp dp
       | TArray _ | TList _ ->
         let is_str =
@@ -2198,10 +2220,10 @@ let gen_struct_assign_fn (sd : sdef) : string =
         let old = Printf.sprintf "%%o%d" i in
         let nv = Printf.sprintf "%%n%d" i in
         let cp = Printf.sprintf "%%c%d" i in
-        emit "  %s = load ptr, ptr %s" old dp;
-        emit "  call void @zfy_seq_free(ptr %s, i8 %d)" old is_str;
         emit "  %s = load ptr, ptr %s" nv sp;
         emit "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" cp nv is_str;
+        emit "  %s = load ptr, ptr %s" old dp;
+        emit "  call void @zfy_seq_free(ptr %s, i8 %d)" old is_str;
         emit "  store ptr %s, ptr %s" cp dp
       | TStruct s2 ->
         emit "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" s2 dp sp
@@ -2386,8 +2408,8 @@ let gen_program (m : mir) : string =
         (Printf.sprintf "declare ptr @zfy_frac_str_%s(ptr)\n" suf))
     sufs;
   (* remove 运行时函数：数组槽位填零 / 列表删除并左移（元素资源按头部释放） *)
-  Buffer.add_string g.mbuf "declare void @zfy_seq_zero(ptr, i64)\n";
-  Buffer.add_string g.mbuf "declare void @zfy_seq_remove(ptr, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_seq_zero(ptr, i64, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_seq_remove(ptr, i64, ptr)\n";
   Buffer.add_string g.mbuf
     "declare void @zfy_seq_aug_range(ptr, i64, i64, i64, i32, ptr, i32, i32, i32)\n";
   (* 文件 I/O（design_fileio.md）：句柄对象 {FILE* fp; int closed}，

@@ -8,11 +8,11 @@ fn i32[3] mkarr()
 fn i32[] upto(let i32 n)
     let i32 a[]
     for let i32 i = 0,   i < n, i++
-        push(a, i)
+        a = push(a, i)
     return a
 fn void fill(ref let i32 xs[])
-    push(xs, 10)
-    push(xs, 20)
+    xs = push(xs, 10)
+    xs = push(xs, 20)
     xs[0] = 99
 fn main()
     let i32[] a = mk()

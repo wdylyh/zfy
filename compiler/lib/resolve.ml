@@ -472,6 +472,7 @@ let resolve (main : program) (main_dir : string)
       | EPanic (c, msg, p) -> EPanic (Option.map (rw_expr m) c, rw_expr m msg, p)
       | EUnwrap (a, b, p) -> EUnwrap (rw_expr m a, rw_expr m b, p)
       | EPropagate (x, p) -> EPropagate (rw_expr m x, p)
+      | ERemove (b, i, p) -> ERemove (rw_expr m b, rw_expr m i, p)
       | EInt _ | EFloat _ | EStr _ | EChar _ | EBool _ -> e
     and rw_block m bl = List.map (rw_stmt m) bl
     and rw_stmt m (s : stmt) : stmt =
@@ -525,7 +526,6 @@ let resolve (main : program) (main_dir : string)
            p)
       | SReduce (a, b, c, p) ->
         SReduce (rw_expr m a, rw_expr m b, rw_expr m c, p)
-      | SRemove (a, b, p) -> SRemove (rw_expr m a, rw_expr m b, p)
       | SUnsafe (b, p) -> SUnsafe (rw_block m b, p)
       | SBreak _ | SContinue _ -> s
     in

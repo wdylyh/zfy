@@ -200,7 +200,7 @@ fn Ledger load_ledger()
         let i64! amt = strutil.parse_i64(cols[2])
         let i64 av = amt ?? 0
         let Entry e = Entry(date=cols[0], category=cols[1], amount=av, note=cols[3])
-        push(L.items, e)
+        L.items = push(L.items, e)
     return L
 
 fn void cmd_init()
@@ -217,7 +217,7 @@ fn void cmd_add(let string date, let string category, let string amount, let str
         die("invalid amount: " + amount)
     let Ledger L = load_ledger()
     let Entry e = Entry(date=date, category=category, amount=cv, note=note)
-    push(L.items, e)
+    L.items = push(L.items, e)
     save_items(L.items)
     output("added: ", date, " ", category, " ", cents_to_yuan(cv), " ", note, "\n")
 
@@ -229,7 +229,7 @@ fn void cmd_del(let string idx_s)
     let i64 len = length(items)
     if iv < 1 or iv > len
         die("index out of range")
-    remove(items, iv - 1)
+    let Entry dropped = remove(items, iv - 1)
     save_items(items)
     output("deleted entry #", iv, "\n")
 
@@ -267,14 +267,14 @@ fn void cmd_sum()
 fn void cmd_month(let string ym)
     let Ledger L = load_ledger()
     let Entry hit[] = Entry(date="", category="", amount=0, note="")
-    remove(hit, 0)
+    let Entry blank = remove(hit, 0)
     let i64 total = 0
     let i64 n = length(L.items)
     let i64 i = 0
     while i < n
         let Entry e = L.items[i]
         if strutil.starts_with(e.date, ym)
-            push(hit, e)
+            hit = push(hit, e)
             total += e.amount
         i++
     if length(hit) == 0

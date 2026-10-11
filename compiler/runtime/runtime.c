@@ -1495,14 +1495,24 @@ static void elem_init(void *dst, const void *src, int kind, zfy_ops *ops,
     }
 }
 
-/* 把 src 元素深拷贝进"已有元素"槽（覆盖写路径：先释放旧资源） */
+/* 把 src 元素深拷贝进"已有元素"槽（覆盖写路径）。
+ * 顺序敏感：先把新值深拷贝到临时缓冲，再释放旧值——src 可能就是 dst
+ * 本身（push 原地修改后返回同一头部 / 自赋值），先释放会悬垂 */
 static void elem_assign(void *dst, const void *src, int kind, zfy_ops *ops,
                         long long esz) {
-    if (kind != 0) {
-        elem_dtor(dst, kind, ops);
-        memset(dst, 0, (size_t)esz);
+    if (kind == 0) {
+        memcpy(dst, src, (size_t)esz);
+        return;
     }
-    elem_init(dst, src, kind, ops, esz);
+    unsigned char tmpbuf[64];
+    void *buf = esz <= (long long)sizeof(tmpbuf) ? tmpbuf
+                                                 : malloc((size_t)esz);
+    if (!buf) zfy_die("elem_assign: 内存分配失败");
+    memset(buf, 0, (size_t)esz);
+    elem_init(buf, src, kind, ops, esz);
+    elem_dtor(dst, kind, ops);
+    memcpy(dst, buf, (size_t)esz);
+    if (buf != tmpbuf) free(buf);
 }
 
 /* output(数组/列表)（w-013）：按元素类型码打印序列，元素间以 sep 分隔。
@@ -1668,22 +1678,25 @@ zfy_seq *zfy_seq_clone(const zfy_seq *src) {
     return s;
 }
 
-/* remove(数组, idx)：把 idx 槽位填零值（长度不变）。
- * 元素内含堆资源先按头部释放；越界报错 */
-void zfy_seq_zero(zfy_seq *s, long long idx) {
+/* remove(数组, idx, out)：把 idx 槽位填零值（长度不变）；被删元素
+ * 深拷贝副本写入 out（v3 2026-10-11 表达式化，out 可为 NULL 仅删除）。
+ * 元素内含堆资源先深拷贝再释放；越界报错 */
+void zfy_seq_zero(zfy_seq *s, long long idx, void *out) {
     if (!s) zfy_die("remove: 源为空");
     if (idx < 0 || idx >= s->len) zfy_die("remove: 数组下标越界");
     void *slot = seq_at(s, idx);
+    if (out) elem_init(out, slot, s->kind, s->ops, s->elemsz);
     elem_dtor(slot, s->kind, s->ops);
     memset(slot, 0, (size_t)s->elemsz);
 }
 
-/* remove(列表, idx)：删除第 idx 个元素，后续元素左移，长度 -1。
- * 被删元素内含堆资源先按头部释放；越界报错 */
-void zfy_seq_remove(zfy_seq *s, long long idx) {
+/* remove(列表, idx, out)：被删元素深拷贝副本写入 out，后续元素左移，
+ * 长度 -1（v3 2026-10-11 表达式化，out 可为 NULL 仅删除）。越界报错 */
+void zfy_seq_remove(zfy_seq *s, long long idx, void *out) {
     if (!s) zfy_die("remove: 源为空");
     if (idx < 0 || idx >= s->len) zfy_die("remove: 列表下标越界");
     void *slot = seq_at(s, idx);
+    if (out) elem_init(out, slot, s->kind, s->ops, s->elemsz);
     elem_dtor(slot, s->kind, s->ops);
     memmove(slot, (char *)slot + s->elemsz,
             (size_t)(s->len - idx - 1) * (size_t)s->elemsz);

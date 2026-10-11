@@ -56,7 +56,9 @@ type instr =
   | MFracNew of string * zty * operand * operand (* 分数字面量：�? frac 类型, 分子, 分母 *)
   | MNorm of string * zty                        (* frac 槽约分：调用 zfy_frac_norm_<suf> *)
   | MTempAlloca of string * zty                  (* 归一用临时聚合槽（llvmgen 入口块 alloca） *)
-  | MSeqRemove of string * zty * operand * bool  (* remove：槽, 元素类型, 下标, 是否列表 *)
+  | MSeqRemove of string * operand * operand * zty * bool
+    (* remove 表达式（v3）：(目标寄存器, seq 操作数, 下标, 元素类型, 是否列表)。
+       返回被删元素副本；数组=槽位填零、列表=删除并左移 *)
   | MAugSlice of string * zty * operand * operand * operand * binop * operand
     (* a[x,y:st] op= v：槽, 元素类型, 起点, 终点, 步长, 运算, 右值（逐元素原地） *)
   | MReduce of string * zty * operand * operand  (* reduce(root, frac 类型, 次数, 起始除数) *)
@@ -327,6 +329,22 @@ let elem_kind_of (z : zty) : int =
      | _ -> assert false)   (* typeck 已校验元素类型 *)
   | _ -> assert false
 
+(* 赋值目标 / push 槽根的槽键：(根槽名, 字段序号链)。解引用/元素槽等
+   复杂根返回 None（不参与同槽判定）。用于 xs = push(xs, v) 零拷贝特判 *)
+let seq_root_key_opt (e : texpr) : (string * int list) option =
+  let rec go acc x =
+    match x.e with
+    | EFieldK (b, i) -> go (i :: acc) b
+    | EVarK n -> Some (n, acc)
+    | _ -> None
+  in
+  go [] e
+
+let same_seq_root (a : texpr) (b : texpr) : bool =
+  match seq_root_key_opt a, seq_root_key_opt b with
+  | Some ka, Some kb -> ka = kb
+  | _ -> false
+
 let rec lexpr l (e : texpr) : operand =
   match e.e with
   | EIntK n ->
@@ -517,7 +535,9 @@ let rec lexpr l (e : texpr) : operand =
     op (OLocal d) (TList elem)
   | EPushK (base, v) ->
     (* push(列表, 值)：下标 = 当前长度，写入时自动扩长。
-       槽根分派（w-014 #3）：变量槽直写；字段链/ref 解引用/元素槽经槽地址 *)
+       槽根分派（w-014 #3）：变量槽直写；字段链/ref 解引用/元素槽经槽地址。
+       返回列表本身（v3 2026-10-11 表达式化）：变量槽直接以槽值为结果，
+       其余槽根 load seq 头（指向 base 的堆，赋值目标异槽时由 MCopy 深拷贝） *)
     let elem = (match base.ety with
                 | TList t -> t
                 | TPtr (TList t) -> t
@@ -535,7 +555,7 @@ let rec lexpr l (e : texpr) : operand =
          | _ -> ov
        in
        emit l (MSeqSet (name, elem, op (OLocal dl) (TInt 64), ov, true, l.unchecked));
-       op (OInt 0L) TVoid
+       op (OLocal name) base.ety
      | _ ->
        let addr = seq_slot_addr l base elem in
        let sp = fresh l in
@@ -545,7 +565,30 @@ let rec lexpr l (e : texpr) : operand =
        let ov = lexpr l v in
        let ov = (match elem with TFrac _ -> norm_frac_val l ov elem | _ -> ov) in
        emit l (MSeqSetAt (addr, elem, op (OLocal dl) (TInt 64), ov, true, l.unchecked));
-       op (OInt 0L) TVoid)
+       op (OLocal sp) (TList elem))
+  | ERemoveK (base, idx, is_list) ->
+    (* remove(数组/列表, i)：表达式（v3 2026-10-11），返回被删元素的
+       深拷贝副本（runtime elem_init 出独立值；数组=槽位填零、
+       列表=删除并左移）。结果登记语句临时（string 元素语句末释放） *)
+    let elem = (match base.ety with
+                | TArray (t, _) | TList t | TPtr (TArray (t, _)) | TPtr (TList t) -> t
+                | _ -> assert false) in
+    let oi = lexpr l idx in
+    let d = fresh l in
+    (match base.e with
+     | EVarK name ->
+       emit l (MSeqRemove (d, op (OLocal name) base.ety, oi, elem, is_list))
+     | _ ->
+       let addr = seq_slot_addr l base elem in
+       let sp = fresh l in
+       emit l (MLoadSeq (sp, addr));
+       emit l (MSeqRemove (d, op (OLocal sp) (TList elem), oi, elem, is_list)));
+    (match elem with
+     | TStruct _ -> add_temp l d (FStruct elem)
+     | TString -> add_temp l d FStr
+     | TList _ | TArray _ -> add_temp l d (FSeq false)
+     | _ -> ());
+    op (OLocal d) elem
   | EStructNewK (_, fields) ->
     (* struct 构造：逐字段求值后写入聚合目标槽（llvmgen 负责 alloca 与
        深拷贝语义）。目标登记为语句临时：语句末释放，或整体赋值时 move 接管 *)
@@ -806,6 +849,13 @@ and lstmt_inner l (s : tstmt) : unit =
     let ops = List.map (lexpr l) parts in
     emit l (MStrAppend (name, ops))
   | SAssignK (lhs, rhs, nn, mov) ->
+    (* v3 2026-10-11：xs = push(xs, v) / bag.xs = push(bag.xs, v)——赋值
+       目标与 push 槽根同槽时原地追加即可，零拷贝（push 本就原地写槽根）；
+       异槽走通用路径（MCopy/MFieldStore 深拷贝，语义正确） *)
+    (match rhs.e with
+     | EPushK (base, _) when same_seq_root lhs base ->
+       ignore (lexpr l rhs)
+     | _ ->
     let v = lexpr l rhs in
     (match lhs.e with
      | EVarK name ->
@@ -853,7 +903,7 @@ and lstmt_inner l (s : tstmt) : unit =
         | Some (rootn, idxs, rootty) ->
           emit l (MFieldStore (op (OLocal rootn) rootty, rootty, idxs, v))
         | None -> merr lhs.epos "unsupported field assignment target")
-     | _ -> merr lhs.epos "unsupported assignment target")
+     | _ -> merr lhs.epos "unsupported assignment target"))
   | SAugIndexK (root, elem, idx, bop, v, grow) ->
     (* a[i] op= v：下标只求值一次（load + op + store 同一槽位）。
        槽根分派（w-014 #3）：变量槽直写；其余经槽地址 *)
@@ -931,28 +981,40 @@ and lstmt_inner l (s : tstmt) : unit =
     in
     let oi = lexpr l idx and ov = lexpr l v in
     emit l (MCall (None, "zfy_str_set", [ sp; oi; ov ], TVoid))
-  | SRemoveK (name, elem, idx, is_list) ->
-    (* remove(数组/列表, i)：数组槽位填零值；列表删除并左移，长度-1 *)
-    emit l (MSeqRemove (name, elem, lexpr l idx, is_list))
   | SAugSliceK (name, elem, a, b, st, bop, v) ->
     (* a[x,y:st] op= v：运行时逐元素原地运算 *)
     emit l (MAugSlice (name, elem, lexpr l a, lexpr l b, lexpr l st, bop,
                        lexpr l v))
   | SFieldSetK (root, idxs, rootty, v) ->
     (* 字段写入：根地址（变量槽/元素槽地址/解引用）定位一次 + GEP 链，
-       深拷贝新值 + 释放旧值（llvmgen 按字段类型分派） *)
-    let rp =
-      match root.e with
-      | EVarK n -> op (OLocal n) root.ety
-      | EAddrOfK { e = ESeqGetK (b, i); _ } ->
-        let d = fresh l in
-        let ety = (match root.ety with TPtr t -> t | _ -> assert false) in
-        emit l (MElemAddr (d, lexpr l b, lexpr l i, ety, true));
-        op (OLocal d) ety
-      | EDerefK p -> lexpr l p
-      | _ -> merr root.epos "unsupported field-set root"
+       深拷贝新值 + 释放旧值（llvmgen 按字段类型分派）。
+       v3 2026-10-11：bag.items = push(bag.items, x) 同槽特判——push 本就
+       原地写该字段，跳过整体深拷贝（MFieldStore 先释放旧值会让 push
+       写入的 seq 变悬垂） *)
+    let same_field_root =
+      match v.e with
+      | EPushK (base, _) ->
+        (match seq_root_key_opt base, seq_root_key_opt root with
+         | Some (n, il), Some (n', []) -> n = n' && il = idxs
+         | _ -> false)
+      | _ -> false
     in
-    emit l (MFieldStore (rp, root.ety, idxs, lexpr l v))
+    if same_field_root then
+      ignore (lexpr l v)
+    else begin
+      let rp =
+        match root.e with
+        | EVarK n -> op (OLocal n) root.ety
+        | EAddrOfK { e = ESeqGetK (b, i); _ } ->
+          let d = fresh l in
+          let ety = (match root.ety with TPtr t -> t | _ -> assert false) in
+          emit l (MElemAddr (d, lexpr l b, lexpr l i, ety, true));
+          op (OLocal d) ety
+        | EDerefK p -> lexpr l p
+        | _ -> merr root.epos "unsupported field-set root"
+      in
+      emit l (MFieldStore (rp, root.ety, idxs, lexpr l v))
+    end
   | SAugFieldK (root, idxs, rootty, bop, v) ->
     (* 字段增广：load 字段 + op + 写回（字段只求值一次；字段类型 = 右值类型） *)
     let fty = v.ety in
@@ -1403,7 +1465,7 @@ let uses_of (i : instr) : string list =
   | MFracNew (_, _, a, b) -> operand_names a @ operand_names b
   | MNorm _ -> []
   | MTempAlloca _ -> []
-  | MSeqRemove (_, _, idx, _) -> operand_names idx
+  | MSeqRemove (_, s, idx, _, _) -> operand_names s @ operand_names idx
   | MAugSlice (_, _, a, b, st, _, v) ->
     operand_names a @ operand_names b @ operand_names st @ operand_names v
   | MReduce (r, _, a, b) -> r :: operand_names a @ operand_names b

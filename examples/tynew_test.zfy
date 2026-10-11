@@ -20,8 +20,8 @@ fn i32 sum(let f64 xs[])
     return s
 
 fn main()
-    push(empty, 7)
-    push(empty, 8)
+    empty = push(empty, 7)
+    empty = push(empty, 8)
     output(a, b, c, big)
     output(arr[0], arr[1], arr[2])
     output(lst[0], lst[1])

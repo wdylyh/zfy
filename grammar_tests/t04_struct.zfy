@@ -35,10 +35,10 @@ fn main()
     // 含数组/列表字段的 struct
     let Buf b
     b.data[0] = 9
-    push(b.vals, 3)
+    b.vals = push(b.vals, 3)
     // struct 作列表元素：深拷贝值语义
     let Point ps[]
-    push(ps, p1)
+    ps = push(ps, p1)
     let Point got = ps[0]
     got.x = 99.0
     ps[0].x = 55.0

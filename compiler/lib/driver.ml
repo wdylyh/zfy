@@ -257,6 +257,7 @@ let code_of = function
       ["input target must be string/integer/float/bool/char"], "E3084";
       ["output does not support argument type: "], "E3085";
       ["input's delim must be char or string"], "E3086";
+      ["statement discards a value of type "], "E3189";
       ["strings do not support index assignment"], "E3017";
       ["dereference assignment supports only scalar/pointer types"], "E3031";
       ["does not support index assignment"], "E3032";
@@ -477,6 +478,7 @@ let expand_uses (main : program) (main_dir : string)
     | ESlice (b, a, bb, st, p) ->
       ESlice (rw_expr m b, rw_expr m a, rw_expr m bb, Option.map (rw_expr m) st, p)
     | ECast (e1, t, p) -> ECast (rw_expr m e1, t, p)
+    | ERemove (b, i, p) -> ERemove (rw_expr m b, rw_expr m i, p)
     | EBlock (bl, p) -> EBlock (rw_block m bl, p)
     | e -> e
   and rw_block m bl = List.map (rw_stmt m) bl
@@ -519,7 +521,6 @@ let expand_uses (main : program) (main_dir : string)
                Option.map (rw_expr m) endd, p)
     | SInput (ts, d, p) -> SInput (ts, Option.map (rw_expr m) d, p)
     | SReduce (a, b, c, p) -> SReduce (rw_expr m a, rw_expr m b, rw_expr m c, p)
-    | SRemove (a, b, p) -> SRemove (rw_expr m a, rw_expr m b, p)
     | s -> s
   in
   (* 把一个文件的函数并入全局：ns 前缀；import 为 None 导入全部，Some m 只导入模块 m *)

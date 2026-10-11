@@ -33,8 +33,8 @@ fn i32 list_len_str(let string xs[])
 fn main()
     // 全局变量读写
     output(gcount, gname, "sep=", end="\n")
-    push(gnums, 3)
-    push(gnums, 4)
+    gnums = push(gnums, 3)
+    gnums = push(gnums, 4)
     output(gnums[0], gnums[1], end="\n")
 
     // frac 参数
@@ -50,7 +50,7 @@ fn main()
     // 数组参数（长度=另一参数）
     let i32 m = 4
     let i32 d[4]
-    arr_fill(m, d)
+    let i32 rc = arr_fill(m, d)
     output(arr_fill(m, d), d[2], end="\n")  // 4（函数内写入成功） 0（深拷贝不影响调用方）
 
     // 列表参数

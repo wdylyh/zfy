@@ -16,13 +16,13 @@ fn main()
 
     // remove：数组槽位填零值，长度不变
     let i64 arr[5] = 1,2,3
-    remove(arr, 1)
+    let i64 dropped1 = remove(arr, 1)
     output(arr[0], arr[1], arr[2], arr[4], sep=',', end=' ')   // 期望 1,0,3,0
     output(length(arr))                       // 期望 5
 
     // remove：列表删除并左移
     let f64 lst[] = 1.5,2.5,3.5,4.5
-    remove(lst, 1)
+    let f64 dropped2 = remove(lst, 1)
     output(lst[0], lst[1], lst[2], sep=',', end=' ')   // 期望 1.500000,3.500000,4.500000
     output(length(lst))                       // 期望 3
 
@@ -44,10 +44,10 @@ fn main()
     output(sb[0], sb[2], sb[4], sep=',', end=' ')   // 期望 3,9,18
     output("")
 
-    // cast 语句重绑定
+    // cast 表达式（v3 起裸 cast 语句已删除）
     let f64 pi = 3.75
-    cast(pi, i32)
-    output(pi, end=' ')                       // 期望 3
+    let i32 pin = cast(pi, i32)
+    output(pin, end=' ')                      // 期望 3
     output("")
 
     // 转义序列新增 \a \b \f \v \r \0

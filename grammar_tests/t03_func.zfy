@@ -8,17 +8,17 @@ fn void wrap(ref let string s)
     s = s + "!"
 
 fn void fill(ref let i32 xs[])
-    push(xs, 10)
-    push(xs, 20)
+    xs = push(xs, 10)
+    xs = push(xs, 20)
     xs[0] = 99
 
 fn void fill2(ref let i32[] xs)
-    push(xs, 1)
+    xs = push(xs, 1)
 
 fn i32[] upto(let i32 n)
     let i32 a[]
     for let i32 i = 0,   i < n, i++
-        push(a, i)
+        a = push(a, i)
     return a
 
 fn i32[3] triple()

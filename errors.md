@@ -447,6 +447,14 @@
 - input：input: EOF（无输入可读）/ input: 无法把输入解析为整数 / 解析为小数 / 解析为布尔值
 - 运算：除以零（浮点/整数除）/ 取模除零 / 浮点不支持取模
 
+## 附录 A2. v3.1 新增错误码（2026-10-11）
+
+| 错误码 | 消息前缀 | 触发场景 |
+|---|---|---|
+| E3189 | `statement discards a value of type T (cast/find/push/remove and user functions return values; assign it to a variable: x = f(...))` | 裸语句丢弃产值：push/remove/find/length/cast/prec 等产值内建与用户函数返回值不能单独成句。例外：fail/panic（非局部退出）、?? 解包块内的表达式（块末兜底值） |
+
+同批变更（2026-10-11 v3.1）：裸 cast 语句重绑定特例删除（原 cast(a, T) 单独成句把 a 重绑定为 T 槽，现按 E3189 报错）；push 返回列表、remove 返回被删元素副本；cast(e, frac) 支持（int/bool/char→n/1，float 字面量二进制精确转分数，0.5→1/2）；bool→整数 cast 由 sext 改 zext（true=1，不再是 -1）。
+
 ## 附录 B. 多错误恢复行为说明（当前实现）
 
 1. 词法错误：单错即停（token 流不可靠）。

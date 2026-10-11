@@ -49,8 +49,12 @@ and texpr_kind =
     (* base[a,b:step]：数组/列表切片，返回同元素类型的动态序列（TList 元素） *)
   | ESplitK of texpr * texpr        (* split(s, x)：结果为 string 列表（新 seq，临时） *)
   | ESeqLitK of zty * texpr list    (* 序列字面量（整体赋值右值，w-014 #3）：新分配 seq + 逐元素写入 *)
-  | EPushK of texpr * texpr         (* push(list, v)：追加到列表末尾（自动扩长），结果 void。
+  | EPushK of texpr * texpr         (* push(list, v)：追加到列表末尾（自动扩长），
+                                       返回列表本身（v3 2026-10-11 表达式化）。
                                        base 为可写 seq 槽根：变量槽/字段链/解引用（ref 参数） *)
+  | ERemoveK of texpr * texpr * bool
+    (* remove(数组/列表, i)：(槽根, 下标, 是否列表)，返回被删元素（深拷贝副本，
+       v3 2026-10-11 表达式化）；数组=槽位填零（长度不变）、列表=删除并左移 *)
   | EStructNewK of string * texpr list
     (* struct 构造：名, 字段值（按声明序，typeck 已补全 default/零值） *)
   | EFieldK of texpr * int          (* 字段读取：base, 字段序号（ety = 字段类型） *)
@@ -117,7 +121,6 @@ and tstmt_kind =
   | SOutputK of texpr list * texpr * texpr      (* (参数, sep, end)——sep/end 已转 string *)
   | SInputK of tin_target list * texpr option   (* (目标列表, delim 表达式；None 默认字符集) *)
   | SReduceK of texpr * texpr * texpr           (* reduce(x, 次数, 起始除数) *)
-  | SRemoveK of string * zty * texpr * bool     (* remove(x, i)：(槽名, 元素类型, 下标, 是否列表) *)
   | SUnwrapBlockK of bool * bool * string * zty * texpr * string * tblock
     (* 解包块：a ?? 缩进块。(是否声明新变量, 是否 return 形式, 目标槽, 元素类型,
        a 表达式, err 槽名（TStruct "Err"）, 块)。块末值表达式已由 typeck 改写为

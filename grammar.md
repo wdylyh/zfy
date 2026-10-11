@@ -1,6 +1,10 @@
-# zfy 语言规范（v3，2026-10-11）
+# zfy 语言规范（v3.1，2026-10-11）
 
 > 本版每一节都经过编译器实测校准（examples 全回归通过）。
+> 与 v3 的主要差异：**push/remove 表达式化**（push 返回列表、remove 返回被删元素）、
+> **裸语句丢弃值报错**（E3189；fail/panic 与 ?? 块例外）、
+> **cast(x, frac) 支持**、**裸 cast 语句（重绑定特例）删除**、
+> bool→整数 cast 修为 zext（true=1）。
 > 与 v2 的主要差异：**frac 上下文整棵表达式按分数计算**（消除 1/4+1/4=0 陷阱）、
 > 新增**循环小数字面量** `(前缀,循环节,)`、切片支持**负步长反向**、
 > **T! 解除数组/列表元素与 128 位限制**、cast(string→i128/u128) 改产错误值。
@@ -200,7 +204,7 @@ struct [packed] 名字<T, U>? 缩进块
 | 输入 | `input(目标..., delim=?)`（见 §13） |
 | unsafe | `unsafe 缩进块`（指针算术、p[i]、p^ 必须在其中） |
 | reduce | `reduce(frac变量, 次数, 起始除数)` |
-| remove | `remove(列表名, 下标)` |
+| `remove` | `remove(名, 下标)`（v3.1：**表达式**，返回被删元素副本，见 §12） |
 
 **for 头部规则（w-021 收紧）**：
 ```
@@ -323,12 +327,22 @@ fn main()
 | `utf8_char_at(s, i)` | 第 i 个码点（0 起），返回单码点 string |
 | `utf8_sub(s, a, b)` | 按码点闭区间切片 |
 | `sizeof(T)` / `alignof(T)` | 编译期常量 |
-| `cast(e, T)` | 显式转换（含 string→数值；失败产 `T!` 错误值，i128/u128 目标同样产错误值） |
+| `cast(e, T)` | 显式转换（含 string→数值；失败产 `T!` 错误值，i128/u128 目标同样产错误值）。v3.1：`cast(e, frac)` 支持——int/bool/char → n/1；float **字面量**按二进制精确转分数（0.5→1/2）；非字面量 float 拒绝。**裸 cast 语句（重绑定）已删除** |
 | `ord(c)` / `chr(n)` | char↔码值 |
 
-**语句式**：`push(列表, 值)`（**恰两参**；目标是列表非定长数组；嵌套列表
-`push(ll, row)` 的 row 须是列表变量/表达式，**不能 push 标量进列表的列表**）；
-`remove(名, 下标)`；`reduce(x, n, 起始除数)`。
+**表达式化的序列操作（v3.1 2026-10-11）**：
+- `push(列表, 值)`（**恰两参**；目标是列表非定长数组；嵌套列表
+  `push(ll, row)` 的 row 须是列表变量/表达式，**不能 push 标量进列表的列表**）
+  ——**返回列表本身**：惯用 `xs = push(xs, v)` / `bag.xs = push(bag.xs, v)`
+  （同槽赋值零拷贝）。
+- `remove(名, 下标)`——**返回被删元素的深拷贝副本**（数组=槽位填零长度不变、
+  列表=删除并左移长度-1）：`let i32 v = remove(xs, 0)`；不需要返回值时
+  赋给丢弃变量（`let i32 dropped = remove(xs, 0)`）。
+- `reduce(x, n, 起始除数)` 保持语句形式。
+- **裸语句丢弃值一律报错**（E3189）：push/remove/find/length/cast 等产值内建
+  与用户函数的返回值不能裸写成一句（`push(xs, 1)` ✗ → `xs = push(xs, 1)` ✓）。
+  例外：`fail(...)`/`panic(...)`（非局部退出）；`??` 解包块内不受限
+  （块末兜底值表达式即块值）。
 
 **string `+=`**：变量 `s += v`、元素 `parts[i] += v`、解引用 `p^ += v` 均支持；
 v 为 string 或 char。
@@ -429,6 +443,9 @@ fn main()
 | Tab 与空格混缩进 | inconsistent indentation | 统一 4 空格 |
 | 语句后写分号 | 报错 | 去掉分号 |
 | `i32 x = 1.5` | 需显式 cast | `let i32 x = cast(1.5, i32)`（截断） |
+| `push(xs, 1)` 裸语句 | E3189（v3.1 新增） | `xs = push(xs, 1)`（push 返回列表） |
+| `remove(xs, 0)` 裸语句 | E3189（v3.1 新增） | `let i32 v = remove(xs, 0)`（返回被删元素） |
+| `cast(pi, i32)` 裸语句（旧重绑定） | E3189（v3.1：特例已删除） | `pi = cast(pi, i32)` 或 `let i32 n = cast(pi, i32)` |
 
 ## 17. 已知限制
 

@@ -10,6 +10,6 @@ fn main()
     y = 5
     output(y)                        // 期望 5
     let i32 lst[]
-    push(lst, x)
-    push(lst, y)
+    lst = push(lst, x)
+    lst = push(lst, y)
     output(lst[0], lst[1], sep=',')  // 期望 0,5

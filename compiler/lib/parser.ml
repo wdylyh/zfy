@@ -231,6 +231,11 @@ let rec parse_ty ?(allow_fun = false) p =
       | _ -> TNamed (s, tp)
     in
     suffixes base
+  | Keyword KFrac ->
+    (* frac 作类型（cast 目标等类型位置）：单写 = i32 frac（v3 2026-10-11）；
+       conv_ty 侧把 TNamed "frac" 解为 TFrac (TInt 32) *)
+    ignore (next p);
+    TNamed ("frac", tp)
   | Keyword (KArray | KList) ->
     err tp "'array'/'list' keywords removed: arrays are written T a[N], lists T a[]"
   | Star ->
@@ -566,6 +571,16 @@ and parse_primary p =
     let t = parse_ty p in
     expect p RParen ")";
     ECast (e, t, tp)
+  | Keyword KRemove ->
+    (* remove(数组/列表, 下标)：表达式（v3 2026-10-11）——返回被删元素
+       （深拷贝副本），数组槽位填零、列表删除并左移；裸语句由 typeck 拒绝 *)
+    ignore (next p);
+    expect p LParen "(";
+    let a = parse_expr p in
+    expect p Comma ",";
+    let b = parse_expr p in
+    expect p RParen ")";
+    ERemove (a, b, tp)
   | Ident s ->
     ignore (next p);
     let s = qpath_extend p s in    (* 模块路径引用 m::f / m::Point(...) *)
@@ -927,15 +942,6 @@ and parse_stmt p =
     expect p RParen ")";
     end_of_stmt p;
     SReduce (a, b, c, tp)
-  | Keyword KRemove ->
-    ignore (next p);
-    expect p LParen "(";
-    let a = parse_expr p in
-    expect p Comma ",";
-    let b = parse_expr p in
-    expect p RParen ")";
-    end_of_stmt p;
-    SRemove (a, b, tp)
   | Semicolon -> skip_trivia p; parse_stmt p
   | _ -> parse_expr_stmt p
 

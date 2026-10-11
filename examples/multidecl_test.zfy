@@ -1,8 +1,8 @@
 // 一行多声明器（w-012）：标量/数组/列表/混合
 fn main()
     let string a[], b[]
-    push(a, "x")
-    push(b, "z")
+    a = push(a, "x")
+    b = push(b, "z")
     output(length(a), length(b), sep=',')
     let i32 m, n = 5
     output(m, n, sep=',')

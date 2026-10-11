@@ -8,5 +8,5 @@ struct Ledger
 fn main()
     let Ledger L = Ledger()
     let Entry e = Entry(date="x", amount=1)
-    push(L.items, e)
+    L.items = push(L.items, e)
     output("len=", length(L.items), "\n")

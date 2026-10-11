@@ -80,7 +80,7 @@ fn main()
     sa[1] = 100
     output(sa[0], sa[1], sa[2], sep=',')     // 期望 1,100,3
     let u32 lst[] = 10, 20, 30
-    push(lst, 40)
+    lst = push(lst, 40)
     output(lst[0], lst[1], lst[2], lst[3], sep=',')   // 期望 10,20,30,40
     output(length(lst))                      // 期望 4
     let u128 la[2] = 5, 6
@@ -96,10 +96,10 @@ fn main()
     let i64 y = 22
     output(sum(cast(x, i8), y))           // 期望 122（u8→i8 显式 cast，new2.md #5）
 
-    // ⑧ cast 用别名（语句重绑定 + 表达式）
+    // ⑧ cast 用别名（表达式形式；v3 起裸 cast 语句已删除）
     let f64 pi = 3.75
-    cast(pi, i32)
-    output(pi)                               // 期望 3
+    let i32 pin = cast(pi, i32)
+    output(pin)                              // 期望 3
     let i128 big = cast(300, i128)
     output(big)                              // 期望 300
     let u32 u = cast(65, u32)

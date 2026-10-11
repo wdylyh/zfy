@@ -51,6 +51,9 @@ and expr =
   | EPanic of expr option * expr * pos     (* panic(msg) / panic(code, msg)：不可恢复终止 *)
   | EUnwrap of expr * expr * pos           (* a ?? b：解包；b 为 EBlock 时为解包块形式 *)
   | EPropagate of expr * pos               (* a?：错误传播（函数返回类型须 T!） *)
+  | ERemove of expr * expr * pos
+    (* remove(数组/列表, 下标)：表达式（v3 2026-10-11）——返回被删元素
+       （深拷贝副本），数组槽位填零、列表删除并左移；裸语句报错 *)
 
 and stmt =
   | SDecl of bool * bool * bool * string * ty option * expr option * pos
@@ -84,7 +87,6 @@ and stmt =
   | SInput of in_target list * expr option * pos
     (* input(目标..., delim=?)；delim 为 char/string 表达式，None 默认"换行和空格"字符集 *)
   | SReduce of expr * expr * expr * pos        (* reduce(x, 次数, 起始除数) *)
-  | SRemove of expr * expr * pos               (* remove(数组/列表名, 下标) *)
   | SBreak of pos
   | SContinue of pos
   | SUnsafe of block * pos

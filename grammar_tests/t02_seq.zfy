@@ -12,9 +12,9 @@ fn main()
     // 嵌套列表：push 构建
     let i32[][] m
     let i32 row[] = 1, 2, 3
-    push(m, row)
-    push(m[0], 4)
-    push(m, c)
+    m = push(m, row)
+    m[0] = push(m[0], 4)
+    m = push(m, c)
     // 定长二维自动分配全零行
     let i32 g[2][3]
     g[1][2] = 5
@@ -22,8 +22,8 @@ fn main()
     a[0] = 100
     a[0] += 1
     // push / remove
-    push(a, 7)
-    remove(a, 0)
+    a = push(a, 7)
+    let i32 dropped = remove(a, 0)
     // 切片：两端含，可带步长
     let i32[] sl = a[0, 2]
     let i32[] sl2 = a[0, 2:2]

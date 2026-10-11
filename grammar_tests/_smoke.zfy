@@ -34,7 +34,7 @@ fn main()
     output(ux, uy, sep="|")
     output(fa[0], fa[1], sep="|")
     let l2 = lst
-    push(l2, 9)
+    l2 = push(l2, 9)
     output(l2)
     show(addf(1/4, 1/4))
     output(raw(ux))

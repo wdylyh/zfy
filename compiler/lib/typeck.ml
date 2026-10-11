@@ -119,6 +119,7 @@ type env = {
   mutable fnvars : (string, unit) Hashtbl.t; (* 函数内已用过的变量名（兄弟作用域同名也要新槽） *)
   const_vals : (string, int64) Hashtbl.t;    (* const 整数变量的编译期值（按槽名） *)
   mutable in_unsafe : bool;                  (* 是否在 unsafe 块内（指针算术门禁） *)
+  mutable in_unwrap : bool;                  (* 是否在 ?? 解包块内（块末兜底值表达式合法） *)
   mutable moved : (string, unit) Hashtbl.t;  (* 已被显式 move 的变量槽（使用报错；写回解除） *)
   mutable uses : (string * pos) list;        (* 当前函数体内全部 EVar 出现位置
                                                 （自动 move 后向判定用，new2.md #1） *)
@@ -229,6 +230,9 @@ let rec subst_ty_ast (map : (string * zty) list) (t : ty) : ty =
 
 let rec conv_ty (g : genv) p (t : ty) : zty =
   match t with
+  | TNamed ("frac", pp) ->
+    (* frac 作类型（cast 目标等类型位置）：单写 = i32 frac（v3 2026-10-11） *)
+    TFrac (TInt 32)
   | TNamed (s, pp) ->
     (match prim_type s with
      | Some t' -> t'
@@ -389,6 +393,7 @@ let pos_of_expr = function
   | EStructNew (_, _, p) | EField (_, _, p)
   | EAddrOf (_, p) | EDeref (_, p) | ENull p
   | EFail (_, _, p) | EPanic (_, _, p) | EUnwrap (_, _, p) | EPropagate (_, p)
+  | ERemove (_, _, p)
   | EBlock (_, p) -> p
 
 (* "a.b.c" -> Some ("a", ["b"; "c"])；不含 '.'、首尾为 '.' 或有空段时 None *)
@@ -1050,7 +1055,8 @@ and check_expr env (e : expr) : texpr =
              mk (ECastK (tn, TChar)) TChar
            | _ -> terr p' "chr takes one argument: chr(n)")
         | "push" ->
-          (* push(列表, 值)：追加到末尾（自动扩长），无返回值。
+          (* push(列表, 值)：追加到末尾（自动扩长），返回列表本身
+             （v3 2026-10-11 表达式化：xs = push(xs, v)；裸语句由 SExpr 拒绝）。
              目标槽根泛化（w-014 #3）：变量/字段链（bag.xs）/ref 参数
              解引用/嵌套元素槽（push(a[i], v)——内层列表为真实槽） *)
           (match args with
@@ -1059,7 +1065,11 @@ and check_expr env (e : expr) : texpr =
              (match resolve root.ety with
               | TList e | TPtr (TList e) ->
                 let tv0 = coerce p' (check_expr env v) e in
-                mk (EPushK (root, { tv0 with ety = resolve e })) TVoid
+                (* 返回列表本身（指针根解引用：push(a[i], v) 返回 a[i] 的列表值） *)
+                mk (EPushK (root, { tv0 with ety = resolve e }))
+                  (match resolve root.ety with
+                   | TPtr t -> t
+                   | t -> t)
               | TArray _ | TPtr (TArray _) ->
                 terr p' "push target must be a list, not a fixed-length array"
               | t -> terr p' "push target must be a list, got %s" (pp_zty t))
@@ -1259,16 +1269,41 @@ and check_expr env (e : expr) : texpr =
       | TVar _, _ | _, TVar _ -> true
       | _ -> false
     in
-    if not ok then
-      terr p' "unsupported cast: %s -> %s"
-        (pp_zty a) (pp_zty b);
-    (* string -> 数值：运行时解析可能失败，结果为 T!（错误值）；
-       128 位整数目标同样产错误值（32 字节宽容器，new.md 2026-10-11 用户
-       拍板）；f128 无 T! 包装，保持 fail-fast 语义 *)
-    let wide128 = match b with TFloat 128 -> true | _ -> false in
-    if a = TString && b <> TString && num b && not wide128 then
-      mk (ECastK (t1, t')) (TErr t')
-    else mk (ECastK (t1, t')) t'
+    (* cast(e, frac)（v3 2026-10-11）：整数/bool/char → 分数 n/1（不失败，
+       不产错误值）；float 字面量按二进制精确值转分数（0.5→1/2）；运行期
+       float 值与 frac 跨宽不支持 *)
+    (match b with
+     | TFrac elem ->
+       let tv =
+         match t1.e, resolve a with
+         | EFloatK v, (TFloat _ | TVar _) ->
+           (* 浮点字面量（含 TVar 未定型）：按二进制精确值转分数（0.5→1/2） *)
+           frac_of_float_lit v elem p'
+         | _, TFloat _ ->
+           terr p'
+             "cannot cast a non-literal float to frac (floats have no exact fraction form; write n/d or use a frac literal)"
+         | _, TFrac e2 ->
+           if resolve e2 <> resolve elem then
+             terr p' "cast between frac widths is not supported: %s -> %s"
+               (pp_zty a) (pp_zty b);
+           t1
+         | _, t when num t -> mk_frac_from t1 elem p'
+         | _, t ->
+           terr p' "unsupported cast: %s -> %s (int/bool/char/float-literal -> frac only)"
+             (pp_zty t) (pp_zty b)
+       in
+       { e = tv.e; ety = TFrac elem; epos = p' }
+     | _ ->
+       if not ok then
+         terr p' "unsupported cast: %s -> %s"
+           (pp_zty a) (pp_zty b);
+       (* string -> 数值：运行时解析可能失败，结果为 T!（错误值）；
+          128 位整数目标同样产错误值（32 字节宽容器，new.md 2026-10-11 用户
+          拍板）；f128 无 T! 包装，保持 fail-fast 语义 *)
+       let wide128 = match b with TFloat 128 -> true | _ -> false in
+       if a = TString && b <> TString && num b && not wide128 then
+         mk (ECastK (t1, t')) (TErr t')
+       else mk (ECastK (t1, t')) t')
   | EBlock (_, p') -> terr p' "block expressions are not supported here"
   | EFail (c, m, p') ->
     (* fail(code, msg)：构造 T! 错误值；元素类型为 fresh TVar，由上下文
@@ -1317,6 +1352,17 @@ and check_expr env (e : expr) : texpr =
      | rt ->
        terr p' "? propagation requires the enclosing function to return %s! (current: %s)" (pp_zty elem) (pp_zty rt));
     mk (EPropagateK ta) elem
+  | ERemove (b, i, p') ->
+    (* remove(数组/列表, 下标)：表达式（v3 2026-10-11），返回被删元素
+       （深拷贝副本）。数组=槽位填零（长度不变）；列表=删除并左移（长度-1）。
+       槽根泛化同 push：变量/字段链/ref 解引用/元素槽 *)
+    let root = seq_slot_root env b "remove target" in
+    (match resolve root.ety with
+     | TArray (e, _) | TList e | TPtr (TArray (e, _)) | TPtr (TList e) as seqty ->
+       let ti = to_i64 (check_expr env i) in
+       let isl = (match seqty with TList _ | TPtr (TList _) -> true | _ -> false) in
+       mk (ERemoveK (root, ti, isl)) e
+     | t -> terr p' "remove only works on arrays/lists, got %s" (pp_zty t))
 
 and check_call env p name0 targs origs modes =
   let name = ref name0 in
@@ -1441,6 +1487,7 @@ and uses_of_expr (acc : (string * pos) list) (e : expr) : (string * pos) list =
     uses_of_expr acc b
   | EUnwrap (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | EPropagate (a, _) -> uses_of_expr acc a
+  | ERemove (b, i, _) -> uses_of_expr (uses_of_expr acc b) i
 
 and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
   match s with
@@ -1503,7 +1550,6 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
     in
     (match delim with Some e -> uses_of_expr acc e | None -> acc)
   | SReduce (a, b, c, _) -> uses_of_expr (uses_of_expr (uses_of_expr acc a) b) c
-  | SRemove (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | SBreak _ | SContinue _ -> acc
   | SUnsafe (blk, _) -> List.fold_left uses_of_stmt acc blk
 
@@ -1621,6 +1667,7 @@ and deref_refs (refs : string list) (body : block) : block =
     | EUnwrap (a, b, p) ->
       EUnwrap (re a, (match b with EBlock (blk, bp) -> EBlock (List.map rs blk, bp) | b2 -> b2), p)
     | EPropagate (a, p) -> EPropagate (re a, p)
+    | ERemove (b, i, p) -> ERemove (re b, re i, p)
   (* 赋值类左值：EVar ∈ refs → EDeref（解引用写） *)
   and lhs (e : expr) : expr =
     match e with
@@ -1678,7 +1725,6 @@ and deref_refs (refs : string list) (body : block) : block =
         tgts;
       SInput (tgts, (match delim with Some e -> Some (re e) | None -> None), p)
     | SReduce (a, b, c, p) -> SReduce (re a, re b, re c, p)
-    | SRemove (a, b, p) -> SRemove (re a, re b, p)
     | SUnsafe (blk, p) -> SUnsafe (List.map rs blk, p)
     | SBreak _ | SContinue _ -> s
   in
@@ -2624,7 +2670,10 @@ and check_unwrap env p (a : expr) (blk : block) target =
   push_scope env;
   declare env "err" { lconst = true; lty = TStruct "Err"; lslot = ""; lunred = false; lconstp = false };
   let errslot = (match lookup_var env "err" with Some l -> l.lslot | None -> assert false) in
+  let saved_unwrap = env.in_unwrap in
+  env.in_unwrap <- true;
   let tblk = check_block env blk in
+  env.in_unwrap <- saved_unwrap;
   pop_scope env;
   let tblk =
     match target, List.rev tblk with
@@ -3085,26 +3134,29 @@ and check_stmt env (st : stmt) : tstmt =
   | SDec (e, p) ->
     let one = Ast.EInt (1L, p) in
     mk (check_aug env p e Ast.Sub one)
-  | SExpr e when is_unwrap_block e ->
-    (* 裸解包块：a ?? 缩进块（块内通常 return/break/panic） *)
-    (match e with
-     | EUnwrap (a, EBlock (blk, _), wp) -> mk (check_unwrap env wp a blk `Discard)
-     | _ -> assert false)
   | SExpr e ->
     (match e with
-     | ECast (EVar (name, np), _, _) ->
-       (* cast(a, T) 单独成句：把 a 重绑定为 T 类型新槽（值转换，原槽保留） *)
-       (match lookup_var env name with
-        | None -> terr np "undefined variable: %s" name
-        | Some _ ->
-          let te = check_expr env e in
-          declare env name { lconst = false; lty = te.ety; lslot = ""; lunred = false; lconstp = false };
-          let slot =
-            (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
-          mk (SDeclK (false, slot, te.ety, te, false)))
+     | EUnwrap (a, EBlock (blk, _), wp) ->
+       (* 裸解包块：a ?? 缩进块（块内通常 return/break/panic） *)
+       (match e with
+        | EUnwrap (a, EBlock (blk, _), wp) -> mk (check_unwrap env wp a blk `Discard)
+        | _ -> assert false)
      | _ ->
+       (* v3 2026-10-11 语句逻辑大改：表达式语句丢弃值即报错——cast/find/
+          push/remove 等产值内建与用户函数只能作为表达式（赋给变量），
+          output/input/close/write/writeln 等无返回值内建仍可裸用。
+          例外：fail/panic（非局部退出，丢弃值即本意）；
+          ?? 解包块内（块末兜底值表达式是块值来源） *)
        let te = check_expr env e in
-       mk (SExprK te))
+       (match e, resolve te.ety with
+        | (EFail _ | EPanic _), _ -> mk (SExprK te)
+        | _, TVoid -> mk (SExprK te)
+        | _, _ when env.in_unwrap -> mk (SExprK te)
+        | _, t ->
+          terr te.epos
+            "statement discards a value of type %s (cast/find/push/remove and user functions return values; assign it to a variable: x = f(...))"
+            (pp_zty t);
+          mk (SExprK te)))
   | SReturn (e, p) ->
     (match e with
      | None ->
@@ -3272,24 +3324,6 @@ and check_stmt env (st : stmt) : tstmt =
            | t -> terr p' "reduce requires a frac-typed variable, got %s" (pp_zty t))
         | None -> terr p' "undefined variable: %s" name)
      | _ -> terr p "reduce's first argument must be a frac-typed local variable")
-  | SRemove (lhs, idx, p) ->
-    (* remove(数组/列表名, 下标)：数组=槽位填零值（长度不变）；列表=删除并左移（长度-1） *)
-    (match lhs with
-     | EVar (name, p') ->
-       (match lookup_var env name with
-        | Some l ->
-          if Hashtbl.mem env.moved l.lslot then
-            terr p' "array %s has been moved and cannot be removed from" name;
-          (match resolve l.lty with
-           | TArray (e, _) | TList e as seqty ->
-             if l.lconst then
-               terr p' "cannot remove from constant %s" name;
-             let ti = to_i64 (check_expr env idx) in
-             let isl = (match seqty with TList _ -> true | _ -> false) in
-             mk (SRemoveK (l.lslot, e, ti, isl))
-           | t -> terr p' "remove only works on arrays/lists, got %s" (pp_zty t))
-        | None -> terr p' "undefined variable: %s" name)
-     | _ -> terr p "remove's first argument must be an array/list variable")
   | SBreak p ->
     ignore p;
     mk SBreakK
@@ -3321,7 +3355,6 @@ and pos_of_stmt = function
   | SInc (_, p) | SDec (_, p)
   | SReturn (_, p) | SIf (_, _, _, p)
   | SWhile (_, _, p) | SFor (_, _, _, _, p) | SReduce (_, _, _, p)
-  | SRemove (_, _, p)
   | SOutput (_, _, _, p) | SInput (_, _, p)
   | SSeqDecl (_, _, _, _, _, _, _, _, p)
   | SUnsafe (_, p)
@@ -3615,7 +3648,7 @@ let check_program (prog : program) : hir =
   let env =
     { g; scopes = []; fncur_ret = TVoid; slotn = 0;
       fnvars = Hashtbl.create 8; const_vals = Hashtbl.create 16;
-      in_unsafe = false; moved = Hashtbl.create 8; uses = [] }
+      in_unsafe = false; in_unwrap = false; moved = Hashtbl.create 8; uses = [] }
   in
   (* 全局作用域：顶层声明（const 内联；非 const 为全局可变变量） *)
   push_scope env;
@@ -3906,6 +3939,7 @@ let check_program (prog : program) : hir =
       | ESplitK (a, c) -> ESplitK (fix_texpr a, fix_texpr c)
       | ESeqLitK (t, es) -> ESeqLitK (subst_ty t, List.map fix_texpr es)
       | EPushK (a, v) -> EPushK (fix_texpr a, fix_texpr v)
+      | ERemoveK (a, i, isl) -> ERemoveK (fix_texpr a, fix_texpr i, isl)
       | EStructNewK (s, args) -> EStructNewK (s, List.map fix_texpr args)
       | EFieldK (b, i) -> EFieldK (fix_texpr b, i)
       | ENullK -> ENullK
@@ -3944,7 +3978,6 @@ let check_program (prog : program) : hir =
       | SSeqSetK (r, t, i, v, g) ->
         SSeqSetK (fix_texpr r, subst_ty t, fix_texpr i, fix_texpr v, g)
       | SStrSetK (r, i, v) -> SStrSetK (fix_texpr r, fix_texpr i, fix_texpr v)
-      | SRemoveK (n, t, i, b) -> SRemoveK (n, subst_ty t, fix_texpr i, b)
       | SExprK e -> SExprK (fix_texpr e)
       | SReturnK e -> SReturnK (Option.map fix_texpr e)
       | SIfK (c, a, b) -> SIfK (fix_texpr c, List.map fix_stmt a, List.map fix_stmt b)
