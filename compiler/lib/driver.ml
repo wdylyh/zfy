@@ -414,8 +414,16 @@ let caret_width lines line col =
    <错误行及上下各 2 行，共 5 行>
         ^ *)
 let report_err errs =
-  List.iter
-    (fun (e : zerr) ->
+  (* 错误数上限（n4）：超长程序失败时防终端爆刷；超出部分汇总一行 *)
+  let max_show = 30 in
+  let total = List.length errs in
+  List.iteri
+    (fun i (e : zerr) ->
+      if i >= max_show then begin
+        if i = max_show then
+          Printf.eprintf "zfy: ... and %d more errors (suppressed)\n" (total - max_show)
+      end
+      else begin
       Printf.eprintf "zfy:error[%s] in %d of %s because (%s)\n"
         e.code e.zpos.line e.zpos.file e.zmsg;
       (try
@@ -427,7 +435,8 @@ let report_err errs =
          let w = caret_width lines e.zpos.line e.zpos.col in
          Printf.eprintf "%s%s\n"
            (String.make (max 0 (e.zpos.col - 1)) ' ') (String.make w '^')
-       with _ -> ()))
+       with _ -> ())
+      end)
     errs
 
 let read_file path =

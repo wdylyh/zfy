@@ -44,7 +44,7 @@ let rec ll_ty (t : zty) : string =
      | TString -> "%err.str"
      | TPtr _ | TFile -> "%err.ptr"
      | _ -> lerr None "invalid error value element type (scalar/string/pointer only)")
-  | TVar _ -> lerr None "unresolved type variable"
+  | TVar _ | TError -> lerr None "unresolved type variable"
 
 (* frac 与 struct 是真正的 LLVM 聚合；数组/列表槽是 ptr 标量 *)
 let is_agg = function TFrac _ | TStruct _ | TErr _ -> true | _ -> false
@@ -88,7 +88,7 @@ let rec size_of g (t : zty) : int =
     (match find_struct g s with
      | Some sd -> fst (Hir.struct_size_align g.structs sd)
      | None -> lerr None "undefined struct %s" s)
-  | TVoid | TVar _ -> lerr None "cannot determine type size"
+  | TVoid | TVar _ | TError -> lerr None "cannot determine type size"
 
 let string_escape (s : string) : string * int =
   let b = Buffer.create (String.length s + 8) in

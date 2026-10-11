@@ -19,6 +19,10 @@ type zty =
                                        {FILE* fp; int closed}，open 分配，close/RAII 释放 *)
   | TFunSig of zty list * zty       (* 函数签名：(参数类型, 返回类型)——仅经 type 别名 *)
   | TVar of int                     (* 类型推断变量 *)
+  | TError                          (* poison（毒化）：声明失败的变量与含错
+                                       子表达式。所有引用/运算/转换静默通过，
+                                       不产生新错误（错误级联抑制，n4）。
+                                       不会流到 MIR/LLVM（有错不进后续阶段） *)
 
 (* struct 定义（typeck 收集后随 HIR/MIR 传递，llvmgen 生成布局与深拷贝辅助） *)
 type sdef = { sname : string; spacked : bool; sfields : (string * zty) list }
@@ -208,6 +212,7 @@ let rec pp_zty = function
     Printf.sprintf "%s(%s)" (pp_zty ret)
       (String.concat "," (List.map pp_zty ptys))
   | TVar n -> Printf.sprintf "?T%d" n
+  | TError -> "<error>"
 
 (* 类型后缀（frac 与 LLVM 类型命名共用） *)
 and suffix_of = function

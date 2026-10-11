@@ -156,12 +156,6 @@ let str_builtin_names =
   [ "length"; "find"; "trim"; "split"; "replace"; "prec";
     "utf8_len"; "utf8_char_at"; "utf8_sub" ]
 
-(* 泛型函数调用钩子（check_program 内装配）：按已检查实参（texpr）推断
-   实例化后返回 mangled 名；未装配时（不应发生）直接报未定义 *)
-let generic_call_hook
-    : (env -> string -> texpr list -> pos -> string) ref =
-  ref (fun _ name _ p -> terr p "undefined function: %s" name)
-
 (* 期望类型提示（new2.md 第2条）：声明/字段上下文把已知的期望类型传给
    泛型推断，字面量实参按期望落型（如 Box<i32> a = Box(7) 中 7 → i32
    而非默认 i64）。仅在"即将检查的顶层表达式是对泛型函数/泛型 struct
@@ -181,6 +175,72 @@ let lookup_var env name =
 
 let push_scope env = env.scopes <- Hashtbl.create 8 :: env.scopes
 let pop_scope env = env.scopes <- List.tl env.scopes
+
+(* ---------- did you mean（n4） ---------- *)
+
+(* Damerau-Levenshtein 编辑距离（含相邻转置；OCaml int 数组 DP） *)
+let edit_distance (a : string) (b : string) =
+  let n = String.length a and m = String.length b in
+  let d = Array.make_matrix (n + 1) (m + 1) 0 in
+  for i = 0 to n do d.(i).(0) <- i done;
+  for j = 0 to m do d.(0).(j) <- j done;
+  for i = 1 to n do
+    for j = 1 to m do
+      let c = if a.[i - 1] = b.[j - 1] then 0 else 1 in
+      let best = min (d.(i - 1).(j) + 1) (d.(i).(j - 1) + 1) in
+      let best = min best (d.(i - 1).(j - 1) + c) in
+      let best =
+        if i > 1 && j > 1 && a.[i - 1] = b.[j - 2] && a.[i - 2] = b.[j - 1]
+        then min best (d.(i - 2).(j - 2) + 1)
+        else best
+      in
+      d.(i).(j) <- best
+    done
+  done;
+  d.(n).(m)
+
+(* 从给定候选里找最接近的：距离上限按长度缩放（≤3 字符容 1 错，
+   其余容 2 错），完全无相近候选返回 None（不硬凑建议） *)
+let edit_close name (cands : string list) =
+  let lim_of k = if String.length k <= 3 then 1 else 2 in
+  let best = ref None and bestd = ref max_int in
+  List.iter
+    (fun k ->
+      if k <> name then
+        let lim = lim_of k in
+        let d = edit_distance name k in
+        if d > 0 && d <= lim && d < !bestd then begin
+          bestd := d; best := Some k
+        end)
+    cands;
+  !best
+
+(* 从可见名字里找最接近的候选：作用域链 + 全局/泛型函数 + struct +
+   类型别名 *)
+let suggest_name env name =
+  let cands = Hashtbl.create 32 in
+  let add k = if k <> name then Hashtbl.replace cands k () in
+  List.iter (fun sc -> Hashtbl.iter (fun k _ -> add k) sc) env.scopes;
+  Hashtbl.iter (fun k _ -> add k) env.g.fns;
+  Hashtbl.iter (fun k _ -> add k) env.g.gfns;
+  Hashtbl.iter (fun k _ -> add k) env.g.structs;
+  Hashtbl.iter (fun k _ -> add k) env.g.aliases;
+  List.iter (fun (k, _) -> add k) builtin_fns_aux;   (* 内建函数也是候选（n4） *)
+  List.iter add str_builtin_names;                   (* 函数式 string 内建（length/find/...） *)
+  edit_close name (Hashtbl.fold (fun k _ acc -> k :: acc) cands [])
+
+(* 报错文案组装：有建议则追加 (did you mean 'x'?) *)
+let with_suggestion env name base =
+  match suggest_name env name with
+  | Some s -> Printf.sprintf "%s (did you mean '%s'?)" base s
+  | None -> base
+
+(* 泛型函数调用钩子（check_program 内装配）：按已检查实参（texpr）推断
+   实例化后返回 mangled 名；未装配时（不应发生）直接报未定义 *)
+let generic_call_hook
+    : (env -> string -> texpr list -> pos -> string) ref =
+  ref (fun env name _ p ->
+    terr p "%s" (with_suggestion env name (Printf.sprintf "undefined function: %s" name)))
 
 (* 声明变量：同名 shadowing 或兄弟作用域重用时分配新槽位名
    （不同声明绝不能共享 LLVM 槽位：宽度不同会 stack 腐败，RAII 槽位冲突） *)
@@ -216,7 +276,8 @@ let rec tag_of_zty (z : zty) : string =
   | TFrac e -> "frac" ^ tag_of_zty e
   | TArray (t, n) -> "a" ^ string_of_int n ^ "$" ^ tag_of_zty t
   | TList t -> "l$" ^ tag_of_zty t
-  | TErr _ | TFunSig _ | TVar _ -> assert false   (* 类型实参校验拦截 *)
+  | TErr _ | TFunSig _ | TVar _ | TError ->
+    assert false   (* 类型实参校验拦截；TError 不做泛型实参 *)
 
 (* zty -> AST 类型叶子（实例化 subst 用；数组/列表形态由 pseq 单独携带，
    不经 fty/pty 表达，故不会到达） *)
@@ -230,7 +291,7 @@ let rec ast_of_zty (p : pos) (z : zty) : ty =
   | TStruct s -> TNamed (s, p)
   | TPtr t -> TPtr (ast_of_zty p t, p)
   | TErr t -> TErr (ast_of_zty p t, p)
-  | TFrac _ | TArray _ | TList _ | TFunSig _ | TVar _ ->
+  | TFrac _ | TArray _ | TList _ | TFunSig _ | TVar _ | TError ->
     terr p "this type cannot be used as a generic type argument"
 
 (* AST 类型层替换：TNamed（类型参数名）-> 实参类型的 AST 形态 *)
@@ -493,7 +554,13 @@ and find_field (env : env) p (s : string) (seg : string) : int * zty =
   | None -> terr p "undefined type: %s" s
   | Some sd ->
     let rec go i = function
-      | [] -> terr p "struct %s has no field %s" s seg
+      | [] ->
+        (* did you mean：字段名候选（n4） *)
+        let cands = List.map (fun (fn, _, _) -> fn) sd.sfields in
+        (match edit_close seg cands with
+         | Some f ->
+           terr p "struct %s has no field %s (did you mean '%s'?)" s seg f
+         | None -> terr p "struct %s has no field %s" s seg)
       | (fn, ft, _) :: rest -> if fn = seg then (i, ft) else go (i + 1) rest
     in
     go 0 sd.sfields
@@ -780,13 +847,13 @@ and check_expr env (e : expr) : texpr =
                 (match errcode_const seg with
                  | Some v -> mk (EIntK v) (TInt 32)
                  | None -> terr p' "undefined error code: ErrCode.%s" seg)
-              | _ -> terr p' "undefined variable: %s" name))
+              | _ -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
         | None ->
           (* 名字是函数（本文件/extern 声明）：引用为函数指针值 *)
           (match Hashtbl.find_opt env.g.fns name with
            | Some sig' ->
              mk (EFunPtrK name) (TPtr (TFunSig (sig'.params, sig'.ret)))
-           | None -> terr p' "undefined variable: %s" name)))
+           | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))))
   | EBin (op, l, r, p') ->
     let tl = check_expr env l in
     let tr = check_expr env r in
@@ -807,6 +874,14 @@ and check_expr env (e : expr) : texpr =
     end
     else
       let rl = resolve tl.ety and rr = resolve tr.ety in
+      (* poison 传播（n4）：任一侧含错子表达式 → 静默通过不再判定，
+         比较结果 bool、其余保持 poison，杜绝连带噪声 *)
+      if rl = TError || rr = TError then
+        mk (EBinK (bop, tl, tr))
+          (match bop with
+           | BEq | BNe | BLt | BGt | BLe | BGe -> TBool
+           | _ -> TError)
+      else
       let isf = function TFrac _ -> true | _ -> false in
       (* 字符串拼接：+ 对 string 是拼接；char 侧提升单字符 string
          （v3.3.4：s + 'c' / 'c' + s，复用 to_string_of 的运行时格式化） *)
@@ -1095,6 +1170,11 @@ and check_expr env (e : expr) : texpr =
       end
   | EUn (op, e1, p') ->
     let t1 = check_expr env e1 in
+    (* poison：毒操作数静默通过（n4） *)
+    if resolve t1.ety = TError then
+      let uo = match op with Neg -> UNeg | Not -> UNot | BitNot -> UBitNot in
+      mk (EUnK (uo, t1)) TError
+    else
     (match op with
      | Neg ->
        (match resolve t1.ety with
@@ -1156,7 +1236,7 @@ and check_expr env (e : expr) : texpr =
               | Some s ->
                 terr p' "panic_handler signature must be (i32, string) -> void, got (%s) -> %s"
                   (String.concat ", " (List.map pp_zty s.params)) (pp_zty s.ret)
-              | None -> terr fp "undefined function: %s" fname)
+              | None -> terr fp "%s" (with_suggestion env fname (Printf.sprintf "undefined function: %s" fname)))
            | _ -> terr p' "panic_handler expects a function name argument: panic_handler(fn)")
         | "open" ->
           (* open(path, mode) -> File!（design_fileio.md）：失败产 ErrCode.IO
@@ -1394,6 +1474,9 @@ and check_expr env (e : expr) : texpr =
   | EIndex (base, idx, p') ->
     let tb = check_expr env base in
     let ti = to_i64 (check_expr env idx) in
+    (* poison：毒底数/毒下标静默通过（n4） *)
+    if resolve tb.ety = TError then mk (ESeqGetK (tb, ti)) TError
+    else
     (match resolve tb.ety with
      | TArray (e, _) | TList e ->
        (* 数组/列表读取：结果为元素类型（越界运行时报错） *)
@@ -1661,7 +1744,7 @@ and check_call env p name0 targs origs modes =
            let mangled = !generic_call_hook env name0 targs p in
            name := mangled;
            Hashtbl.find env.g.fns mangled
-         end else terr p "undefined function: %s" name0)
+         end else terr p "%s" (with_suggestion env name0 (Printf.sprintf "undefined function: %s" name0)))
   in
   if List.length sig_.params <> List.length targs then
     terr p "function %s expects %d arguments, got %d"
@@ -2311,6 +2394,7 @@ and check_struct_new_generic env p name (args : call_arg list) : texpr =
 (* 下标/整数参数统一转成 i64（小整数隐式拓宽） *)
 and to_i64 (ti : texpr) : texpr =
   match resolve ti.ety with
+  | TError -> ti   (* poison：含错下标静默通过（n4） *)
   | TInt 64 | TUint 64 -> ti
   | TInt _ | TUint _ | TVar _ ->
     { e = ECastK (ti, TInt 64); ety = TInt 64; epos = ti.epos }
@@ -2323,6 +2407,7 @@ and to_i64 (ti : texpr) : texpr =
 and coerce p (te : texpr) (want : zty) : texpr =
   let a = resolve te.ety and b = resolve want in
   if a = b then te
+  else if a = TError then te   (* poison：含错表达式落任意槽静默通过（n4） *)
   else
     match a, b with
     | TVar _, (TInt 128 | TUint 128 as tgt)
@@ -2430,9 +2515,12 @@ and check_builtin env p name (args : call_arg list) =
   let named = List.filter_map (function CNamed (n, e) -> Some (n, e) | _ -> None) args in
   let str_of (e : expr) what =
     let t = check_expr env e in
-    if resolve t.ety <> TString then
-      terr p "%s expects a string for its %s parameter, got %s" name what (pp_zty t.ety);
-    t
+    if resolve t.ety = TError then t   (* poison：静默通过（n4） *)
+    else begin
+      if resolve t.ety <> TString then
+        terr p "%s expects a string for its %s parameter, got %s" name what (pp_zty t.ety);
+      t
+    end
   in
   (* 第二参数：char -> 字符语义；string -> 子串语义；其他类型报错
      （w-020：不再走 to_string_of 兜底——trim(s, 65) 这类调用语义含糊，
@@ -2441,6 +2529,7 @@ and check_builtin env p name (args : call_arg list) =
     let t = check_expr env e in
     match resolve t.ety with
     | TChar -> `Char t
+    | TError -> `Str t   (* poison：按 string 侧继续装配，不再报错（n4） *)
     | TString -> `Str t
     | _ ->
       terr p "%s's %s must be char or string, got %s" name what (pp_zty t.ety)
@@ -2450,6 +2539,7 @@ and check_builtin env p name (args : call_arg list) =
     let tx = check_expr env x in
     (* v3.3.4：长度/下标类内建返回 i32（此前 i64，落 i32 槽需显式 cast） *)
     (match resolve tx.ety with
+     | TError -> mk (ESeqLenK tx) TError   (* poison（n4） *)
      | TString ->
        let c = mk (ECallK ("strlen", [ tx ], [])) (TInt 64) in
        mk (ECastK (c, TInt 32)) (TInt 32)
@@ -2748,7 +2838,7 @@ and assign_var env p name =
     if l.lconst then
       terr p "cannot assign to constant %s (declared const)" name;
     l.lslot
-  | None -> terr p "undefined variable: %s" name
+  | None -> terr p "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))
 
 (* 9c：解引用写目标若为指向 const 的指针变量（T const*）则报错 *)
 and check_constp env (pe : expr) p =
@@ -2814,7 +2904,7 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           let trhs = coerce ip trhs t in
           SAugDerefK (addr, bop, trhs)
         | t -> terr ap "augmented assignment target does not support indexing: %s" (pp_zty t))
-     | None -> terr ap "undefined variable: %s" arr)
+     | None -> terr ap "%s" (with_suggestion env arr (Printf.sprintf "undefined variable: %s" arr)))
   | EIndex (base, idx, ip) ->
     (* 元素复合赋值槽根泛化（w-014 #3）：bag.xs[i] += v / xs[i]++（ref）等 *)
     let root = seq_slot_root env base "augmented index-assignment target" in
@@ -2862,7 +2952,7 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
              let trhs = coerce sp trhs e in
              SAugSliceK (l.lslot, e, ta, tb', ts, bop, trhs))
         | t -> terr ap "augmented assignment target does not support slicing: %s" (pp_zty t))
-     | None -> terr ap "undefined variable: %s" arr)
+     | None -> terr ap "%s" (with_suggestion env arr (Printf.sprintf "undefined variable: %s" arr)))
   | EVar (name, p') ->
     (match lookup_var env name with
      | Some l ->
@@ -2919,8 +3009,8 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
                    terr p' "struct field augmented assignment supports only numeric scalar fields, got %s"
                      (pp_zty t))
               | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
-           | None -> terr p' "undefined variable: %s" name)
-        | None -> terr p' "undefined variable: %s" name))
+           | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
+        | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
   | EDeref (pe, dp) ->
     (* p* op= v / p*++ / p*--：解引用复合赋值（仅数值标量/指针目标；
        string 例外：p^ += v 走 concat + 引用槽整体替换，w-020） *)
@@ -2979,7 +3069,7 @@ and check_unwrap env p (a : expr) (blk : block) target =
          if l.lconst then terr p "cannot assign to constant %s (declared const)" name;
          unify p elem l.lty;
          (l.lslot, l.lty)
-       | None -> terr p "undefined variable: %s" name)
+       | None -> terr p "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
     | `Discard -> ("", elem)
     | `Return ->
       (* return a ?? 块：函数须返回 T!，块元素与 T! 元素一致 *)
@@ -3043,6 +3133,16 @@ and check_block env (stmts : stmt list) : tblock =
         None
     in
     while List.length env.scopes > depth do pop_scope env done;
+    (* poison（n4）：声明失败的变量以 TError 入作用域（在恢复后的语句级
+       scope 声明），后续引用静默通过——否则每个引用点都报 undefined/
+       类型错（级联噪声）。变量可能已被声明到一半（报错点在右值），查重后再补 *)
+    (match s with
+     | SDecl (_, _, _, name, _, _, _) | SSeqDecl (_, _, _, name, _, _, _, _, _) ->
+       if lookup_var env name = None then
+         declare env name
+           { lconst = false; lty = TError; lslot = "<err>";
+             lunred = false; lconstp = false }
+     | _ -> ());
     r
   in
   List.filter_map recover (List.concat_map expand stmts)
@@ -3222,7 +3322,7 @@ and check_stmt env (st : stmt) : tstmt =
               | t' ->
                 terr ap "dereference assignment supports only scalar/pointer types (for now), got %s" (pp_zty t'))
            | t -> terr ap "type %s does not support index assignment" (pp_zty t))
-        | None -> terr ap "undefined variable: %s" arr)
+        | None -> terr ap "%s" (with_suggestion env arr (Printf.sprintf "undefined variable: %s" arr)))
      | EIndex (base, idx, ip), _ ->
        (* 元素写入槽根泛化（w-014 #3）：字段链 bag.xs[i] / ref 参数解引用
           xs[i] / 嵌套元素槽 a[i][j]（EAddrOfK 元素槽地址）。
@@ -3376,8 +3476,8 @@ and check_stmt env (st : stmt) : tstmt =
                    mk (SFieldSetK ({ e = EVarK l.lslot; ety = l.lty; epos = p' },
                                    idxs, l.lty, trhs))
                  | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
-              | None -> terr p' "undefined variable: %s" name)
-           | None -> terr p' "undefined variable: %s" name))
+              | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
+           | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
      | _ -> terr p "unsupported assignment target")
   | SAssignList (lhs, exprs, p) ->
     (* 序列字面量整体赋值（w-014 #3）：a = 1, 2, 3 / bag.xs = 1, 2 /
@@ -3435,8 +3535,8 @@ and check_stmt env (st : stmt) : tstmt =
                                       idxs, l.lty, mk_lit e elems))
                     | t -> terr p' "sequence literal assignment requires an array/list field, got %s" (pp_zty t))
                  | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
-              | None -> terr p' "undefined variable: %s" name)
-           | None -> terr p' "undefined variable: %s" name))
+              | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
+           | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
      | EDeref (pe, dp) ->
        (* ref 参数整体赋值：xs = 1, 2 / xs = 新表 *)
        check_constp env pe dp;
@@ -3549,6 +3649,7 @@ and check_stmt env (st : stmt) : tstmt =
     List.iter
       (fun (ta : texpr) ->
         match resolve ta.ety with
+        | TError -> ()   (* poison：不检查不转 string（n4） *)
         | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString | TFrac _ | TVar _ -> ()
         | TArray (_, _) | TList _ ->
           (* 数组/列表整体打印（w-013；w-015 #6 支持嵌套）：叶元素须为
@@ -3629,7 +3730,7 @@ and check_stmt env (st : stmt) : tstmt =
                Hashtbl.remove env.moved l.lslot;  (* 写入：move 状态解除 *)
                check_input_ty p' l.lty;
                { tname = l.lslot; tnew = false; tty = l.lty }
-             | None -> terr p' "undefined variable: %s" name))
+             | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
         targets
     in
     mk (SInputK (ttargets, tdelim))
@@ -3649,7 +3750,7 @@ and check_stmt env (st : stmt) : tstmt =
              let tx = { e = EVarK l.lslot; ety = TFrac e; epos = p' } in
              mk (SReduceK (tx, tc, ts))
            | t -> terr p' "reduce requires a frac-typed variable, got %s" (pp_zty t))
-        | None -> terr p' "undefined variable: %s" name)
+        | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
      | _ -> terr p "reduce's first argument must be a frac-typed local variable")
   | SBreak p ->
     ignore p;

@@ -2,6 +2,20 @@
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 ---
+id: w-031
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-11 14:20
+---
+错误报告 DX 轮（用户指令：抑制级联噪声 + did you mean 建议）。回归 61 例 0 失败（探针验证，无新 examples 用例——回归框架只跑成功程序，错误输出质量靠 _probe/e1~e7 覆盖）。
+- **级联抑制（poison 类型）**：hir.zty 加 `TError` 哨兵。语句级 recover（check_block）失败后把该语句声明的变量以 TError 入作用域；此后凡引用毒变量的表达式全部静默——coerce 入口、EBin 整体（比较产 TBool、其余产 TError）、EUn/EIndex/to_i64、check_builtin 的 str_of/char_or_str/length、SOutput 参数、ECallK 类型随实参。效果：`let i32 z = zzz + 1` 失败后，`if z > 0`、`z = z+1`、`helper(z)`、`arr[0] = z`、`output(z)` 全部不再报错（此前 z 的每个引用点都报 undefined/类型错）。
+- **did you mean**：typeck 加 Damerau-Levenshtein 编辑距离 + `edit_close`（≤3 字符容 1 错、其余容 2 错，无相近候选不硬凑）+ `with_suggestion`。15 处 undefined variable、3 处 undefined function（含 generic_call_hook 默认值，移到 with_suggestion 之后修 unbound）追加 `(did you mean 'x'?)`；字段报错内联用 edit_close（候选=struct 字段表）。候选来源=作用域链+全局/泛型函数+struct+type 别名+**内建表**（lenth→length 提示靠这个）。实测：`m.mesage`→message、`lenth`→length、`y`→x。
+- **错误数上限**：driver report_err 超 30 条截断 + `zfy: ... and N more errors (suppressed)`。**教训：OCaml dangling else**——`if c1 then if c2 then A else B` 的 else 绑内层，导致 i<30 全静默而 i>30 反而打印错误块（e5 探针 40 错只显示后 9 条才暴露）；嵌套 if 必须显式 begin/end。
+- llvmgen size_of/ll_ty 加 TError 防御分支（exhaustive 警告驱动，编译器帮找全豁免点——这招好使）。
+- TError 不会流到 MIR/LLVM：毒声明只存在于 env 作用域（recover 返回 None 不产 tstmt）；毒引用语句产出的 tstmt 结构正常，且 collected 非空必有错不进 codegen。
+
+---
 id: w-030
 from: workbuddy
 to: trae
