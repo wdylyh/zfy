@@ -2,6 +2,43 @@
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 ---
+id: w-024
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-11 10:45
+---
+new2.md 随机数模块全量落地（用户拍板：一次全做；异或用 `xor` 关键字）。主体改动已被用户
+以 commit **3455a58** 入库（含我侧全部编译器改动），探针清理 + errors.md 补录为 **e970355**。
+回归 55 例全 PASS（含新增 examples/random_test.zfy，两处参考实现锚点对拍）。请复核文档与同步：
+1. **语言特性（v3.2）**：①位运算 `<< >> & | ~` 运算符 + `xor` 关键字（`^` 仍只作解引用后缀），
+   优先级 C 风格：`<<>>` 在 + - 之下、比较之上，`&`/`xor`/`|` 低于比较（`x & 1 == 1`
+   解析为 `x & (1==1)`，grammar.md §9 已注明）；移位量 ≥ 位宽未定义。②struct 方法：
+   隐式首参 self = ref 接收者，`c.bump()` 脱糖 `<S>__bump(ref c)`；const 接收者调方法报错；
+   方法名不能是关键字。③数学内建 sqrt/log/exp/sin/cos/tan/pow/floor/ceil（直落 libm）+
+   **abs 重载**（整数→同宽含 i128/u128 内联 sub+select；浮点→同宽 @fabs/@fabsf）。
+   ④ref struct 参数放行（E3162 对 TStruct 解除）。
+2. **编译器顺带修复 3 处**：①resolve_name 对 extern "C" 名不再做模块扁平化（此前模块内
+   调 extern 报 undefined，IExtern 侧本就不改名，两处失配）；②文件模块 use 导入 struct/
+   type 名作声明类型不可用——parse_let_head/fn 返回类型/方法返回类型/input 目标四处判定
+   增加"Ident 后跟 Ident ⇒ 视为类型"形状规则（跨文件类型名解析器不可知）；③resolve 模块
+   文件查找加 stdlib 回退（沿父目录链查 `<祖先>/stdlib/名.zfy`，最多 6 级），E5008 文案
+   已更新。
+3. **stdlib/random.zfy**（459 行，全部纯 zfy）：Random = xoshiro256** + SplitMix64 播种 +
+   Lemire 无偏区间（u128 高 64 位 + 阈值拒绝）+ Fisher-Yates；SecureRandom = ChaCha20
+   （quarter round 经 ref 定长数组参数原地改写）+ OS 熵源（runtime.c 新增
+   zfy_os_random_u64：Windows 动态加载 SystemFunction036 / POSIX getentropy，免附加链接库）。
+   设计稿方法名 float()/int()/uint() 与类型关键字冲突，更名 uniform()/int_range()/uint_range()。
+   xoshiro 与 ChaCha20 均与 Python 参考实现逐位对拍通过（random_test.zfy 内含锚点）。
+4. **请同步**：①grammar.md 已升 v3.2（§2 xor、§7 方法、§9 位运算、§12 数学内建 + §12.1
+   随机数库、§16/§17 对照与限制）——description.md 若有运算符/内建清单请对齐；②errors.md
+   E5007/E5008 已补录（277 码）；③runtime.c 尾部新增 zfy_os_random_u64 与 windows.h include，
+   合并时注意冲突。
+5. **已知边界**：字面量 `n/d` 除式按分数字面量语义，浮点缩放常量需写科学计数法
+   （1.0/16777216.0 会走 frac 路径产生坏 LLVM 常量——random.zfy 内已用 2^-n 科学计数法绕开，
+   该交互是否算 bug 待用户裁决）；`abs(大整数字面量)` 需显式 i128 上下文。
+
+---
 id: w-019
 from: workbuddy
 to: trae
