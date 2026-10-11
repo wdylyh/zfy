@@ -518,22 +518,57 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | BShl -> emitf fc "  %s = shl %s %s, %s" d tya va vb
      | BShr -> emitf fc "  %s = lshr %s %s, %s" d tya va vb
      | BPow ->
-       (* ** 整数幂：运行时快速幂（无符号版），≤64 位；结果截回目标宽度 *)
-       let ext v =
-         if tya = "i64" then v
-         else
-           let z = fresh_r fc in
-           emitf fc "  %s = zext %s %s to i64" z tya v;
-           z
-       in
-       let a64 = ext va and b64 = ext vb in
-       (match tya with
-        | "i64" ->
-          emitf fc "  %s = call i64 @zfy_pow_ull(i64 %s, i64 %s)" d a64 b64
-        | _ ->
-          let c = fresh_r fc in
-          emitf fc "  %s = call i64 @zfy_pow_ull(i64 %s, i64 %s)" c a64 b64;
-          emitf fc "  %s = trunc i64 %s to %s" d c tya)
+       (* ** 整数幂：运行时快速幂（无符号版），≤64 位；结果截回目标宽度。
+          128 位走 zfy_pow_u128 64 位对接口（参数/结果全 64 位，规避
+          win32 __int128 ABI），LLVM 侧拆/拼 i128（v3.3.3） *)
+       if tya = "i128" then begin
+         let blo = fresh_r fc in
+         emitf fc "  %s = trunc %s %s to i64" blo tya va;
+         let bh1 = fresh_r fc in
+         emitf fc "  %s = lshr %s %s, 64" bh1 tya va;
+         let bhi = fresh_r fc in
+         emitf fc "  %s = trunc i128 %s to i64" bhi bh1;
+         let elo = fresh_r fc in
+         emitf fc "  %s = trunc %s %s to i64" elo tya vb;
+         let eh1 = fresh_r fc in
+         emitf fc "  %s = lshr %s %s, 64" eh1 tya vb;
+         let ehi = fresh_r fc in
+         emitf fc "  %s = trunc i128 %s to i64" ehi eh1;
+         let op = fresh_r fc in
+         emitf_entry fc "  %s = alloca [2 x i64]" op;
+         emitf fc "  call void @zfy_pow_u128(ptr %s, i64 %s, i64 %s, i64 %s, i64 %s)"
+           op blo bhi elo ehi;
+         let p1 = fresh_r fc in
+         emitf fc "  %s = getelementptr inbounds [2 x i64], ptr %s, i32 0, i32 1" p1 op;
+         let lo = fresh_r fc in
+         emitf fc "  %s = load i64, ptr %s" lo op;
+         let hi = fresh_r fc in
+         emitf fc "  %s = load i64, ptr %s" hi p1;
+         let low = fresh_r fc in
+         emitf fc "  %s = zext i64 %s to i128" low lo;
+         let hiw = fresh_r fc in
+         emitf fc "  %s = zext i64 %s to i128" hiw hi;
+         let his = fresh_r fc in
+         emitf fc "  %s = shl i128 %s, 64" his hiw;
+         emitf fc "  %s = or i128 %s, %s" d low his
+       end
+       else begin
+         let ext v =
+           if tya = "i64" then v
+           else
+             let z = fresh_r fc in
+             emitf fc "  %s = zext %s %s to i64" z tya v;
+             z
+         in
+         let a64 = ext va and b64 = ext vb in
+         (match tya with
+          | "i64" ->
+            emitf fc "  %s = call i64 @zfy_pow_ull(i64 %s, i64 %s)" d a64 b64
+          | _ ->
+            let c = fresh_r fc in
+            emitf fc "  %s = call i64 @zfy_pow_ull(i64 %s, i64 %s)" c a64 b64;
+            emitf fc "  %s = trunc i64 %s to %s" d c tya)
+       end
      | bopc -> emitf fc "  %s = icmp %s %s %s, %s" d (cmp_op_int true bopc) tya va vb)
   | _ ->
     (match bop with
@@ -548,22 +583,57 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | BShl -> emitf fc "  %s = shl %s %s, %s" d tya va vb
      | BShr -> emitf fc "  %s = ashr %s %s, %s" d tya va vb
      | BPow ->
-       (* ** 整数幂：运行时快速幂（有符号版，负指数得 0） *)
-       let ext v =
-         if tya = "i64" then v
-         else
-           let z = fresh_r fc in
-           emitf fc "  %s = sext %s %s to i64" z tya v;
-           z
-       in
-       let a64 = ext va and b64 = ext vb in
-       (match tya with
-        | "i64" ->
-          emitf fc "  %s = call i64 @zfy_pow_ll(i64 %s, i64 %s)" d a64 b64
-        | _ ->
-          let c = fresh_r fc in
-          emitf fc "  %s = call i64 @zfy_pow_ll(i64 %s, i64 %s)" c a64 b64;
-          emitf fc "  %s = trunc i64 %s to %s" d c tya)
+       (* ** 整数幂：运行时快速幂（有符号版，负指数得 0）。
+          128 位走 zfy_pow_i128 64 位对接口（同无符号版，v3.3.3）；
+          hi 用 lshr 取原始位型（补码语义由 runtime 内部转换处理） *)
+       if tya = "i128" then begin
+         let blo = fresh_r fc in
+         emitf fc "  %s = trunc %s %s to i64" blo tya va;
+         let bh1 = fresh_r fc in
+         emitf fc "  %s = lshr %s %s, 64" bh1 tya va;
+         let bhi = fresh_r fc in
+         emitf fc "  %s = trunc i128 %s to i64" bhi bh1;
+         let elo = fresh_r fc in
+         emitf fc "  %s = trunc %s %s to i64" elo tya vb;
+         let eh1 = fresh_r fc in
+         emitf fc "  %s = lshr %s %s, 64" eh1 tya vb;
+         let ehi = fresh_r fc in
+         emitf fc "  %s = trunc i128 %s to i64" ehi eh1;
+         let op = fresh_r fc in
+         emitf_entry fc "  %s = alloca [2 x i64]" op;
+         emitf fc "  call void @zfy_pow_i128(ptr %s, i64 %s, i64 %s, i64 %s, i64 %s)"
+           op blo bhi elo ehi;
+         let p1 = fresh_r fc in
+         emitf fc "  %s = getelementptr inbounds [2 x i64], ptr %s, i32 0, i32 1" p1 op;
+         let lo = fresh_r fc in
+         emitf fc "  %s = load i64, ptr %s" lo op;
+         let hi = fresh_r fc in
+         emitf fc "  %s = load i64, ptr %s" hi p1;
+         let low = fresh_r fc in
+         emitf fc "  %s = zext i64 %s to i128" low lo;
+         let hiw = fresh_r fc in
+         emitf fc "  %s = zext i64 %s to i128" hiw hi;
+         let his = fresh_r fc in
+         emitf fc "  %s = shl i128 %s, 64" his hiw;
+         emitf fc "  %s = or i128 %s, %s" d low his
+       end
+       else begin
+         let ext v =
+           if tya = "i64" then v
+           else
+             let z = fresh_r fc in
+             emitf fc "  %s = sext %s %s to i64" z tya v;
+             z
+         in
+         let a64 = ext va and b64 = ext vb in
+         (match tya with
+          | "i64" ->
+            emitf fc "  %s = call i64 @zfy_pow_ll(i64 %s, i64 %s)" d a64 b64
+          | _ ->
+            let c = fresh_r fc in
+            emitf fc "  %s = call i64 @zfy_pow_ll(i64 %s, i64 %s)" c a64 b64;
+            emitf fc "  %s = trunc i64 %s to %s" d c tya)
+       end
      | bopc -> emitf fc "  %s = icmp %s %s %s, %s" d (cmp_op_int false bopc) tya va vb)
 
 let gen_unop fc d u (a : operand) =
@@ -2451,6 +2521,8 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare float @powf(float, float)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_pow_ll(i64, i64)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_pow_ull(i64, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_pow_u128(ptr, i64, i64, i64, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_pow_i128(ptr, i64, i64, i64, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   (* output 运行时函数 *)

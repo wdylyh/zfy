@@ -2178,3 +2178,42 @@ unsigned long long zfy_pow_ull(unsigned long long b, unsigned long long e) {
     }
     return r;
 }
+
+/* ---------- ** 幂运算 128 位扩展（v3.3.3） ----------
+   参数与结果全部走 64 位对（out[0]=低 64 位 / out[1]=高 64 位），
+   规避 win32 __int128 参数/返回 ABI 的 byval/sret 约定（同
+   zfy_stoi_wide 策略）；内部按无符号回绕乘法（与 LLVM mul 一致）；
+   指数支持完整 128 位（平方乘迭代次数 = 指数位长 ≤ 128）；
+   有符号版负指数得 0（与 zfy_pow_ll 语义一致）。 */
+void zfy_pow_u128(unsigned long long out[2],
+                  unsigned long long blo, unsigned long long bhi,
+                  unsigned long long elo, unsigned long long ehi) {
+    unsigned __int128 b = ((unsigned __int128)bhi << 64) | blo;
+    unsigned __int128 e = ((unsigned __int128)ehi << 64) | elo;
+    unsigned __int128 r = 1;
+    while (e > 0) {
+        if (e & 1) r *= b;
+        b *= b;
+        e >>= 1;
+    }
+    out[0] = (unsigned long long)r;
+    out[1] = (unsigned long long)(r >> 64);
+}
+
+void zfy_pow_i128(long long out[2],
+                  long long blo, long long bhi,
+                  long long elo, long long ehi) {
+    if (ehi < 0) { out[0] = 0; out[1] = 0; return; } /* 负指数 → 0 */
+    unsigned __int128 b = ((unsigned __int128)(unsigned long long)bhi << 64)
+                        | (unsigned long long)blo;
+    unsigned __int128 e = ((unsigned __int128)(unsigned long long)ehi << 64)
+                        | (unsigned long long)elo;
+    unsigned __int128 r = 1;
+    while (e > 0) {
+        if (e & 1) r *= b;
+        b *= b;
+        e >>= 1;
+    }
+    out[0] = (unsigned long long)r;
+    out[1] = (unsigned long long)(r >> 64);
+}

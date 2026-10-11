@@ -1,0 +1,70 @@
+// 128 位整数幂（v3.3.3）回归：断言失败 exit 1
+fn u128 ipow128(let u128 b, let u128 e)
+    // 对照实现：循环乘（验证 ** 与手写幂一致）
+    let u128 r = 1
+    let u128 i = 0
+    while i < e
+        r = r * b
+        i++
+    return r
+
+fn main()
+    let i32 bad = 0
+    // 基础与锚点：3^39 = 4052555153018976267（u128 精确）
+    let u128 b = 2
+    let u128 e3 = 3
+    if b ** e3 != 8
+        bad++
+    let u128 t = 3
+    let u128 e39 = 39
+    if t ** e39 != 4052555153018976267
+        bad++
+    // 与对照实现一致（5^23 = 11920928955078125）
+    let u128 f = 5
+    let u128 e23 = 23
+    if f ** e23 != ipow128(f, e23)
+        bad++
+    if f ** e23 != 11920928955078125
+        bad++
+    // 回绕：2^128 = 0（模 2^128）
+    let u128 e128 = 128
+    if b ** e128 != 0
+        bad++
+    // 大指数（64 位对高位路径）：2^(2^64) = 0、1^big = 1
+    let u128 eb = 18446744073709551616
+    if b ** eb != 0
+        bad++
+    let u128 one = 1
+    if one ** eb != 1
+        bad++
+    // 0^0 = 1（与 64 位语义一致）
+    let u128 z = 0
+    let u128 ez = 0
+    if z ** ez != 1
+        bad++
+    // 有符号：负底数 / 负指数得 0
+    let i128 nb = -3
+    let i128 e2 = 2
+    let i128 e3s = 3
+    if nb ** e2 != 9
+        bad++
+    if nb ** e3s != -27
+        bad++
+    let i128 ne = -1
+    if nb ** ne != 0
+        bad++
+    // 跨宽度/跨符号：u64 底 ** i32 指（隐式宽化与通用算术一致）
+    let u64 ub = 5
+    let i32 se = 3
+    let u128 r6 = ub ** se
+    if r6 != 125
+        bad++
+    // 右结合与混合字面量树
+    let u128 e2u = 2
+    if b ** e3 ** e2u != 512
+        bad++
+    if b ** (2 + 1) != 8
+        bad++
+    output("pow128 done ", bad, end='\n')
+    if bad > 0
+        return 1

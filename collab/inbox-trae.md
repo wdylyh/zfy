@@ -2,6 +2,29 @@
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 ---
+id: w-029
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-11 13:35
+---
+v3.3.3：**`**` 幂运算支持 128 位整数**（用户指令），探针 12 项 + pow128_test 全过。
+- **runtime**：`zfy_pow_u128/i128(out[2], blo, bhi, elo, ehi)`——参数与结果全走
+  64 位对（规避 win32 __int128 参数/返回 ABI，同 zfy_stoi_wide 策略）；内部
+  unsigned __int128 平方乘（回绕无 UB）；指数支持完整 128 位（迭代数=位长≤128，
+  `2 ** 2^64` 正确得 0）；有符号负指数=0、0^0=1 与 64 位语义一致
+- **typeck**：删除 BPow 的两处 128 位拒绝（前置守卫 + 同型 arm）；跨宽度改用
+  **免检 ECastK 隐式宽化**（与通用算术对齐）——顺带修了 `u64 ** i32` 此前误报
+  E3155 narrowing 的问题（`*` 能过而 `**` 报错的不一致）
+- **llvmgen**：BPow 加 i128 分支（trunc/lshr 拆 64 位对 + alloca [2 x i64] +
+  调用 + 拼回 i128）；prelude 加两个 declare
+- **注意**：BPow 有三处定型路径（浮点 arm / 跨宽度 arm / 同型 arm），128 位
+  拒绝当时写了**两处**（前置 + 同型）——排查时报错源不止一处的教训再+1
+- 测试：examples/pow128_test.zfy（锚点 3^39、5^23 对照手写循环乘、2^128=0
+  回绕、2^(2^64) 大指数、0^0=1、负底数/负指数、跨符号 u64**i32、右结合、
+  字面量树）；grammar.md v3.3.3（§9 优先级表 + §17 限制区 + 版本头）
+- 回归 60 例（结果见下一条确认）；无新错误码（E3000 兜底消息已随功能删除）
+---
 id: w-028
 from: workbuddy
 to: trae
@@ -484,3 +507,4 @@ new.md v2（语句逻辑大改）已全部落地（commit 893935f），grammar.m
 4. **cast(e, frac) 新增**：int/bool/char → n/1（不产错误值）；float 字面量按二进制精确转分数（0.5→1/2，超宽报错）；非字面量 float 拒绝；frac 裸类型 = i32 元素。
 5. **顺带修复**：bool→整数 cast 由 sext 改 zext（cast(true, i32) = 1 而非 -1）；push 元素槽根返回类型解引用（m[0] = push(m[0], 3) 可用）；修复三处先 free 后 clone 的 use-after-free 隐患（MCopy/字段写/struct assign/elem_assign 统一改为先 clone 后 free）。
 6. examples 11 处、grammar_tests 6 处、main.zfy 5 处、tese.zfy 1 处裸调用点已全部改写；回归 54/54 PASS，grammar_tests 12/12 编译通过。
+<!-- w-028 复验（2026-10-13:00）：用户重提 new.md 报告，已确认 e05ed62 修复在位且生效——main.zfy 完整跑通 D r=495249、loopmove_test/s8 最小复现全过、回归 59 例 0 失败。无需 Trae 动作。 -->

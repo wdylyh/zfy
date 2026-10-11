@@ -922,11 +922,10 @@ and check_expr env (e : expr) : texpr =
       end
       (* ** 幂（v3.3）：数学优先级（parser 层右结合）。类型规则：
          浮点参与 → f64（双侧均 f32 则 f32）走 libm pow/powf；
-         整数 ≤64 位 → 运行时快速幂 zfy_pow_ll/ull（负整数指数得 0，
-         溢出回绕与其他整数运算一致）；char 提升 i32；
-         128 位整数不支持 *)
+         整数 → 运行时快速幂 zfy_pow_ll/ull（≤64 位，负整数指数得 0，
+         溢出回绕与其他整数运算一致）；128 位走 zfy_pow_u128/i128
+         64 位对接口（v3.3.3）；char 提升 i32 *)
       else if bop = BPow then begin
-        let is128 = function TInt 128 | TUint 128 -> true | _ -> false in
         let is_int = function
           | TInt _ | TUint _ | TVar _ | TChar -> true | _ -> false in
         (* 子树是否含浮点字面量（未定型 TVar 的形态判别） *)
@@ -943,9 +942,7 @@ and check_expr env (e : expr) : texpr =
           | TVar _ -> floaty e
           | _ -> false
         in
-        if is128 rl || is128 rr then
-          terr p' "** does not support 128-bit integers (use pow on f64 or cast)"
-        else if floaty_side rl tl.e || floaty_side rr tr.e then begin
+        if floaty_side rl tl.e || floaty_side rr tr.e then begin
           (* 浮点幂：任一侧是浮点或含浮点字面量的未定子树 → 整树按同宽
              浮点算（fix_texpr 会把未约束浮点字面量独立翻 f64，混合
              int/float 字面量树必须在此统一，否则 f64/i64 混算发坏 IR）。
@@ -979,18 +976,15 @@ and check_expr env (e : expr) : texpr =
           let rr = if rr = TChar then TInt 32 else rr in
           (match rl, rr with
            | (TInt _ | TUint _ as a), (TInt _ | TUint _ as b) when a <> b ->
+             (* v3.3.3：128 位支持；跨宽度用隐式宽化 cast（ECastK 免检，
+                与通用算术一致——i32→u64 这类同宽异符提升不报 narrowing） *)
              let tgt = widen_target a b in
-             if is128 tgt then
-               terr p' "** does not support 128-bit integers (use pow on f64 or cast)";
-             let tl = coerce p' tl tgt and tr = coerce p' tr tgt in
+             let tl = mk (ECastK (tl, tgt)) tgt in
+             let tr = mk (ECastK (tr, tgt)) tgt in
              mk (EBinK (BPow, tl, tr)) tgt
            | _ ->
              unify p' tl.ety tr.ety;
              let t = resolve tl.ety in
-             (match t with
-              | TInt 128 | TUint 128 ->
-                terr p' "** does not support 128-bit integers (use pow on f64 or cast)"
-              | _ -> ());
              mk (EBinK (BPow, tl, tr)) t)
         end
       end
