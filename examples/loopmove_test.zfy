@@ -1,0 +1,57 @@
+// 自动 move 循环误判修复（new.md 2026-10-11 bug 报告，v3.3.2）回归：
+// 断言失败 exit 1。此前 last_use 按源码位置判"最后使用"——循环体内反复
+// 使用的列表变量被误 move（store null 清槽），下一轮迭代读到 null 崩溃。
+// 修复：循环体内（任意深度）的实参/赋值一律不自动 move，走克隆。
+fn i32[] wrap_len(let i32[] a)
+    let i32[] out
+    out = push(out, cast(length(a), i32))
+    return out
+
+fn main()
+    let i32 bad = 0
+    // ---- 报告最小复现：嵌套 while 内反复传同一列表 ----
+    let i32 i = 0
+    while i < 3
+        let i32[] r
+        r = push(r, i)
+        let i32 j = 0
+        while j < 2
+            let i32[] t = wrap_len(r)
+            if length(t) != 1
+                bad++
+            if t[0] != 1
+                bad++
+            j++
+        // 关键断言：内层循环结束后 r 仍然有效（修复前第二轮为 null 崩溃）
+        if r[0] != i
+            bad++
+        i++
+    // ---- 单层循环内反复传参 ----
+    let i32 k = 0
+    while k < 4
+        let i32[] s = 10, 20
+        let i32[] u = wrap_len(s)
+        if s[1] != 20
+            bad++
+        k++
+    // ---- 循环内赋值触发的自动 move（同根因）----
+    let i32[] src = 1, 2, 3
+    let i32 m = 0
+    while m < 2
+        let i32[] dst
+        dst = src
+        if dst[2] != 3
+            bad++
+        if src[0] != 1
+            bad++
+        m++
+    // ---- 循环外自动 move 仍生效（顶层最后使用免克隆）----
+    let i32[] top = 7, 8
+    let i32[] got = wrap_len(top)
+    if got[0] != 2
+        bad++
+    if bad > 0
+        output("FAIL ", bad, end='\n')
+    output("loopmove done ", bad, end='\n')
+    if bad > 0
+        return 1

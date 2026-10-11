@@ -247,7 +247,12 @@ let float_const (t : zty) (f : float) : string =
     if e <> 0 && e <> 0x7FF && e - 1023 >= -126 && e - 1023 <= 127
        && Int64.logand m 0x1FFFFFFFL = 0L then dec ()
     else Printf.sprintf "0x%016LX" (f32_as_double_bits f)
-  | _ -> dec ()
+  | _ ->
+    (* v3.3.2：f64 非有限字面量（1e400 → inf、0/0 折叠 → nan）不能走
+       十进制——%.17g 产 "inf.0"/"nan.0" 被 LLVM 拒（expected value
+       token）。按 double 位型 hex 发（LLVM 标准特值写法） *)
+    if Float.is_finite f then dec ()
+    else Printf.sprintf "0x%016LX" (Int64.bits_of_float f)
 
 (* ---------- 函数上下文 ---------- *)
 
@@ -1119,10 +1124,8 @@ let own_arg fc (o : operand) (mv : bool) : string * string =
     let (v, t) = val_of fc o in
     if mv then (t, v)
     else begin
-      let is_str =
-        (match o.oty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
       let r = fresh_r fc in
-      emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" r v is_str;
+      emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s)" r v;
       (t, r)
     end
   | _ -> let (v, t) = val_of fc o in (t, v)
@@ -1213,14 +1216,13 @@ let gen_field_store ~(free_old : bool) fc (fp : string) (v : operand) : unit =
     end;
     emitf fc "  store ptr %s, ptr %s" r fp
   | TArray _ | TList _ ->
-    let fe = (match v.oty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
     let (sv, _) = val_of fc v in
     let r = fresh_r fc in
-    emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" r sv fe;
+    emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s)" r sv;
     if free_old then begin
       let old = fresh_r fc in
       emitf fc "  %s = load ptr, ptr %s" old fp;
-      emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" old fe
+      emitf fc "  call void @zfy_seq_free(ptr %s)" old
     end;
     emitf fc "  store ptr %s, ptr %s" r fp
   | TStruct s ->
@@ -1331,14 +1333,12 @@ let gen_instr fc (i : instr) : unit =
       (match ty with
        | TArray _ | TList _ ->
          (* 深拷贝 seq：避免两个变量共享同一资源导致双重释放 *)
-         let is_str =
-           match ty with TArray (TString, _) | TList TString -> 1 | _ -> 0 in
          let (sv, _) = val_of fc v in
          let r = fresh_r fc in
-         emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" r sv is_str;
+         emitf fc "  %s = call ptr @zfy_seq_clone(ptr %s)" r sv;
          let ov = fresh_r fc in
          emitf fc "  %s = load ptr, ptr %s" ov dstp;
-         emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" ov is_str;
+         emitf fc "  call void @zfy_seq_free(ptr %s)" ov;
          emitf fc "  store ptr %s, ptr %s" r dstp
        | TString ->
          (* 深拷贝语义：槽内恒持有独立堆串（字面量为全局常量，需 strdup） *)
@@ -1412,9 +1412,7 @@ let gen_instr fc (i : instr) : unit =
        emitf fc "  %s = load ptr, ptr %s" ov dstp;
        (match ty with
         | TString -> emitf fc "  call void @zfy_free_str(ptr %s)" ov
-        | _ ->
-          let fe = (match ty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
-          emitf fc "  call void @zfy_seq_free(ptr %s, i8 %d)" ov fe);
+        | _ -> emitf fc "  call void @zfy_seq_free(ptr %s)" ov);
        let (sv, st) = val_of fc v in
        if st <> "ptr" then lerr None "invalid move target slot type %s" st;
        emitf fc "  store ptr %s, ptr %s" sv dstp)
@@ -2334,12 +2332,10 @@ let gen_struct_free_fn (sd : sdef) : string =
         emit "  %s = load ptr, ptr %s" v fp;
         emit "  call void @zfy_free_str(ptr %s)" v
       | TArray _ | TList _ ->
-        let is_str =
-          (match fty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
         let fp = Printf.sprintf "%%f%d" i and v = Printf.sprintf "%%v%d" i in
         emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
         emit "  %s = load ptr, ptr %s" v fp;
-        emit "  call void @zfy_seq_free(ptr %s, i8 %d)" v is_str
+        emit "  call void @zfy_seq_free(ptr %s)" v
       | TStruct s2 ->
         let fp = Printf.sprintf "%%f%d" i in
         emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
@@ -2376,15 +2372,13 @@ let gen_struct_assign_fn (sd : sdef) : string =
         emit "  call void @zfy_free_str(ptr %s)" old;
         emit "  store ptr %s, ptr %s" cp dp
       | TArray _ | TList _ ->
-        let is_str =
-          (match fty with TArray (TString, _) | TList TString -> 1 | _ -> 0) in
         let old = Printf.sprintf "%%o%d" i in
         let nv = Printf.sprintf "%%n%d" i in
         let cp = Printf.sprintf "%%c%d" i in
         emit "  %s = load ptr, ptr %s" nv sp;
-        emit "  %s = call ptr @zfy_seq_clone(ptr %s, i8 %d)" cp nv is_str;
+        emit "  %s = call ptr @zfy_seq_clone(ptr %s)" cp nv;
         emit "  %s = load ptr, ptr %s" old dp;
-        emit "  call void @zfy_seq_free(ptr %s, i8 %d)" old is_str;
+        emit "  call void @zfy_seq_free(ptr %s)" old;
         emit "  store ptr %s, ptr %s" cp dp
       | TStruct s2 ->
         emit "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" s2 dp sp

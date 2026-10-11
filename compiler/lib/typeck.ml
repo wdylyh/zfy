@@ -128,6 +128,9 @@ type env = {
   mutable moved : (string, unit) Hashtbl.t;  (* 已被显式 move 的变量槽（使用报错；写回解除） *)
   mutable uses : (string * pos) list;        (* 当前函数体内全部 EVar 出现位置
                                                 （自动 move 后向判定用，new2.md #1） *)
+  mutable ldepth : int;                      (* 循环嵌套深度（while/for 体检查时 +1）：
+                                                自动 move 门禁——循环内实参/赋值一律
+                                                克隆（new.md 2026-10-11 bug 报告） *)
 }
 
 (* 内建函数表（与 hir.ml builtin_fns 同步） *)
@@ -513,7 +516,18 @@ and const_eval (env : env) (e : texpr) : int64 option =
      | None -> None)
   | EUnK (UNeg, a) ->
     (match const_eval env a with Some v -> Some (Int64.neg v) | None -> None)
+  | EUnK (UBitNot, a) ->
+    (match const_eval env a with Some v -> Some (Int64.lognot v) | None -> None)
   | ECastK (a, _) -> const_eval env a
+  | ECallK ("abs", [ a ], _) ->
+    (* abs 常量折叠（v3.3.2）：无符号=恒等（与 llvmgen 一致）、
+       有符号=负取反。|n| 可作数组长度 *)
+    (match const_eval env a with
+     | Some v ->
+       (match resolve e.ety with
+        | TUint _ -> Some v
+        | _ -> Some (if v < 0L then Int64.neg v else v))
+     | None -> None)
   | EBinK (op, a, b) ->
     (match const_eval env a, const_eval env b with
      | Some x, Some y ->
@@ -523,6 +537,30 @@ and const_eval (env : env) (e : texpr) : int64 option =
         | BMul -> Some (Int64.mul x y)
         | BDiv when y <> 0L -> Some (Int64.div x y)
         | BMod when y <> 0L -> Some (Int64.rem x y)
+        | BBitAnd -> Some (Int64.logand x y)
+        | BBitOr -> Some (Int64.logor x y)
+        | BBitXor -> Some (Int64.logxor x y)
+        | BShl when y >= 0L && y < 64L -> Some (Int64.shift_left x (Int64.to_int y))
+        | BShr when y >= 0L && y < 64L ->
+          (* 与 llvmgen 一致：有符号 ashr、无符号 lshr *)
+          (match resolve e.ety with
+           | TUint _ -> Some (Int64.shift_right_logical x (Int64.to_int y))
+           | _ -> Some (Int64.shift_right x (Int64.to_int y)))
+        | BPow ->
+          (** 幂常量折叠（v3.3.2）：与 runtime zfy_pow_ll/ull 语义一致——
+              负指数 = 0、乘法按 64 位回绕（Int64.mul 天然回绕），
+              平方乘迭代 *)
+          if y < 0L then Some 0L
+          else begin
+            let rec go acc b e =
+              if e = 0L then acc
+              else
+                let acc =
+                  if Int64.logand e 1L = 1L then Int64.mul acc b else acc in
+                go acc (Int64.mul b b) (Int64.shift_right_logical e 1)
+            in
+            Some (go 1L x y)
+          end
         | _ -> None)
      | _ -> None)
   | _ -> None
@@ -761,8 +799,10 @@ and check_expr env (e : expr) : texpr =
       | Shl -> BShl | Shr -> BShr | Pow -> BPow
     in
     if bop = BAnd || bop = BOr then begin
-      unify p' tl.ety TBool;
-      unify p' tr.ety TBool;
+      (* 条件位走 coerce（v3.3.2）：延迟定型算术树（2**0）得正规错误，
+         而非静默 unify 成 TBool 致 codegen E4025 *)
+      ignore (coerce p' tl TBool);
+      ignore (coerce p' tr TBool);
       mk (EBinK (bop, tl, tr)) TBool
     end
     else
@@ -1065,7 +1105,17 @@ and check_expr env (e : expr) : texpr =
             terr p' "unary minus requires a numeric type, got %s" (pp_zty t1');
           mk (EUnK (UNeg, t1)) t1')
      | Not ->
-       unify p' t1.ety TBool;
+       (match resolve t1.ety with
+        | TBool -> ()
+        | TVar _ ->
+          (* 延迟定型的算术/调用树（2**0、|3|）不可当 bool 用——
+             直接 unify 会静默绑成 TBool 致 codegen E4025（同 coerce 守卫） *)
+          (match t1.e with
+           | EBinK _ | EUnK _ | ECallK _ ->
+             terr p' "not requires a bool operand, got %s (wrap the comparison explicitly)"
+               (pp_zty t1.ety)
+           | _ -> unify p' t1.ety TBool)
+        | _ -> unify p' t1.ety TBool);
        mk (EUnK (UNot, t1)) TBool
      | BitNot ->
        (* ~ 按位取反（v3.2）：仅整数/char（char 提升为 i32） *)
@@ -1579,41 +1629,20 @@ and check_call env p name0 targs origs modes =
     if name0 = "abs" then begin
       (* abs 重载（v3.2）：整数→同宽整数（llvmgen 内联 sub+select），
          浮点→同宽浮点（llvmgen 走 @fabs/@fabsf）；其余类型报错。
-         字面量延迟定型（ety=TVar）：按节点形态给默认目标型，
-         coerce 会按目标型重解释字面量并做范围校验 *)
-      let lit_default tv =
-        (* 未定型（ety=TVar）实参必为纯字面量表达式树（含变量/具体型的
-           中间节点会提前 unify 成具体型）：递归找节点形态定默认型，
-           树中含浮点字面量则取 f64，否则 i64 *)
-        let rec go e =
-          match e with
-          | EIntK _ -> Some (TInt 64)
-          | EBigK _ -> Some (TInt 128)
-          | EFloatK _ -> Some (TFloat 64)
-          | EUnK (_, u) ->
-            (match resolve u.ety with
-             | (TInt _ | TUint _ | TFloat _) as t -> Some t
-             | _ -> go u.e)
-          | EBinK (_, x, y) ->
-            (match go x.e with
-             | Some (TFloat 64) -> Some (TFloat 64)
-             | r -> (match r with Some _ -> r | None -> go y.e))
-          | _ -> None
-        in
-        go tv.e
-      in
+         纯字面量实参树（ety=TVar）延迟定型（v3.3.2，与 BPow 字面量树
+         同机制）：实参自身的 TVar 直接作 sig 参数/返回——调用结果与
+         实参树共享同一 TVar，由外层 coerce（声明/赋值/实参/return 的
+         目标型）统一求解，无约束时 fix 阶段按默认型收口。此前
+         lit_default 提前定 i64/f64，|3| 落 i32 期望报 E3155 窄化、
+         |2.5| 落 f32 期望报 E3005——期望无法传播进调用 *)
       match targs with
       | [ a ] ->
-        let aty =
-          match resolve a.ety with
-          | (TInt _ | TUint _ | TFloat _) as t -> Some t
-          | TVar _ -> lit_default a
-          | _ -> None
-        in
-        (match aty with
-         | Some t ->
+        (match resolve a.ety with
+         | (TInt _ | TUint _ | TFloat _) as t ->
            { params = [ t ]; prefs = [ false ]; ret = t; runred = false }
-         | None ->
+         | TVar _ ->
+           { params = [ a.ety ]; prefs = [ false ]; ret = a.ety; runred = false }
+         | _ ->
            terr p "abs expects an integer or float argument, got %s" (pp_zty (resolve a.ety)))
       | _ -> terr p "abs expects exactly 1 argument"
     end
@@ -1826,16 +1855,22 @@ and last_use env n (p : pos) =
   not (List.exists (fun (m, q) -> m = n && pos_after q p) env.uses)
 
 (* 自动 move 候选：聚合类型（string/数组/列表）局部非 const 变量、
-   未被 move 过、且此后不再出现 *)
+   未被 move 过、且此后不再出现。
+   循环门禁（new.md 2026-10-11 bug 报告）：last_use 按源码位置判"之后"，
+   而循环体内的使用每次运行期迭代都执行——把循环内的使用点判成
+   "最后使用"并 move（store null 清槽）后，下一轮迭代读到 null 崩溃
+   （静态位置相同，pos_after 不成立）。故循环体内（任意深度）的
+   实参/赋值一律不自动 move，走克隆 *)
 and auto_moveable env n (p : pos) =
-  match lookup_var env n with
-  | Some l ->
-    (not l.lconst) && l.lslot.[0] <> '@'
-    && (match resolve l.lty with
-        | TString | TArray _ | TList _ -> true | _ -> false)
-    && not (Hashtbl.mem env.moved l.lslot)
-    && last_use env n p
-  | None -> false
+  env.ldepth = 0
+  && (match lookup_var env n with
+      | Some l ->
+        (not l.lconst) && l.lslot.[0] <> '@'
+        && (match resolve l.lty with
+            | TString | TArray _ | TList _ -> true | _ -> false)
+        && not (Hashtbl.mem env.moved l.lslot)
+        && last_use env n p
+      | None -> false)
 
 (* 显式 copy 实参：f(copy p)——与默认值语义相同（深拷贝）。
    若编译器能确定此处为最后使用（应自动 move），与显式 copy 冲突 → 报错 *)
@@ -2332,6 +2367,14 @@ and coerce p (te : texpr) (want : zty) : texpr =
          （x += 2.5 落整型槽、2.5 作 i64 实参等） *)
       terr p "floating-point literal cannot be used as %s (explicit cast required)"
         (pp_zty tgt)
+    | TVar _, (TBool | TChar)
+      when (match te.e with
+            | EBinK _ | EUnK _ | ECallK _ -> true | _ -> false) ->
+      (* v3.3.2：延迟定型的算术/调用树（2**0、|3| 等，ety=TVar）不可落
+         bool/char 目标——此前 unify 静默把共享 TVar 绑成 TBool/TChar，
+         codegen 无对应分发报 E4025 内部错误（if 2**0） *)
+      terr p "arithmetic result cannot be used as %s (explicit comparison or conversion required)"
+        (pp_zty b)
     | TVar _, _ | _, TVar _ -> unify p te.ety want; te
     | _, TFrac e when (match te.e with EIntK _ | EFloatK _ -> true | _ -> false) ->
       (* 数值字面量提升为分数（实参/返回等表达式上下文，与声明初值一致；
@@ -3454,7 +3497,7 @@ and check_stmt env (st : stmt) : tstmt =
        mk (SReturnK (Some te)))
   | SIf (cond, then_b, else_b, p) ->
     let tc = check_expr env cond in
-    unify p tc.ety TBool;
+    ignore (coerce p tc TBool);
     push_scope env;
     let tb = check_block env then_b in
     pop_scope env;
@@ -3470,9 +3513,11 @@ and check_stmt env (st : stmt) : tstmt =
     mk (SIfK (tc, tb, eb))
   | SWhile (cond, body, p) ->
     let tc = check_expr env cond in
-    unify p tc.ety TBool;
+    ignore (coerce p tc TBool);
     push_scope env;
+    env.ldepth <- env.ldepth + 1;
     let tb = check_block env body in
+    env.ldepth <- env.ldepth - 1;
     pop_scope env;
     mk (SWhileK (tc, tb))
   | SFor (inits, cond, updates, body, p) ->
@@ -3487,9 +3532,11 @@ and check_stmt env (st : stmt) : tstmt =
         inits
     in
     let tc = check_expr env cond in
-    unify p tc.ety TBool;
+    ignore (coerce p tc TBool);
     let up_stmts = List.map (check_for_update env) updates in
+    env.ldepth <- env.ldepth + 1;
     let tb = check_block env body in
+    env.ldepth <- env.ldepth - 1;
     mk (SForK (init_stmts, tc, up_stmts, tb))
   | SOutput (args, sep, end_, p) ->
     let targs = List.map (check_expr env) args in
@@ -3924,7 +3971,8 @@ let check_program (prog : program) : hir =
   let env =
     { g; scopes = []; fncur_ret = TVoid; slotn = 0;
       fnvars = Hashtbl.create 8; const_vals = Hashtbl.create 16;
-      in_unsafe = false; in_unwrap = false; moved = Hashtbl.create 8; uses = [] }
+      in_unsafe = false; in_unwrap = false; moved = Hashtbl.create 8; uses = [];
+      ldepth = 0 }
   in
   (* 全局作用域：顶层声明（const 内联；非 const 为全局可变变量） *)
   push_scope env;
@@ -4247,7 +4295,17 @@ let check_program (prog : program) : hir =
         if is_fl u'.ety && (match ety with TInt _ | TUint _ -> true | _ -> false)
         then (EUnK (op, u'), u'.ety)
         else (EUnK (op, u'), ety)
-      | ECallK (c, args, moves) -> (ECallK (c, List.map fix_texpr args, moves), ety)
+      | ECallK (c, args, moves) ->
+        (* abs 延迟定型（v3.3.2）：调用未被上下文约束（ety 落默认 i64）
+           而实参为浮点时，调用型随实参对齐（llvmgen 的 abs 按实参分发、
+           output 按实参选打印器——错位会产 print_i64(double) 非法 IR） *)
+        let args' = List.map fix_texpr args in
+        let ety =
+          match c, args', ety with
+          | "abs", [ a ], TInt 64 when is_fl a.ety -> a.ety
+          | _, _, _ -> ety
+        in
+        (ECallK (c, args', moves), ety)
       | ECastK (a, t) -> (ECastK (fix_texpr a, subst_ty t), ety)
       | EFracNewK (a, b) -> (EFracNewK (fix_texpr a, fix_texpr b), ety)
       | ESeqGetK (a, i) -> (ESeqGetK (fix_texpr a, fix_texpr i), ety)

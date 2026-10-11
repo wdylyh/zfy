@@ -1,0 +1,94 @@
+// abs/|e| 延迟定型 + 常量折叠 + 特值字面量（v3.3.2）回归：断言失败 exit 1
+// 覆盖：|e| 在 i32/f32/i128/实参/返回/嵌套/output 各期望上下文按目标型落型
+//       （此前 lit_default 提前定 i64/f64 报 E3155/E3005）；
+//       2**0、|3| 落 bool 目标报正规类型错误（负例见 collab 记录）；
+//       const_eval 折叠 ** 与 abs（可作数组长度）；
+//       编译期 inf/-inf/下溢字面量按位型发射（此前 "inf.0" 非法 LLVM）
+fn i32 take_i32(let i32 v)
+    return v * 2
+
+fn i32 ret_abs()
+    return |7| - 10
+
+fn main()
+    let i32 bad = 0
+    // ---- 声明上下文按期望落型 ----
+    let i32 a = |3|
+    if a != 3
+        bad++
+    let i32 b = |2 - 5|
+    if b != 3
+        bad++
+    let f32 c = |2.5|
+    if cast(c, f64) != 2.5
+        bad++
+    let f64 d = |2.5 - 1|
+    if d != 1.5
+        bad++
+    let i64 e = |3|
+    if e != 3
+        bad++
+    let i128 f = |5|
+    if f != 5
+        bad++
+    // ---- 实参/返回上下文 ----
+    let i32 g = take_i32(|6|)
+    if g != 12
+        bad++
+    let i32 h = ret_abs()
+    if h != -3
+        bad++
+    // ---- 嵌套 |e| ----
+    let i32 i = ||3| - 5|
+    if i != 2
+        bad++
+    // ---- 比较上下文 ----
+    if not (|3| == 3)
+        bad++
+    // ---- output 上下文（浮点 abs 调用型随实参对齐）----
+    output("|2.5|=", |2.5|, end='\n')
+    // ---- T! 包装上下文 ----
+    let i32! w = |4|
+    if (w ?? -1) != 4
+        bad++
+    // ---- const 折叠：** 与 abs 作数组长度 ----
+    let i32 const n = 2 ** 4
+    let i32 arr[n]
+    arr[0] = |n| - 16
+    if n != 16
+        bad++
+    if arr[0] != 0
+        bad++
+    let i32 const m = |3 - 7|
+    if m != 4
+        bad++
+    let i32 const pw = 2 ** 10 + 1
+    if pw != 1025
+        bad++
+    // ---- 特值字面量发射 ----
+    let f64 big = 1e400
+    let f64 small = 1e-400
+    let f32 ovf = 1e40
+    let f64 nz = -0.0
+    let f128 q = 1e400
+    let f16 hh = 1e5
+    if cast(ovf, f64) != big
+        bad++
+    if cast(q, f64) != big
+        bad++
+    if cast(hh, f64) != big
+        bad++
+    // 负零判定：1/(-0.0) = -inf（== 比较区分不了 ±0）
+    let f64 ninf = -1e400
+    let f64 inv = 1.0 / nz
+    if inv != ninf
+        bad++
+    if small != 0.0
+        bad++
+    // ---- const 折叠大数：与运行期回绕语义一致 ----
+    let i64 const big2 = 2 ** 62
+    if big2 != 4611686018427387904
+        bad++
+    output("done ", bad, end='\n')
+    if bad > 0
+        return 1

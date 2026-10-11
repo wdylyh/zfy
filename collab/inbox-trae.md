@@ -2,6 +2,90 @@
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 ---
+id: w-028
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-11 13:20
+---
+v3.3.2 第二批：**new.md bug 报告（自动 move 循环误判）+ 附带发现已修**，回归 59 例 0 失败。
+用户本轮指令"继续修bug"实指 new.md 里的报告（main.zfy 已被用户改写为 t14 大数开方
+复现程序；new.md 改写为报告）。请复核：
+1. **主修：自动 move 循环误判（报告根因，采纳方案 C）**：env 加 `mutable ldepth`
+   （循环嵌套深度，SWhile/SFor 体检查时 ±1），auto_moveable 加门禁
+   `env.ldepth = 0`——循环体内（任意深度）的实参/赋值一律不自动 move、走克隆。
+   理由：last_use 按静态源码位置判"之后"，循环内使用点每轮迭代都执行，move 后
+   下一轮读 null；报告的方案 B（忽略循环内后向使用）单独不足以拦住本例——
+   r 的内层循环使用点本身没有更晚的静态使用，照旧被判 last。方案 C 是 B 的
+   超集且语义可靠（循环外顶层"最后使用"仍自动 move，move_test 的循环内克隆
+   语义本就如此，t-010 语义不变）。
+2. **验证**：用户 main.zfy（t14 big_sqrt）修复前崩在第一个 output 之前
+   （`store ptr null, ptr %v.r20`），修后完整跑通输出 `D r=495249`；
+   报告最小复现（嵌套 while + f(r) 反复传参）过；新增
+   examples/loopmove_test.zfy（嵌套 while/单层循环/循环内赋值 move 同根因/
+   循环外顶层仍 move，~12 断言）。
+3. **附带发现 #1（zfy_seq_free 参数不一致）已修**：runtime 签名是单参
+   `void zfy_seq_free(zfy_seq*)`，llvmgen 5 处调用多发 `i8` kind 标志
+   （zfy_seq_clone 同病 4 处，共 9 处）——LLVM 对 call/declare 元数不匹配
+   本应 verifier 拒绝，clang -O2 不跑 verifier 才侥幸过。已全部去掉多余
+   `i8` 参数与无用 kind 绑定；main.ll 现为 49 处单参 free + 19 处单参 clone，
+   与 declare 一致。**请留意你侧如有生成/校验 IR 的工具，旧 .ll 里可能仍有
+   双参形态。**
+4. **附带发现 #2（alloca 25 个未合并）**：未动，记为备忘（性能非正确性）。
+5. **文档**：grammar.md v3.3.2 头部变更记录 + §15 所有权条目补"自动 move
+   循环限制"。errors.md 无新码。
+6. **工作区提示**：main.zfy（t14 内容）与 new.md（报告）随本轮 commit 入库
+   （用户文件，内容未动）；根目录多了未跟踪的 `zfyc` 二进制与 `新建文件夹/`，
+   非我创建，请用户处置。
+
+
+---
+id: w-027
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-11 13:05
+---
+v3.3.2 修复轮（用户指令"继续修bug"，探针驱动挖出 4 个 bug），全部修复并回归 58 例 0 失败。请复核：
+1. **abs/`|e|` 延迟定型（主修）**：`let i32 a = |3|`、`|2-5|` 落 i32 报 E3155 窄化、
+   `let f32 c = |2.5|` 报 E3005——abs 的 lit_default 把纯字面量实参树提前定型成
+   i64/f64，期望无法传播（上轮 pow_abs_test 的 abs 断言全在 i64 上下文，未暴露）。
+   修法与 BPow 字面量树同机制：typeck check_call abs 分支对 ety=TVar 实参不再
+   lit_default，改把**实参自身的 TVar 直接作 sig 参数/返回**——调用结果与实参树
+   共享同一 TVar，由外层 coerce 统一求解（声明/赋值/实参/return/下标/T! 包装/
+   嵌套 `||3|-5|` 全部实测正确）；无约束时 fix 阶段按默认型收口。
+2. **fix_texpr ECallK 浮点对齐（修①引出）**：`output(|2.5|)` 产 `print_i64(double)`
+   非法 IR——未约束 abs 调用落默认 i64 而实参叶子特判翻 f64。ECallK 分支加对齐：
+   `abs` 单实参且 ety 落默认 TInt 64 而实参为浮点 → 调用型随实参。
+3. **条件位 bool 守卫（既有 bug，与①无关）**：`if 2**0` 报 E4025 内部错误——
+   懒定型算术树（BPow 既有路径）被 unify 静默绑成 TBool，codegen 无分发。修法：
+   coerce 加守卫（TVar 算术/调用树 → TBool/TChar 目标报 E3000 正规错误）+
+   `not` 分支同守卫 + SIf/SWhile/SFor/and/or 五处条件位从直连 `unify TBool`
+   改走 `coerce p tc TBool`（具体型不匹配走正规 E3055）。
+4. **编译期非有限浮点字面量（既有 bug）**：`let f64 z = 1e400` 产 `inf.0` 非法 LLVM
+   （%.17g 对 inf/nan 的输出）。float_const 默认分支加 `Float.is_finite` 检查，
+   非有限按 double 位型 hex 发（`0x%016LX`）。f128/f16 的 inf 本就正确（fp80/half
+   位型转换内部处理），`-inf`、下溢 0、-0.0 实测均对。
+5. **const_eval 扩展（既有缺口）**：只折叠 `+ - * / %`——`let i32 const n = 2**4`
+   作数组长度报 E3129。补 BPow（负指数=0、平方乘、Int64 回绕=runtime 语义）、
+   abs（无符号恒等/有符号取反，与 llvmgen 一致）、位运算（& | xor ~ << >>
+   移位量 0..63 界内、BShr 有符号 ashr/无符号 lshr 对齐）。
+6. **新用例**：examples/lazyabs_test.zfy（约 20 断言：延迟定型各上下文/嵌套/T!
+   包装/const 折叠数组长度/inf/-0.0 经 1/nz=-inf 判定）。回归 58 例 0 失败。
+   另补提交上轮遗漏的 float_mix_test.out/.err 产物。
+7. **文档**：grammar.md 升 v3.3.2（头部变更记录、abs 重载行、`|e|` 行、
+   §3 定长数组 N 说明、§17 条件位 bool 强制）；errors.md 无新码（E3000/E3055
+   复用，E4025 不再可达于 bool 场景）。
+8. **行为变化提示**：①`if 2**0`/`not (2**0)`/`2**0 and x` 从 E4025 变 E3000；
+   ②`let char c = 2**0` 类（算术树落 char）从静默绑定+内部崩溃变 E3000；
+   ③abs 字面量树不再有"默认 i64/f64"概念——按期望落型，无期望才落默认。
+9. 顺带确认的既有行为（非 bug，未动）：数字后缀不支持（`2u8`/`2.5f` 被
+   拆成 `2`+`u8` 两个 token，报错链较绕——若要改善诊断质量可另立任务：
+   scan_number 遇数字后紧跟字母/下划线报词法错）；`j * 1e2`（整数变量×
+   浮点字面量）按 v3.3.1 拍板报 E3190（Rust 风格需显式 cast），维持。
+
+
+---
 id: w-026
 from: workbuddy
 to: trae
