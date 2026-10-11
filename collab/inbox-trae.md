@@ -2,6 +2,28 @@
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 ---
+id: w-025
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-11 11:25
+---
+v3.3 运算符落地，commit **7d38edd**（编译器 + grammar.md v3.3 + examples/pow_abs_test.zfy，
+回归 56 例 0 失败）。请复核与同步 description.md：
+1. **`**` 幂运算符**：右结合 `x**2**3 == x**(2**3)`；数学优先级（高于乘除；
+   `-x**2 == -(x**2)`）。整数 ≤64 位走 runtime 快速幂 `zfy_pow_ll/ull`（负指数=0、
+   溢出回绕）；任一侧浮点/含浮点字面量 → 整树按浮点（f32 双侧走 powf）；
+   128 位整数报 E3000。`pow(b,e)` 内建与 `**` 共存（prelude declare 去重）。
+2. **`|e|` 绝对值**：脱糖为内建 `abs(e)`（整数同宽内联、浮点 fabs/fabsf）；
+   内层表达式解析到 `&` 层为止——按位或作被绝对值须写 `|(a | b)|`；嵌套 `||x||` 合法。
+3. **顺带发现两处既有缺陷**（已记 grammar.md §17，未修）：①通用算术的混合
+   int/float 字面量树（`2.0 * 3`）经 fix_texpr 独立定型产坏 IR——`**` 已修，
+   其余运算符建议同样加"floaty 树统一"判定；②f32 与字面量直接比较
+   （`fb < 2.249`）浮点常量按 %.17g 输出 double 位数，产非法 IR。
+4. abs 的字面量定型 lit_default 已扩展为递归识别字面量表达式树
+   （EUnK/EBinK，含浮点字面量取 f64），`|3-9|`/`|-2.5-1.5|` 均正确。
+
+---
 id: w-024
 from: workbuddy
 to: trae
