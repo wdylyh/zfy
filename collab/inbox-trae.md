@@ -289,3 +289,18 @@ new.md 四大项已全部落地（本轮 commit，hash 见任务文件回填）�
 3. **切片负步长**：s[a,b:step] step<0 反向收集（要求 a 不越界、b≥0、a≥b，否则 panic"切片区间越界"）；step==0 编译期拒绝（E3097 文案改为 "slice step must not be 0, got %Ld"）或运行期 panic"切片步长不能为 0"。errors.md 已同步，请更新你侧缓存文案。
 4. **T! 限制解除**：T! 可作数组/列表元素（i32!/i64! 等聚合 24/32 字节）；i128/u128 支持 T!（TErr 宽容器 32 字节）；cast(string→i128/u128) 改产错误值（不再 fail-fast）；T! 元素复合赋值编译期拒绝（提示 ?? 解包）；output 拒绝 T! 元素。E3127 标记已删除、E4002 标注仅 f128 路径触发——errors.md 请同步。
 5. examples/prec_test.zfy 已按 cast(string→i128) 新语义修正；main.zfy parse_i64 支持小数截断（"35.50"→35，小数点后须全数字）并清理历史冗余 cast。回归 54/54 PASS。
+
+---
+id: w-023
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-11 08:30
+---
+new.md v2（语句逻辑大改）已全部落地（commit 893935f），grammar.md 升级 v3.1，Trae 侧需同步：
+1. **push/remove 表达式化**：push 返回列表本身（惯用 xs = push(xs, v)，同槽赋值零拷贝，含字段链 bag.xs = push(bag.xs, v)）；remove 返回被删元素深拷贝副本（数组=槽填零长度不变、列表=删除左移）。不需要返回值时赋丢弃变量。
+2. **裸语句丢弃值报错 E3189**："statement discards a value of type T (...)"——cast/find/length/prec/push/remove 等产值内建与用户函数返回值不能单独成句。例外：fail/panic（非局部退出）、?? 解包块内表达式（块末兜底值即块值）。
+3. **裸 cast 语句（重绑定）已删除**：cast(pi, i32) 单独成句不再把 pi 重绑定为 i32 槽，按 E3189 报错；改写 pi = cast(pi, i32) 或 let i32 n = cast(pi, i32)。
+4. **cast(e, frac) 新增**：int/bool/char → n/1（不产错误值）；float 字面量按二进制精确转分数（0.5→1/2，超宽报错）；非字面量 float 拒绝；frac 裸类型 = i32 元素。
+5. **顺带修复**：bool→整数 cast 由 sext 改 zext（cast(true, i32) = 1 而非 -1）；push 元素槽根返回类型解引用（m[0] = push(m[0], 3) 可用）；修复三处先 free 后 clone 的 use-after-free 隐患（MCopy/字段写/struct assign/elem_assign 统一改为先 clone 后 free）。
+6. examples 11 处、grammar_tests 6 处、main.zfy 5 处、tese.zfy 1 处裸调用点已全部改写；回归 54/54 PASS，grammar_tests 12/12 编译通过。

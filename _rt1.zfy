@@ -1,0 +1,52 @@
+mod random;
+
+use random::{Random, seed_from_u64, seed_from_i64, seed_from_string}
+
+fn main()
+    // 可复现性
+    let Random a = seed_from_u64(42)
+    let Random b = seed_from_u64(42)
+    output("a==b stream: ", a.next_u64() == b.next_u64(), "\n")
+    let Random c = seed_from_u64(42)
+    output("first=0x", c.hex_string(16), "\n")
+    // 相近种子不相关
+    let Random d = seed_from_u64(43)
+    let Random e = seed_from_u64(42)
+    output("43/42 differ: ", d.next_u64() != e.next_u64(), "\n")
+    // 区间
+    let Random r = seed_from_i64(7)
+    let i32 hits[5] = 0, 0, 0, 0, 0
+    let i32 i = 0
+    while i < 1000
+        let i64 v = r.int_range(1, 5)
+        hits[v]++
+        i++
+    output("hist 1..4: ", hits[1], " ", hits[2], " ", hits[3], " ", hits[4], "\n")
+    // 边界：int_range_incl 全范围
+    let i32 seen_lo = 0
+    let i32 seen_hi = 0
+    let i32 j = 0
+    while j < 200
+        let i64 v = r.int_range_incl(3, 3)
+        if v == 3
+            seen_lo++
+        j++
+    output("incl(3,3)==3: ", seen_lo == 200, "\n")
+    // uniform 值域
+    let f64 u = r.uniform()
+    output("u in [0,1): ", u >= 0.0 and u < 1.0, "\n")
+    // boolean 均衡
+    let i32 trues = 0
+    let i32 k = 0
+    while k < 1000
+        if r.boolean()
+            trues++
+        k++
+    output("booleans ~500: ", trues, "\n")
+    // string seed 复现
+    let Random s1 = seed_from_string("hello")
+    let Random s2 = seed_from_string("hello")
+    output("str seed repro: ", s1.next_u64() == s2.next_u64(), "\n")
+    let Random s3 = seed_from_string("hellp")
+    output("str seed differ: ", s1.next_u64() != s3.next_u64(), "\n")
+    return 0

@@ -142,11 +142,28 @@ let resolve (main : program) (main_dir : string)
     else modt.locals <- modt.locals @ [ (name, pub, kind) ]
   in
   let find_mod_file dir name =
-    let c1 = Filename.concat dir (name ^ ".zfy") in
-    let c2 = Filename.concat (Filename.concat dir name) "mod.zfy" in
-    if Sys.file_exists c1 then Some c1
-    else if Sys.file_exists c2 then Some c2
-    else None
+    let try_dir d =
+      let c1 = Filename.concat d (name ^ ".zfy") in
+      let c2 = Filename.concat (Filename.concat d name) "mod.zfy" in
+      if Sys.file_exists c1 then Some c1
+      else if Sys.file_exists c2 then Some c2
+      else None
+    in
+    match try_dir dir with
+    | Some p -> Some p
+    | None ->
+      (* stdlib 回退（v3.2 随机数模块）：本目录找不到时沿父目录链查
+         <d>/stdlib/name.zfy（最多 6 级），支持子目录源文件引用标准库 *)
+      let rec up d n =
+        if n <= 0 then None
+        else
+          match try_dir (Filename.concat d "stdlib") with
+          | Some p -> Some p
+          | None ->
+            let parent = Filename.dirname d in
+            if parent = d then None else up parent (n - 1)
+      in
+      up dir 6
   in
   let rec add_item modt it pub =
     match it with
@@ -164,8 +181,8 @@ let resolve (main : program) (main_dir : string)
       (match find_mod_file modt.dir name with
        | None ->
          collect RDriver p
-           (Printf.sprintf "module file not found: mod %s (looked for %s.zfy and %s%cm%czfy)"
-              name name name '/' 'm')
+           (Printf.sprintf "module file not found: mod %s (looked for %s.zfy, %s%cm%czfy and <parents>%cstdlib%c%s.zfy)"
+              name name name '/' 'm' '/' '/' name)
        | Some path ->
          let norm = String.lowercase_ascii (Filename.concat (Sys.getcwd ()) path) in
          if List.exists (fun (n, _) -> n = norm) !stack then begin
@@ -413,7 +430,9 @@ let resolve (main : program) (main_dir : string)
          | _ -> name)
       else
         (match local_find m name with
-         | Some (_, _, k) when k <> "mod" -> flat_prefix m.mpath ^ name
+         (* extern "C" 符号名不改（C 链接名恒为原名；IExtern 也不扁平化） *)
+         | Some (_, _, k) when k <> "mod" && k <> "extern" ->
+           flat_prefix m.mpath ^ name
          | Some _ -> name
          | None ->
            (match Hashtbl.find_opt m.binds name with
@@ -548,7 +567,12 @@ let resolve (main : program) (main_dir : string)
       | IStruct s ->
         out := IStruct { name = flat_prefix m.mpath ^ s.name; packed = s.packed;
                          fields = List.map (rw_field m) s.fields; pos = s.pos;
-                         tparams = s.tparams } :: !out
+                         tparams = s.tparams;
+                         methods =
+                           List.map
+                             (fun mth ->
+                               { mth with mbody = rw_block m mth.mbody })
+                             s.methods } :: !out
       | ITypeAlias a ->
         out := ITypeAlias { name = flat_prefix m.mpath ^ a.name;
                             ty = rw_ty m a.ty; pos = a.pos } :: !out

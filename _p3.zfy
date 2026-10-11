@@ -1,0 +1,5 @@
+fn main()
+    let i32[] xs = 1, 2, 3, 4, 5
+    let i32[] ys = xs[0, 2]
+    output("len=", length(ys), " ys=", ys, "\n")
+    return 0

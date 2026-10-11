@@ -3,7 +3,7 @@ type keyword =
   | KIf | KElse | KWhile | KFor | KReturn
   | KTrue | KFalse
   | KPub | KMod | KUse | KBreak | KContinue
-  | KConst | KFrac | KUnreduced | KReduce | KAnd | KOr | KNot
+  | KConst | KFrac | KUnreduced | KReduce | KAnd | KOr | KNot | KXor
   | KOutput | KInput
   | KCast | KArray | KList
   | KRemove | KImport | KAs | KSep | KEnd | KDelim
@@ -19,7 +19,7 @@ let keyword_table =
     "mod", KMod; "use", KUse; "break", KBreak; "continue", KContinue;
     "const", KConst; "frac", KFrac; "unred", KUnreduced;
     "reduce", KReduce;
-    "and", KAnd; "or", KOr; "not", KNot;
+    "and", KAnd; "or", KOr; "not", KNot; "xor", KXor;
     "output", KOutput; "input", KInput;
     "cast", KCast; "array", KArray; "list", KList;
     "remove", KRemove; "import", KImport; "as", KAs;
@@ -50,6 +50,7 @@ type token =
   | PlusAssign | MinusAssign | StarAssign | SlashAssign | PercentAssign
   | PlusPlus | MinusMinus
   | Eq | Ne | Lt | Gt | Le | Ge
+  | Shl (* << *) | Shr (* >> *) | Pipe (* | *) | Tilde (* ~ *)
   | Question (* ? *) | QuestionQuestion (* ?? *) | Bang (* ! *)
   | Caret (* ^：解引用后缀 p^（new2.md #10，替代 p* 消歧） *)
   | Dot
@@ -76,7 +77,7 @@ let pp_keyword = function
   | KCopy -> "copy" | KRef -> "ref"
   | KNull -> "null" | KUnsafe -> "unsafe" | KExtern -> "extern" | KType -> "type"
   | KSep -> "sep" | KEnd -> "end" | KDelim -> "delim"
-  | KAnd -> "and" | KOr -> "or" | KNot -> "not"
+  | KAnd -> "and" | KOr -> "or" | KNot -> "not" | KXor -> "xor"
   | KCast -> "cast"
   | KArray -> "array" | KList -> "list"
   | KLet -> "let" | KFn -> "fn"
@@ -99,6 +100,7 @@ let pp_token = function
   | StarAssign -> "*=" | SlashAssign -> "/=" | PercentAssign -> "%="
   | PlusPlus -> "++" | MinusMinus -> "--"
   | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Le -> "<=" | Ge -> ">="
+  | Shl -> "<<" | Shr -> ">>" | Pipe -> "|" | Tilde -> "~"
   | Question -> "?" | QuestionQuestion -> "??" | Bang -> "!"
   | Caret -> "^"
   | Dot -> "."

@@ -23,8 +23,10 @@ type zty =
 (* struct 定义（typeck 收集后随 HIR/MIR 传递，llvmgen 生成布局与深拷贝辅助） *)
 type sdef = { sname : string; spacked : bool; sfields : (string * zty) list }
 
-type binop = BAdd | BSub | BMul | BDiv | BMod | BEq | BNe | BLt | BGt | BLe | BGe | BAnd | BOr
-type unop = UNeg | UNot
+type binop =
+  BAdd | BSub | BMul | BDiv | BMod | BEq | BNe | BLt | BGt | BLe | BGe | BAnd | BOr
+| BBitAnd | BBitOr | BBitXor | BShl | BShr
+type unop = UNeg | UNot | UBitNot
 
 type texpr =
   { e : texpr_kind; ety : zty; epos : pos }
@@ -218,8 +220,10 @@ let pp_binop = function
   | BAdd -> "+" | BSub -> "-" | BMul -> "*" | BDiv -> "/" | BMod -> "%"
   | BEq -> "==" | BNe -> "!=" | BLt -> "<" | BGt -> ">" | BLe -> "<=" | BGe -> ">="
   | BAnd -> "&&" | BOr -> "||"
+  | BBitAnd -> "&" | BBitOr -> "|" | BBitXor -> "xor"
+  | BShl -> "<<" | BShr -> ">>"
 
-let pp_unop = function UNeg -> "-" | UNot -> "!"
+let pp_unop = function UNeg -> "-" | UNot -> "!" | UBitNot -> "~"
 
 (* ---------- x86-64 C 布局（sizeof/alignof 与 struct 字段偏移） ---------- *)
 

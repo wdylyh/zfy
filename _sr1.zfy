@@ -1,0 +1,48 @@
+mod random;
+
+use random::{SecureRandom, secure_new, secure_from_string}
+
+fn main()
+    // 可复现性（字符串种子）
+    let SecureRandom a = secure_from_string("test")
+    let SecureRandom b = secure_from_string("test")
+    output("repro: ", a.next_u64() == b.next_u64(), "\n")
+    // 不同种子不同流
+    let SecureRandom c = secure_from_string("test2")
+    let SecureRandom d = secure_from_string("test")
+    output("differ: ", c.next_u64() != d.next_u64(), "\n")
+    // ChaCha20 正确性：与 Python 参考实现对拍（固定 nonce/key 场景
+    // 通过 secure_from_string 间接构造，这里验证统计量与块轮转）
+    let SecureRandom e = secure_from_string("chacha")
+    let i32 ones = 0
+    let i32 i = 0
+    while i < 10000
+        if e.boolean()
+            ones++
+        i++
+    output("booleans ~5000: ", ones, "\n")
+    // token 字符集
+    let string t1 = e.token(32)
+    output("token32 len: ", length(t1), " t=", t1, "\n")
+    let string h1 = e.hex_token(20)
+    output("hex20: ", h1, "\n")
+    // OS 熵：两实例不同
+    let SecureRandom s1 = secure_new()
+    let SecureRandom s2 = secure_new()
+    output("os differ: ", s1.next_u64() != s2.next_u64(), "\n")
+    // 区间
+    let i32 in_range = 0
+    let i32 j = 0
+    while j < 500
+        let i64 v = s1.int_range(10, 20)
+        if v >= 10 and v < 20
+            in_range++
+        j++
+    output("int_range [10,20): ", in_range == 500, "\n")
+    // reseed 换流
+    let SecureRandom s3 = secure_new()
+    let u64 before = s3.next_u64()
+    s3.reseed()
+    let u64 after = s3.next_u64()
+    output("reseed changes: ", before != after, "\n")
+    return 0

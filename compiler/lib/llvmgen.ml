@@ -416,6 +416,11 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | BMul -> emitf fc "  %s = mul %s %s, %s" d tya va vb
      | BDiv -> emitf fc "  %s = udiv %s %s, %s" d tya va vb
      | BMod -> emitf fc "  %s = urem %s %s, %s" d tya va vb
+     | BBitAnd -> emitf fc "  %s = and %s %s, %s" d tya va vb
+     | BBitOr -> emitf fc "  %s = or %s %s, %s" d tya va vb
+     | BBitXor -> emitf fc "  %s = xor %s %s, %s" d tya va vb
+     | BShl -> emitf fc "  %s = shl %s %s, %s" d tya va vb
+     | BShr -> emitf fc "  %s = lshr %s %s, %s" d tya va vb
      | bopc -> emitf fc "  %s = icmp %s %s %s, %s" d (cmp_op_int true bopc) tya va vb)
   | _ ->
     (match bop with
@@ -424,6 +429,11 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | BMul -> emitf fc "  %s = mul %s %s, %s" d tya va vb
      | BDiv -> emitf fc "  %s = sdiv %s %s, %s" d tya va vb
      | BMod -> emitf fc "  %s = srem %s %s, %s" d tya va vb
+     | BBitAnd -> emitf fc "  %s = and %s %s, %s" d tya va vb
+     | BBitOr -> emitf fc "  %s = or %s %s, %s" d tya va vb
+     | BBitXor -> emitf fc "  %s = xor %s %s, %s" d tya va vb
+     | BShl -> emitf fc "  %s = shl %s %s, %s" d tya va vb
+     | BShr -> emitf fc "  %s = ashr %s %s, %s" d tya va vb
      | bopc -> emitf fc "  %s = icmp %s %s %s, %s" d (cmp_op_int false bopc) tya va vb)
 
 let gen_unop fc d u (a : operand) =
@@ -435,6 +445,7 @@ let gen_unop fc d u (a : operand) =
      | TFloat _ -> emitf fc "  %s = fneg %s %s" d tya va
      | _ -> emitf fc "  %s = sub %s 0, %s" d tya va)
   | UNot -> emitf fc "  %s = xor %s %s, 1" d tya va
+  | UBitNot -> emitf fc "  %s = xor %s %s, -1" d tya va
 
 (* ---------- 值 -> string（输出格式，供 prec 与 cast 用） ---------- *)
 
@@ -814,6 +825,31 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
   end
   else
   match name, args with
+  | "abs", [ a ] ->
+    (* abs 重载（v3.2）：无符号=恒等；有符号=内联 sub+icmp+select（规避
+       C abs 的 32 位截断，i128 同样适用）；浮点=@fabs。is_rt_name 已排除
+       "abs"，不会误生成 declare *)
+    (match dst with
+     | None -> ()
+     | Some d ->
+       (match a.oty with
+        | TUint _ ->
+          let (v, t) = val_of fc a in
+          emitf fc "  %s = add %s %s, 0" d t v
+        | TInt _ ->
+          let (v, t) = val_of fc a in
+          let neg = fresh_r fc in
+          emitf fc "  %s = sub %s 0, %s" neg t v;
+          let c = fresh_r fc in
+          emitf fc "  %s = icmp slt %s %s, 0" c t v;
+          emitf fc "  %s = select i1 %s, %s %s, %s %s" d c t neg t v
+        | TFloat 32 ->
+          let (v, _) = val_of fc a in
+          emitf fc "  %s = call float @fabsf(float %s)" d v
+        | TFloat _ ->
+          let (v, _) = val_of fc a in
+          emitf fc "  %s = call double @fabs(double %s)" d v
+        | _ -> lerr None "abs: unsupported argument type"))
   | "str_len", [ a ] ->
     let (v, _) = val_of fc a in
     (match dst with
@@ -2290,6 +2326,9 @@ let gen_program (m : mir) : string =
     m.mstructs;
   (* 运行时声明 *)
   Buffer.add_string g.mbuf "declare i64 @strlen(ptr)\n";
+  Buffer.add_string g.mbuf "declare double @fabs(double)\n";
+  Buffer.add_string g.mbuf "declare float @fabsf(float)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   (* output 运行时函数 *)
   Buffer.add_string g.mbuf "declare void @zfy_print_str(ptr)\n";
@@ -2444,7 +2483,7 @@ let gen_program (m : mir) : string =
     Hashtbl.mem user_fns n || n = "main" || n = "strlen"
     || String.length n >= 4 && String.sub n 0 4 = "zfy_"
     || String.length n >= 4 && String.sub n 0 4 = "zfy."
-    || n = "str_len" || n = "zfy.prec"
+    || n = "str_len" || n = "zfy.prec" || n = "abs"
   in
   let decls : (string, string * string) Hashtbl.t = Hashtbl.create 8 in
   let add_decl name (args : operand list) ret =

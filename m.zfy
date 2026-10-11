@@ -1,0 +1,6 @@
+pub struct Pt
+    i32 x
+    i32 y
+
+pub fn i32 sq(let i32 v)
+    return v * v

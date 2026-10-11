@@ -444,6 +444,7 @@ let read_file path =
 
 let expand_uses (main : program) (main_dir : string)
     (perrs : (pos * string) list ref) : program =
+  Hashtbl.reset Typeck.method_tbl;   (* 方法表：每次编译重置 *)
   let names : (string, unit) Hashtbl.t = Hashtbl.create 16 in
   let loaded : (string, unit) Hashtbl.t = Hashtbl.create 8 in
   let out : item list ref = ref [] in
@@ -599,9 +600,35 @@ let expand_uses (main : program) (main_dir : string)
              (match List.assoc_opt f.name m with
               | Some n -> emit_fn n f.pos f.params f.ret f.body
               | None -> emit_fn (ns ^ f.name) f.pos f.params f.ret f.body))
-        | IStruct it ->
-          (* struct 原样并入（类型名无命名空间；重名由 typeck 统一报错） *)
-          out := IStruct it :: !out
+        | IStruct ({ name; methods; _ } as s) ->
+          (* struct 原样并入（类型名无命名空间；重名由 typeck 统一报错）。
+             v3.2：struct 方法脱糖为顶层函数 <S>__<m>（ns 前缀随文件），
+             隐式首参 self = ref let <S>；方法表供调用点分派 *)
+          (match methods with
+           | [] -> out := IStruct s :: !out
+           | _ ->
+             out := IStruct { s with methods = [] } :: !out;
+             List.iter
+               (fun mth ->
+                 let gname = ns ^ name ^ "__" ^ mth.mname in
+                 Hashtbl.replace Typeck.method_tbl (name, mth.mname) gname;
+                 let selfp =
+                   { pname = "self"; pty = TNamed (name, mth.mpos); pfrac = false;
+                     pseq = PScalar; pconst = false; punred = false; pref = true;
+                     ppos = mth.mpos }
+                 in
+                 (* 方法体裸调用映射：兄弟方法名 → 全局名（自由函数沿用 m） *)
+                 let mm =
+                   m @ List.map
+                       (fun x -> (x.mname, ns ^ name ^ "__" ^ x.mname))
+                       methods
+                 in
+                 reg gname mth.mpos;
+                 out := IFn { name = gname; params = selfp :: mth.mparams;
+                              ret = mth.mret; rfrac = mth.mrfrac; runred = false;
+                              body = rw_block mm mth.mbody; pos = mth.mpos;
+                              tparams = [] } :: !out)
+               methods)
         | IExtern it ->
           (* extern "C" 原样并入（符号链接期解析；重名由 typeck 报错） *)
           out := IExtern it :: !out
@@ -658,6 +685,34 @@ let expand_uses (main : program) (main_dir : string)
       | (IFn _ | IMod _ | IDecl _ | IStruct _ | IExtern _ | ITypeAlias _) as it ->
         out := it :: !out)
     main;
+  List.rev !out
+
+(* v3.2：主文件 struct 方法脱糖——IStruct.methods → 顶层 IFn <S>__<m>，
+   隐式首参 self = ref let <S>；方法表供调用点分派。
+   导入文件的方法已在 expand_uses 内脱糖（带 ns 前缀），此处只处理主文件，
+   故不重置方法表 *)
+let desugar_main_methods (prog : program) : program =
+  let out = ref [] in
+  List.iter
+    (fun it ->
+      match it with
+      | IStruct ({ name; methods; _ } as s) when methods <> [] ->
+        out := IStruct { s with methods = [] } :: !out;
+        List.iter
+          (fun mth ->
+            let gname = name ^ "__" ^ mth.mname in
+            Hashtbl.replace Typeck.method_tbl (name, mth.mname) gname;
+            let selfp =
+              { pname = "self"; pty = TNamed (name, mth.mpos); pfrac = false;
+                pseq = PScalar; pconst = false; punred = false; pref = true;
+                ppos = mth.mpos }
+            in
+            out := IFn { name = gname; params = selfp :: mth.mparams;
+                         ret = mth.mret; rfrac = mth.mrfrac; runred = false;
+                         body = mth.mbody; pos = mth.mpos; tparams = [] } :: !out)
+          methods
+      | it -> out := it :: !out)
+    prog;
   List.rev !out
 
 (* 收集式管线：词法 → 语法 → use 展开 → 类型 → MIR → LLVM。
@@ -728,6 +783,8 @@ let run_checked path : (string, zerr list) result =
             (* 子文件词法/语法错误（use 展开）；已恢复的 AST 继续做类型
                检查（报出更多错误，不在此终止） *)
             List.iter (fun (p, m) -> add `Parse p m) (List.rev !perrs);
+            (* 主文件 struct 方法脱糖（v3.2；导入文件的已在 expand_uses 处理） *)
+            let prog = desugar_main_methods prog in
             let hir = Typeck.check_program prog in
             List.iter (fun (p, m) -> add `Type p m)
               (List.rev !(Typeck.collected));

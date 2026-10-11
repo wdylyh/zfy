@@ -1,0 +1,15 @@
+struct R
+    u64 a = 0
+    u64 b = 0
+
+fn u64 mix(ref let R r, let u64 x)
+    r.a += x
+    let u64 old_b = r.b
+    r.b = r.a
+    return old_b
+
+fn main()
+    let R r = R(a=1, b=2)
+    let u64 v = mix(ref r, 3)
+    output(v, " ", r.a, " ", r.b, "\n")   // 期望 2 4 4
+    return 0

@@ -15,9 +15,15 @@ type ty =
   | TSeqN of ty * expr * pos          (* T[N]：定长数组（类型后缀形式；N 须整数字面量，
                                          声明/参数处仍可用完整表达式长度） *)
 
-and binop = Add | Sub | Mul | Div | Mod | Eq | Ne | Lt | Gt | Le | Ge | And | Or
+and binop =
+  | Add | Sub | Mul | Div | Mod | Eq | Ne | Lt | Gt | Le | Ge | And | Or
+  | BitAnd (* & 二元位与（一元 Amp 是取地址，位置区分） *)
+  | BitOr  (* | 位或 *)
+  | Xor    (* xor 关键字：二元异或（^ 仍为解引用后缀） *)
+  | Shl    (* << *)
+  | Shr    (* >> *)
 
-and unop = Neg | Not
+and unop = Neg | Not | BitNot (* ~ 按位取反 *)
 
 (* input 的目标：声明新变量（<类型> 名）或使用已有变量（名） *)
 and in_target =
@@ -143,6 +149,12 @@ type extern_fn =
 type sfield =
   { fname : string; fty : ty; fseq : pseq_kind; fdefault : expr option; fpos : pos }
 
+(* struct 方法（v3.2 随机数模块）：struct 块内 fn 定义；
+   脱糖为顶层 IFn <S>__<m>，隐式首参 self = ref let <S>（可变接收者） *)
+type smethod =
+  { mname : string; mparams : param list; mret : ty option; mrfrac : bool;
+    mbody : block; mpos : pos }
+
 type item =
   | IUse of { path : string; import : string option; alias : string option;
               pos : pos }
@@ -160,7 +172,7 @@ type item =
        ret=None 仅限 main（隐含 i32，return 可省）；runred：返回类型带 unred
        （返回值不做 frac 归一）；tparams：泛型类型参数（fn <T, U> ...），空 = 普通 *)
   | IStruct of { name : string; packed : bool; fields : sfield list; pos : pos;
-                 tparams : string list }
+                 tparams : string list; methods : smethod list }
     (* tparams：泛型类型参数（struct Box<T, U>），空 = 普通 struct *)
   | IMod of string * item list * pos
     (* 内联模块 mod name（缩进块体，可嵌套）；resolve 展开为扁平名 *)

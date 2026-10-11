@@ -1,0 +1,7 @@
+mod m;
+use m::sq
+
+fn main()
+    let m.Pt p = Pt(x = 1, y = 2)
+    output(sq(7), " ", p.x, "\n")
+    return 0

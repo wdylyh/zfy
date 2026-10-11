@@ -49,14 +49,16 @@ let punct2 =
     "++", PlusPlus; "--", MinusMinus;
     "%=", PercentAssign;
     "=>", FatArrow; "->", ThinArrow;
-    "??", QuestionQuestion ]
+    "??", QuestionQuestion;
+    "<<", Shl; ">>", Shr ]
 
 let punct1 =
   [ '(', LParen; ')', RParen; '[', LBracket; ']', RBracket; '{', LBrace;
     '}', RBrace; ',', Comma; ';', Semicolon; ':', Colon; '=', Assign;
     '+', Plus; '-', Minus; '*', Star; '&', Amp; '/', Slash; '%', Percent;
     '<', Lt; '>', Gt; '.', Dot;
-    '?', Question; '!', Bang; '^', Caret ]
+    '?', Question; '!', Bang; '^', Caret;
+    '|', Pipe; '~', Tilde ]
 
 (* ---------- 子扫描器 ---------- *)
 

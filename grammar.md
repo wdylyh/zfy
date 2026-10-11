@@ -1,6 +1,11 @@
-# zfy 语言规范（v3.1，2026-10-11）
+# zfy 语言规范（v3.2，2026-10-11）
 
 > 本版每一节都经过编译器实测校准（examples 全回归通过）。
+> 与 v3.1 的主要差异：**位运算全套**（`<< >> & | ~` 运算符 + `xor` 关键字异或，
+> `^` 仍只作解引用后缀）、**struct 方法**（隐式 `ref self` 首参）、
+> **数学内建**（sqrt/log/exp/sin/cos/tan/pow/floor/ceil/abs）、
+> **ref struct 参数**、**随机数标准库**（stdlib/random.zfy：xoshiro256** 与
+> ChaCha20，含 OS 熵源播种）。
 > 与 v3 的主要差异：**push/remove 表达式化**（push 返回列表、remove 返回被删元素）、
 > **裸语句丢弃值报错**（E3189；fail/panic 与 ?? 块例外）、
 > **cast(x, frac) 支持**、**裸 cast 语句（重绑定特例）删除**、
@@ -51,18 +56,19 @@ fn main()
   - 错误传播是 `e?`。
 - **分号**：语句位置非法（写了报错）；仅空语句占位可用。
 
-## 2. 关键字（44 个）
+## 2. 关键字（45 个）
 
 ```
 if else while for return true false pub mod use break continue
 const frac unred reduce and or not output input cast remove import as
 fail panic err sep end delim struct packed move copy ref null unsafe
-extern type let fn array list
+extern type let fn array list xor
 ```
 
 - `array`/`list`：旧关键字语法已删除，仅保留用于报错提示，**不能当标识符**。
 - `sep`/`end`/`delim`：output/input 的命名参数名。
 - `err`：`??` 块内的错误值绑定名。
+- `xor`：二元异或运算符（v3.2）。**`^` 不是异或**——它只作后缀解引用。
 - 10 个传统类型别名（int/long/double 等）**已删除**，不再是关键字——
   用它们当类型名会报"迁移提示"错误（见 §16 对照表）。
 
@@ -179,6 +185,7 @@ struct [packed] 名字<T, U>? 缩进块
     字段：TYPE 名字[N]        # 数组字段，不可有默认值
     字段：TYPE 名字[]         # 列表字段，不可有默认值
     字段可为指针（自引用）/函数类型/嵌套数组/另一个 struct
+    方法（v3.2）：fn 返回类型? 方法名(参数) 缩进块
 ```
 
 - 实例化：`Point(1, 2)` 位置 / `Point(x=1)` 命名（**struct 构造支持命名实参**，
@@ -187,6 +194,27 @@ struct [packed] 名字<T, U>? 缩进块
 - struct 作数组/列表元素：值语义深拷贝；`ps[i].x = v` 直接改元素；
   const 深不可变同样生效。
 - `sizeof(T)` / `alignof(T)` 编译期内建。
+
+**方法（v3.2）**：struct 块内用 `fn` 声明，隐式首参 `self` = 接收者的
+引用（方法可改调用方状态）：
+
+```
+struct Counter
+    i32 n = 0
+    fn void bump()
+        self.n += 1
+    fn i32 get()
+        return self.n
+```
+
+- 调用：`c.bump()` / `c.get()` / `c.add(6)`——接收者自动按 `ref` 传，
+  等价于自由函数 `Counter__bump(ref c)`。
+- 方法体内字段用 `self.字段`；调兄弟方法写 `self.其他方法(...)`。
+- **const 接收者调方法报错**（方法可能改状态）；方法不支持命名实参；
+  方法名不能是关键字（`float`/`int` 等不行，换 `uniform` 这类名字）。
+- 方法调用与字段访问不冲突：`rng.s0` 是字段，`rng.next_u64()` 是方法。
+- 跨文件 use 导入 struct 后方法照常可用（`mod random; use random::Random`
+  → `rng.next_u64()`）。
 
 ## 8. 语句全集
 
@@ -226,12 +254,21 @@ or / and    短路逻辑
 not         一元；比较高于 not：not x == 1 即 not (x == 1)
 == !=       不结合
 < > <= >=   不结合
+<< >>       左结合（v3.2：移位，C 语义；有符号右移=算术移位）
 + -         左结合
 * / %       左结合
-一元 -e、&e
+一元 -e、&e、~e（v3.2：按位取反，仅整数/char）
+== != 之后的位运算链（v3.2，左结合，注意与 C 一致地低于比较）：
+&           位与（x & 1 == 1 会解析成 x & (1 == 1)，必须写 (x & 1) == 1）
+xor         位异或（关键字；^ 是解引用后缀不是异或）
+|           位或
 后缀：调用 f(args)、下标 a[i]、切片 s[a,b] / s[a,b:step]、
      字段/命名空间 a.b、错误传播 e?、解引用 p^
 ```
+
+- **移位/位运算仅整数（char 提升 i32）**；`x << k` / `x >> k` 的 k 会被
+  coerce 到左操作数类型（变量移位量建议直接用同宽类型，避免窄化报错）。
+- 移位量 ≥ 位宽 = 未定义（LLVM poison），自行保证 0 ≤ k < 位宽。
 
 - **`??` 值形式**：`let i32 v = 可能失败 ?? 默认值`。
 - **`??` 块形式**：`??` 后**直接换行 + 缩进块**（不是 `?? +`！）：
@@ -329,6 +366,15 @@ fn main()
 | `sizeof(T)` / `alignof(T)` | 编译期常量 |
 | `cast(e, T)` | 显式转换（含 string→数值；失败产 `T!` 错误值，i128/u128 目标同样产错误值）。v3.1：`cast(e, frac)` 支持——int/bool/char → n/1；float **字面量**按二进制精确转分数（0.5→1/2）；非字面量 float 拒绝。**裸 cast 语句（重绑定）已删除** |
 | `ord(c)` / `chr(n)` | char↔码值 |
+| `sqrt(x)` | 平方根（v3.2；实参 coerce 到 f64，返回 f64；下同） |
+| `log(x)` / `exp(x)` | 自然对数 / e^x |
+| `sin(x)` / `cos(x)` / `tan(x)` | 三角函数（弧度） |
+| `pow(b, e)` | b^e（两参均 f64） |
+| `floor(x)` / `ceil(x)` | 向下/向上取整（返回 f64） |
+| `abs(x)` | **重载**：整数→同宽整数（含 i128/u128，内联生成）；浮点→同宽浮点（f32 走 fabsf）。字面量实参按字面量形态定默认型（整数 i64 / 浮点 f64） |
+
+**数学内建说明（v3.2）**：直接落到 libm 符号（`@sqrt` `@log` `@fabs` 等）；
+`abs` 与 C 的 32 位 `abs` 无关，i128/u128 正确。
 
 **表达式化的序列操作（v3.1 2026-10-11）**：
 - `push(列表, 值)`（**恰两参**；目标是列表非定长数组；嵌套列表
@@ -348,6 +394,59 @@ fn main()
 v 为 string 或 char。
 
 **string 是字节串**：`length("中文")` = 6（字节数）；按码点操作用 utf8_* 组。
+
+### 12.1 随机数标准库（stdlib/random.zfy，v3.2）
+
+`stdlib/` 目录下的文件模块可被任意源文件引用（resolve 沿父目录链查
+`<祖先>/stdlib/名.zfy`）。用法：
+
+```
+mod random;
+use random::{Random, seed_from_u64, seed_from_entropy, SecureRandom, secure_new}
+
+fn main()
+    let Random rng = seed_from_u64(42)     # 可复现
+    let i64 n = rng.int_range(1, 100)      # [1, 100) 无偏
+    let f64 x = rng.uniform()              # [0, 1) 53 位精度
+    let SecureRandom sr = secure_new()     # OS 熵源 + ChaCha20
+    let string tok = sr.token(32)          # base64url 字符集 token
+```
+
+**Random（非加密，xoshiro256\*\*，周期 2^256-1）**：
+
+| API | 说明 |
+|---|---|
+| `next_u64()` / `next_u32()` | 引擎原语 |
+| `uniform()` / `uniform32()` | [0,1)，f64 取高 53 位 / f32 取高 24 位（不会取到 1.0） |
+| `boolean()` / `boolean_p(p)` | p=0.5 / 伯努利 P(true)=p |
+| `int_range(lo,hi)` / `int_range_incl(lo,hi)` | i64 半开 [lo,hi) / 闭 [lo,hi] |
+| `uint_range(lo,hi)` / `uint_range_incl(lo,hi)` | u64 同上 |
+| `normal(mean,stddev)` / `exponential(lambda)` / `geometric(p)` | Box-Muller 正态 / 指数 / 几何（试验次数口径 ≥1） |
+| `shuffle(ref xs)` / `shuffle_u64(ref xs)` | Fisher-Yates 洗牌（i32/u64 列表，原地） |
+| `choice(xs)` / `sample(xs,k)` | 均匀选一（空表 panic）/ 无放回抽 k（k>n 截断） |
+| `fill_bytes(ref buf)` / `hex_string(n)` / `ascii_char()` | 随机字节 / 小写 hex 串 / 可见 ASCII 字符 |
+
+构造：`seed_from_i64` / `seed_from_u64` / `seed_from_string`（FNV-1a）/ 
+`seed_from_entropy()`（OS 熵源）。播种一律 SplitMix64 扩展（相近种子不相关）。
+
+**SecureRandom（加密，ChaCha20 纯 zfy 实现）**：
+
+| API | 说明 |
+|---|---|
+| `next_u64()` / `next_u32()` / `boolean()` / `boolean_p(p)` / `uniform()` | 同 Random 语义 |
+| `int_range` / `int_range_incl` / `uint_range` / `uint_range_incl` / `uint_below` | 同 Random 语义 |
+| `fill_bytes(ref buf)` | 随机字节 |
+| `token(n)` / `hex_token(n)` | base64url 字符集（A-Z a-z 0-9 - _，每字符 6 位熵，无偏）/ 小写 hex |
+| `reseed()` | 重新从 OS 熵源播种 |
+
+构造：`secure_new()`（OS 熵源：Windows SystemFunction036 / POSIX getentropy）/
+`secure_from_string(s)`（可复现，仅测试用）。状态布局：sigma 常数 + 256 位 key
++ counter + 96 位 nonce，块用尽自动递增 counter。
+
+**设计要点**：区间采样用 Lemire 无偏乘法（u128 高 64 位 + 阈值拒绝），
+杜绝 `x % n` 模偏差；`Random`/`SecureRandom` 类型隔离（加密强度显式选择）。
+注意：设计稿中的 `float()`/`int()`/`uint()` 方法名与类型关键字冲突，
+实现更名为 `uniform()`/`int_range()`/`uint_range()`。
 
 ## 13. output 与 input（行为详述）
 
@@ -430,6 +529,7 @@ fn main()
 | `s[0, 4, 2]`（逗号步长） | 报错+提示 | `s[0, 4:2]` |
 | `f(x=1)`（用户函数命名实参） | E3068 | `f(1)` |
 | `p*`（解引用） | 报错提示 | `p^` |
+| `a ^ b`（当异或用） | E3074（`^` 只作后缀解引用） | `a xor b` |
 | `extern` 块内 `let i64 f(...)` | E2008 | `i64 f(let string s)`（返回旧式、参数 let 式） |
 | `File! f = open(...)`（无 let） | E2003 | `let File! f = open(...)` |
 | `string! s = read_file(...)` | E2003 | `let string! s = read_file(...)` |
@@ -455,3 +555,9 @@ fn main()
 - struct 不能整体 output。
 - extern 不支持序列（数组/列表）返回。
 - 溢出无检查（i128 除外：字面量编译期范围校验）。
+- 移位量 ≥ 位宽未定义（LLVM poison）；`x & 1 == 1` 按优先级解析为
+  `x & (1 == 1)`，位运算与比较混用建议加括号。
+- `n/d` 字面量除式按分数字面量语义处理（§5），浮点缩放常量请写成
+  科学计数法（如 `1.1102230246251565e-16`）而非 `1.0/9007199254740992.0`。
+- 跨文件 use 的 struct/类型别名作声明类型：解析器按"Ident 后跟 Ident"
+  形状识别（v3.2 起），`let Pt p` / `let Random rng` 均可。

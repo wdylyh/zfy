@@ -1,0 +1,2 @@
+pub fn i32 sq(let i32 v)
+    return v * v

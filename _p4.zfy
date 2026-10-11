@@ -1,0 +1,11 @@
+fn void qr(ref let u32 w[4], let i32 a, let i32 b)
+    w[a] += w[b]
+    w[a] = w[a] + 1
+
+fn main()
+    let u32 w[4] = 1, 2, 3, 4
+    qr(ref w, 0, 1)
+    output("w0=", w[0], " w1=", w[1], "\n")
+    let u32 x = w[3] << 8
+    output("shift=", x, "\n")
+    return 0

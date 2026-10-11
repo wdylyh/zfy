@@ -1,0 +1,459 @@
+// stdlib/random.zfy —— 随机数模块（new2.md 设计，v3.2）
+//
+// 非加密引擎：xoshiro256**（周期 2^256-1，BigCrush 通过）
+//   - 状态 4 x u64，全平台一致
+//   - 播种：SplitMix64 扩展（防相近种子相关）
+//   - 区间采样：Lemire 无偏乘法（u128 高 64 位），杜绝模偏差
+//   - float：取 u64 高 53 位（f32 用高 24 位），[0,1) 不会取到 1.0
+//   - shuffle：Fisher-Yates（不是 sort-by-random，那是有偏的）
+//
+// 用法：
+//   mod random;
+//   use random::{Random, seed_from_u64}
+//   fn main()
+//       let Random rng = seed_from_u64(42)
+//       let i64 n = rng.int_range(1, 100)
+//       output(n)
+//
+// 命名说明：设计稿的 float()/int()/uint() 与 zfy 类型关键字冲突，
+// 更名 uniform()/int_range()/uint_range()（_incl 后缀为闭区间）。
+
+extern "C"
+    void zfy_os_random_u64(let u64* out)
+
+// ===== 私有辅助 =====
+
+fn u64 rotl(let u64 x, let u64 k)
+    return (x << k) | (x >> (64 - k))
+
+fn u64 splitmix_final(let u64 z)
+    let u64 z1 = (z xor (z >> 30)) * 0xBF58476D1CE4E5B9
+    let u64 z2 = (z1 xor (z1 >> 27)) * 0x94D049BB133111EB
+    return z2 xor (z2 >> 31)
+
+fn u64 fnv1a(let string s)
+    let u64 h = 0xCBF29CE484222325
+    let i64 n = length(s)
+    let i64 i = 0
+    while i < n
+        h = h xor (cast(cast(s[i], i32), u64) & 255)
+        h = h * 0x100000001B3
+        i++
+    return h
+
+fn u64 entropy_u64()
+    let u64 v = 0
+    zfy_os_random_u64(&v)
+    return v
+
+// ===== Random：xoshiro256** =====
+
+pub struct Random
+    u64 s0
+    u64 s1
+    u64 s2
+    u64 s3
+
+    // 引擎原语：核心一步（结果 = rotl(s1*5,7)*9，状态按 xoshiro256** 轮转）
+    fn u64 next_u64()
+        let u64 result = rotl(self.s1 * 5, 7) * 9
+        let u64 t = self.s1 << 17
+        self.s2 = self.s2 xor self.s0
+        self.s3 = self.s3 xor self.s1
+        self.s1 = self.s1 xor self.s2
+        self.s0 = self.s0 xor self.s3
+        self.s2 = self.s2 xor t
+        self.s3 = rotl(self.s3, 45)
+        return result
+
+    fn u32 next_u32()
+        let u64 r = self.next_u64()
+        return cast(r >> 32, u32)
+
+    // [0, 1)，53 位精度（u64 高 53 位 x 2^-53；2^-53 写成科学计数法
+    // 字面量——n/d 除式会触发分数字面量语义，不适用于这里）
+    fn f64 uniform()
+        let u64 x = self.next_u64()
+        return cast(x >> 11, f64) * 1.1102230246251565e-16
+
+    // [0, 1)，24 位精度（u32 高 24 位 x 2^-24）
+    fn f32 uniform32()
+        let u32 x = self.next_u32()
+        return cast(x >> 8, f32) * 5.9604644775390625e-08
+
+    fn bool boolean()
+        return (self.next_u64() & 1) == 1
+
+    // 伯努利：P(true) = p，p ∈ [0, 1]
+    fn bool boolean_p(let f64 p)
+        return self.uniform() < p
+
+    // 无偏 [0, range)（Lemire：128 位乘积取高 64 位，
+    // 低 64 位低于阈值时拒绝重采样，杜绝模偏差）
+    fn u64 uint_below(let u64 range)
+        if range <= 1
+            return 0
+        let u128 m = cast(self.next_u64(), u128) * cast(range, u128)
+        let u64 low = cast(m, u64)
+        let u64 threshold = (0 - range) % range
+        while low < threshold
+            m = cast(self.next_u64(), u128) * cast(range, u128)
+            low = cast(m, u64)
+        return cast(m >> 64, u64)
+
+    // 整数区间：[lo, hi) 与 [lo, hi]
+    fn i64 int_range(let i64 lo, let i64 hi)
+        return lo + cast(self.uint_below(cast(hi - lo, u64)), i64)
+
+    fn i64 int_range_incl(let i64 lo, let i64 hi)
+        return lo + cast(self.uint_below(cast(hi - lo, u64) + 1), i64)
+
+    fn u64 uint_range(let u64 lo, let u64 hi)
+        return lo + self.uint_below(hi - lo)
+
+    fn u64 uint_range_incl(let u64 lo, let u64 hi)
+        return lo + self.uint_below(hi - lo + 1)
+
+    // 正态分布 N(mean, stddev^2)，Box-Muller（后续可换 Ziggurat）
+    fn f64 normal(let f64 mean, let f64 stddev)
+        let f64 u1 = self.uniform()
+        while u1 == 0.0
+            u1 = self.uniform()
+        let f64 u2 = self.uniform()
+        let f64 r = sqrt(-2.0 * log(u1))
+        let f64 theta = 2.0 * 3.141592653589793 * u2
+        return mean + stddev * r * cos(theta)
+
+    // 指数分布 Exp(lambda)，lambda > 0
+    fn f64 exponential(let f64 lambda)
+        let f64 u = self.uniform()
+        while u == 0.0
+            u = self.uniform()
+        return -log(u) / lambda
+
+    // 几何分布（试验次数口径，成功概率 p，返回 >= 1）
+    fn i64 geometric(let f64 p)
+        if p >= 1.0
+            return 1
+        let f64 u = self.uniform()
+        while u == 0.0
+            u = self.uniform()
+        let f64 v = floor(log(u) / log(1.0 - p))
+        return cast(v, i64) + 1
+
+    // Fisher-Yates 洗牌（i32 列表，原地）
+    fn void shuffle(ref let i32 xs[])
+        let i64 n = length(xs)
+        let i64 i = n - 1
+        while i > 0
+            let i64 j = cast(self.uint_below(cast(i + 1, u64)), i64)
+            let i32 tmp = xs[i]
+            xs[i] = xs[j]
+            xs[j] = tmp
+            i--
+
+    // u64 列表洗牌
+    fn void shuffle_u64(ref let u64 xs[])
+        let i64 n = length(xs)
+        let i64 i = n - 1
+        while i > 0
+            let i64 j = cast(self.uint_below(cast(i + 1, u64)), i64)
+            let u64 tmp = xs[i]
+            xs[i] = xs[j]
+            xs[j] = tmp
+            i--
+
+    // 均匀选一个（空列表 panic）
+    fn i32 choice(let i32[] xs)
+        let i64 n = length(xs)
+        if n == 0
+            panic("random.choice: empty sequence")
+        let i64 j = cast(self.uint_below(cast(n, u64)), i64)
+        return xs[j]
+
+    // 无放回抽 k 个（k > n 时截断为 n；返回新列表）
+    fn i32[] sample(let i32[] xs, let i32 k)
+        let i64 n = length(xs)
+        let i64 kk = cast(k, i64)
+        if kk > n
+            kk = n
+        let i64 i = 0
+        while i < kk
+            let i64 j = cast(self.uint_below(cast(n - i, u64)), i64) + i
+            let i32 tmp = xs[i]
+            xs[i] = xs[j]
+            xs[j] = tmp
+            i++
+        if kk == 0
+            let i32[] empty
+            return empty
+        return xs[0, kk - 1]
+
+    // 随机字节填入 u8 列表
+    fn void fill_bytes(ref let u8 buf[])
+        let i64 n = length(buf)
+        let i64 i = 0
+        while i < n
+            let u64 r = self.next_u64()
+            let i32 j = 0
+            while j < 8 and i < n
+                buf[i] = cast(r & 255, u8)
+                r = r >> 8
+                j++
+                i++
+
+    // n 个小写 hex 字符（'0'-'9' 'a'-'f'；按 u64 标准 hex 序：高 nibble 在前）
+    fn string hex_string(let i32 n)
+        let string s = ""
+        let i32 made = 0
+        while made < n
+            let u64 r = self.next_u64()
+            let i32 j = 15
+            while j >= 0 and made < n
+                let u64 sh = cast(j, u64)
+                let i32 d = cast((r >> (sh * 4)) & 15, i32)
+                let i32 code = 0
+                if d < 10
+                    code = 48 + d
+                else
+                    code = 87 + d
+                s += chr(code)
+                j--
+                made++
+        return s
+
+    // 可见 ASCII 字符（33-126：'!' 到 '~'）
+    fn char ascii_char()
+        let u64 v = 33 + self.uint_below(94)
+        return chr(cast(v, i32))
+
+// ===== 构造函数（自由函数：构造前无 self）=====
+
+// SplitMix64 扩展播种（防相近种子相关）
+pub fn Random seed_from_u64(let u64 seed)
+    let u64 z = seed
+    z = z + 0x9E3779B97F4A7C15
+    let u64 a = splitmix_final(z)
+    z = z + 0x9E3779B97F4A7C15
+    let u64 b = splitmix_final(z)
+    z = z + 0x9E3779B97F4A7C15
+    let u64 c = splitmix_final(z)
+    z = z + 0x9E3779B97F4A7C15
+    let u64 d = splitmix_final(z)
+    if a == 0 and b == 0 and c == 0 and d == 0
+        return seed_from_u64(0xDEADBEEF)
+    return Random(s0 = a, s1 = b, s2 = c, s3 = d)
+
+pub fn Random seed_from_i64(let i64 seed)
+    return seed_from_u64(cast(seed, u64))
+
+// 字符串种子：FNV-1a 64 压缩后 SplitMix64 扩展
+pub fn Random seed_from_string(let string s)
+    return seed_from_u64(fnv1a(s))
+
+// OS 熵源播种（非加密用途也建议用这个起种子）
+pub fn Random seed_from_entropy()
+    let u64 a = entropy_u64()
+    let u64 b = entropy_u64()
+    let u64 c = entropy_u64()
+    let u64 d = entropy_u64()
+    if a == 0 and b == 0 and c == 0 and d == 0
+        a = 1
+    return Random(s0 = a, s1 = b, s2 = c, s3 = d)
+
+// ===== SecureRandom：ChaCha20（加密强度）=====
+
+// ChaCha20 quarter round（ref 定长数组参数：原地改写 working state）
+fn void qr(ref let u32 w[16], let i32 a, let i32 b, let i32 c, let i32 d)
+    w[a] = w[a] + w[b]
+    w[d] = w[d] xor w[a]
+    w[d] = rotl32(w[d], 16)
+    w[c] = w[c] + w[d]
+    w[b] = w[b] xor w[c]
+    w[b] = rotl32(w[b], 12)
+    w[a] = w[a] + w[b]
+    w[d] = w[d] xor w[a]
+    w[d] = rotl32(w[d], 8)
+    w[c] = w[c] + w[d]
+    w[b] = w[b] xor w[c]
+    w[b] = rotl32(w[b], 7)
+
+fn u32 rotl32(let u32 x, let u32 k)
+    return (x << k) | (x >> (32 - k))
+
+fn u32 entropy_u32()
+    let u64 e = entropy_u64()
+    return cast(e, u32)
+
+// base64url 字符表第 d 个字符（0-63：A-Z a-z 0-9 - _）
+fn char b64char(let i32 d)
+    if d < 26
+        return chr(65 + d)
+    if d < 52
+        return chr(71 + d)
+    if d < 62
+        return chr(d - 4)
+    if d == 62
+        return chr(45)
+    return chr(95)
+
+// ChaCha20 状态布局：state[0..3]=常数 sigma，state[4..11]=256 位 key，
+// state[12]=counter，state[13..15]=96 位 nonce。
+// ks[16] 为当前 keystream 块缓存（16 x u32 = 64 字节），ksp 为已用字数。
+pub struct SecureRandom
+    u32 state[16]
+    u32 ks[16]
+    i32 ksp = 16
+
+    // 生成下一个 keystream 块（20 轮 = 10 个 double round），counter 递增
+    fn void refill()
+        let u32 w[16]
+        let i32 i = 0
+        while i < 16
+            w[i] = self.state[i]
+            i++
+        let i32 r = 0
+        while r < 10
+            qr(ref w, 0, 4, 8, 12)
+            qr(ref w, 1, 5, 9, 13)
+            qr(ref w, 2, 6, 10, 14)
+            qr(ref w, 3, 7, 11, 15)
+            qr(ref w, 0, 5, 10, 15)
+            qr(ref w, 1, 6, 11, 12)
+            qr(ref w, 2, 7, 8, 13)
+            qr(ref w, 3, 4, 9, 14)
+            r++
+        i = 0
+        while i < 16
+            self.ks[i] = w[i] + self.state[i]
+            i++
+        self.state[12]++
+        self.ksp = 0
+
+    // 从 keystream 取下一个 u32（块用尽自动换块）
+    fn u32 next_u32()
+        if self.ksp >= 16
+            self.refill()
+        let u32 v = self.ks[self.ksp]
+        self.ksp++
+        return v
+
+    fn u64 next_u64()
+        let u32 lo = self.next_u32()
+        let u32 hi = self.next_u32()
+        return cast(hi, u64) << 32 | cast(lo, u64)
+
+    fn bool boolean()
+        return (self.next_u32() & 1) == 1
+
+    fn bool boolean_p(let f64 p)
+        return self.uniform() < p
+
+    fn f64 uniform()
+        let u64 x = self.next_u64()
+        return cast(x >> 11, f64) * 1.1102230246251565e-16
+
+    // 无偏 [0, range)（Lemire，同 Random）
+    fn u64 uint_below(let u64 range)
+        if range <= 1
+            return 0
+        let u128 m = cast(self.next_u64(), u128) * cast(range, u128)
+        let u64 low = cast(m, u64)
+        let u64 threshold = (0 - range) % range
+        while low < threshold
+            m = cast(self.next_u64(), u128) * cast(range, u128)
+            low = cast(m, u64)
+        return cast(m >> 64, u64)
+
+    fn i64 int_range(let i64 lo, let i64 hi)
+        return lo + cast(self.uint_below(cast(hi - lo, u64)), i64)
+
+    fn i64 int_range_incl(let i64 lo, let i64 hi)
+        return lo + cast(self.uint_below(cast(hi - lo, u64) + 1), i64)
+
+    fn u64 uint_range(let u64 lo, let u64 hi)
+        return lo + self.uint_below(hi - lo)
+
+    fn u64 uint_range_incl(let u64 lo, let u64 hi)
+        return lo + self.uint_below(hi - lo + 1)
+
+    // 随机字节填入 u8 列表
+    fn void fill_bytes(ref let u8 buf[])
+        let i64 n = length(buf)
+        let i64 i = 0
+        while i < n
+            let u32 v = self.next_u32()
+            let i32 j = 0
+            while j < 4 and i < n
+                buf[i] = cast(v & 255, u8)
+                v = v >> 8
+                j++
+                i++
+
+    // n 个 URL-safe token 字符（base64url 字符集，每字符 6 位熵，
+    // 取 u32 高 30 位切 5 x 6 位——u32 均匀故切片无偏；非标准 base64 编码）
+    fn string token(let i32 nchars)
+        let string s = ""
+        let i32 made = 0
+        while made < nchars
+            let u32 v = self.next_u32()
+            let i32 j = 0
+            while j < 5 and made < nchars
+                let u32 sh = cast(25 - j * 6, u32)
+                let i32 d = cast((v >> sh) & 63, i32)
+                s += b64char(d)
+                j++
+                made++
+        return s
+
+    // n 个小写 hex 字符（同 Random.hex_string 约定）
+    fn string hex_token(let i32 nhex)
+        let string s = ""
+        let i32 made = 0
+        while made < nhex
+            let u32 v = self.next_u32()
+            let i32 j = 7
+            while j >= 0 and made < nhex
+                let u32 sh = cast(j * 4, u32)
+                let i32 d = cast((v >> sh) & 15, i32)
+                let i32 code = 0
+                if d < 10
+                    code = 48 + d
+                else
+                    code = 87 + d
+                s += chr(code)
+                j--
+                made++
+        return s
+
+    // 重新从 OS 熵源播种（key+counter+nonce 共 12 x u32；sigma 常数固定）
+    fn void reseed()
+        self.state[0] = 0x61707865
+        self.state[1] = 0x3320646e
+        self.state[2] = 0x79622d32
+        self.state[3] = 0x6b206574
+        let i32 i = 0
+        while i < 12
+            self.state[i + 4] = entropy_u32()
+            i++
+        self.ksp = 16
+
+// 构造：OS 熵源播种
+pub fn SecureRandom secure_new()
+    let SecureRandom sr = SecureRandom()
+    sr.reseed()
+    return sr
+
+// 构造：字符串种子（FNV-1a + SplitMix64 扩展 12 x u32）。
+// 注意：熵上限受种子约束，仅用于测试/可复现场景
+pub fn SecureRandom secure_from_string(let string s)
+    let SecureRandom sr = SecureRandom()
+    sr.reseed()
+    let u64 h = fnv1a(s)
+    let i32 i = 0
+    while i < 12
+        h = h + 0x9E3779B97F4A7C15
+        sr.state[i + 4] = cast(splitmix_final(h), u32)
+        i++
+    sr.ksp = 16
+    return sr

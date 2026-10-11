@@ -16,6 +16,11 @@ let collected : (pos * string) list ref = ref []
    与 clang win32 的 __int128 ABI 一致） *)
 let extern_fns : (string, unit) Hashtbl.t = Hashtbl.create 8
 
+(* struct 方法表（v3.2 随机数模块）：(struct 名, 方法名) → 脱糖后全局函数名。
+   driver 在 expand_uses（导入文件）/脱糖 pass（主文件）里填充；
+   check_program 开头清空（单文件单进程，防御性重置） *)
+let method_tbl : (string * string, string) Hashtbl.t = Hashtbl.create 16
+
 (* ---------- TVar 求解 ---------- *)
 
 let subs : (int, zty) Hashtbl.t = Hashtbl.create 16
@@ -128,7 +133,19 @@ type env = {
 (* 内建函数表（与 hir.ml builtin_fns 同步） *)
 let builtin_fns_aux : (string * (zty list * zty)) list =
   List.map (fun (n, ps, r) -> (n, (ps, r)))
-    [ ("str_len", [ TString ], TInt 64) ]
+    [ ("str_len", [ TString ], TInt 64);
+      (* 数学内建（v3.2）：直接落 libm 符号，实参经 coerce 自动宽化到 f64 *)
+      ("sqrt", [ TFloat 64 ], TFloat 64);
+      ("log", [ TFloat 64 ], TFloat 64);
+      ("exp", [ TFloat 64 ], TFloat 64);
+      ("sin", [ TFloat 64 ], TFloat 64);
+      ("cos", [ TFloat 64 ], TFloat 64);
+      ("tan", [ TFloat 64 ], TFloat 64);
+      ("floor", [ TFloat 64 ], TFloat 64);
+      ("ceil", [ TFloat 64 ], TFloat 64);
+      ("pow", [ TFloat 64; TFloat 64 ], TFloat 64) ]
+(* abs 不在此表：整数/f64 双重载，check_call 特判（同宽整数内联 sub+select，
+   浮点走 @fabs） *)
 
 (* 字符串内建名（EField 误用提示与 ECall 分派共用，w-020 DX）。
    须定义在下方 let rec 大递归链之前（field_chain 会引用它） *)
@@ -731,6 +748,8 @@ and check_expr env (e : expr) : texpr =
       | Add -> BAdd | Sub -> BSub | Mul -> BMul | Div -> BDiv | Mod -> BMod
       | Eq -> BEq | Ne -> BNe | Lt -> BLt | Gt -> BGt | Le -> BLe | Ge -> BGe
       | And -> BAnd | Or -> BOr
+      | BitAnd -> BBitAnd | BitOr -> BBitOr | Xor -> BBitXor
+      | Shl -> BShl | Shr -> BShr
     in
     if bop = BAnd || bop = BOr then begin
       unify p' tl.ety TBool;
@@ -824,6 +843,34 @@ and check_expr env (e : expr) : texpr =
           terr p' "unsupported pointer operation: %s (only + - inside unsafe and == !=)"
             (pp_binop bop)
       end
+      (* 位运算/移位（v3.2）：仅整数（char 提升为 i32）；& | xor 两侧宽化
+         到公共宽度，移位结果取左操作数类型（移位量任意整数） *)
+      else if (match bop with
+               | BBitAnd | BBitOr | BBitXor | BShl | BShr -> true
+               | _ -> false) then begin
+        let is_bit_int = function
+          | TInt _ | TUint _ | TChar | TVar _ -> true | _ -> false in
+        if not (is_bit_int rl && is_bit_int rr) then
+          terr p' "bitwise operations require integer operands, got %s and %s"
+            (pp_zty rl) (pp_zty rr);
+        let tl, tr =
+          match rl, rr with
+          | TChar, _ -> mk (ECastK (tl, TInt 32)) (TInt 32), tr
+          | _, TChar -> tl, mk (ECastK (tr, TInt 32)) (TInt 32)
+          | _ -> tl, tr
+        in
+        let res_ty =
+          match bop with
+          | BShl | BShr -> tl.ety
+          | _ ->
+            (match resolve tl.ety, resolve tr.ety with
+             | (TInt _ | TUint _ as a), (TInt _ | TUint _ as b) when a <> b ->
+               widen_target a b
+             | _ -> tl.ety)
+        in
+        let tl = coerce p' tl res_ty and tr = coerce p' tr res_ty in
+        mk (EBinK (bop, tl, tr)) res_ty
+      end
       else
       (* char 数值化（w-014 #5）：算术运算中 char 与 char/整数混合 →
          双方提升为 i32（C 整数提升语义），结果 i32；
@@ -913,7 +960,22 @@ and check_expr env (e : expr) : texpr =
           mk (EUnK (UNeg, t1)) t1')
      | Not ->
        unify p' t1.ety TBool;
-       mk (EUnK (UNot, t1)) TBool)
+       mk (EUnK (UNot, t1)) TBool
+     | BitNot ->
+       (* ~ 按位取反（v3.2）：仅整数/char（char 提升为 i32） *)
+       let ti =
+         match resolve t1.ety with
+         | TChar -> Some (TInt 32)
+         | TInt _ | TUint _ -> Some t1.ety
+         | _ -> None
+       in
+       (match ti with
+        | Some t ->
+          let t1 = if t = t1.ety then t1 else mk (ECastK (t1, t)) t in
+          mk (EUnK (UBitNot, t1)) t
+        | None ->
+          terr p' "bitwise not (~) requires an integer type, got %s" (pp_zty t1.ety);
+          mk (EUnK (UBitNot, t1)) t1.ety))
   | ECall (callee, args, p') ->
     (match callee with
      | EVar (name, _) ->
@@ -1123,41 +1185,53 @@ and check_expr env (e : expr) : texpr =
               | _ ->
                (* 字段链 callee（h.op(...)，new2.md 9a）：根为局部变量且
                   字段链为函数指针时间接调用；否则按普通函数调用处理
-                  （模块扁平化后的点名 math.add 走 check_call） *)
-               (match split_field_path name with
-                | Some (first, _) ->
-                  (match lookup_var env first with
-                   | Some _ ->
-                     let tcallee = check_expr env callee in
-                     (match resolve tcallee.ety with
-                      | TPtr (TFunSig (ptys, ret)) ->
-                        if List.length ptys <> List.length args then
-                          terr p' "function pointer expects %d arguments, got %d"
-                            (List.length ptys) (List.length args);
-                        let targs =
-                          List.map2
-                            (fun (ca : call_arg) pt ->
-                              match ca with
-                              | CPos e -> coerce p' (check_expr env e) pt
-                              | CCopy e -> coerce p' (check_expr env e) pt
-                              | CMove _ -> terr p' "function pointer calls do not support move arguments"
-                              | CRef _ -> terr p' "function pointer calls do not support ref arguments"
-                              | CNamed (n, _) -> terr p' "function pointer calls do not support named argument %s=" n)
-                            args ptys
-                        in
-                        mk (EIndirectCallK (tcallee, targs)) ret
-                      | _ ->
-                        (* 普通/未知函数调用：走统一实参分派（自动 move/copy/ref） *)
+                  （模块扁平化后的点名 math.add 走 check_call）。
+                  v3.2：dotted 末端命中 struct 方法表 → 方法调用脱糖 *)
+               let mres =
+                 match split_field_path name with
+                 | Some (first, _ :: _) ->
+                   (match lookup_var env first with
+                    | Some _ -> try_method env name p' args
+                    | None -> None)
+                 | _ -> None
+               in
+               (match mres with
+                | Some te -> te
+                | None ->
+                  (match split_field_path name with
+                   | Some (first, _) ->
+                     (match lookup_var env first with
+                      | Some _ ->
+                        let tcallee = check_expr env callee in
+                        (match resolve tcallee.ety with
+                         | TPtr (TFunSig (ptys, ret)) ->
+                           if List.length ptys <> List.length args then
+                             terr p' "function pointer expects %d arguments, got %d"
+                               (List.length ptys) (List.length args);
+                           let targs =
+                             List.map2
+                               (fun (ca : call_arg) pt ->
+                                 match ca with
+                                 | CPos e -> coerce p' (check_expr env e) pt
+                                 | CCopy e -> coerce p' (check_expr env e) pt
+                                 | CMove _ -> terr p' "function pointer calls do not support move arguments"
+                                 | CRef _ -> terr p' "function pointer calls do not support ref arguments"
+                                 | CNamed (n, _) -> terr p' "function pointer calls do not support named argument %s=" n)
+                               args ptys
+                           in
+                           mk (EIndirectCallK (tcallee, targs)) ret
+                         | _ ->
+                           (* 普通/未知函数调用：走统一实参分派（自动 move/copy/ref） *)
+                           let (targs, origs, modes) = check_args_modes env args in
+                           check_call env p' name targs origs modes)
+                      | None ->
+                        (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
                         let (targs, origs, modes) = check_args_modes env args in
                         check_call env p' name targs origs modes)
                    | None ->
                      (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
                      let (targs, origs, modes) = check_args_modes env args in
-                     check_call env p' name targs origs modes)
-                | None ->
-                 (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
-                 let (targs, origs, modes) = check_args_modes env args in
-                 check_call env p' name targs origs modes))))
+                     check_call env p' name targs origs modes)))))
      | _ -> terr p' "unsupported callee expression")
   | EIndex (base, idx, p') ->
     let tb = check_expr env base in
@@ -1364,9 +1438,75 @@ and check_expr env (e : expr) : texpr =
        mk (ERemoveK (root, ti, isl)) e
      | t -> terr p' "remove only works on arrays/lists, got %s" (pp_zty t))
 
+(* 方法调用尝试（v3.2 随机数模块）：dotted 名 a.b.m(...)，末端 m 命中
+   接收者 struct 的方法表 → 改写为脱糖函数调用 <S>__m(ref recv, args)。
+   未命中（普通字段链/函数指针字段/模块函数）返回 None 走原路径 *)
+and try_method env name p' args =
+  match split_field_path name with
+  | Some (first, segs) when segs <> [] ->
+    let mname = List.hd (List.rev segs) in
+    let front = String.concat "." (first :: List.rev (List.tl (List.rev segs))) in
+    (match lookup_var env front with
+     | Some l ->
+       (match resolve l.lty with
+        | TStruct s | TPtr (TStruct s) ->
+          (match Hashtbl.find_opt method_tbl (s, mname) with
+           | Some gname ->
+             if l.lconst then
+               terr p' "cannot call method %s on const value %s (methods may mutate the receiver)"
+                 mname front;
+             (* self 按引用传：TPtr 接收者直接传指针值，TStruct 传槽地址 *)
+             let rarg =
+               match resolve l.lty with
+               | TPtr _ -> CPos (EVar (front, p'))
+               | _ -> CRef (EVar (front, p'))
+             in
+             Some (check_expr env (ECall (EVar (gname, p'), rarg :: args, p')))
+           | None -> None)
+        | _ -> None)
+     | None -> None)
+  | _ -> None
+
 and check_call env p name0 targs origs modes =
   let name = ref name0 in
   let sig_ =
+    if name0 = "abs" then begin
+      (* abs 重载（v3.2）：整数→同宽整数（llvmgen 内联 sub+select），
+         浮点→同宽浮点（llvmgen 走 @fabs/@fabsf）；其余类型报错。
+         字面量延迟定型（ety=TVar）：按节点形态给默认目标型，
+         coerce 会按目标型重解释字面量并做范围校验 *)
+      let lit_default ty tv =
+        match tv.e with
+        | EIntK _ -> Some (TInt 64)
+        | EBigK _ -> Some (TInt 128)
+        | EFloatK _ -> Some (TFloat 64)
+        | EUnK (UNeg, u) ->
+          (match resolve u.ety with
+           | (TInt _ | TUint _ | TFloat _) as t -> Some t
+           | _ ->
+             (match u.e with
+              | EIntK _ -> Some (TInt 64)
+              | EBigK _ -> Some (TInt 128)
+              | EFloatK _ -> Some (TFloat 64)
+              | _ -> None))
+        | _ -> None
+      in
+      match targs with
+      | [ a ] ->
+        let aty =
+          match resolve a.ety with
+          | (TInt _ | TUint _ | TFloat _) as t -> Some t
+          | TVar _ -> lit_default (resolve a.ety) a
+          | _ -> None
+        in
+        (match aty with
+         | Some t ->
+           { params = [ t ]; prefs = [ false ]; ret = t; runred = false }
+         | None ->
+           terr p "abs expects an integer or float argument, got %s" (pp_zty (resolve a.ety)))
+      | _ -> terr p "abs expects exactly 1 argument"
+    end
+    else
     match List.assoc_opt name0 builtin_fns_aux with
     | Some (ptys, ret) -> { params = ptys; prefs = List.map (fun _ -> false) ptys; ret; runred = false }
     | None ->
@@ -1384,14 +1524,31 @@ and check_call env p name0 targs origs modes =
   if List.length sig_.params <> List.length targs then
     terr p "function %s expects %d arguments, got %d"
       !name (List.length sig_.params) (List.length targs);
-  (* ref 参数/实参匹配（new2.md #1）：ref 参数必须 f(ref x)，反之亦然 *)
+  (* ref 参数/实参匹配（new2.md #1）：ref 参数必须 f(ref x)，反之亦然。
+     例外（v3.2 struct 方法）：实参本身已是同型指针（方法内 self 转发）时
+     CPos 值传等价于传地址，放行 *)
   List.iteri
     (fun i m ->
       let pref = try List.nth sig_.prefs i with _ -> false in
       if m = 2 && not pref then
         terr p "argument %d of %s is passed by ref, but the parameter is not declared ref" (i + 1) !name
-      else if pref && m <> 2 then
-        terr p "parameter %d of %s is ref, pass the argument with ref (f(ref x))" (i + 1) !name)
+      else if pref && m <> 2 then begin
+        let already_ptr =
+          match m, (try List.nth origs i with _ -> None) with
+          | 0, Some (EVar (n, _)) ->
+            (match lookup_var env n with
+             | Some l ->
+               (match resolve l.lty with
+                | TPtr _ ->
+                  (match try List.nth sig_.params i with _ -> TVoid with
+                   | TPtr _ -> true | _ -> false)
+                | _ -> false)
+             | None -> false)
+          | _ -> false
+        in
+        if not already_ptr then
+          terr p "parameter %d of %s is ref, pass the argument with ref (f(ref x))" (i + 1) !name
+      end)
     modes;
   (* File 参数 move-only（design_fileio.md）：只能 f(move f) 所有权移交；
      值传/copy/ref 一律报错（句柄共享会破坏"谁持有谁关闭"约定） *)
@@ -3583,12 +3740,14 @@ let check_program (prog : program) : hir =
               if pd.pref then begin
                 (* ref 参数（new2.md #1 / w-014 #1）：签名侧降为指针（调用方
                    传地址）；标量/string/数组/列表——seq 槽引用使函数内
-                   push/元素写直接作用于调用方列表 *)
+                   push/元素写直接作用于调用方列表。
+                   v3.2：struct 也支持 ref（随机数模块方法依赖）——字段
+                   访问经指针自动解引用 *)
                 (match resolve t with
                  | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString
-                 | TList _ | TArray _ -> ()
+                 | TList _ | TArray _ | TStruct _ -> ()
                  | _ ->
-                   terr pd.ppos "ref parameters support scalar/string/array/list types only (got %s)"
+                   terr pd.ppos "ref parameters support scalar/string/array/list/struct types only (got %s)"
                      (pp_zty t));
                 TPtr t
               end else t)

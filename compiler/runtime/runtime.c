@@ -21,8 +21,9 @@
 #include <malloc.h>
 #ifdef _WIN32
 #include <io.h>                      /* _isatty（交互控制台探测） */
+#include <windows.h>                 /* OS 熵源（SystemFunction036 动态加载） */
 #else
-#include <unistd.h>                  /* isatty */
+#include <unistd.h>                  /* isatty / getentropy */
 #endif
 #include <errno.h>
 
@@ -2131,4 +2132,24 @@ zfy_seq *zfy_str_split(const char *s, char c) {
 /* 按多字符分隔串切分（整串匹配） */
 zfy_seq *zfy_str_split_str(const char *s, const char *delim) {
     return split_impl(s, -1, delim);
+}
+
+/* ---------- OS 熵源（v3.2 随机数模块：Random.seed_from_entropy /
+   SecureRandom 播种） ----------
+   Windows: 动态加载 advapi32!SystemFunction036（RtlGenRandom），免附加
+   链接库（kernel32 的 GetModuleHandle/GetProcAddress 恒可用）；
+   POSIX: getentropy()。
+   熵源不可用属不可恢复错误，fail-fast die。 */
+void zfy_os_random_u64(unsigned long long *out) {
+#ifdef _WIN32
+    typedef unsigned char (WINAPI *rng_fn)(void *, unsigned long);
+    HMODULE h = GetModuleHandleA("Advapi32.dll");
+    rng_fn pfn = NULL;
+    if (!h) h = LoadLibraryA("Advapi32.dll");
+    if (h) pfn = (rng_fn)(void *)GetProcAddress(h, "SystemFunction036");
+    if (!pfn) zfy_die("os_random: SystemFunction036 unavailable");
+    if (!pfn(out, 8)) zfy_die("os_random: SystemFunction036 failed");
+#else
+    if (getentropy(out, 8) != 0) zfy_die("os_random: getentropy failed");
+#endif
 }

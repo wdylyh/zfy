@@ -271,6 +271,12 @@ and parse_tyargs p base_name npos =
     match peek p with
     | (Comma, _) -> ignore (next p); go acc
     | (Gt, _) -> ignore (next p); List.rev acc
+    | (Shr, _) ->
+      (* 嵌套泛型闭包 Box<Box<i32>>：词法的 >> 在此拆半——只消耗一层 >，
+         把单个 > 塞回 token 流供外层闭合 *)
+      ignore (next p);
+      p.toks <- (Gt, npos) :: p.toks;
+      List.rev acc
     | (_, tp) -> err tp "expected ',' or '>' to end the type argument list"
   in
   let targs = go [] in
@@ -327,7 +333,43 @@ and parse_not p =
   | (Keyword KNot, tp) ->
     ignore (next p);
     EUn (Not, parse_not p, tp)
-  | _ -> parse_eq p
+  | _ -> parse_bor p
+
+(* 位运算层级（C 优先级）：| < xor < & ，均低于 ==/!= 高于 or/and。
+   xor 用关键字（用户拍板 2026-10-11），^ 仍为解引用后缀；
+   & 一元取地址在 parse_unary，二元位与在此按位置区分（左值完整后遇 & ） *)
+and parse_bor p =
+  let l = parse_bxor p in
+  let rec go l =
+    match peek p with
+    | (Pipe, tp) ->
+      ignore (next p);
+      go (EBin (BitOr, l, parse_bxor p, tp))
+    | _ -> l
+  in
+  go l
+
+and parse_bxor p =
+  let l = parse_band p in
+  let rec go l =
+    match peek p with
+    | (Keyword KXor, tp) ->
+      ignore (next p);
+      go (EBin (Xor, l, parse_band p, tp))
+    | _ -> l
+  in
+  go l
+
+and parse_band p =
+  let l = parse_eq p in
+  let rec go l =
+    match peek p with
+    | (Amp, tp) ->
+      ignore (next p);
+      go (EBin (BitAnd, l, parse_eq p, tp))
+    | _ -> l
+  in
+  go l
 
 (* 关系比较（高）与相等判断（低）分两层：a < b == c 解析为 (a<b)==c *)
 and parse_eq p =
@@ -340,7 +382,7 @@ and parse_eq p =
   | _ -> l
 
 and parse_rel p =
-  let l = parse_add p in
+  let l = parse_shift p in
   let (tk, tp) = peek p in
   let op =
     match tk with
@@ -350,8 +392,24 @@ and parse_rel p =
   | None -> l
   | Some op ->
     ignore (next p);
-    let r = parse_add p in
+    let r = parse_shift p in
     EBin (op, l, r, tp) (* 不结合 *)
+
+(* 移位（C 优先级：低于加减、高于比较） *)
+and parse_shift p =
+  let l = parse_add p in
+  let rec go l =
+    let (tk, tp) = peek p in
+    match tk with
+    | Shl ->
+      ignore (next p);
+      go (EBin (Shl, l, parse_add p, tp))
+    | Shr ->
+      ignore (next p);
+      go (EBin (Shr, l, parse_add p, tp))
+    | _ -> l
+  in
+  go l
 
 and parse_add p =
   let l = parse_mul p in
@@ -395,6 +453,7 @@ and parse_unary p =
   match peek p with
   | (Minus, tp) -> ignore (next p); EUn (Neg, parse_unary p, tp)
   | (Amp, tp) -> ignore (next p); EAddrOf (parse_unary p, tp)
+  | (Tilde, tp) -> ignore (next p); EUn (BitNot, parse_unary p, tp)
   | _ -> parse_postfix p
 
 and parse_postfix p =
@@ -665,6 +724,12 @@ and parse_let_head p =
   let ty_opt =
     match peek p with
     | (Ident s, _) when List.mem s p.tynames -> Some (parse_ty ~allow_fun:true p)
+    (* 跨文件类型名（模块导入的 struct/type 别名）：Ident 后紧跟 Ident
+       只能是"类型 名字"形状（无类型推断形式名字后必须是 = 或修饰符） *)
+    | (Ident _, _) ->
+      (match peek2 p with
+       | (Ident _, _) -> Some (parse_ty ~allow_fun:true p)
+       | _ -> None)
     | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty ~allow_fun:true p)
     | _ -> None
   in
@@ -1060,6 +1125,14 @@ and parse_input p tp =
           let ty_opt =
             match peek p with
             | (Ident s, _) when List.mem s p.tynames -> Some (parse_ty p)
+            | (Ident _, _) ->
+              (match peek2 p with
+               | (Ident _, _) -> Some (parse_ty p)
+               | _ -> None)
+      | (Ident _, _) ->
+        (match peek2 p with
+         | (Ident _, _) -> Some (parse_ty p)
+         | _ -> None)
             | _ -> None
           in
           let ty =
@@ -1223,13 +1296,57 @@ let parse_param p =
       pconst = false; punred = false; pref = is_ref; ppos = tp0 }
   | (_, _, _, _ :: _) -> err tp0 "unsupported parameter shape"
 
-(* struct 字段块：每行一个字段；块以 DEDENT 结束 *)
-let rec parse_struct_fields p acc =
+(* struct 字段块：每行一个字段（或 fn 方法，v3.2）；块以 DEDENT 结束。
+   返回 (字段, 方法) 对 *)
+let rec parse_struct_fields p facc macc =
   skip_trivia p;
   match peek p with
-  | (Indent, _) -> ignore (next p); parse_struct_fields p acc
-  | (Dedent, _) -> ignore (next p); List.rev acc
-  | (Eof, _) -> List.rev acc
+  | (Indent, _) -> ignore (next p); parse_struct_fields p facc macc
+  | (Dedent, _) -> ignore (next p); (List.rev facc, List.rev macc)
+  | (Eof, _) -> (List.rev facc, List.rev macc)
+  | (Keyword KFn, ftp) ->
+    (* struct 方法（v3.2 随机数模块）：fn (返回类型)? (frac)? 名字(参数) 块；
+       隐式首参 self = ref 接收者（脱糖在 driver 展开） *)
+    ignore (next p);
+    let ty_opt =
+      match peek p with
+      | (Ident s, _) when List.mem s p.tynames -> Some (parse_ty p)
+      | (Ident _, _) ->
+        (match peek2 p with
+         | (Ident _, _) -> Some (parse_ty p)
+         | _ -> None)
+      | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty p)
+      | _ -> None
+    in
+    let is_frac =
+      match peek p with
+      | (Keyword KFrac, _) -> ignore (next p); true
+      | _ -> false
+    in
+    let name = expect_ident p "method name" in
+    expect p LParen "(";
+    let params =
+      let rec go acc =
+        match peek p with
+        | (RParen, _) -> ignore (next p); List.rev acc
+        | _ ->
+          let pd = parse_param p in
+          (match peek p with
+           | (Comma, _) -> ignore (next p); go (pd :: acc)
+           | (RParen, _) -> ignore (next p); List.rev (pd :: acc)
+           | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
+      in
+      go []
+    in
+    let body = parse_block p in
+    let ret =
+      match ty_opt with
+      | Some ty -> Some ty
+      | None -> err ftp "method declaration requires a return type (or use void)"
+    in
+    parse_struct_fields p facc
+      ({ mname = name; mparams = params; mret = ret; mrfrac = is_frac;
+         mbody = body; mpos = ftp } :: macc)
   | (Ident _, ftp) ->
     (* 字段类型：任意标识符（基础宽度类型或已声明 struct 名，typeck 校验），
        可带 * 指针后缀与类型侧 []/[N] 组；
@@ -1257,7 +1374,7 @@ let rec parse_struct_fields p acc =
         | Some _ -> err ftp "array/list struct fields cannot have default values"
         | None -> ()));
     end_of_stmt p;
-    parse_struct_fields p ({ fname = name; fty; fseq; fdefault; fpos = ftp } :: acc)
+    parse_struct_fields p ({ fname = name; fty; fseq; fdefault; fpos = ftp } :: facc) macc
   | (_, tp) -> err tp "struct field syntax: TYPE NAME [= default]"
 
 (* 模块体：缩进块内每行一个顶层项（fn/struct/mod/use/...；可嵌套 mod） *)
@@ -1467,9 +1584,9 @@ and parse_item p =
       | (Lt, _) -> parse_tparams p
       | _ -> []
     in
-    let fields = parse_struct_fields p [] in
+    let (fields, methods) = parse_struct_fields p [] [] in
     p.tynames <- name :: p.tynames;
-    IStruct { name; packed; fields; pos = tp; tparams }
+    IStruct { name; packed; fields; pos = tp; tparams; methods }
   | Keyword KExtern ->
     (* extern "C"：缩进块内每行一个 C 函数声明（类型 (frac)? 名字(参数)），
        解析为多个 IExtern 函数（块结构不保留） *)
@@ -1533,6 +1650,10 @@ and parse_item p =
     let ty_opt =
       match peek p with
       | (Ident s, _) when List.mem s p.tynames -> Some (parse_ty p)
+      | (Ident _, _) ->
+        (match peek2 p with
+         | (Ident _, _) -> Some (parse_ty p)
+         | _ -> None)
       | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty p)
       | _ -> None
     in
