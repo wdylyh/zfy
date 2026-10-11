@@ -1,359 +1,168 @@
-// ledger.zfy —— 单文件迷你记账 / 文本数据库
-// 编译：zfyc build ledger.zfy
+// t14.zfy —— big_sqrt 第 3 段：内层求 digit 循环
 
-mod strutil
-    pub fn bool starts_with(let string s, let string prefix)
-        let i64 ls = length(s)
-        let i64 lp = length(prefix)
-        if ls < lp
-            return false
-        let i64 i = 0
-        while i < lp
-            if s[i] != prefix[i]
-                return false
-            i++
-        return true
-
-    pub fn bool ends_with(let string s, let string suffix)
-        let i64 ls = length(s)
-        let i64 lx = length(suffix)
-        if ls < lx
-            return false
-        let i64 off = ls - lx
-        let i64 i = 0
-        while i < lx
-            if s[off + i] != suffix[i]
-                return false
-            i++
-        return true
-
-    pub fn i64! parse_i64(let string s)
-        let i64 n = length(s)
-        if n == 0
-            fail(ErrCode.CUSTOM, "empty number")
-        let i64 i = 0
-        let bool neg = false
-        if s[0] == '-'
-            neg = true
-            i = 1
-        if i >= n
-            fail(ErrCode.CUSTOM, "bad number")
-        let i64 v = 0
-        while i < n
-            let char c = s[i]
-            if c == '.'
-                let i64 j = i + 1
-                while j < n
-                    let char c2 = s[j]
-                    let i32 cv2 = ord(c2)
-                    if cv2 < ord('0') or cv2 > ord('9')
-                        fail(ErrCode.CUSTOM, "bad digit")
-                    j++
-                break
-            let i32 cv = ord(c)
-            if cv < ord('0') or cv > ord('9')
-                fail(ErrCode.CUSTOM, "bad digit")
-            v = v * 10 + cast(cv - ord('0'), i64)
-            i++
-        if neg
-            v = -v
-        return v
-
-    pub fn string pad_i64(let i64 v, let i32 width)
-        let bool neg = v < 0
-        let i64 a = v
-        if neg
-            a = -a
-        let string digits = ""
-        if a == 0
-            digits = "0"
-        while a > 0
-            let i32 d = cast(a % 10, i32)
-            let string ch = ""
-            ch += chr(ord('0') + d)
-            digits = ch + digits
-            a = a / 10
-        if neg
-            digits = "-" + digits
-        let i64 w = cast(width, i64)
-        while length(digits) < w
-            digits = "0" + digits
-        return digits
-
-struct Entry
-    string date
-    string category
-    i64 amount
-    string note
-
-struct Ledger
-    Entry items[]
-
-let string DB_FILE = "ledger.db"
-
-fn void die(let string msg)
-    output("error: ", msg, "\n")
-    panic(ErrCode.CUSTOM, msg)
-
-fn bool is_leap(let i32 y)
-    if y % 400 == 0
-        return true
-    if y % 100 == 0
-        return false
-    return y % 4 == 0
-
-fn i32 days_in_month(let i32 y, let i32 m)
-    if m == 2
-        if is_leap(y)
-            return 29
-        return 28
-    if m == 4 or m == 6 or m == 9 or m == 11
-        return 30
-    return 31
-
-fn bool valid_date(let string d)
-    if length(d) != 10
-        return false
-    if d[4] != '-' or d[7] != '-'
-        return false
-    let i64! y = strutil.parse_i64(d[0, 3])
-    let i64! m = strutil.parse_i64(d[5, 6])
-    let i64! day = strutil.parse_i64(d[8, 9])
-    let i64 yy = y ?? -1
-    let i64 mm = m ?? -1
-    let i64 dd = day ?? -1
-    if yy < 1
-        return false
-    if mm < 1 or mm > 12
-        return false
-    if dd < 1 or dd > cast(days_in_month(cast(yy, i32), cast(mm, i32)), i64)
-        return false
-    return true
-
-fn i64! yuan_to_cents(let string s)
-    let string parts[] = split(s, '.')
-    if length(parts) == 1
-        let i64! v = strutil.parse_i64(parts[0])
-        let i64 base = v ?? 0
-        return base * 100
-    if length(parts) != 2
-        fail(ErrCode.CUSTOM, "bad amount")
-    let i64! iv = strutil.parse_i64(parts[0])
-    let i64 ip = iv ?? 0
-    let string fp_str = parts[1]
-    if length(fp_str) == 0
-        return ip * 100
-    if length(fp_str) == 1
-        fp_str += "0"
-    if length(fp_str) > 2
-        fp_str = fp_str[0, 1]
-    let i64! fv = strutil.parse_i64(fp_str)
-    let i64 fp = fv ?? 0
-    return ip * 100 + fp
-
-fn string cents_to_yuan(let i64 cents)
-    let bool neg = cents < 0
-    let i64 a = cents
-    if neg
-        a = -a
-    let i64 yuan = a / 100
-    let i64 cent = a % 100
-    let string out = strutil.pad_i64(yuan, 1) + "." + strutil.pad_i64(cent, 2)
-    if neg
-        out = "-" + out
+fn i32[] big_trim(let i32[] a)
+    let i32[] out
+    let i64 i = 0
+    let i64 n = length(a)
+    while i < n and a[i] == 0
+        i++
+    if i == n
+        out = push(out, 0)
+        return out
+    while i < n
+        out = push(out, a[i])
+        i++
     return out
 
-fn void save_items(let Entry items[])
-    let string content = ""
-    let i64 n = length(items)
+fn bool big_zero(let i32[] a)
+    return length(a) == 1 and a[0] == 0
+
+fn i32[] big_mul_add(let i32[] a, let i32 m, let i32 add)
+    let i32[] out
+    if big_zero(a) and m == 0
+        out = push(out, add)
+        return big_trim(out)
+    let i32[] rev
+    let i64 i = length(a) - 1
+    while i >= 0
+        rev = push(rev, a[i])
+        i--
+    let i32 carry = add
+    let i32[] outr
+    let i64 j = 0
+    while j < length(rev)
+        let i32 t = rev[j] * m + carry
+        outr = push(outr, t % 10)
+        carry = t / 10
+        j++
+    while carry > 0
+        outr = push(outr, carry % 10)
+        carry = carry / 10
+    let i64 k = length(outr) - 1
+    while k >= 0
+        out = push(out, outr[k])
+        k--
+    return big_trim(out)
+
+fn i32 big_cmp(let i32[] a, let i32[] b)
+    if length(a) < length(b)
+        return 0 - 1
+    if length(a) > length(b)
+        return 1
     let i64 i = 0
-    while i < n
-        let Entry e = items[i]
-        content += e.date + "\t" + e.category + "\t" + strutil.pad_i64(e.amount, 1) + "\t" + e.note + "\n"
+    while i < length(a)
+        if a[i] < b[i]
+            return 0 - 1
+        if a[i] > b[i]
+            return 1
         i++
-    let i64! w = write_file(DB_FILE, content)
-    let i64 wv = w ?? -1
-    if wv < 0
-        die("cannot write database")
+    return 0
 
-fn Ledger load_ledger()
-    let Ledger L = Ledger()
-    if not exists(DB_FILE)
-        return L
-    let string! raw = read_file(DB_FILE)
-    let string content = raw ?? ""
-    if length(content) == 0
-        return L
-    let string raw_lines[] = split(content, '\n')
-    let i64 n = length(raw_lines)
+fn i32[] big_sub(let i32[] a, let i32[] b)
+    let i32[] ar
+    let i64 i = length(a) - 1
+    while i >= 0
+        ar = push(ar, a[i])
+        i--
+    let i32[] br
+    let i64 j = length(b) - 1
+    while j >= 0
+        br = push(br, b[j])
+        j--
+    let i32[] outr
+    let i32 borrow = 0
+    let i64 k = 0
+    while k < length(ar)
+        let i32 av = ar[k]
+        let i32 bv = 0
+        if k < length(br)
+            bv = br[k]
+        let i32 t = av - bv - borrow
+        if t < 0
+            t = t + 10
+            borrow = 1
+        else
+            borrow = 0
+        outr = push(outr, t)
+        k++
+    let i32[] out
+    let i64 m2 = length(outr) - 1
+    while m2 >= 0
+        out = push(out, outr[m2])
+        m2--
+    return big_trim(out)
+
+fn string big_sqrt(let i32[] N, let i64 want)
+    output("  S1 enter\n")
+    let i32[] groups
+    let i64 n = length(N)
+    let i64 first = n % 2
+    if first == 0
+        first = 2
+    let i32 g0 = 0
     let i64 i = 0
-    while i < n
-        let string line = raw_lines[i]
+    while i < first
+        g0 = g0 * 10 + N[i]
         i++
-        if length(line) == 0
-            continue
-        if strutil.ends_with(line, "\r")
-            line = line[0, length(line) - 2]
-        let string cols[] = split(line, '\t')
-        if length(cols) < 4
-            continue
-        let i64! amt = strutil.parse_i64(cols[2])
-        let i64 av = amt ?? 0
-        let Entry e = Entry(date=cols[0], category=cols[1], amount=av, note=cols[3])
-        L.items = push(L.items, e)
-    return L
-
-fn void cmd_init()
-    let Ledger L = Ledger()
-    save_items(L.items)
-    output("initialized empty ledger at ", DB_FILE, "\n")
-
-fn void cmd_add(let string date, let string category, let string amount, let string note)
-    if not valid_date(date)
-        die("invalid date: " + date)
-    let i64! cents = yuan_to_cents(amount)
-    let i64 cv = cents ?? -1
-    if cv < 0
-        die("invalid amount: " + amount)
-    let Ledger L = load_ledger()
-    let Entry e = Entry(date=date, category=category, amount=cv, note=note)
-    L.items = push(L.items, e)
-    save_items(L.items)
-    output("added: ", date, " ", category, " ", cents_to_yuan(cv), " ", note, "\n")
-
-fn void cmd_del(let string idx_s)
-    let Ledger L = load_ledger()
-    let Entry items[] = L.items
-    let i64! idx = strutil.parse_i64(idx_s)
-    let i64 iv = idx ?? -1
-    let i64 len = length(items)
-    if iv < 1 or iv > len
-        die("index out of range")
-    let Entry dropped = remove(items, iv - 1)
-    save_items(items)
-    output("deleted entry #", iv, "\n")
-
-fn void print_entries(let Entry items[])
-    output(" #  date        category       amount      note\n")
-    output("--------------------------------------------------------\n")
-    let i64 n = length(items)
-    let i64 i = 0
+    groups = push(groups, g0)
     while i < n
-        let Entry e = items[i]
-        output(strutil.pad_i64(i + 1, 2), "  ",
-               e.date, "  ",
-               prec(e.category, 12), "  ",
-               prec(cents_to_yuan(e.amount), 10), "  ",
-               e.note, "\n")
-        i++
+        let i32 g = N[i] * 10 + N[i + 1]
+        groups = push(groups, g)
+        i = i + 2
+    output("  S2 grouped glen=", length(groups), "\n")
 
-fn void cmd_list()
-    let Ledger L = load_ledger()
-    if length(L.items) == 0
-        output("(empty)\n")
-        return
-    print_entries(L.items)
-
-fn void cmd_sum()
-    let Ledger L = load_ledger()
-    let i64 total = 0
-    let i64 n = length(L.items)
-    let i64 i = 0
-    while i < n
-        total += L.items[i].amount
-        i++
-    output("total: ", cents_to_yuan(total), " (", n, " entries)\n")
-
-fn void cmd_month(let string ym)
-    let Ledger L = load_ledger()
-    let Entry hit[] = Entry(date="", category="", amount=0, note="")
-    let Entry blank = remove(hit, 0)
-    let i64 total = 0
-    let i64 n = length(L.items)
-    let i64 i = 0
-    while i < n
-        let Entry e = L.items[i]
-        if strutil.starts_with(e.date, ym)
-            hit = push(hit, e)
-            total += e.amount
-        i++
-    if length(hit) == 0
-        output("no entries for ", ym, "\n")
-        return
-    print_entries(hit)
-    output("month ", ym, " total: ", cents_to_yuan(total), "\n")
-
-fn void cmd_export(let string path)
-    let Ledger L = load_ledger()
-    let string out = "date,category,amount,note\n"
-    let i64 n = length(L.items)
-    let i64 i = 0
-    while i < n
-        let Entry e = L.items[i]
-        out += e.date + "," + e.category + "," + cents_to_yuan(e.amount) + "," + e.note + "\n"
-        i++
-    let i64! w = write_file(path, out)
-    let i64 wv = w ?? -1
-    if wv < 0
-        die("cannot export")
-    output("exported ", n, " entries to ", path, "\n")
-
-fn void cmd_help()
-    output("ledger commands:\n")
-    output("  init\n")
-    output("  add <YYYY-MM-DD> <category> <amount> <note...>\n")
-    output("  del <index>\n")
-    output("  list\n")
-    output("  sum\n")
-    output("  month <YYYY-MM>\n")
-    output("  export <file>\n")
-    output("  help\n")
+    let i32[] rem
+    rem = push(rem, 0)
+    let i32[] r
+    r = push(r, 0)
+    let string digits = ""
+    let i64 gi = 0
+    let i64 produced = 0
+    output("  S4 loop start\n")
+    while produced < want
+        let i32 g = 0
+        if gi < length(groups)
+            g = groups[gi]
+        let i32[] cur = big_mul_add(rem, 100, g)
+        let i32[] r20 = big_mul_add(r, 20, 0)
+        output("    L4 r20 len=", length(r20), "\n")
+        let i32 d = 9
+        let bool found = false
+        let i32[] chosen
+        chosen = push(chosen, 0)
+        output("    L5 chosen init\n")
+        while d >= 0 and not found
+            let i32[] t = big_mul_add(r20, d, d * d)
+            output("      M1 d=", d, " t len=", length(t), "\n")
+            if big_cmp(t, cur) <= 0
+                chosen = t
+                found = true
+            else
+                d--
+        output("    L6 d=", d, " found=", found, "\n")
+        if not found
+            d = 0
+        rem = big_sub(cur, chosen)
+        output("    L7 rem done\n")
+        r = big_mul_add(r, 10, d)
+        output("    L8 r done\n")
+        digits = digits + cast(d + 48, string)
+        output("    L9 digits=", digits, "\n")
+        produced++
+        gi++
+        if produced >= 3
+            return digits
+    return digits
 
 fn main()
-    let string line = ""
-    input(line, delim='\n')
-    if strutil.ends_with(line, "\r")
-        line = line[0, length(line) - 2]
-    let string args[] = split(line, ' ')
-    let i64 n = length(args)
-    if n == 0
-        cmd_help()
-        return 0
-
-    let string cmd = args[0]
-
-    if cmd == "init"
-        cmd_init()
-    else if cmd == "add"
-        if n < 5
-            die("usage: add <date> <category> <amount> <note...>")
-        let string note = ""
-        let i64 i = 4
-        while i < n
-            if i > 4
-                note += " "
-            note += args[i]
-            i++
-        cmd_add(args[1], args[2], args[3], note)
-    else if cmd == "del"
-        if n < 2
-            die("usage: del <index>")
-        cmd_del(args[1])
-    else if cmd == "list"
-        cmd_list()
-    else if cmd == "sum"
-        cmd_sum()
-    else if cmd == "month"
-        if n < 2
-            die("usage: month <YYYY-MM>")
-        cmd_month(args[1])
-    else if cmd == "export"
-        if n < 2
-            die("usage: export <file>")
-        cmd_export(args[1])
-    else if cmd == "help"
-        cmd_help()
-    else
-        die("unknown command: " + cmd)
-
-    return 0
+    output("A\n")
+    let i32[] N
+    N = push(N, 2)
+    let i64 e = 0
+    while e < 4
+        N = big_mul_add(N, 10, 0)
+        e++
+    output("B N len=", length(N), "\n")
+    output("C call\n")
+    let string r = big_sqrt(N, 4)
+    output("D r=", r, "\n")
