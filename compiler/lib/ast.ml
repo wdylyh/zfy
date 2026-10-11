@@ -22,6 +22,7 @@ and binop =
   | Xor    (* xor 关键字：二元异或（^ 仍为解引用后缀） *)
   | Shl    (* << *)
   | Shr    (* >> *)
+  | Pow    (* ** 幂，右结合（v3.3）：x**2**3 == x**(2**3) *)
 
 and unop = Neg | Not | BitNot (* ~ 按位取反 *)
 

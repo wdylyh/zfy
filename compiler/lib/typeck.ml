@@ -749,7 +749,7 @@ and check_expr env (e : expr) : texpr =
       | Eq -> BEq | Ne -> BNe | Lt -> BLt | Gt -> BGt | Le -> BLe | Ge -> BGe
       | And -> BAnd | Or -> BOr
       | BitAnd -> BBitAnd | BitOr -> BBitOr | Xor -> BBitXor
-      | Shl -> BShl | Shr -> BShr
+      | Shl -> BShl | Shr -> BShr | Pow -> BPow
     in
     if bop = BAnd || bop = BOr then begin
       unify p' tl.ety TBool;
@@ -870,6 +870,80 @@ and check_expr env (e : expr) : texpr =
         in
         let tl = coerce p' tl res_ty and tr = coerce p' tr res_ty in
         mk (EBinK (bop, tl, tr)) res_ty
+      end
+      (* ** 幂（v3.3）：数学优先级（parser 层右结合）。类型规则：
+         浮点参与 → f64（双侧均 f32 则 f32）走 libm pow/powf；
+         整数 ≤64 位 → 运行时快速幂 zfy_pow_ll/ull（负整数指数得 0，
+         溢出回绕与其他整数运算一致）；char 提升 i32；
+         128 位整数不支持 *)
+      else if bop = BPow then begin
+        let is128 = function TInt 128 | TUint 128 -> true | _ -> false in
+        let is_int = function
+          | TInt _ | TUint _ | TVar _ | TChar -> true | _ -> false in
+        (* 子树是否含浮点字面量（未定型 TVar 的形态判别） *)
+        let rec floaty e =
+          match e with
+          | EFloatK _ -> true
+          | EUnK (_, u) -> floaty u.e
+          | EBinK (_, x, y) -> floaty x.e || floaty y.e
+          | _ -> false
+        in
+        let floaty_side t e =
+          match resolve t with
+          | TFloat _ -> true
+          | TVar _ -> floaty e
+          | _ -> false
+        in
+        if is128 rl || is128 rr then
+          terr p' "** does not support 128-bit integers (use pow on f64 or cast)"
+        else if floaty_side rl tl.e || floaty_side rr tr.e then begin
+          (* 浮点幂：任一侧是浮点或含浮点字面量的未定子树 → 整树按同宽
+             浮点算（fix_texpr 会把未约束浮点字面量独立翻 f64，混合
+             int/float 字面量树必须在此统一，否则 f64/i64 混算发坏 IR）。
+             数学语义：2.0**10、2**0.5、x**0.5 均为浮点结果 *)
+          let w =
+            match resolve rl, resolve rr with
+            | TFloat 32, (TFloat 32 | TVar _) | (TVar _), TFloat 32 -> 32
+            | _ -> 64
+          in
+          let tof x =
+            match resolve x.ety with
+            | TFloat w0 when w0 = w -> x
+            | TFloat _ -> mk (ECastK (x, TFloat w)) (TFloat w)
+            | TVar _ -> coerce p' x (TFloat w)
+            | TInt _ | TUint _ | TChar ->
+              mk (ECastK (x, TFloat w)) (TFloat w)
+            | _ ->
+              terr p' "** requires numeric operands, got %s" (pp_zty x.ety)
+          in
+          let tl = tof tl and tr = tof tr in
+          mk (EBinK (BPow, tl, tr)) (TFloat w)
+        end
+        else begin
+          if not (is_int rl && is_int rr) then
+            terr p' "** requires numeric operands, got %s and %s"
+              (pp_zty rl) (pp_zty rr);
+          (* char 数值化（与算术路径一致的 C 整数提升） *)
+          let tl = if rl = TChar then mk (ECastK (tl, TInt 32)) (TInt 32) else tl in
+          let tr = if rr = TChar then mk (ECastK (tr, TInt 32)) (TInt 32) else tr in
+          let rl = if rl = TChar then TInt 32 else rl in
+          let rr = if rr = TChar then TInt 32 else rr in
+          (match rl, rr with
+           | (TInt _ | TUint _ as a), (TInt _ | TUint _ as b) when a <> b ->
+             let tgt = widen_target a b in
+             if is128 tgt then
+               terr p' "** does not support 128-bit integers (use pow on f64 or cast)";
+             let tl = coerce p' tl tgt and tr = coerce p' tr tgt in
+             mk (EBinK (BPow, tl, tr)) tgt
+           | _ ->
+             unify p' tl.ety tr.ety;
+             let t = resolve tl.ety in
+             (match t with
+              | TInt 128 | TUint 128 ->
+                terr p' "** does not support 128-bit integers (use pow on f64 or cast)"
+              | _ -> ());
+             mk (EBinK (BPow, tl, tr)) t)
+        end
       end
       else
       (* char 数值化（w-014 #5）：算术运算中 char 与 char/整数混合 →
@@ -1475,28 +1549,33 @@ and check_call env p name0 targs origs modes =
          浮点→同宽浮点（llvmgen 走 @fabs/@fabsf）；其余类型报错。
          字面量延迟定型（ety=TVar）：按节点形态给默认目标型，
          coerce 会按目标型重解释字面量并做范围校验 *)
-      let lit_default ty tv =
-        match tv.e with
-        | EIntK _ -> Some (TInt 64)
-        | EBigK _ -> Some (TInt 128)
-        | EFloatK _ -> Some (TFloat 64)
-        | EUnK (UNeg, u) ->
-          (match resolve u.ety with
-           | (TInt _ | TUint _ | TFloat _) as t -> Some t
-           | _ ->
-             (match u.e with
-              | EIntK _ -> Some (TInt 64)
-              | EBigK _ -> Some (TInt 128)
-              | EFloatK _ -> Some (TFloat 64)
-              | _ -> None))
-        | _ -> None
+      let lit_default tv =
+        (* 未定型（ety=TVar）实参必为纯字面量表达式树（含变量/具体型的
+           中间节点会提前 unify 成具体型）：递归找节点形态定默认型，
+           树中含浮点字面量则取 f64，否则 i64 *)
+        let rec go e =
+          match e with
+          | EIntK _ -> Some (TInt 64)
+          | EBigK _ -> Some (TInt 128)
+          | EFloatK _ -> Some (TFloat 64)
+          | EUnK (_, u) ->
+            (match resolve u.ety with
+             | (TInt _ | TUint _ | TFloat _) as t -> Some t
+             | _ -> go u.e)
+          | EBinK (_, x, y) ->
+            (match go x.e with
+             | Some (TFloat 64) -> Some (TFloat 64)
+             | r -> (match r with Some _ -> r | None -> go y.e))
+          | _ -> None
+        in
+        go tv.e
       in
       match targs with
       | [ a ] ->
         let aty =
           match resolve a.ety with
           | (TInt _ | TUint _ | TFloat _) as t -> Some t
-          | TVar _ -> lit_default (resolve a.ety) a
+          | TVar _ -> lit_default a
           | _ -> None
         in
         (match aty with

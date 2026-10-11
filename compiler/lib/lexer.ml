@@ -50,7 +50,8 @@ let punct2 =
     "%=", PercentAssign;
     "=>", FatArrow; "->", ThinArrow;
     "??", QuestionQuestion;
-    "<<", Shl; ">>", Shr ]
+    "<<", Shl; ">>", Shr;
+    "**", Pow ]
 
 let punct1 =
   [ '(', LParen; ')', RParen; '[', LBracket; ']', RBracket; '{', LBrace;

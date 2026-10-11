@@ -25,7 +25,7 @@ type sdef = { sname : string; spacked : bool; sfields : (string * zty) list }
 
 type binop =
   BAdd | BSub | BMul | BDiv | BMod | BEq | BNe | BLt | BGt | BLe | BGe | BAnd | BOr
-| BBitAnd | BBitOr | BBitXor | BShl | BShr
+| BBitAnd | BBitOr | BBitXor | BShl | BShr | BPow (* ** 幂（v3.3） *)
 type unop = UNeg | UNot | UBitNot
 
 type texpr =
@@ -221,7 +221,7 @@ let pp_binop = function
   | BEq -> "==" | BNe -> "!=" | BLt -> "<" | BGt -> ">" | BLe -> "<=" | BGe -> ">="
   | BAnd -> "&&" | BOr -> "||"
   | BBitAnd -> "&" | BBitOr -> "|" | BBitXor -> "xor"
-  | BShl -> "<<" | BShr -> ">>"
+  | BShl -> "<<" | BShr -> ">>" | BPow -> "**"
 
 let pp_unop = function UNeg -> "-" | UNot -> "!" | UBitNot -> "~"
 

@@ -2153,3 +2153,28 @@ void zfy_os_random_u64(unsigned long long *out) {
     if (getentropy(out, 8) != 0) zfy_die("os_random: getentropy failed");
 #endif
 }
+
+/* ---------- ** 幂运算（v3.3）：整数快速幂 ----------
+   平方乘法；有符号版负指数得 0（整数幂无意义取截断语义）；
+   内部按无符号回绕乘法（与 LLVM mul 一致，避免 C 有符号溢出 UB） */
+long long zfy_pow_ll(long long b, long long e) {
+    if (e < 0) return 0;
+    unsigned long long ub = (unsigned long long)b;
+    unsigned long long r = 1;
+    while (e > 0) {
+        if (e & 1) r *= ub;
+        ub *= ub;
+        e >>= 1;
+    }
+    return (long long)r;
+}
+
+unsigned long long zfy_pow_ull(unsigned long long b, unsigned long long e) {
+    unsigned long long r = 1;
+    while (e > 0) {
+        if (e & 1) r *= b;
+        b *= b;
+        e >>= 1;
+    }
+    return r;
+}

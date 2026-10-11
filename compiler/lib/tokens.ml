@@ -51,6 +51,7 @@ type token =
   | PlusPlus | MinusMinus
   | Eq | Ne | Lt | Gt | Le | Ge
   | Shl (* << *) | Shr (* >> *) | Pipe (* | *) | Tilde (* ~ *)
+  | Pow (* ** 幂，右结合（v3.3） *)
   | Question (* ? *) | QuestionQuestion (* ?? *) | Bang (* ! *)
   | Caret (* ^：解引用后缀 p^（new2.md #10，替代 p* 消歧） *)
   | Dot
@@ -100,7 +101,7 @@ let pp_token = function
   | StarAssign -> "*=" | SlashAssign -> "/=" | PercentAssign -> "%="
   | PlusPlus -> "++" | MinusMinus -> "--"
   | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Le -> "<=" | Ge -> ">="
-  | Shl -> "<<" | Shr -> ">>" | Pipe -> "|" | Tilde -> "~"
+  | Shl -> "<<" | Shr -> ">>" | Pipe -> "|" | Tilde -> "~" | Pow -> "**"
   | Question -> "?" | QuestionQuestion -> "??" | Bang -> "!"
   | Caret -> "^"
   | Dot -> "."

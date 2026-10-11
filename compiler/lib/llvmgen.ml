@@ -395,6 +395,13 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | BMul -> emitf fc "  %s = fmul %s %s, %s" d tya va vb
      | BDiv -> emitf fc "  %s = fdiv %s %s, %s" d tya va vb
      | BMod -> lerr None "float type does not support modulo"
+     | BPow ->
+       (* ** 幂：libm pow/powf（v3.3） *)
+       (match tya with
+        | "float" ->
+          emitf fc "  %s = call float @powf(float %s, float %s)" d va vb
+        | _ ->
+          emitf fc "  %s = call double @pow(double %s, double %s)" d va vb)
      | bopc ->
        let c =
          match bopc with
@@ -421,6 +428,23 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | BBitXor -> emitf fc "  %s = xor %s %s, %s" d tya va vb
      | BShl -> emitf fc "  %s = shl %s %s, %s" d tya va vb
      | BShr -> emitf fc "  %s = lshr %s %s, %s" d tya va vb
+     | BPow ->
+       (* ** 整数幂：运行时快速幂（无符号版），≤64 位；结果截回目标宽度 *)
+       let ext v =
+         if tya = "i64" then v
+         else
+           let z = fresh_r fc in
+           emitf fc "  %s = zext %s %s to i64" z tya v;
+           z
+       in
+       let a64 = ext va and b64 = ext vb in
+       (match tya with
+        | "i64" ->
+          emitf fc "  %s = call i64 @zfy_pow_ull(i64 %s, i64 %s)" d a64 b64
+        | _ ->
+          let c = fresh_r fc in
+          emitf fc "  %s = call i64 @zfy_pow_ull(i64 %s, i64 %s)" c a64 b64;
+          emitf fc "  %s = trunc i64 %s to %s" d c tya)
      | bopc -> emitf fc "  %s = icmp %s %s %s, %s" d (cmp_op_int true bopc) tya va vb)
   | _ ->
     (match bop with
@@ -434,6 +458,23 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | BBitXor -> emitf fc "  %s = xor %s %s, %s" d tya va vb
      | BShl -> emitf fc "  %s = shl %s %s, %s" d tya va vb
      | BShr -> emitf fc "  %s = ashr %s %s, %s" d tya va vb
+     | BPow ->
+       (* ** 整数幂：运行时快速幂（有符号版，负指数得 0） *)
+       let ext v =
+         if tya = "i64" then v
+         else
+           let z = fresh_r fc in
+           emitf fc "  %s = sext %s %s to i64" z tya v;
+           z
+       in
+       let a64 = ext va and b64 = ext vb in
+       (match tya with
+        | "i64" ->
+          emitf fc "  %s = call i64 @zfy_pow_ll(i64 %s, i64 %s)" d a64 b64
+        | _ ->
+          let c = fresh_r fc in
+          emitf fc "  %s = call i64 @zfy_pow_ll(i64 %s, i64 %s)" c a64 b64;
+          emitf fc "  %s = trunc i64 %s to %s" d c tya)
      | bopc -> emitf fc "  %s = icmp %s %s %s, %s" d (cmp_op_int false bopc) tya va vb)
 
 let gen_unop fc d u (a : operand) =
@@ -2328,6 +2369,10 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare i64 @strlen(ptr)\n";
   Buffer.add_string g.mbuf "declare double @fabs(double)\n";
   Buffer.add_string g.mbuf "declare float @fabsf(float)\n";
+  Buffer.add_string g.mbuf "declare double @pow(double, double)\n";
+  Buffer.add_string g.mbuf "declare float @powf(float, float)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_pow_ll(i64, i64)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_pow_ull(i64, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   (* output 运行时函数 *)
@@ -2484,6 +2529,7 @@ let gen_program (m : mir) : string =
     || String.length n >= 4 && String.sub n 0 4 = "zfy_"
     || String.length n >= 4 && String.sub n 0 4 = "zfy."
     || n = "str_len" || n = "zfy.prec" || n = "abs"
+    || n = "pow" || n = "powf"   (* ** 幂与 pow 内建共用 prelude declare，避免重复声明 *)
   in
   let decls : (string, string * string) Hashtbl.t = Hashtbl.create 8 in
   let add_decl name (args : operand list) ret =

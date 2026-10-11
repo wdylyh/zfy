@@ -429,29 +429,53 @@ and parse_add p =
   go l
 
 and parse_mul p =
-  let l = parse_unary p in
+  let l = parse_pow p in
   let rec go l =
     let (tk, tp) = peek p in
     match tk with
     | Star ->
       ignore (next p);
-      let r = parse_unary p in
+      let r = parse_pow p in
       go (EBin (Mul, l, r, tp))
     | Slash ->
       ignore (next p);
-      let r = parse_unary p in
+      let r = parse_pow p in
       go (EBin (Div, l, r, tp))
     | Percent ->
       ignore (next p);
-      let r = parse_unary p in
+      let r = parse_pow p in
       go (EBin (Mod, l, r, tp))
     | _ -> l
   in
   go l
 
+(* ** 幂（v3.3）：右结合——x**2**3 == x**(2**3)；数学优先级：
+   高于 * /，且一元负号左侧绑定更松：-x**2 == -(x**2)。
+   底数经 parse_unary（允许 |x|**2 / (-x)**2 写法），
+   指数递归 parse_pow（右结合 + 允许 2**-3） *)
+and parse_pow p =
+  let l = parse_unary p in
+  match peek p with
+  | (Pow, tp) ->
+    ignore (next p);
+    EBin (Pow, l, parse_pow p, tp)
+  | _ -> l
+
 and parse_unary p =
   match peek p with
-  | (Minus, tp) -> ignore (next p); EUn (Neg, parse_unary p, tp)
+  | (Minus, tp) ->
+    (* 负号操作数取 parse_pow 层：-x**2 == -(x**2)（数学约定） *)
+    ignore (next p);
+    EUn (Neg, parse_pow p, tp)
+  | (Pipe, tp) ->
+    (* |e| 绝对值（v3.3）：脱糖为内建 abs(e)（复用 abs 重载：
+       整数同宽取非负、浮点 @fabs/@fabsf）。
+       内层解析到 & 层为止——xor/| 层会把闭 | 吃成按位或；
+       需要按位或作被绝对值时用括号：|(a | b)| *)
+    ignore (next p);
+    let e = parse_band p in
+    expect p Pipe "|";
+    ECall (EVar ("abs", tp), [ CPos e ], tp)
   | (Amp, tp) -> ignore (next p); EAddrOf (parse_unary p, tp)
   | (Tilde, tp) -> ignore (next p); EUn (BitNot, parse_unary p, tp)
   | _ -> parse_postfix p
