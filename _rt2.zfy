@@ -1,8 +1,0 @@
-mod random;
-use random::seed_from_u64
-use random::Random
-
-fn main()
-    let Random a = seed_from_u64(42)
-    output("ok", "\n")
-    return 0

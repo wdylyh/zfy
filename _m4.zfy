@@ -1,9 +1,0 @@
-struct C
-    i32 n = 0
-    fn void bump()
-        self.n += 1
-
-fn main()
-    let C const c = C(n = 5)
-    c.bump()
-    return 0

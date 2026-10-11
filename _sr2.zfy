@@ -1,9 +1,0 @@
-mod random;
-use random::{SecureRandom, secure_from_string}
-fn main()
-    let SecureRandom a = secure_from_string("test")
-    output(a.next_u64())
-    output("\n")
-    output(a.next_u64())
-    output("\n")
-    return 0

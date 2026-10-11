@@ -1,7 +1,0 @@
-mod m;
-use m::{Pt, sq}
-
-fn main()
-    let Pt p = Pt(x = 1, y = 2)
-    output(sq(7), " ", p.x, "\n")
-    return 0

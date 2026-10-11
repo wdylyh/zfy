@@ -8,7 +8,7 @@
 >
 > **跳号说明**：号段不连续是条目合并的结果（同一错误多处触发 / 同文案合并同码），各节末尾列出。已删除两条占位交叉引用：E300-112（main 返回类型检查实际由 LLVM 阶段报，归 E4012）、E300-143（TErr 元素非法由 E4002 承担）。
 >
-> 统计：词法 14 码 / 语法 35 码 / 类型语义 170 码 / 代码生成 50 码 / 驱动配置 6 码，**合计 275 码**；另有 4 个兜底码（E1000 / E3000 / E4000 / E5000，错误消息未命中映射表时回退，正常不触发）。运行期 die（不入 EXXX 码体系，附录 A）38 类。
+> 统计：词法 14 码 / 语法 35 码 / 类型语义 170 码 / 代码生成 50 码 / 驱动配置 8 码，**合计 277 码**；另有 4 个兜底码（E1000 / E3000 / E4000 / E5000，错误消息未命中映射表时回退，正常不触发）。运行期 die（不入 EXXX 码体系，附录 A）38 类。
 
 格式说明：
 - 「触发」列给最小触发示例（`…` 表示任意合法代码）；「文案」列为编译器当前输出原文。
@@ -431,8 +431,10 @@
 | E5004 | clang 退出码非 0 | link failed (clang exit code %d)（直输 `zfy:error[E5004] in 0 of <主文件> because (…)`） |
 | E5005 | 读源文件失败（权限/IO） | cannot read source file: %s |
 | E5006 | CLI 参数错误 | usage: zfyc <tokens\|ast\|hir\|mir\|llvm\|build> <file.zfy>（输出 `in 0 of (cli)`，exit 2） |
+| E5007 | use/mod 路径指向私有项 | `'x' is not visible from module m (...)`（v3.2 起含 declare it pub to export 提示） |
+| E5008 | 文件模块未找到 / use 路径解析失败 | `module file not found: mod x (looked for x.zfy, x/mod.zfy and <parents>/stdlib/x.zfy)`；`unresolved path: 'x' not found (...)`。v3.2：stdlib 目录回退（沿父目录链查 `<祖先>/stdlib/名.zfy`，最多 6 级） |
 
-> E5001~E5006 连续无跳号；E5000 为本段兜底码（正常不触发）。
+> E5001~E5008 连续无跳号（E5007/E5008 为 v3.2 模块系统补录）；E5000 为本段兜底码（正常不触发）。
 
 ---
 

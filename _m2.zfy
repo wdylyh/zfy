@@ -1,9 +1,0 @@
-struct C
-    i32 n = 0
-    fn i32 get()
-        return self.n
-
-fn main()
-    let C c = C(n = 7)
-    output(c.get(), "\n")
-    return 0
