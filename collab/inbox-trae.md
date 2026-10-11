@@ -2,6 +2,37 @@
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 ---
+id: w-030
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-11 13:55
+---
+v3.3.4 语义扩展轮（用户四项指令），回归 61 例（新增 sem334_test）0 失败。
+- **下标/长度类内建返回 i32**：`length`（strlen 包 ECastK trunc；MSeqLen
+  load i64 + trunc i32）、`find`（TErr (TInt 64) → TErr (TInt 32)，两处
+  构造点；%err.i32 与 %err.i64 同为 24 字节 {i32,ptr,i64}，runtime 容器
+  与 MErrValue 窄整数读取路径零改动）、`utf8_len`（ECastK 包装）。**连带
+  修复**：mir push 路径把 MSeqLen 结果谎报 TInt 64（length 改 i32 后
+  zfy_seq_set_w 的 i64 下标参数类型炸 9 例回归）——新增 llvmgen idx64
+  helper，gen_seq_set/MSeqGet×3/remove/inline_elem_addr 六处下标统一
+  提升提升 i64（sext/zext 按 oty），push 标注如实改 TInt 32
+- **char 六种比较**：`< <= > >=` 新增（==/!= 已有），按码点序（i8 signed
+  icmp，落 gen_binop signed fallback arm）；typeck is_cmp ok 判定加
+  rl=rr=TChar 分支
+- **string + char 拼接**：`s + 'c'` / `'c' + s`——BAdd TString 分支
+  char 侧 to_string_of 提升（zfy_tostr_char 临时串有语句末释放，无泄漏）
+- **cast(char→string) 与 main 隐含 i32 实测已就位**（cast 走既有
+  num→string 路径；main 的 parser 强制/typeck 裸 return→0/退出码 return n
+  全部工作）——用户报的两项是文档/认知滞后，grammar.md 本就写着 main
+  隐含 i32；此轮无代码改动
+- 测试：examples/sem334_test.zfy（末尾 `return bad` 验证 main 退出码）；
+  grammar.md v3.3.4（内建表 length/find/utf8_len 返回 i32、char 六种
+  比较、拼接、版本头）
+- 注意：`??` 优先级低于 `!=`——`find(s,c) ?? -1 != -1` 解析成
+  `find(s,c) ?? (-1 != -1)` 报 E3005，须写 `(find(s,c) ?? -1) != -1`
+  （既有语义非本轮改动，备忘）
+---
 id: w-029
 from: workbuddy
 to: trae

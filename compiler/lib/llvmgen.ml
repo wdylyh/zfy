@@ -1302,12 +1302,27 @@ let gen_field_store ~(free_old : bool) fc (fp : string) (v : operand) : unit =
     let (vv, tt) = val_of fc v in
     emitf fc "  store %s %s, ptr %s" tt vv fp
 
-(* 元素写入公共体（MSeqSet/MSeqSetAt/MSeqLit 共用，w-014 #3）：
+(* 元素写入公共体（MSeqSet/MSeqSetAt/MSeqLit 共用，w-14 #3）：
    seqp 为 seq 结构指针值。按元素宽度存储；string 元素深拷贝（数组独占
    堆串）；非 string 且不扩长时走内联路径（边界检查 + 直接 store），
    消除逐元素函数调用与 i128 中转槽；其余走运行时函数。 *)
+(* v3.3.4：下标/长度统一提升 i64（length 返回 i32 后，push 追加位等
+   直接以 i32 长度作下标；既有 u32 下标同样补齐） *)
+let idx64 fc (idx : operand) =
+  let (iv, ity) = val_of fc idx in
+  match idx.oty with
+  | TInt 64 | TUint 64 -> iv
+  | TUint _ | TBool ->
+    let r = fresh_r fc in
+    emitf fc "  %s = zext %s %s to i64" r ity iv;
+    r
+  | _ ->
+    let r = fresh_r fc in
+    emitf fc "  %s = sext %s %s to i64" r ity iv;
+    r
+
 let gen_seq_set fc seqp (elem : zty) (idx : operand) (v : operand) grow unchecked =
-  let (iv, _) = val_of fc idx in
+  let iv = idx64 fc idx in
   match elem, grow with
   | TString, _ ->
     let (sv, _) = val_of fc v in
@@ -1779,7 +1794,7 @@ let gen_instr fc (i : instr) : unit =
        删除"。数组=槽位填零（长度不变）；列表=删除并左移。
        被删元素为深拷贝副本（elem_init 出独立值） *)
     let (seqp, _) = val_of fc base in
-    let (iv, _) = val_of fc idx in
+    let iv = idx64 fc idx in
     let out = fresh_r fc in
     (match elem with
      | TStruct _ | TErr _ ->
@@ -2009,7 +2024,7 @@ let gen_instr fc (i : instr) : unit =
     (match elem with
      | TStruct _ | TList _ | TArray _ | TErr _ ->
        let (seqp, _) = val_of fc base in
-       let (iv, _) = val_of fc idx in
+       let iv = idx64 fc idx in
        let dst_addr = fresh_r fc in
        (match elem with
         | TStruct _ | TErr _ ->
@@ -2025,7 +2040,7 @@ let gen_instr fc (i : instr) : unit =
        let tmp = fresh_r fc in
        emitf_entry fc "  %s = alloca i128" tmp;
        let (seqp, _) = val_of fc base in
-       let (iv, _) = val_of fc idx in
+       let iv = idx64 fc idx in
        emitf fc "  call void @zfy_seq_get(ptr %s, i64 %s, ptr %s, i32 %d, i8 %d)"
          seqp iv tmp (elem_width fc.g elem) (elem_signed elem);
        let raw = fresh_r fc in
@@ -2034,7 +2049,7 @@ let gen_instr fc (i : instr) : unit =
        Hashtbl.replace fc.regs d v
      | _ ->
        let (seqp, _) = val_of fc base in
-       let (iv, _) = val_of fc idx in
+       let iv = idx64 fc idx in
        let (ep, jb) = inline_elem_addr fc seqp iv elem ~checked:(not unchecked) in
        let raw = fresh_r fc in
        let w = elem_width fc.g elem * 8 in
@@ -2055,12 +2070,15 @@ let gen_instr fc (i : instr) : unit =
        let (v, _) = from_bits fc bits elem in
        Hashtbl.replace fc.regs d v)
   | MSeqLen (d, base) ->
-    (* 读 zfy.seq 的 len 字段（第 3 个字段） *)
+    (* 读 zfy.seq 的 len 字段（第 3 个字段，i64），截断为 i32（v3.3.4：
+       length 返回 i32） *)
     let (seqp, _) = val_of fc base in
     let lp = fresh_r fc in
     emitf fc "  %s = getelementptr inbounds %%zfy.seq, ptr %s, i32 0, i32 2" lp seqp;
+    let r64 = fresh_r fc in
+    emitf fc "  %s = load i64, ptr %s" r64 lp;
     let r = fresh_r fc in
-    emitf fc "  %s = load i64, ptr %s" r lp;
+    emitf fc "  %s = trunc i64 %s to i32" r r64;
     Hashtbl.replace fc.regs d r
   | MSeqSlice (d, src, a, b, st, _is_str) ->
     (* 数组/列表切片：运行时生成新 seq（元素按头部 kind/ops 深拷贝，
@@ -2175,7 +2193,7 @@ let gen_instr fc (i : instr) : unit =
        （checked=1 时先做 icmp ult 边界检查，w-014 #3）。
        基为数组/列表槽（值=seq 指针，再取 data 字段）或指针值（直接指向元素） *)
     let (bp, _) = val_of fc base in
-    let (iv, _) = val_of fc idx in
+    let iv = idx64 fc idx in
     let jb =
       if checked then begin
         let lenp = fresh_r fc in

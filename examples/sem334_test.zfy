@@ -1,0 +1,65 @@
+// v3.3.4 四项语义扩展回归：length/find/utf8_len → i32、char 六种比较、
+// string+char 拼接、main 隐含 i32（return 设退出码）。断言失败 exit 1
+fn main()
+    let i32 bad = 0
+    let string s = "hello world"
+    // ---- length 返回 i32 ----
+    let i32 n = length(s)
+    if n != 11
+        bad++
+    // i32 结果直接落 i32 槽 / 作下标 / 与 i64 混算
+    if s[n - 1] != 'd'
+        bad++
+    let i64 wide = length(s)
+    if wide != 11
+        bad++
+    // ---- find 返回 TErr i32 ----
+    let i32 p = find(s, 'w') ?? -1
+    if p != 6
+        bad++
+    let i32 ps = find(s, "orld") ?? -1
+    if ps != 7
+        bad++
+    if (find(s, 'z') ?? -1) != -1
+        bad++
+    // find 结果直接作下标
+    if s[find(s, 'w') ?? -1] != 'w'
+        bad++
+    // ---- char 六种比较（码点序） ----
+    let char a = 'a'
+    let char b = 'b'
+    if not (a < b)
+        bad++
+    if not (b > a)
+        bad++
+    if not (a <= a)
+        bad++
+    if not (b >= b)
+        bad++
+    if not (a == a)
+        bad++
+    if not (a != b)
+        bad++
+    // ---- string + char 双向拼接 ----
+    let char c = 'H'
+    let string t1 = c + s
+    if t1 != "Hhello world"
+        bad++
+    let string t2 = s + c
+    if t2 != "hello worldH"
+        bad++
+    // ---- cast(char -> string) ----
+    let string cs = cast(c, string)
+    if cs != "H"
+        bad++
+    if length(cs) != 1
+        bad++
+    // ---- utf8_len 返回 i32 ----
+    let string zh = "héllo"
+    if utf8_len(zh) != 5
+        bad++
+    // ---- main 隐含 i32：末尾 return bad 非 0 则退出码 = bad ----
+    output("v334 done ", bad, end='\n')
+    if bad > 0
+        return bad
+    return 0

@@ -808,11 +808,18 @@ and check_expr env (e : expr) : texpr =
     else
       let rl = resolve tl.ety and rr = resolve tr.ety in
       let isf = function TFrac _ -> true | _ -> false in
-      (* 字符串拼接：+ 对 string 是拼接（两边都必须是 string） *)
+      (* 字符串拼接：+ 对 string 是拼接；char 侧提升单字符 string
+         （v3.3.4：s + 'c' / 'c' + s，复用 to_string_of 的运行时格式化） *)
       if bop = BAdd && (rl = TString || rr = TString) then begin
-        if rl <> TString || rr <> TString then
-          terr p' "string concatenation requires both sides to be string, got %s and %s"
-            (pp_zty rl) (pp_zty rr);
+        let tl, tr =
+          match rl, rr with
+          | TString, TString -> (tl, tr)
+          | TString, TChar -> (tl, to_string_of tr)
+          | TChar, TString -> (to_string_of tl, tr)
+          | _ ->
+            terr p' "string concatenation requires string or char operands, got %s and %s"
+              (pp_zty rl) (pp_zty rr)
+        in
         mk (ECallK ("zfy_str_concat", [ tl; tr ], [])) TString
       end
       else if isf rl || isf rr then begin
@@ -1042,14 +1049,15 @@ and check_expr env (e : expr) : texpr =
           | BEq | BNe | BLt | BGt | BLe | BGe ->
             let ok =
               if is_numeric rl && is_numeric rr then true
+              else if rl = rr && rl = TChar then true
               else
-                (* ==/!= 额外支持同型 bool / char / string（内容比较）/ 泛型 T；
-                   < <= > >= 仍仅数值 *)
+                (* ==/!= 额外支持同型 bool / string（内容比较）/ 泛型 T；
+                   char 全部六种比较（v3.3.4：码点序，< <= > >= 新增） *)
                 (match bop with
                  | BEq | BNe ->
                    rl = rr
                    && (match rl with
-                       | TBool | TChar | TString | TVar _ -> true
+                       | TBool | TString | TVar _ -> true
                        | _ -> false)
                  | _ -> false)
             in
@@ -2440,9 +2448,12 @@ and check_builtin env p name (args : call_arg list) =
   match name, pos_args, named with
   | "length", [ x ], [] ->
     let tx = check_expr env x in
+    (* v3.3.4：长度/下标类内建返回 i32（此前 i64，落 i32 槽需显式 cast） *)
     (match resolve tx.ety with
-     | TString -> mk (ECallK ("strlen", [ tx ], [])) (TInt 64)
-     | TArray _ | TList _ -> mk (ESeqLenK tx) (TInt 64)
+     | TString ->
+       let c = mk (ECallK ("strlen", [ tx ], [])) (TInt 64) in
+       mk (ECastK (c, TInt 32)) (TInt 32)
+     | TArray _ | TList _ -> mk (ESeqLenK tx) (TInt 32)
      | t -> terr p "length expects string/array/list, got %s" (pp_zty t))
   | "find", [ s; c ], [] ->
     (* find(s, x)：x 为 char 找第 1 次出现的字符；为 string 找子串
@@ -2450,8 +2461,8 @@ and check_builtin env p name (args : call_arg list) =
     let ts = str_of s "argument 1" in
     let one = { e = EIntK 1L; ety = TInt 64; epos = p } in
     (match char_or_str c "argument 2" with
-     | `Char tc -> { e = EFindK (ts, tc, one); ety = TErr (TInt 64); epos = p }
-     | `Str tx -> { e = EFindK (ts, tx, one); ety = TErr (TInt 64); epos = p })
+     | `Char tc -> { e = EFindK (ts, tc, one); ety = TErr (TInt 32); epos = p }
+     | `Str tx -> { e = EFindK (ts, tx, one); ety = TErr (TInt 32); epos = p })
   | "find", [ s; c ], [ ("count", k) ] ->
     (* find(s, x, count=k)：找第 k 次出现（k 从 1 起）；找不到 = NOT_FOUND（T!）；
        k < 1 编译期拒绝（字面量/常量），运行期 panic（runtime 统一，w-020） *)
@@ -2462,8 +2473,8 @@ and check_builtin env p name (args : call_arg list) =
        terr p "find's count must be > 0, got %Ld" v
      | _ -> ());
     (match char_or_str c "argument 2" with
-     | `Char tc -> { e = EFindK (ts, tc, tk); ety = TErr (TInt 64); epos = p }
-     | `Str tx -> { e = EFindK (ts, tx, tk); ety = TErr (TInt 64); epos = p })
+     | `Char tc -> { e = EFindK (ts, tc, tk); ety = TErr (TInt 32); epos = p }
+     | `Str tx -> { e = EFindK (ts, tx, tk); ety = TErr (TInt 32); epos = p })
   | "trim", [ s; x ], [] ->
     let ts = str_of s "argument 1" in
     (match char_or_str x "argument 2" with
@@ -2511,9 +2522,10 @@ and check_builtin env p name (args : call_arg list) =
     mk (ECallK ("zfy.prec", [ tv; tn ], [])) TString
   | "utf8_len", [ s ], [] ->
     (* utf8_len(s)：码点数（string 底层仍是字节串，length 按字节不变；
-       本组 UTF-8 API 为 w-020 用户拍板扩展集） *)
+       本组 UTF-8 API 为 w-020 用户拍板扩展集）。v3.3.4：返回 i32 对齐 length *)
     let ts = str_of s "argument 1" in
-    mk (ECallK ("zfy_utf8_len", [ ts ], [])) (TInt 64)
+    let c = mk (ECallK ("zfy_utf8_len", [ ts ], [])) (TInt 64) in
+    mk (ECastK (c, TInt 32)) (TInt 32)
   | "utf8_char_at", [ s; i ], [] ->
     (* utf8_char_at(s, i)：第 i 个码点（0 起），返回单码点 string（可能多字节；
        越界运行期 panic）。返回 string 而非 char：char 是单字节，装不下中文码点 *)

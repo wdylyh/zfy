@@ -554,7 +554,9 @@ let rec lexpr l (e : texpr) : operand =
          | TFrac _, _ -> norm_frac_val l ov elem
          | _ -> ov
        in
-       emit l (MSeqSet (name, elem, op (OLocal dl) (TInt 64), ov, true, l.unchecked));
+       (* v3.3.4：MSeqLen 结果为 i32（length 改 i32），如实标注；
+          llvmgen gen_seq_set 内统一下标提升 i64 *)
+       emit l (MSeqSet (name, elem, op (OLocal dl) (TInt 32), ov, true, l.unchecked));
        op (OLocal name) base.ety
      | _ ->
        let addr = seq_slot_addr l base elem in
@@ -564,7 +566,7 @@ let rec lexpr l (e : texpr) : operand =
        emit l (MSeqLen (dl, op (OLocal sp) (TList elem)));
        let ov = lexpr l v in
        let ov = (match elem with TFrac _ -> norm_frac_val l ov elem | _ -> ov) in
-       emit l (MSeqSetAt (addr, elem, op (OLocal dl) (TInt 64), ov, true, l.unchecked));
+       emit l (MSeqSetAt (addr, elem, op (OLocal dl) (TInt 32), ov, true, l.unchecked));
        op (OLocal sp) (TList elem))
   | ERemoveK (base, idx, is_list) ->
     (* remove(数组/列表, i)：表达式（v3 2026-10-11），返回被删元素的
