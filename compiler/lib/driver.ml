@@ -863,13 +863,15 @@ let compile path : string =
     | Some rt -> Printf.sprintf "%s " rt
     | None -> ""
   in
+  (* GUI 核心层（v3.3.7）依赖 GDI/User32；非 Windows 无 GUI 层无需链接 *)
+  let libs = if Sys.win32 then "-lgdi32 -luser32 " else "" in
   let cmd =
     (* cmd.exe 对整串引号处理怪异：路径无空格时不加引号 *)
     if String.contains clang ' ' then
-      Printf.sprintf "\"%s\" %s\"%s\" %s-O2 -o \"%s\"" clang target ll_path runtime exe
+      Printf.sprintf "\"%s\" %s\"%s\" %s-O2 %s-o \"%s\"" clang target ll_path runtime libs exe
   else
     (* -O2：链接时对 LLVM IR 做 mem2reg/内联等优化（否则 alloca 槽全走内存，性能差数倍） *)
-    Printf.sprintf "%s %s%s %s-O2 -o %s" clang target ll_path runtime exe
+    Printf.sprintf "%s %s%s %s-O2 %s-o %s" clang target ll_path runtime libs exe
   in
   let code = Sys.command cmd in
   if code <> 0 then begin

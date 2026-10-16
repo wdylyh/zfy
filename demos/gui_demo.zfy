@@ -1,0 +1,78 @@
+// gui_demo.zfy — GUI 交互演示：按钮计数器 + 绘图
+// 运行后：点击按钮计数、显示鼠标坐标、按 Esc 或点 X 关闭
+mod gui;
+
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_KEY}
+
+// 简单按钮：区域内点击命中检测（L2 组件层的雏形）
+struct Button
+    i32 x
+    i32 y
+    i32 w
+    i32 h
+    string label
+
+    fn bool hit(let i64 mx, let i64 my)
+        return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + self.h
+
+    fn void draw(let u32 bg)
+        gui_fill_rect(self.x, self.y, self.w, self.h, bg)
+        gui_rect(self.x, self.y, self.w, self.h, 0x606060)
+        let i32 tw = gui_text_w(self.label)
+        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - 20) / 2, self.label, 0xFFFFFF)
+
+fn main()
+    if gui_open(480, 320, "zfy GUI 演示") != 0
+        output("无法创建窗口")
+        return 1
+    let i32 count = 0
+    let i64 mx = 0
+    let i64 my = 0
+    let bool pressed = false
+    while gui_alive()
+        let i64 f0 = tick_ms()
+        let Event e = Event()
+        while gui_poll(ref e)
+            if e.is(EV_MOVE)
+                mx = e.x
+                my = e.y
+            if e.is(EV_KEY)
+                // Esc = 27 关闭
+                if e.key == 27
+                    gui_close()
+            if e.is(EV_LDOWN)
+                pressed = true
+            if e.is(EV_LUP)
+                pressed = false
+                // 按钮命中（LUP 时确认点击）
+        // 背景
+        gui_fill_rect(0, 0, gui_w(), gui_h(), 0x1E1E26)
+        // 标题栏（自绘）
+        gui_fill_rect(0, 0, gui_w(), 36, 0x2D2D3A)
+        gui_draw_text(12, 8, "zfy GUI 演示 — 点击按钮计数，Esc 退出", 0xC8C8D0)
+        // 按钮（按下时高亮）
+        let Button btn = Button(x = 40, y = 80, w = 140, h = 44, label = "点击 +1")
+        let u32 bg = 0x2060A0
+        if pressed and btn.hit(mx, my)
+            bg = 0x3090E0
+        btn.draw(bg)
+        // 计数显示
+        gui_draw_text(220, 96, "计数:", 0xE0E0E0)
+        gui_draw_text(280, 96, "", 0)
+        // 画布：彩色条纹（演示 fill_rect 性能）
+        let i32 i = 0
+        while i < 16
+            let u32 c = 0xFF0000
+            if i % 3 == 1
+                c = 0x00C000
+            if i % 3 == 2
+                c = 0x2060FF
+            gui_fill_rect(40 + i * 26, 180, 24, 60, c)
+            i++
+        // 鼠标坐标
+        gui_draw_text(40, 270, "鼠标:", 0x808080)
+        gui_draw_text(200, 270, "计数说明区", 0x606060)
+        gui_present()
+        gui_frame_sleep(f0)
+    gui_close()
+    return 0

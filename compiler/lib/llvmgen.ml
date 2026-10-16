@@ -2547,6 +2547,20 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_time_sleep(i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_time_local(ptr, i64)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_time_mktime(i64, i64, i64, i64, i64, i64)\n";
+  (* GUI 核心层（v3.3.7 design_gui.md L0；stdlib/gui.zfy extern 声明同名符号，
+     declare 收集器对 zfy_ 前缀豁免，故在此统一定义） *)
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_open(i32, i32, ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_poll(ptr, ptr, ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_alive()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_should_close()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_w()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_h()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_close()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_title(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_present()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_fill_rect(i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_draw_text(i32, i32, ptr, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_text_w(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   (* output 运行时函数 *)

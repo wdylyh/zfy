@@ -1,0 +1,53 @@
+// gui_smoke.zfy — GUI 核心层冒烟测试（自动开关窗，可入回归）
+// 断言：开窗/alive/绘图不崩/poll 泵消息/关闭后 alive=0；全部通过 exit 0
+mod gui;
+
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, Event, EV_MOVE, EV_LDOWN, EV_KEY}
+
+fn main()
+    let i32 rc = gui_open(480, 300, "zfy gui smoke")
+    if rc != 0
+        output("FAIL open rc=", rc)
+        return 1
+    if gui_w() != 480 or gui_h() != 300
+        output("FAIL size")
+        return 1
+    // 画 90 帧：背景 + 描边矩形 + 文本（中文 + 英文 + 宽度测量）
+    let i32 frames = 0
+    let i32 moves = 0
+    let i32 keys = 0
+    let i32 tw = 0
+    while gui_alive() and frames < 90
+        let Event e = Event()
+        while gui_poll(ref e)
+            if e.is(EV_MOVE)
+                moves++
+            if e.is(EV_KEY)
+                keys++
+        let i64 f0 = tick_ms()
+        gui_fill_rect(0, 0, gui_w(), gui_h(), 0x202028)
+        gui_rect(40, 60, 400, 180, 0x40C0FF)
+        gui_fill_rect(60, 80, 120, 40, 0x2060A0)
+        gui_draw_text(72, 90, "按钮 A", 0xFFFFFF)
+        tw = gui_text_w("Hello 你好 zfy")
+        gui_draw_text(60, 140, "Hello 你好 zfy", 0xE0E0E0)
+        gui_draw_text(60, 170, "宽度=", 0x80FF80)
+        gui_draw_text(110, 170, "", 0)
+        // 帧计数水印
+        gui_draw_text(200, 170, "frame:", 0x808080)
+        gui_present()
+        gui_frame_sleep(f0)
+        frames++
+    gui_close()
+    if frames != 90
+        output("FAIL frames=", frames)
+        return 1
+    if gui_alive()
+        output("FAIL alive after close")
+        return 1
+    // 宽度测量合理性（16px 雅黑：该串应 > 60px 且 < 300px）
+    if tw < 60 or tw > 300
+        output("FAIL text width=", tw)
+        return 1
+    output("gui smoke PASS: 90 帧, move 事件 ", moves, ", key 事件 ", keys, ", text_w=", tw)
+    return 0

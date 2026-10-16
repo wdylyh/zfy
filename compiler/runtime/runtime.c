@@ -2297,3 +2297,229 @@ int64_t zfy_time_mktime(int64_t y, int64_t mo, int64_t d,
     time_t t = mktime(&tmv);
     return (t == (time_t)-1) ? -1 : (int64_t)t;
 }
+
+/* ==================== GUI 核心层（v3.3.7 design_gui.md L0） ====================
+ * 架构（速度保障）：
+ *  - CreateDIBSection 32bpp 帧缓冲：zfy/C 直接写像素内存，无 GDI 逐像素开销
+ *  - fill_rect 按行块填充，draw_text 走 GDI（内存 DC 与 DIB 共享，
+ *    支持中文/抗锯齿）；present 单次 BitBlt 提交整帧
+ *  - 事件：环形队列（WndProc 生产、poll 消费），轮询模型 O(1)
+ *  - 单线程模型：poll() 顺带泵消息，用户每帧至少 poll 一次
+ *  - 颜色约定：zfy 侧 0xRRGGBB；帧缓冲 dword = (B<<16)|(G<<8)|R（DIB 内存序）
+ *  - 固定客户区尺寸（Phase 2 再做 resize + DIB 重建 + damage 跟踪） */
+#ifdef _WIN32
+#include <wchar.h>                     /* wcslen（GUI 文本转换） */
+
+typedef struct { int64_t t, x, y, k; } gui_ev;
+#define GUI_EVQ 256
+static gui_ev g_gui_q[GUI_EVQ];
+static volatile long g_gui_qh = 0, g_gui_qt = 0;   /* head=读, tail=写 */
+
+/* 事件类型常量（与 stdlib/gui.zfy 保持一致） */
+#define GUI_EV_MOVE  1
+#define GUI_EV_LDOWN 2
+#define GUI_EV_LUP   3
+#define GUI_EV_RDOWN 4
+#define GUI_EV_RUP   5
+#define GUI_EV_KEY   6
+#define GUI_EV_WHEEL 7
+
+static HWND    g_gui_hwnd = NULL;
+static HDC     g_gui_win_dc = NULL;
+static HDC     g_gui_mem = NULL;
+static HBITMAP g_gui_bmp = NULL, g_gui_oldbmp = NULL;
+static HFONT   g_gui_font = NULL, g_gui_oldfont = NULL;
+static uint32_t *g_gui_fb = NULL;
+static int g_gui_w = 0, g_gui_h = 0;
+static volatile int g_gui_alive = 0, g_gui_should_close = 0;
+
+static void gui_push_ev(int64_t t, int64_t x, int64_t y, int64_t k) {
+    long nxt = (g_gui_qt + 1) % GUI_EVQ;
+    if (nxt == g_gui_qh) return;          /* 队列满：丢弃新事件（UI 帧率高不会积压） */
+    g_gui_q[g_gui_qt].t = t; g_gui_q[g_gui_qt].x = x;
+    g_gui_q[g_gui_qt].y = y; g_gui_q[g_gui_qt].k = k;
+    g_gui_qt = nxt;
+}
+
+static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hw, &ps);
+        if (g_gui_mem)
+            BitBlt(dc, 0, 0, g_gui_w, g_gui_h, g_gui_mem, 0, 0, SRCCOPY);
+        EndPaint(hw, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;                          /* 防闪烁：擦背景交给 present */
+    case WM_MOUSEMOVE:
+        gui_push_ev(GUI_EV_MOVE, (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0);
+        return 0;
+    case WM_LBUTTONDOWN: gui_push_ev(GUI_EV_LDOWN, (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
+    case WM_LBUTTONUP:   gui_push_ev(GUI_EV_LUP,   (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
+    case WM_RBUTTONDOWN: gui_push_ev(GUI_EV_RDOWN, (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
+    case WM_RBUTTONUP:   gui_push_ev(GUI_EV_RUP,   (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
+    case WM_MOUSEWHEEL:
+        gui_push_ev(GUI_EV_WHEEL, 0, 0, (int16_t)(wp >> 16));
+        return 0;
+    case WM_CHAR:
+        gui_push_ev(GUI_EV_KEY, 0, 0, (int64_t)wp);
+        return 0;
+    case WM_CLOSE:
+        g_gui_should_close = 1;
+        DestroyWindow(hw);
+        return 0;
+    case WM_DESTROY:
+        g_gui_alive = 0;
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hw, msg, wp, lp);
+}
+
+static wchar_t *gui_utf8_to_wide(const char *s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) n = 1;
+    wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
+    return w;
+}
+
+int32_t zfy_gui_open(int32_t w, int32_t h, char *title_utf8) {
+    if (g_gui_alive) return -1;            /* 已开窗 */
+    if (w <= 0 || h <= 0) return -2;
+    static int class_registered = 0;
+    if (!class_registered) {
+        WNDCLASSW wc;
+        memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc = gui_wndproc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = NULL;
+        wc.lpszClassName = L"ZfyGuiWindow";
+        if (!RegisterClassW(&wc)) return -3;
+        class_registered = 1;
+    }
+    wchar_t *wt = gui_utf8_to_wide(title_utf8 ? title_utf8 : "zfy");
+    /* 固定尺寸：客户区精确为 w x h（无 thickframe，Phase 2 再支持 resize） */
+    RECT rc = { 0, 0, w, h };
+    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 0);
+    g_gui_hwnd = CreateWindowW(L"ZfyGuiWindow", wt,
+                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                               CW_USEDEFAULT, CW_USEDEFAULT,
+                               rc.right - rc.left, rc.bottom - rc.top,
+                               NULL, NULL, GetModuleHandleW(NULL), NULL);
+    free(wt);
+    if (!g_gui_hwnd) return -4;
+    g_gui_w = w; g_gui_h = h;
+    g_gui_win_dc = GetDC(g_gui_hwnd);
+    g_gui_mem = CreateCompatibleDC(g_gui_win_dc);
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;            /* top-down：原点左上，与 UI 坐标一致 */
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_gui_bmp = CreateDIBSection(g_gui_mem, &bi, DIB_RGB_COLORS, (void **)&g_gui_fb, NULL, 0);
+    g_gui_oldbmp = (HBITMAP)SelectObject(g_gui_mem, g_gui_bmp);
+    /* 字体：微软雅黑 16px（覆盖中英文）；SetBkMode 在 draw_text 内保持透明 */
+    g_gui_font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g_gui_oldfont = (HFONT)SelectObject(g_gui_mem, g_gui_font);
+    SetBkMode(g_gui_mem, TRANSPARENT);
+    g_gui_should_close = 0;
+    g_gui_alive = 1;
+    ShowWindow(g_gui_hwnd, SW_SHOW);
+    UpdateWindow(g_gui_hwnd);
+    return 0;
+}
+
+/* 泵消息（非阻塞）+ 取一事件；返回 1=取到，0=无 */
+int32_t zfy_gui_poll(int64_t *t, int64_t *x, int64_t *y, int64_t *k) {
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) { g_gui_alive = 0; break; }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (g_gui_qh == g_gui_qt) return 0;
+    *t = g_gui_q[g_gui_qh].t; *x = g_gui_q[g_gui_qh].x;
+    *y = g_gui_q[g_gui_qh].y; *k = g_gui_q[g_gui_qh].k;
+    g_gui_qh = (g_gui_qh + 1) % GUI_EVQ;
+    return 1;
+}
+
+int32_t zfy_gui_alive(void)        { return g_gui_alive; }
+int32_t zfy_gui_should_close(void) { return g_gui_should_close; }
+int32_t zfy_gui_w(void)            { return g_gui_w; }
+int32_t zfy_gui_h(void)            { return g_gui_h; }
+
+void zfy_gui_close(void) {
+    if (g_gui_hwnd) { DestroyWindow(g_gui_hwnd); g_gui_hwnd = NULL; }
+    g_gui_alive = 0;
+}
+
+void zfy_gui_title(char *title_utf8) {
+    if (!g_gui_hwnd) return;
+    wchar_t *wt = gui_utf8_to_wide(title_utf8 ? title_utf8 : "");
+    SetWindowTextW(g_gui_hwnd, wt);
+    free(wt);
+}
+
+void zfy_gui_present(void) {
+    if (g_gui_win_dc && g_gui_mem)
+        BitBlt(g_gui_win_dc, 0, 0, g_gui_w, g_gui_h, g_gui_mem, 0, 0, SRCCOPY);
+}
+
+void zfy_gui_fill_rect(int32_t rx, int32_t ry, int32_t rw, int32_t rh, uint32_t rgb) {
+    if (!g_gui_fb) return;
+    /* 裁剪到客户区 */
+    int x0 = rx < 0 ? 0 : rx, y0 = ry < 0 ? 0 : ry;
+    int x1 = (rx + rw) > g_gui_w ? g_gui_w : (rx + rw);
+    int y1 = (ry + rh) > g_gui_h ? g_gui_h : (ry + rh);
+    if (x0 >= x1 || y0 >= y1) return;
+    uint32_t pix = ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
+    for (int y = y0; y < y1; y++) {
+        uint32_t *row = g_gui_fb + (size_t)y * g_gui_w + x0;
+        for (int x = x0; x < x1; x++) row[x] = pix;
+    }
+}
+
+void zfy_gui_draw_text(int32_t tx, int32_t ty, char *utf8, uint32_t rgb) {
+    if (!g_gui_mem) return;
+    wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
+    COLORREF old = SetTextColor(g_gui_mem,
+        (COLORREF)((rgb & 0xFF) | (rgb & 0xFF00) | (((rgb >> 16) & 0xFF) << 16)));
+    TextOutW(g_gui_mem, tx, ty, wt, (int)wcslen(wt));
+    SetTextColor(g_gui_mem, old);
+    free(wt);
+}
+
+int32_t zfy_gui_text_w(char *utf8) {
+    if (!g_gui_mem) return 0;
+    wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
+    SIZE sz;
+    if (!GetTextExtentPoint32W(g_gui_mem, wt, (int)wcslen(wt), &sz)) sz.cx = 0;
+    free(wt);
+    return (int32_t)sz.cx;
+}
+
+#else
+/* 非 Windows：桩实现（返回失败，UI 程序可优雅降级为 TUI） */
+int32_t zfy_gui_open(int32_t w, int32_t h, char *t) { (void)w; (void)h; (void)t; return -1; }
+int32_t zfy_gui_poll(int64_t *t, int64_t *x, int64_t *y, int64_t *k) { (void)t; (void)x; (void)y; (void)k; return 0; }
+int32_t zfy_gui_alive(void) { return 0; }
+int32_t zfy_gui_should_close(void) { return 1; }
+int32_t zfy_gui_w(void) { return 0; }
+int32_t zfy_gui_h(void) { return 0; }
+void zfy_gui_close(void) {}
+void zfy_gui_title(char *s) { (void)s; }
+void zfy_gui_present(void) {}
+void zfy_gui_fill_rect(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e) { (void)a; (void)b; (void)c; (void)d; (void)e; }
+void zfy_gui_draw_text(int32_t a, int32_t b, char *s, uint32_t c) { (void)a; (void)b; (void)s; (void)c; }
+int32_t zfy_gui_text_w(char *s) { (void)s; return 0; }
+#endif

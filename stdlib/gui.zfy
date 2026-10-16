@@ -1,0 +1,128 @@
+// stdlib/gui.zfy —— GUI 绑定层（design_gui.md L1，v3.3.7）
+//
+// 底层为 runtime.c 的 GUI 核心层（Win32 + DIB 帧缓冲），本模块只做声明与
+// 薄包装；组件层（L2）与应用框架（L3）在此之上用纯 zfy 构建。
+//
+// 用法：
+//   mod gui;
+//   use gui::{gui_open, gui_poll, gui_fill_rect, gui_draw_text, gui_present, EV_LDOWN}
+//   fn main()
+//       if gui_open(480, 360, "demo") != 0
+//           output("无法创建窗口")
+//           return 1
+//       while gui_alive() == 1
+//           let Event e = Event()
+//           if gui_poll(e)
+//               ...
+//           gui_fill_rect(0, 0, 480, 360, 0x202028)
+//           gui_draw_text(20, 20, "你好 zfy GUI", 0xFFFFFF)
+//           gui_present()
+//           sleep_ms(16)
+//
+// 颜色：0xRRGGBB（如 0xFF0000 红、0x20A0FF 蓝）
+// 坐标：客户区左上为原点，y 向下
+//
+// 事件类型（与 runtime.c GUI_EV_* 一致）
+pub let i32 const EV_MOVE = 1      // x,y = 鼠标客户区坐标
+pub let i32 const EV_LDOWN = 2
+pub let i32 const EV_LUP = 3
+pub let i32 const EV_RDOWN = 4
+pub let i32 const EV_RUP = 5
+pub let i32 const EV_KEY = 6       // key = UTF-16 码元（WM_CHAR）
+pub let i32 const EV_WHEEL = 7     // key = 滚动增量（正=向上）
+
+// 鼠标/键盘事件（gui_poll 填充）
+pub struct Event
+    i64 typ
+    i64 x
+    i64 y
+    i64 key
+
+    // 便捷判断
+    fn bool is(let i64 t)
+        return self.typ == t
+
+// ===== runtime.c L0 外部符号 =====
+
+extern "C"
+    // 打开固定尺寸窗口（客户区 w x h），标题 UTF-8。0=成功，负数=失败
+    i32 zfy_gui_open(let i32 w, let i32 h, let string title)
+    // 泵消息并取一事件（4 个出参指针）。1=取到，0=队列空
+    i32 zfy_gui_poll(let i64* t, let i64* x, let i64* y, let i64* k)
+    i32 zfy_gui_alive()
+    i32 zfy_gui_should_close()
+    i32 zfy_gui_w()
+    i32 zfy_gui_h()
+    void zfy_gui_close()
+    void zfy_gui_title(let string title)
+    // 提交整帧（BitBlt）。每帧画完后调用一次
+    void zfy_gui_present()
+    // 块填充矩形（自动裁剪客户区）。C 侧按行填充，热路径不出 C
+    void zfy_gui_fill_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 rgb)
+    // 绘制 UTF-8 文本（GDI，微软雅黑 16px，左上角对齐，透明背景）
+    void zfy_gui_draw_text(let i32 x, let i32 y, let string s, let u32 rgb)
+    // 文本像素宽度（布局用）
+    i32 zfy_gui_text_w(let string s)
+
+// ===== 包装（zfy 侧友好形态） =====
+
+pub fn i32 gui_open(let i32 w, let i32 h, let string title)
+    return zfy_gui_open(w, h, title)
+
+pub fn bool gui_alive()
+    return zfy_gui_alive() == 1
+
+pub fn bool gui_should_close()
+    return zfy_gui_should_close() == 1
+
+pub fn i32 gui_w()
+    return zfy_gui_w()
+
+pub fn i32 gui_h()
+    return zfy_gui_h()
+
+pub fn void gui_close()
+    zfy_gui_close()
+
+pub fn void gui_title(let string t)
+    zfy_gui_title(t)
+
+pub fn void gui_present()
+    zfy_gui_present()
+
+pub fn void gui_fill_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 rgb)
+    zfy_gui_fill_rect(x, y, w, h, rgb)
+
+// 描边矩形（4 次块填充）
+pub fn void gui_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 rgb)
+    zfy_gui_fill_rect(x, y, w, 1, rgb)
+    zfy_gui_fill_rect(x, y + h - 1, w, 1, rgb)
+    zfy_gui_fill_rect(x, y, 1, h, rgb)
+    zfy_gui_fill_rect(x + w - 1, y, 1, h, rgb)
+
+pub fn void gui_draw_text(let i32 x, let i32 y, let string s, let u32 rgb)
+    zfy_gui_draw_text(x, y, s, rgb)
+
+pub fn i32 gui_text_w(let string s)
+    return zfy_gui_text_w(s)
+
+// 取一事件；true = e 已填充
+pub fn bool gui_poll(ref let Event e)
+    let i64 t = 0
+    let i64 x = 0
+    let i64 y = 0
+    let i64 k = 0
+    let i32 got = zfy_gui_poll(&t, &x, &y, &k)
+    if got == 1
+        e.typ = t
+        e.x = x
+        e.y = y
+        e.key = k
+        return true
+    return false
+
+// 帧节拍：16ms ≈ 60fps（L3 循环用；仅当本帧耗时不足时补睡）
+pub fn void gui_frame_sleep(let i64 frame_start_ms)
+    let i64 el = tick_ms() - frame_start_ms
+    if el < 16
+        sleep_ms(16 - el)
