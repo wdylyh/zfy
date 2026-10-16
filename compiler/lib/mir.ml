@@ -640,18 +640,50 @@ let rec lexpr l (e : texpr) : operand =
        op (OLocal d) e.ety
      | EDerefK p -> lexpr l p
      | EFieldK _ ->
-       let rec flatten acc b =
-         match b.e with
-         | EFieldK (b', i) -> flatten (i :: acc) b'
-         | EVarK n -> Some (n, acc, b.ety)
-         | _ -> None
+       (* v3.3.8 泛化：字段链/元素嵌套地址（&a.b[i].c 等）——递归生成
+          基地址（变量槽/字段 GEP/元素 MElemAddr），再逐级 MFieldAddr。
+          非变量根的地址是寄存器值，MFieldAddr 侧统一以 TPtr rootty
+          走 val_of（寄存器直取，不 load）；变量槽根保持原语义 *)
+       let rec addr_of (x : texpr) : operand =
+         match x.e with
+         | EVarK n -> op (OLocal n) x.ety
+         | EFieldK (b, i) ->
+           let (pb, rootty) =
+             match b.e with
+             | EVarK _ -> (addr_of b, b.ety)
+             | _ ->
+               let pb = addr_of b in
+               (pb, (match b.ety with
+                     | TStruct s -> TPtr (TStruct s)
+                     | t -> t))
+           in
+           let d = fresh l in
+           emit l (MFieldAddr (d, pb, rootty, [ i ], x.ety));
+           (* 结果标 x.ety（槽语义）：MElemAddr/MLoadK 对寄存器根直取
+              SSA（不再 load），对 TList 根再取 data 字段——与变量槽
+              「值=seq 指针」的既有约定一致 *)
+           op (OLocal d) x.ety
+         | ESeqGetK (b, i) ->
+           (* 基语义须与「变量槽」一致：val_of(基) = seq 指针。
+              EVarK 槽由 MElemAddr 自行 load；字段链等寄存器地址
+              （reg = seq 槽地址）需先 load 出 seq 指针再传 *)
+           let ob =
+             match b.e with
+             | EVarK _ -> addr_of b
+             | _ ->
+               let pa = addr_of b in
+               let d = fresh l in
+               emit l (MLoadK (d, pa, b.ety));
+               op (OLocal d) b.ety
+           in
+           let oi = lexpr l i in
+           let d = fresh l in
+           emit l (MElemAddr (d, ob, oi, x.ety, false));
+           op (OLocal d) x.ety
+         | EDerefK p -> lexpr l p
+         | _ -> merr x.epos "unsupported address-of target"
        in
-       (match flatten [] a with
-        | Some (root, idxs, rootty) ->
-          let d = fresh l in
-          emit l (MFieldAddr (d, op (OLocal root) rootty, rootty, idxs, a.ety));
-          op (OLocal d) e.ety
-        | None -> merr e.epos "unsupported address-of target")
+       addr_of a
      | ESeqGetK (b, i) ->
        (* 元素地址：基为变量槽/字段链/解引用等任意"seq 指针值"形态
           （w-014 #8 泛化；显式取地址，无越界检查） *)

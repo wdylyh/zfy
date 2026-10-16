@@ -571,7 +571,13 @@ let resolve (main : program) (main_dir : string)
                          methods =
                            List.map
                              (fun mth ->
-                               { mth with mbody = rw_block m mth.mbody })
+                               (* v3.3.8 修复：方法参数/返回类型同样要扁平化
+                                  （此前只重写 mbody，mod 文件内方法的 struct
+                                  类型参数保持裸名 → E3001 undefined type） *)
+                               { mth with
+                                 mparams = List.map (rw_param m) mth.mparams;
+                                 mret = Option.map (rw_ty m) mth.mret;
+                                 mbody = rw_block m mth.mbody })
                              s.methods } :: !out
       | ITypeAlias a ->
         out := ITypeAlias { name = flat_prefix m.mpath ^ a.name;

@@ -73,7 +73,11 @@ Slider、ProgressBar、ListBox、MenuBar。参照 gui_demo.zfy 的 Button 写法
 - 中文渲染（雅黑）与 `0xRRGGBB` 颜色、`gui_text_w` 布局测量均实测正确
 
 ## 5. 里程碑
-- [x] M1（本轮）：L0 渲染核心 + L1 绑定 + 冒烟测试
-- [ ] M2：L2 组件层（8 个组件 + damage 跟踪）+ 组件级测试
+- [x] M1（v3.3.7）：L0 渲染核心 + L1 绑定 + 冒烟测试
+- [x] M2（v3.3.8）：L2 组件层——stdlib/widgets.zfy：Label/Button/InputBox/
+  Slider/ProgressBar/ListBox + App 容器（事件分发/damage 脏区/按需 present）；
+  examples/widgets_test.zfy 自动断言（状态机+渲染+damage）、demos/widgets_demo.zfy
+  交互演示。语言侧配套：元素方法调用 arr[i].m()、元素字段复合赋值（编译器修复
+  mod 内方法 struct 参数 E3001 + mir 取址泛化）
 - [ ] M3：L3 应用框架 + 两个真实小软件（记事本/计算器）
-- [ ] M4：resize、剪贴板、多窗口、图标
+- [ ] M4：resize、剪贴板、多窗口、图标、Checkbox/MenuBar 组件

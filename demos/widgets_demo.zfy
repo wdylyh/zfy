@@ -1,0 +1,90 @@
+// demos/widgets_demo.zfy —— L2 组件层交互演示（v3.3.8）
+// 一个可实际操作的小面板：按钮计数 / 文本框回显 / 滑块联动进度条 /
+// 列表选中 / 添加项目。关闭窗口即退出。
+mod gui;
+mod widgets;
+use widgets::{App, Label, Button, InputBox, Slider, ProgressBar, ListBox, C_OK}
+use gui::{gui_text_w, gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    if app.open(520, 400, "zfy widgets 演示") != 0
+        output("无法创建窗口")
+        return 1
+
+    let Label title = Label(x=20, y=14, text="zfy GUI 组件层演示（L2 · damage 跟踪）")
+    app.add_label(title)
+
+    // 按钮计数
+    let Button btn = Button(x=20, y=48, w=140, h=36, text="点我 0 次")
+    app.add_button(btn)
+    let Button add = Button(x=180, y=48, w=140, h=36, text="添加列表项")
+    app.add_button(add)
+
+    // 文本框 + 回显
+    let InputBox inp = InputBox(x=20, y=100, w=300)
+    app.add_input(inp)
+    let Label echo = Label(x=20, y=130, text="输入回显：")
+    app.add_label(echo)
+
+    // 滑块 → 进度条联动
+    let Slider sld = Slider(x=20, y=170, w=320)
+    app.add_slider(sld)
+    let ProgressBar bar = ProgressBar(x=20, y=206, w=320)
+    app.add_bar(bar)
+
+    // 列表
+    let ListBox lst = ListBox(x=20, y=240, w=240, rows=5)
+    lst.add_item("项目 1")
+    lst.add_item("项目 2")
+    lst.add_item("项目 3")
+    app.add_list(lst)
+    let Label sel = Label(x=280, y=248, text="选中：无")
+    app.add_label(sel)
+
+    let i32 counter = 0
+    let i32 item_no = 3
+
+    while app.alive()
+        app.t0 = tick_ms()
+        let i32 clicks_before = app.buttons[0].clicks
+        let i32 adds_before = app.buttons[1].clicks
+        let i32 sld_before = app.sliders[0].value
+        let i32 sel_before = app.lists[0].sel
+        let string text_before = app.inputs[0].text
+        let i32 items_before = length(app.lists[0].items)
+
+        app.step()
+
+        // 按钮 0：更新计数文案
+        if app.buttons[0].clicks != clicks_before
+            counter = counter + 1
+            app.buttons[0].set_text("点我 " + cast(counter, string) + " 次")
+        // 按钮 1：向列表添加项目
+        if app.buttons[1].clicks != adds_before
+            item_no = item_no + 1
+            app.lists[0].add_item("项目 " + cast(item_no, string))
+        // 滑块 → 进度条 + 百分比
+        if app.sliders[0].value != sld_before
+            app.bars[0].set_value(app.sliders[0].value)
+            app.labels[1].text = "进度：" + cast(app.sliders[0].value, string) + "%"
+            app.labels[1].dirty = true
+        // 列表选中 → 标签
+        if app.lists[0].sel != sel_before
+            if app.lists[0].sel >= 0
+                app.labels[2].text = "选中：" + app.lists[0].items[app.lists[0].sel]
+            else
+                app.labels[2].text = "选中：无"
+            app.labels[2].dirty = true
+        // 文本回显
+        if app.inputs[0].text != text_before
+            app.labels[0].text = "输入回显：" + app.inputs[0].text
+            app.labels[0].dirty = true
+        // 新项目加入后列表需要重绘
+        if length(app.lists[0].items) != items_before
+            app.lists[0].dirty = true
+
+        gui_frame_sleep(app.t0)
+
+    app.close()
+    return 0

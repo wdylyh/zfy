@@ -1,0 +1,474 @@
+// stdlib/widgets.zfy —— GUI 组件层（design_gui.md L2，v3.3.8）
+//
+// 纯 zfy 实现，构建在 gui（L1）之上。核心设计：
+//   - **damage 跟踪**：每个组件带 dirty 标志，只有变化的组件在本帧重绘，
+//     整帧仅在"本帧有组件重绘"时才 present（BitBlt）——空闲时零拷贝开销
+//   - **保留模式**（retained）：App 持有组件数组，每帧一次 app.step() 完成
+//     事件分发、状态更新、脏区重绘；业务逻辑读组件状态（clicks/text/value/sel）
+//
+// 用法：
+//   mod widgets;
+//   use widgets::{App, Button, InputBox, Slider}
+//   fn main()
+//       let App app = App()
+//       if app.open(480, 360, "demo") != 0
+//           return 1
+//       let Button btn = Button(x=20, y=20, w=120, h=36, text="点我")
+//       app.add_button(btn)
+//       while app.alive()
+//           app.step()
+//           gui_frame_sleep(app.t0)
+//       app.close()
+
+
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_KEY, EV_WHEEL}
+
+// ===== 主题配色 =====
+pub let u32 const C_BG      = 0x1E1E24   // 窗口背景
+pub let u32 const C_PANEL   = 0x2A2A34   // 面板
+pub let u32 const C_BORDER  = 0x55555F   // 边框
+pub let u32 const C_TEXT    = 0xF0F0F0   // 正文
+pub let u32 const C_ACCENT  = 0x2F7FD6   // 强调（焦点/进度）
+pub let u32 const C_HOT     = 0x3A8FE8   // 悬停
+pub let u32 const C_DOWN    = 0x1F5FA8   // 按下
+pub let u32 const C_OK      = 0x3FA060   // 绿
+
+// 文本行高（雅黑 16px）
+let i32 LH = 22
+
+// ===== Label：静态文本 =====
+pub struct Label
+    i32 x
+    i32 y
+    string text
+    u32 color = C_TEXT
+    bool dirty = true
+
+    fn void draw()
+        let i32 tw = gui_text_w(self.text)
+        gui_fill_rect(self.x - 2, self.y - 2, tw + 4, LH, C_BG)
+        gui_draw_text(self.x, self.y, self.text, self.color)
+        self.dirty = false
+
+// ===== Button：点击计数按钮 =====
+pub struct Button
+    i32 x
+    i32 y
+    i32 w
+    i32 h
+    string text
+    bool hot = false
+    bool pressed = false
+    i32 clicks = 0        // 业务读这个
+    bool dirty = true
+
+    fn bool hit(let i32 mx, let i32 my)
+        return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + self.h
+
+    fn void set_text(let string t)
+        self.text = t
+        self.dirty = true
+
+    fn void draw()
+        let u32 fill = C_PANEL
+        if self.pressed
+            fill = C_DOWN
+        else
+            if self.hot
+                fill = C_HOT
+        gui_fill_rect(self.x, self.y, self.w, self.h, fill)
+        gui_rect(self.x, self.y, self.w, self.h, C_BORDER)
+        let i32 tw = gui_text_w(self.text)
+        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - LH) / 2 + 2, self.text, C_TEXT)
+        self.dirty = false
+
+// ===== InputBox：单行文本框（点击聚焦，Backspace 退格，按键追加） =====
+pub struct InputBox
+    i32 x
+    i32 y
+    i32 w
+    string text
+    bool focus = false
+    bool dirty = true
+
+    fn bool hit(let i32 mx, let i32 my)
+        return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + LH + 8
+
+    fn void set_focus(let bool f)
+        if self.focus != f
+            self.focus = f
+            self.dirty = true
+
+    // 返回 true = 本帧有变化
+    fn bool handle_key(let i64 k)
+        let i64 n = length(self.text)
+        if k == 8
+            // Backspace：删末字符
+            if n > 1
+                self.text = self.text[0, n - 2]
+                self.dirty = true
+                return true
+            if n == 1
+                self.text = ""
+                self.dirty = true
+                return true
+            return false
+        if k >= 32
+            // 可打印（WM_CHAR 已做 Shift 映射）；中文/全角按 UTF-16 码元追加
+            self.text = self.text + cast(k, char)
+            self.dirty = true
+            return true
+        return false
+
+    fn void draw()
+        gui_fill_rect(self.x, self.y, self.w, LH + 8, C_PANEL)
+        if self.focus
+            gui_rect(self.x, self.y, self.w, LH + 8, C_ACCENT)
+        else
+            gui_rect(self.x, self.y, self.w, LH + 8, C_BORDER)
+        gui_draw_text(self.x + 6, self.y + 5, self.text, C_TEXT)
+        if self.focus
+            let i32 tw = gui_text_w(self.text)
+            gui_fill_rect(self.x + 8 + tw, self.y + 5, 2, LH - 4, C_TEXT)
+        self.dirty = false
+
+// ===== Slider：拖动滑块，value 0..100 =====
+pub struct Slider
+    i32 x
+    i32 y
+    i32 w
+    i32 value = 0        // 业务读这个（0..100）
+    bool dragging = false
+    bool dirty = true
+
+    fn void set_value(let i32 v)
+        let i32 vv = v
+        if vv < 0
+            vv = 0
+        if vv > 100
+            vv = 100
+        if vv != self.value
+            self.value = vv
+            self.dirty = true
+
+    // 命中判定（含上下 6px 容差）
+    fn bool hit_wide(let i32 mx, let i32 my)
+        return mx >= self.x and mx < self.x + self.w and my >= self.y - 6 and my < self.y + 26
+
+    fn void draw()
+        gui_fill_rect(self.x, self.y + 8, self.w, 4, C_PANEL)
+        gui_rect(self.x, self.y + 8, self.w, 4, C_BORDER)
+        let i32 fx = self.x + (self.w - 2) * self.value / 100
+        if fx > self.x
+            gui_fill_rect(self.x, self.y + 8, fx - self.x, 4, C_ACCENT)
+        if self.dragging
+            gui_fill_rect(fx - 5, self.y, 10, 20, C_HOT)
+        else
+            gui_fill_rect(fx - 5, self.y, 10, 20, C_ACCENT)
+        self.dirty = false
+
+// ===== ProgressBar：进度条 =====
+pub struct ProgressBar
+    i32 x
+    i32 y
+    i32 w
+    i32 value = 0
+    u32 color = C_OK
+    bool dirty = true
+
+    fn void set_value(let i32 v)
+        let i32 vv = v
+        if vv < 0
+            vv = 0
+        if vv > 100
+            vv = 100
+        if vv != self.value
+            self.value = vv
+            self.dirty = true
+
+    fn void draw()
+        gui_fill_rect(self.x, self.y, self.w, 18, C_PANEL)
+        gui_rect(self.x, self.y, self.w, 18, C_BORDER)
+        let i32 fw = (self.w - 4) * self.value / 100
+        if fw > 0
+            gui_fill_rect(self.x + 2, self.y + 2, fw, 14, self.color)
+        self.dirty = false
+
+// ===== ListBox：字符串列表（滚轮滚动，点击选中） =====
+pub struct ListBox
+    i32 x
+    i32 y
+    i32 w
+    i32 rows             // 可见行数
+    string[] items
+    i32 sel = -1         // 业务读这个（-1 未选）
+    i32 top = 0          // 滚动偏移（首行下标）
+    bool dirty = true
+
+    fn void clear()
+        self.items = self.items[0, 0]
+        self.sel = -1
+        self.top = 0
+        self.dirty = true
+
+    fn void add_item(let string s)
+        self.items = push(self.items, s)
+        self.dirty = true
+
+    fn void scroll(let i32 d)
+        let i32 n = length(self.items)
+        let i32 nt = self.top + d
+        if nt < 0
+            nt = 0
+        if n > self.rows
+            if nt > n - self.rows
+                nt = n - self.rows
+        else
+            nt = 0
+        if nt != self.top
+            self.top = nt
+            self.dirty = true
+
+    fn void draw()
+        let i32 hgt = self.rows * LH + 8
+        gui_fill_rect(self.x, self.y, self.w, hgt, C_PANEL)
+        gui_rect(self.x, self.y, self.w, hgt, C_BORDER)
+        let i32 n = length(self.items)
+        let i32 last = self.top + self.rows
+        if last > n
+            last = n
+        let i32 i = self.top
+        while i < last
+            let i32 row = i - self.top
+            let i32 ry = self.y + 4 + row * LH
+            if i == self.sel
+                gui_fill_rect(self.x + 2, ry - 1, self.w - 4, LH, C_ACCENT)
+                gui_draw_text(self.x + 8, ry, self.items[i], 0xFFFFFF)
+            else
+                gui_draw_text(self.x + 8, ry, self.items[i], C_TEXT)
+            i++
+        self.dirty = false
+
+// ===== App：应用容器 + 事件循环骨架 =====
+pub struct App
+    Label[] labels
+    Button[] buttons
+    InputBox[] inputs
+    Slider[] sliders
+    ProgressBar[] bars
+    ListBox[] lists
+    i32 mx = -1
+    i32 my = -1
+    bool ldown = false
+    bool ldown_prev = false
+    bool quit = false
+    bool any_dirty = false
+    i64 t0 = 0           // 帧起点（gui_frame_sleep 用）
+
+    fn i32 open(let i32 w, let i32 h, let string title)
+        let i32 r = gui_open(w, h, title)
+        if r != 0
+            return r
+        gui_fill_rect(0, 0, gui_w(), gui_h(), C_BG)
+        gui_present()
+        self.t0 = tick_ms()
+        return 0
+
+    fn bool alive()
+        return gui_alive() and not self.quit
+
+    fn void close()
+        gui_close()
+
+    fn void add_label(let Label l)
+        self.labels = push(self.labels, l)
+
+    fn void add_button(let Button b)
+        self.buttons = push(self.buttons, b)
+
+    fn void add_input(let InputBox ib)
+        self.inputs = push(self.inputs, ib)
+
+    fn void add_slider(let Slider s)
+        self.sliders = push(self.sliders, s)
+
+    fn void add_bar(let ProgressBar p)
+        self.bars = push(self.bars, p)
+
+    fn void add_list(let ListBox lb)
+        self.lists = push(self.lists, lb)
+
+    // 任意组件标脏（业务侧主动刷新用）
+    fn void invalidate_all()
+        let i32 i = 0
+        while i < length(self.labels)
+            self.labels[i].dirty = true
+            i++
+        i = 0
+        while i < length(self.buttons)
+            self.buttons[i].dirty = true
+            i++
+        i = 0
+        while i < length(self.inputs)
+            self.inputs[i].dirty = true
+            i++
+        i = 0
+        while i < length(self.sliders)
+            self.sliders[i].dirty = true
+            i++
+        i = 0
+        while i < length(self.bars)
+            self.bars[i].dirty = true
+            i++
+        i = 0
+        while i < length(self.lists)
+            self.lists[i].dirty = true
+            i++
+
+    // 一帧：泵事件 → 更新 → 脏区重绘 → 按需 present
+    fn void step()
+        self.any_dirty = false
+        let Event e = Event()
+        while gui_poll(ref e)
+            if e.typ == EV_MOVE
+                self.mx = cast(e.x, i32)
+                self.my = cast(e.y, i32)
+                self.on_hover()
+            if e.typ == EV_LDOWN or e.typ == EV_LUP
+                self.mx = cast(e.x, i32)
+                self.my = cast(e.y, i32)
+                self.ldown = e.typ == EV_LDOWN
+                self.on_click()
+            if e.typ == EV_WHEEL
+                let i32 i = 0
+                while i < length(self.lists)
+                    self.lists[i].scroll(cast(e.key, i32))
+                    if self.lists[i].dirty
+                        self.any_dirty = true
+                    i++
+            if e.typ == EV_KEY
+                self.on_key(cast(e.key, i64))
+        // 拖动持续更新（按住不放也跟随）
+        let i32 si = 0
+        while si < length(self.sliders)
+            if self.sliders[si].dragging and self.ldown
+                self.sliders[si].set_value((self.mx - self.sliders[si].x) * 100 / (self.sliders[si].w - 2))
+            if self.sliders[si].dirty
+                self.any_dirty = true
+            si++
+        self.ldown_prev = self.ldown
+        // 重绘脏组件
+        self.flush_dirty()
+        if self.any_dirty
+            gui_present()
+
+    fn void on_hover()
+        let i32 i = 0
+        while i < length(self.buttons)
+            let bool h = self.buttons[i].hit(self.mx, self.my) and not self.ldown
+            if h != self.buttons[i].hot
+                self.buttons[i].hot = h
+                self.buttons[i].dirty = true
+            i++
+
+    fn void on_click()
+        let bool press = self.ldown and not self.ldown_prev
+        let bool release = not self.ldown and self.ldown_prev
+        // 输入框聚焦
+        let i32 i = 0
+        while i < length(self.inputs)
+            if press
+                self.inputs[i].set_focus(self.inputs[i].hit(self.mx, self.my))
+            if self.inputs[i].dirty
+                self.any_dirty = true
+            i++
+        // 按钮
+        i = 0
+        while i < length(self.buttons)
+            let bool inside = self.buttons[i].hit(self.mx, self.my)
+            if press and inside
+                self.buttons[i].pressed = true
+                self.buttons[i].dirty = true
+            if release and self.buttons[i].pressed
+                self.buttons[i].pressed = false
+                self.buttons[i].dirty = true
+                if inside
+                    self.buttons[i].clicks++
+            if self.buttons[i].dirty
+                self.any_dirty = true
+            i++
+        // 滑块：左键按下进入拖动，抬起结束
+        i = 0
+        while i < length(self.sliders)
+            if press and self.sliders[i].hit_wide(self.mx, self.my)
+                self.sliders[i].dragging = true
+                self.sliders[i].set_value((self.mx - self.sliders[i].x) * 100 / (self.sliders[i].w - 2))
+            if release
+                self.sliders[i].dragging = false
+            if self.sliders[i].dirty
+                self.any_dirty = true
+            i++
+        // 列表选中
+        i = 0
+        while i < length(self.lists)
+            if press and self.mx >= self.lists[i].x and self.mx < self.lists[i].x + self.lists[i].w
+                let i32 rows = length(self.lists[i].items)
+                let i32 hgt = self.lists[i].rows * LH + 8
+                if self.my >= self.lists[i].y and self.my < self.lists[i].y + hgt
+                    let i32 row = (self.my - self.lists[i].y - 4) / LH
+                    let i32 idx = self.lists[i].top + row
+                    if row >= 0 and idx < rows
+                        self.lists[i].sel = idx
+                        self.lists[i].dirty = true
+            if self.lists[i].dirty
+                self.any_dirty = true
+            i++
+        // 边沿状态推进：每次鼠标事件处理后更新（合成 press/release
+        // 与真实事件流都依赖此序——press 后紧跟 release 才可检出）
+        self.ldown_prev = self.ldown
+
+    fn void on_key(let i64 k)
+        let i32 i = 0
+        while i < length(self.inputs)
+            if self.inputs[i].focus
+                if self.inputs[i].handle_key(k)
+                    self.any_dirty = true
+            i++
+
+    fn void flush_dirty()
+        let i32 i = 0
+        while i < length(self.labels)
+            if self.labels[i].dirty
+                self.labels[i].draw()
+                self.any_dirty = true
+            i++
+        i = 0
+        while i < length(self.buttons)
+            if self.buttons[i].dirty
+                self.buttons[i].draw()
+                self.any_dirty = true
+            i++
+        i = 0
+        while i < length(self.inputs)
+            if self.inputs[i].dirty
+                self.inputs[i].draw()
+                self.any_dirty = true
+            i++
+        i = 0
+        while i < length(self.sliders)
+            if self.sliders[i].dirty
+                self.sliders[i].draw()
+                self.any_dirty = true
+            i++
+        i = 0
+        while i < length(self.bars)
+            if self.bars[i].dirty
+                self.bars[i].draw()
+                self.any_dirty = true
+            i++
+        i = 0
+        while i < length(self.lists)
+            if self.lists[i].dirty
+                self.lists[i].draw()
+                self.any_dirty = true
+            i++

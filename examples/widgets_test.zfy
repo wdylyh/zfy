@@ -1,0 +1,175 @@
+// examples/widgets_test.zfy —— L2 组件层自动测试（v3.3.8）
+// 断言：组件状态机（悬停/点击/聚焦/输入/拖动/滚动/选中）+ 渲染冒烟 + damage 计数
+mod gui;
+mod widgets;
+use widgets::{App, Label, Button, InputBox, Slider, ProgressBar, ListBox, C_BG, C_OK}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let i32 fails = 0
+
+    // ===== 1) 纯逻辑：不需要窗口 =====
+    let Slider s0 = Slider(x=10, y=10, w=200)
+    s0.set_value(150)
+    if s0.value != 100
+        output("FAIL slider clamp up")
+        fails++
+    s0.set_value(-5)
+    if s0.value != 0
+        output("FAIL slider clamp down")
+        fails++
+    s0.set_value(42)
+    if s0.value != 42 or not s0.dirty
+        output("FAIL slider set")
+        fails++
+    s0.dirty = false
+    s0.set_value(42)
+    if s0.dirty
+        output("FAIL slider noop should stay clean")
+        fails++
+    if not s0.hit_wide(100, 12) or s0.hit_wide(100, 40) or s0.hit_wide(300, 12)
+        output("FAIL slider hit_wide")
+        fails++
+
+    let InputBox ib0 = InputBox(x=0, y=0, w=200)
+    let i64 ch_A = 65
+    let i64 ch_B = 66
+    let i64 bs = 8
+    if not ib0.handle_key(ch_A) or not ib0.handle_key(ch_B)
+        output("FAIL input append")
+        fails++
+    if ib0.text != "AB"
+        output("FAIL input text")
+        fails++
+    if not ib0.handle_key(bs) or ib0.text != "A"
+        output("FAIL input backspace")
+        fails++
+    if not ib0.handle_key(bs) or ib0.text != ""
+        output("FAIL input backspace empty")
+        fails++
+    if ib0.handle_key(bs)
+        output("FAIL backspace on empty should be noop")
+        fails++
+
+    let ListBox lb0 = ListBox(x=0, y=0, w=160, rows=3)
+    lb0.add_item("alpha")
+    lb0.add_item("beta")
+    lb0.add_item("gamma")
+    lb0.add_item("delta")
+    if length(lb0.items) != 4
+        output("FAIL list add")
+        fails++
+    lb0.scroll(10)
+    if lb0.top != 1
+        output("FAIL list scroll clamp")
+        fails++
+    lb0.scroll(-10)
+    if lb0.top != 0
+        output("FAIL list scroll zero")
+        fails++
+    lb0.scroll(-1)
+    if lb0.top != 0
+        output("FAIL list scroll negative")
+        fails++
+
+    // ===== 2) 渲染 + App 事件冒烟（窗口闪现约 1.2 秒后自动关闭） =====
+    let App app = App()
+    if app.open(480, 360, "widgets_test") != 0
+        output("FAIL gui open")
+        return 1
+
+    let Label title = Label(x=20, y=16, text="zfy widgets 组件层测试")
+    app.add_label(title)
+    let Button btn = Button(x=20, y=50, w=130, h=36, text="按钮 0 次")
+    app.add_button(btn)
+    let InputBox inp = InputBox(x=20, y=100, w=280)
+    app.add_input(inp)
+    let Slider sld = Slider(x=20, y=150, w=280)
+    sld.set_value(30)
+    app.add_slider(sld)
+    let ProgressBar bar = ProgressBar(x=20, y=190, w=280)
+    bar.set_value(30)
+    app.add_bar(bar)
+    let ListBox lst = ListBox(x=20, y=224, w=200, rows=4)
+    lst.add_item("项目一")
+    lst.add_item("item-2")
+    lst.add_item("item-3")
+    lst.add_item("item-4")
+    lst.add_item("item-5")
+    app.add_list(lst)
+
+    // 首帧：所有组件绘制并 present
+    app.t0 = tick_ms()
+    app.step()
+    // 首帧后所有组件应已被绘制（dirty 清零）
+    if app.buttons[0].dirty or app.inputs[0].dirty or app.sliders[0].dirty
+        output("FAIL first step should flush all dirty")
+        fails++
+
+    // 模拟悬停进入按钮（合成状态后调 step；无真实事件时状态保持）
+    app.mx = 60
+    app.my = 68
+    app.on_hover()
+    if not app.buttons[0].hot
+        output("FAIL button hover")
+        fails++
+
+    // 模拟点击：press + release
+    app.mx = 60
+    app.my = 68
+    app.ldown = true
+    app.on_click()
+    if not app.buttons[0].pressed
+        output("FAIL button press")
+        fails++
+    app.ldown = false
+    app.on_click()
+    if app.buttons[0].pressed or app.buttons[0].clicks != 1
+        output("FAIL button click count")
+        fails++
+
+    // 模拟键盘输入到已聚焦输入框
+    app.inputs[0].set_focus(true)
+    app.on_key(ch_A)
+    if app.inputs[0].text != "A"
+        output("FAIL input via app.on_key")
+        fails++
+
+    // 模拟滑块拖动
+    app.mx = 148
+    app.my = 158
+    app.ldown = true
+    app.sliders[0].dragging = true
+    app.step()
+    if app.sliders[0].value < 40 or app.sliders[0].value > 50
+        output("FAIL slider drag value")
+        fails++
+    app.ldown = false
+    app.sliders[0].dragging = false
+
+    // 进度条跟随滑块（业务联动示例）
+    app.bars[0].set_value(app.sliders[0].value)
+    if app.bars[0].value != app.sliders[0].value
+        output("FAIL bar sync")
+        fails++
+
+    // 渲染数帧（真实事件泵 + 脏区重绘）
+    let i32 f = 0
+    while f < 60 and app.alive()
+        app.step()
+        gui_frame_sleep(app.t0)
+        f++
+    if f < 1
+        output("FAIL frames")
+        fails++
+    if app.buttons[0].clicks != 1
+        output("FAIL clicks changed during frames")
+        fails++
+
+    app.close()
+
+    if fails == 0
+        output("widgets_test: all PASS")
+        return 0
+    output(fails, " failures")
+    return 1

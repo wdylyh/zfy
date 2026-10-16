@@ -1488,6 +1488,24 @@ and check_expr env (e : expr) : texpr =
                      (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
                      let (targs, origs, modes) = check_args_modes env args in
                      check_call env p' name targs origs modes)))))
+     | EField (b, seg, pp) ->
+       (* 元素/表达式接收者的方法调用（v3.3.8）：arr[i].m(...) / a.b[i].m(...)。
+          基为 struct（或 struct 指针）且 seg 命中方法表 → 脱糖为
+          <S>__m(ref recv, args)（接收者按引用传：值 struct 走 CRef 取
+          元素地址，指针接收者直接传指针值）；否则维持 unsupported callee *)
+       let tb = check_expr env b in
+       (match resolve tb.ety with
+        | TStruct s ->
+          (match Hashtbl.find_opt method_tbl (s, seg) with
+           | Some gname ->
+             check_expr env (ECall (EVar (gname, pp), CRef b :: args, pp))
+           | None -> terr pp "unsupported callee expression")
+        | TPtr (TStruct s) ->
+          (match Hashtbl.find_opt method_tbl (s, seg) with
+           | Some gname ->
+             check_expr env (ECall (EVar (gname, pp), CPos b :: args, pp))
+           | None -> terr pp "unsupported callee expression")
+        | _ -> terr pp "unsupported callee expression")
      | _ -> terr p' "unsupported callee expression")
   | EIndex (base, idx, p') ->
     let tb = check_expr env base in
@@ -2003,7 +2021,20 @@ and check_ref_arg env (e : expr) : texpr =
        check_expr env (EAddrOf (e, p))
      | None -> check_expr env (EAddrOf (e, p)))
   | _ ->
-    terr (pos_of_expr e) "ref can only apply to a variable (pass-by-reference needs an addressable variable)"
+    (* v3.3.8：字段链/元素等可定位表达式也可 ref（元素方法调用的接收者，
+       如 self.buttons[i].hit(...) 的接收者取元素地址） *)
+    let rec locatable (x : expr) =
+      match x with
+      | EVar _ -> true
+      | EField (bx, _, _) -> locatable bx
+      | EIndex (bx, _, _) -> locatable bx
+      | EDeref (bx, _) -> locatable bx
+      | _ -> false
+    in
+    if not (locatable e) then
+      terr (pos_of_expr e)
+        "ref can only apply to a variable/field/element (pass-by-reference needs an addressable location)";
+    check_expr env (EAddrOf (e, pos_of_expr e))
 
 (* 实参列表 → (类型化实参, 模式列表)：0=值 1=move（含自动 move） 2=ref 3=copy *)
 and check_args_modes env (args : call_arg list) : texpr list * expr option list * int list =
@@ -3057,6 +3088,18 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
         | t' ->
           terr dp "dereferenced augmented assignment supports only numeric/pointer types, got %s" (pp_zty t'))
      | t -> terr dp "augmented/inc/dec target must be a pointer dereference, got %s" (pp_zty t))
+  | EField _ | EIndex _ ->
+    (* v3.3.8：元素/字段链元素的复合赋值与 inc/dec（self.buttons[i].clicks++、
+       arr[i].v += 1 等）——取可定位目标的地址后按解引用复合赋值处理 *)
+    let fp = pos_of_expr lhs in
+    (match check_expr env (EAddrOf (lhs, fp)) with
+     | { ety = TPtr (TInt _ | TUint _ | TFloat _); _ } as tp ->
+       let t0 = (match resolve tp.ety with TPtr t0 -> t0 | _ -> assert false) in
+       let trhs = check_expr env rhs in
+       let trhs = coerce fp trhs t0 in
+       SAugDerefK (tp, bop, trhs)
+     | { ety = t; _ } ->
+       terr fp "augmented/inc/dec target must be a numeric scalar, got %s" (pp_zty t))
   | _ -> terr p "augmented/inc/dec target must be a variable or array/list element"
 
 (* 解包块公共检查：a（须为 TErr elem）+ 缩进块；块作用域注入 err（Err struct）。
