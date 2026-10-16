@@ -1,6 +1,19 @@
-# zfy 语言规范（v3.3.4，2026-10-11）
+# zfy 语言规范（v3.3.6，2026-10-16）
 
 > 本版每一节都经过编译器实测校准（examples 全回归通过）。
+> 与 v3.3.4 的主要差异（v3.3.5 错误报告轮 + v3.3.6 时间内建轮）：
+> **错误报告 DX（v3.3.5）**——poison 类型抑制级联（一处出错不再拖出一串
+> 附属假错）、undefined variable/function 与 struct 字段报错附
+> did-you-mean 修改建议、报错超 30 条折叠；**时间内建（v3.3.6）**——
+> `now() -> i64`（Unix 时间戳秒）、`tick_ms() -> i64`（单调时钟，进程起
+> 点为 0，测代码段耗时）、`sleep_ms(i64)`（毫秒阻塞，TVoid 可裸语句）、
+> `localtime(i64) -> datetime`（拆解本地时间，datetime 为内建 struct：
+> year/month/day/hour/minute/second/weekday/yday 全 i32，weekday
+> 0=周日）、`mktime(y,mo,d,h,mi,s) -> i64`（反向构造，各分量 i64 允许
+> 越界由 mktime 归一化——日期算术基础：`mktime(2026,10,16,0,0,0) +
+> 86400*30` 即 30 天后）。运行时 zfy_time_now/tick/sleep/local/mktime，
+> datetime 布局 8×i32 与 runtime.c zfy_datetime 一致；
+> `now`/`tick_ms`/`sleep_ms`/`localtime`/`mktime`/`datetime` 为保留名。
 > 与 v3.3.3 的主要差异（v3.3.4 语义扩展轮）：**下标/长度类内建返回 i32**——
 > `length`/`find`（`i32!`）/`utf8_len` 此前返回 i64，落 i32 槽需显式 cast；
 > **char 六种比较全支持**（`<` `<=` `>` `>=` 按码点序，此前需绕道 ord）；
@@ -415,6 +428,11 @@ fn main()
 | `pow(b, e)` | b^e（两参均 f64）。亦可写 **`b**e` 幂运算符**（v3.3）：整数走运行时快速幂（≤64 位；负指数=0；溢出回绕），任一侧为浮点/含浮点字面量则整树按浮点（f32 双侧走 powf）；**右结合** |
 | `floor(x)` / `ceil(x)` | 向下/向上取整（返回 f64） |
 | `abs(x)` | **重载**：整数→同宽整数（含 i128/u128，内联生成）；浮点→同宽浮点（f32 走 fabsf）。字面量实参树**延迟定型**（v3.3.2）：按外层期望落型（`let i32 a = |3|`、`let f32 c = |2.5|`、实参/返回上下文同理；无约束时整数 i64 / 浮点 f64）；`|e|` 运算符即本内建的语法糖 |
+| `now()` | 当前 Unix 时间戳（秒，**i64**，v3.3.6） |
+| `tick_ms()` | 单调时钟毫秒数（**i64**，进程起点为 0；QPC/CLOCK_MONOTONIC，不受系统改时间影响，测代码段耗时：`let i64 el = tick_ms() - t0`） |
+| `sleep_ms(ms)` | 阻塞 ms 毫秒（TVoid，可作裸语句；负值按 0） |
+| `localtime(ts) -> datetime` | 时间戳拆解为本地时间。**datetime 为内建 struct**（8 字段全 i32）：`year month day hour minute second weekday yday`；weekday 0=周日..6=周六；yday 年内第几天 0 起 |
+| `mktime(y,mo,d,h,mi,s)` | 反向构造时间戳（本地时区，**i64**）。各分量 i64 **允许越界**（32 日、13 月、-5 小时），由 mktime 归一化；日期算术直接在时间戳上加减秒即可。失败（越界到不可表示）返回 -1 |
 
 **数学内建说明（v3.2）**：直接落到 libm 符号（`@sqrt` `@log` `@fabs` 等）；
 `abs` 与 C 的 32 位 `abs` 无关，i128/u128 正确。

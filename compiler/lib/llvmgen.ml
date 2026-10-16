@@ -2541,6 +2541,12 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare i64 @zfy_pow_ull(i64, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_pow_u128(ptr, i64, i64, i64, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_pow_i128(ptr, i64, i64, i64, i64)\n";
+  (* 时间内建（v3.3.6）：zfy_time_local 为 sret 形态（首参 = datetime 结果槽） *)
+  Buffer.add_string g.mbuf "declare i64 @zfy_time_now()\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_time_tick()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_time_sleep(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_time_local(ptr, i64)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_time_mktime(i64, i64, i64, i64, i64, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   (* output 运行时函数 *)

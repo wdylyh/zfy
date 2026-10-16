@@ -146,7 +146,25 @@ let builtin_fns_aux : (string * (zty list * zty)) list =
       ("tan", [ TFloat 64 ], TFloat 64);
       ("floor", [ TFloat 64 ], TFloat 64);
       ("ceil", [ TFloat 64 ], TFloat 64);
-      ("pow", [ TFloat 64; TFloat 64 ], TFloat 64) ]
+      ("pow", [ TFloat 64; TFloat 64 ], TFloat 64);
+      (* 时间内建（v3.3.6）：时间戳/单调计时/阻塞/日历拆解与构造。
+         localtime 返回内建 datetime struct（8×i32，见 genv 初始化处注册）；
+         mktime 各分量 i64（整数实参天然落 i64，免窄化 cast），允许越界归一化 *)
+      ("now", [ ], TInt 64);
+      ("tick_ms", [ ], TInt 64);
+      ("sleep_ms", [ TInt 64 ], TVoid);
+      ("localtime", [ TInt 64 ], TStruct "datetime");
+      ("mktime", [ TInt 64; TInt 64; TInt 64; TInt 64; TInt 64; TInt 64 ], TInt 64) ]
+
+(* 时间内建的用户名 -> 运行时符号：zfy_ 前缀使 llvmgen 豁免自动 declare
+   （聚合返回的 declare 收集器签名不匹配 sret 调用形态），由 prelude 统一声明 *)
+let time_rt_name = function
+  | "now" -> "zfy_time_now"
+  | "tick_ms" -> "zfy_time_tick"
+  | "sleep_ms" -> "zfy_time_sleep"
+  | "localtime" -> "zfy_time_local"
+  | "mktime" -> "zfy_time_mktime"
+  | n -> n
 (* abs 不在此表：整数/f64 双重载，check_call 特判（同宽整数内联 sub+select，
    浮点走 @fabs） *)
 
@@ -1797,7 +1815,7 @@ and check_call env p name0 targs origs modes =
       (List.combine sig_.params origs)
   in
   let moves = List.map (fun m -> m = 1) modes in
-  { e = ECallK (!name, targs, moves); ety = sig_.ret; epos = p }
+  { e = ECallK (time_rt_name !name, targs, moves); ety = sig_.ret; epos = p }
 
 (* 显式 move 实参（f(move p)，change.md 1.6）：仅局部 owned 变量
    （string/数组/列表，非 const、非全局、未被 move 过）；标记该变量
@@ -3814,7 +3832,10 @@ let rec subst_ty (t : zty) : zty =
 (* 函数式内建名（用户自定义函数不得与之冲突） *)
 let builtin_names = [ "length"; "find"; "trim"; "split"; "replace"; "prec";
                       "open"; "read_all"; "read_line"; "write"; "writeln";
-                      "close"; "exists"; "read_file"; "write_file"; "read_lines" ]
+                      "close"; "exists"; "read_file"; "write_file"; "read_lines";
+                      (* 时间内建（v3.3.6）+ 内建 datetime struct 名 *)
+                      "now"; "tick_ms"; "sleep_ms"; "localtime"; "mktime";
+                      "datetime" ]
 
 (* 参数 -> zty：
    - 标量：可带 frac 修饰
@@ -3852,6 +3873,14 @@ let check_program (prog : program) : hir =
   Hashtbl.replace g.structs "Err"
     { spacked = false;
       sfields = [ ("code", TInt 32, None); ("msg", TString, None) ] };
+  (* 内建 datetime struct（v3.3.6 时间内建）：localtime 的返回类型，
+     8×i32 与 runtime.c zfy_datetime 布局一致；用户不得重名（见 builtin_names） *)
+  Hashtbl.replace g.structs "datetime"
+    { spacked = false;
+      sfields = [ ("year", TInt 32, None); ("month", TInt 32, None);
+                  ("day", TInt 32, None); ("hour", TInt 32, None);
+                  ("minute", TInt 32, None); ("second", TInt 32, None);
+                  ("weekday", TInt 32, None); ("yday", TInt 32, None) ] };
   (* 收集函数名（struct 名与函数名冲突检查用） *)
   let fn_names = Hashtbl.create 16 in
   List.iter

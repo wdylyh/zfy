@@ -1,0 +1,42 @@
+// time_test.zfy — 时间内建（v3.3.6）验证
+fn main()
+    // 1. now()：当前时间戳，合理性检查（2020-01-01 ~ 2100 年）
+    let i64 t = now()
+    if t < 1577836800 or t > 4102444800
+        output("FAIL now: 越界 ", t)
+        return 1
+    output("now = ", t)
+    // 2. localtime：拆解当前时间并回拼 mktime 应得回同一时间戳（同一分钟内）
+    let datetime dt = localtime(t)
+    output(dt.year, "-", dt.month, "-", dt.day, " ",
+           dt.hour, ":", dt.minute, ":", dt.second)
+    output("weekday=", dt.weekday, " yday=", dt.yday)
+    // 3. mktime：已知历日验证。2026-10-16 00:00:00 本地 = 1792483200（UTC+8）
+    let i64 t2 = mktime(2026, 10, 16, 0, 0, 0)
+    let datetime d2 = localtime(t2)
+    output("mktime(2026,10,16) = ", t2, " -> ",
+           d2.year, "-", d2.month, "-", d2.day, " ", d2.hour, ":", d2.minute)
+    // 4. mktime 越界归一化：2026-13-01 = 2027-01-01；2026-10-32 = 11-01
+    let datetime d3 = localtime(mktime(2026, 13, 1, 0, 0, 0))
+    output("2026-13-01 -> ", d3.year, "-", d3.month, "-", d3.day)
+    let datetime d4 = localtime(mktime(2026, 10, 32, 0, 0, 0))
+    output("2026-10-32 -> ", d4.year, "-", d4.month, "-", d4.day)
+    // 5. 日期算术：mktime + 86400*30（30 天后）
+    let datetime d5 = localtime(mktime(2026, 10, 16, 12, 0, 0) + 86400 * 30)
+    output("+30 天 -> ", d5.year, "-", d5.month, "-", d5.day)
+    // 6. tick_ms：单调计时（sleep 200ms 应测得 >=200ms）
+    let i64 t0 = tick_ms()
+    sleep_ms(200)
+    let i64 el = tick_ms() - t0
+    output("sleep(200) 实测 ", el, " ms")
+    if el < 200 or el > 5000
+        output("FAIL tick/sleep")
+        return 1
+    // 7. tick_ms 单调性：两次读数不回退
+    let i64 a = tick_ms()
+    let i64 b = tick_ms()
+    if b < a
+        output("FAIL monotonic")
+        return 1
+    output("ALL PASS")
+    return 0

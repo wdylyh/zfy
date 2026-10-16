@@ -19,6 +19,7 @@
 #include <string.h>
 #include <math.h>
 #include <malloc.h>
+#include <time.h>                    /* 时间内建（v3.3.6）：time/mktime/localtime */
 #ifdef _WIN32
 #include <io.h>                      /* _isatty（交互控制台探测） */
 #include <windows.h>                 /* OS 熵源（SystemFunction036 动态加载） */
@@ -2216,4 +2217,83 @@ void zfy_pow_i128(long long out[2],
     }
     out[0] = (unsigned long long)r;
     out[1] = (unsigned long long)(r >> 64);
+}
+
+/* ---------- 时间内建（v3.3.6）：时间戳 / 单调计时 / sleep / 日历拆解与构造 ----------
+ * datetime 布局与 LLVM %struct.datetime 一致：8 个 int32_t（32 字节），
+ * zfy_time_local 以 sret 首参写入（调用方分配槽位）。
+ * weekday: 0=周日..6=周六（tm_wday 语义）；yday: 年内第几天，0 起（tm_yday）。 */
+typedef struct {
+    int32_t year, month, day, hour, minute, second, weekday, yday;
+} zfy_datetime;
+
+int64_t zfy_time_now(void) {
+    return (int64_t)time(NULL);
+}
+
+int64_t zfy_time_tick(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq = { { 0 } };
+    static LARGE_INTEGER start;
+    static int inited = 0;
+    if (!inited) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&start);
+        inited = 1;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    /* 先乘后除，ms 精度足够且避免溢出（freq 约 1e7，span 上限 ~2.9 万年） */
+    return (int64_t)((now.QuadPart - start.QuadPart) * 1000 / freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
+void zfy_time_sleep(int64_t ms) {
+    if (ms < 0) ms = 0;
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec req;
+    req.tv_sec = (time_t)(ms / 1000);
+    req.tv_nsec = (long)((ms % 1000) * 1000000L);
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) { /* 重试剩余部分 */ }
+#endif
+}
+
+void zfy_time_local(zfy_datetime *out, int64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm tmv;
+#ifdef _WIN32
+    if (localtime_s(&tmv, &t) != 0) { memset(&tmv, 0, sizeof(tmv)); }
+#else
+    if (localtime_r(&t, &tmv) == NULL) { memset(&tmv, 0, sizeof(tmv)); }
+#endif
+    out->year   = (int32_t)(tmv.tm_year + 1900);
+    out->month  = (int32_t)(tmv.tm_mon + 1);
+    out->day    = (int32_t)tmv.tm_mday;
+    out->hour   = (int32_t)tmv.tm_hour;
+    out->minute = (int32_t)tmv.tm_min;
+    out->second = (int32_t)tmv.tm_sec;
+    out->weekday = (int32_t)tmv.tm_wday;
+    out->yday   = (int32_t)tmv.tm_yday;
+}
+
+int64_t zfy_time_mktime(int64_t y, int64_t mo, int64_t d,
+                        int64_t h, int64_t mi, int64_t s) {
+    /* 各分量允许越界（32 日、13 月等），由 mktime 归一化——日期算术的基础 */
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    tmv.tm_year = (int)(y - 1900);
+    tmv.tm_mon  = (int)(mo - 1);
+    tmv.tm_mday = (int)d;
+    tmv.tm_hour = (int)h;
+    tmv.tm_min  = (int)mi;
+    tmv.tm_sec  = (int)s;
+    tmv.tm_isdst = -1;   /* 交由系统判定夏令时 */
+    time_t t = mktime(&tmv);
+    return (t == (time_t)-1) ? -1 : (int64_t)t;
 }
