@@ -1,10 +1,11 @@
-// demos/calculator.zfy —— zfy GUI 计算器（v3.3.8 组件层演示）
-// 四则状态机：数字连续输入 → 运算符左累积 → = 出结果；C 复位；除 0 报错。
-// 整数运算（i64），关闭窗口即退出。
+// demos/calculator.zfy —— zfy GUI 计算器（组件层展示应用，v3.3.9）
+// 特性：响应式布局（拖拽窗口边缘可任意缩放，按键网格随尺寸重排）
+//       DPI 感知（150%/200% 缩放下不模糊）
+// 逻辑：四则左累积状态机，i64 整数运算，除 0 报错复位。关闭窗口即退出。
 mod gui;
 mod widgets;
-use widgets::{App, Label, Button}
-use gui::{gui_frame_sleep}
+use widgets::{App, Label, Button, SC, C_BG}
+use gui::{gui_w, gui_h, gui_fill_rect, gui_frame_sleep}
 
 // 按键布局（j 0..15）：
 //   7 8 9 ÷ / 4 5 6 × / 1 2 3 − / C 0 = +
@@ -21,18 +22,18 @@ fn i64 apply(let i64 a, let i64 b, let i32 op)
 
 fn main()
     let App app = App()
-    if app.open(258, 300, "zfy 计算器") != 0
+    if app.open(280, 340, "zfy 计算器") != 0
         output("无法创建窗口")
         return 1
 
-    let Label title = Label(x=16, y=8, text="zfy 计算器（整数运算）")
+    let Label title = Label(x=12, y=8, text="zfy 计算器（整数运算）")
     app.add_label(title)
-    let Label expr = Label(x=16, y=34, text="")      // 已累积的运算式
+    let Label expr = Label(x=12, y=34, text="")      // 已累积的运算式
     app.add_label(expr)
-    let Label disp = Label(x=16, y=58, text="0")     // 当前输入 / 结果
+    let Label disp = Label(x=12, y=62, text="0")     // 当前输入 / 结果
     app.add_label(disp)
 
-    // 16 个按键，4x4 网格
+    // 16 个按键
     let string[] keys = "7", "8", "9", "÷", "4", "5", "6", "×", "1", "2", "3", "−", "C", "0", "=", "+"
     let i32[] dig = 7, 8, 9, -1, 4, 5, 6, -1, 1, 2, 3, -1, -1, 0, -1, -1
     let i32[] opv = -1, -1, -1, 3, -1, -1, -1, 2, -1, -1, -1, 1, -1, -1, -2, 0
@@ -40,9 +41,7 @@ fn main()
 
     let i32 j = 0
     while j < 16
-        let i32 col = j % 4
-        let i32 row = j / 4
-        let Button b = Button(x=16 + col * 58, y=88 + row * 50, w=52, h=44, text=keys[j])
+        let Button b = Button(x=0, y=0, w=10, h=10, text=keys[j])
         app.add_button(b)
         j++
 
@@ -54,8 +53,45 @@ fn main()
     let i32 op = -1          // 待执行运算（-1 无）
     let bool entering = false
 
+    // 响应式布局：窗口尺寸变化时重排（也覆盖首帧）
+    let i32 last_w = 0
+    let i32 last_h = 0
+
     while app.alive()
         app.t0 = tick_ms()
+
+        let i32 W = gui_w()
+        let i32 H = gui_h()
+        if W != last_w or H != last_h
+            last_w = W
+            last_h = H
+            let i32 u = SC()
+            let i32 margin = 12 * u / 100
+            let i32 gap = 6 * u / 100
+            let i32 disp_h = 96 * u / 100        // 顶部显示屏区高
+            app.labels[0].x = margin
+            app.labels[0].y = 8 * u / 100
+            app.labels[1].x = margin
+            app.labels[1].y = 34 * u / 100
+            app.labels[2].x = margin
+            app.labels[2].y = 62 * u / 100
+            // 显示屏标签清屏宽度 = 整行，防文本变短残影
+            app.labels[1].bg_w = W - margin
+            app.labels[2].bg_w = W - margin
+            let i32 grid_top = disp_h
+            let i32 bw = (W - 2 * margin - 3 * gap) / 4
+            let i32 bh = (H - margin - grid_top - 3 * gap) / 4
+            j = 0
+            while j < 16
+                let i32 col = j % 4
+                let i32 row = j / 4
+                app.buttons[j].x = margin + col * (bw + gap)
+                app.buttons[j].y = grid_top + row * (bh + gap)
+                app.buttons[j].w = bw
+                app.buttons[j].h = bh
+                j++
+            gui_fill_rect(0, 0, W, H, C_BG)
+            app.invalidate_all()
 
         // 找出本帧被点击的按键
         j = 0

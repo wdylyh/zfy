@@ -2555,6 +2555,7 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare i32 @zfy_gui_should_close()\n";
   Buffer.add_string g.mbuf "declare i32 @zfy_gui_w()\n";
   Buffer.add_string g.mbuf "declare i32 @zfy_gui_h()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_dpi()\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_close()\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_title(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_present()\n";

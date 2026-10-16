@@ -2,15 +2,16 @@
 // 断言：开窗/alive/绘图不崩/poll 泵消息/关闭后 alive=0；全部通过 exit 0
 mod gui;
 
-use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, Event, EV_MOVE, EV_LDOWN, EV_KEY}
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, Event, EV_MOVE, EV_LDOWN, EV_KEY}
 
 fn main()
     let i32 rc = gui_open(480, 300, "zfy gui smoke")
     if rc != 0
         output("FAIL open rc=", rc)
         return 1
-    if gui_w() != 480 or gui_h() != 300
-        output("FAIL size")
+    // gui_open 的 w/h 为逻辑尺寸，实际客户区按 DPI 缩放为物理像素
+    if gui_w() != 480 * gui_dpi() / 96 or gui_h() != 300 * gui_dpi() / 96
+        output("FAIL size w=", gui_w(), " h=", gui_h(), " dpi=", gui_dpi())
         return 1
     // 画 90 帧：背景 + 描边矩形 + 文本（中文 + 英文 + 宽度测量）
     let i32 frames = 0
@@ -45,9 +46,10 @@ fn main()
     if gui_alive()
         output("FAIL alive after close")
         return 1
-    // 宽度测量合理性（16px 雅黑：该串应 > 60px 且 < 300px）
-    if tw < 60 or tw > 300
-        output("FAIL text width=", tw)
+    // 宽度测量合理性（16 逻辑px × DPI 雅黑：该串逻辑 60..300 → 物理 × dpi/96）
+    let i32 twl = tw * 96 / gui_dpi()
+    if twl < 60 or twl > 300
+        output("FAIL text width=", twl, " (logical, dpi=", gui_dpi(), ")")
         return 1
     output("gui smoke PASS: 90 帧, move 事件 ", moves, ", key 事件 ", keys, ", text_w=", tw)
     return 0

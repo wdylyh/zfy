@@ -81,3 +81,13 @@ Slider、ProgressBar、ListBox、MenuBar。参照 gui_demo.zfy 的 Button 写法
   mod 内方法 struct 参数 E3001 + mir 取址泛化）
 - [ ] M3：L3 应用框架 + 两个真实小软件（记事本/计算器）
 - [ ] M4：resize、剪贴板、多窗口、图标、Checkbox/MenuBar 组件
+  - **resize 已完成（v3.3.9）**：WS_THICKFRAME 可调窗口 + WM_SIZE 重建 DIB +
+    EV_SIZE 事件；业务每帧比对 gui_w()/gui_h() 自行重排（calculator 即范例）
+- [x] M4a（v3.3.9）渲染正确性修复（计算器 demo 实测暴露，PrintWindow+像素聚类定位）：
+  - **fill_rect 双重偏移**：row 指针已含 +x0，循环又从 x0 起 → 所有矩形右移自身
+    x 倍（按钮重合的根源）；改为 `for x in 0..span`
+  - **颜色通道**：DIB 32bpp 小端 DWORD 恰为 0xRRGGBB，删掉多余 R/B 交换；
+    draw_text 的 COLORREF(0x00BBGGRR) 反之必须交换——两处此前各错各的
+  - **DPI 感知**：Per-Monitor V2（退回 SetProcessDPIAware）；gui_open 的 w/h 为
+    逻辑尺寸，内部 ×dpi/96 成物理像素，字体同步缩放；新增 gui_dpi()；
+    widgets 组件内部尺寸全部经 SC()（=dpi*100/96）换算——150% 屏不糊不小

@@ -30,6 +30,7 @@ pub let i32 const EV_RDOWN = 4
 pub let i32 const EV_RUP = 5
 pub let i32 const EV_KEY = 6       // key = UTF-16 码元（WM_CHAR）
 pub let i32 const EV_WHEEL = 7     // key = 滚动增量（正=向上）
+pub let i32 const EV_SIZE = 8      // x,y = 新客户区宽高（resize/DPI 变化）
 
 // 鼠标/键盘事件（gui_poll 填充）
 pub struct Event
@@ -53,6 +54,7 @@ extern "C"
     i32 zfy_gui_should_close()
     i32 zfy_gui_w()
     i32 zfy_gui_h()
+    i32 zfy_gui_dpi()
     void zfy_gui_close()
     void zfy_gui_title(let string title)
     // 提交整帧（BitBlt）。每帧画完后调用一次
@@ -80,6 +82,10 @@ pub fn i32 gui_w()
 
 pub fn i32 gui_h()
     return zfy_gui_h()
+
+// 系统 DPI（96=100% 缩放）。布局尺寸用它换算：物理 = 逻辑 * dpi / 96
+pub fn i32 gui_dpi()
+    return zfy_gui_dpi()
 
 pub fn void gui_close()
     zfy_gui_close()

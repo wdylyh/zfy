@@ -21,7 +21,7 @@
 //       app.close()
 
 
-use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_KEY, EV_WHEEL}
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_KEY, EV_WHEEL}
 
 // ===== 主题配色 =====
 pub let u32 const C_BG      = 0x1E1E24   // 窗口背景
@@ -33,8 +33,13 @@ pub let u32 const C_HOT     = 0x3A8FE8   // 悬停
 pub let u32 const C_DOWN    = 0x1F5FA8   // 按下
 pub let u32 const C_OK      = 0x3FA060   // 绿
 
-// 文本行高（雅黑 16px）
-let i32 LH = 22
+// 界面缩放：96dpi=100。组件内部尺寸一律 逻辑值 * SC() / 100
+pub fn i32 SC()
+    return gui_dpi() * 100 / 96
+
+// 文本行高（雅黑 16 逻辑px）——按 DPI 缩放后的物理值
+fn i32 LH()
+    return 22 * SC() / 100
 
 // ===== Label：静态文本 =====
 pub struct Label
@@ -42,11 +47,15 @@ pub struct Label
     i32 y
     string text
     u32 color = C_TEXT
+    i32 bg_w = 0         // 清屏宽度：0=按当前文本宽度；文本会变短时设大可防残影
     bool dirty = true
 
     fn void draw()
         let i32 tw = gui_text_w(self.text)
-        gui_fill_rect(self.x - 2, self.y - 2, tw + 4, LH, C_BG)
+        let i32 cw = self.bg_w
+        if cw <= 0
+            cw = tw + 4
+        gui_fill_rect(self.x - 2, self.y - 2, cw + 2, LH(), C_BG)
         gui_draw_text(self.x, self.y, self.text, self.color)
         self.dirty = false
 
@@ -79,7 +88,7 @@ pub struct Button
         gui_fill_rect(self.x, self.y, self.w, self.h, fill)
         gui_rect(self.x, self.y, self.w, self.h, C_BORDER)
         let i32 tw = gui_text_w(self.text)
-        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - LH) / 2 + 2, self.text, C_TEXT)
+        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - LH()) / 2 + 2 * SC() / 100, self.text, C_TEXT)
         self.dirty = false
 
 // ===== InputBox：单行文本框（点击聚焦，Backspace 退格，按键追加） =====
@@ -92,7 +101,7 @@ pub struct InputBox
     bool dirty = true
 
     fn bool hit(let i32 mx, let i32 my)
-        return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + LH + 8
+        return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + LH() + 8 * SC() / 100
 
     fn void set_focus(let bool f)
         if self.focus != f
@@ -121,15 +130,16 @@ pub struct InputBox
         return false
 
     fn void draw()
-        gui_fill_rect(self.x, self.y, self.w, LH + 8, C_PANEL)
+        let i32 hh = LH() + 8 * SC() / 100
+        gui_fill_rect(self.x, self.y, self.w, hh, C_PANEL)
         if self.focus
-            gui_rect(self.x, self.y, self.w, LH + 8, C_ACCENT)
+            gui_rect(self.x, self.y, self.w, hh, C_ACCENT)
         else
-            gui_rect(self.x, self.y, self.w, LH + 8, C_BORDER)
-        gui_draw_text(self.x + 6, self.y + 5, self.text, C_TEXT)
+            gui_rect(self.x, self.y, self.w, hh, C_BORDER)
+        gui_draw_text(self.x + 6 * SC() / 100, self.y + 5 * SC() / 100, self.text, C_TEXT)
         if self.focus
             let i32 tw = gui_text_w(self.text)
-            gui_fill_rect(self.x + 8 + tw, self.y + 5, 2, LH - 4, C_TEXT)
+            gui_fill_rect(self.x + 8 * SC() / 100 + tw, self.y + 5 * SC() / 100, 2 * SC() / 100, LH() - 4 * SC() / 100, C_TEXT)
         self.dirty = false
 
 // ===== Slider：拖动滑块，value 0..100 =====
@@ -153,18 +163,19 @@ pub struct Slider
 
     // 命中判定（含上下 6px 容差）
     fn bool hit_wide(let i32 mx, let i32 my)
-        return mx >= self.x and mx < self.x + self.w and my >= self.y - 6 and my < self.y + 26
+        return mx >= self.x and mx < self.x + self.w and my >= self.y - 6 * SC() / 100 and my < self.y + 26 * SC() / 100
 
     fn void draw()
-        gui_fill_rect(self.x, self.y + 8, self.w, 4, C_PANEL)
-        gui_rect(self.x, self.y + 8, self.w, 4, C_BORDER)
-        let i32 fx = self.x + (self.w - 2) * self.value / 100
+        let i32 u = SC()
+        gui_fill_rect(self.x, self.y + 8 * u / 100, self.w, 4 * u / 100, C_PANEL)
+        gui_rect(self.x, self.y + 8 * u / 100, self.w, 4 * u / 100, C_BORDER)
+        let i32 fx = self.x + (self.w - 2 * u / 100) * self.value / 100
         if fx > self.x
-            gui_fill_rect(self.x, self.y + 8, fx - self.x, 4, C_ACCENT)
+            gui_fill_rect(self.x, self.y + 8 * u / 100, fx - self.x, 4 * u / 100, C_ACCENT)
         if self.dragging
-            gui_fill_rect(fx - 5, self.y, 10, 20, C_HOT)
+            gui_fill_rect(fx - 5 * u / 100, self.y, 10 * u / 100, 20 * u / 100, C_HOT)
         else
-            gui_fill_rect(fx - 5, self.y, 10, 20, C_ACCENT)
+            gui_fill_rect(fx - 5 * u / 100, self.y, 10 * u / 100, 20 * u / 100, C_ACCENT)
         self.dirty = false
 
 // ===== ProgressBar：进度条 =====
@@ -187,11 +198,12 @@ pub struct ProgressBar
             self.dirty = true
 
     fn void draw()
-        gui_fill_rect(self.x, self.y, self.w, 18, C_PANEL)
-        gui_rect(self.x, self.y, self.w, 18, C_BORDER)
-        let i32 fw = (self.w - 4) * self.value / 100
+        let i32 u = SC()
+        gui_fill_rect(self.x, self.y, self.w, 18 * u / 100, C_PANEL)
+        gui_rect(self.x, self.y, self.w, 18 * u / 100, C_BORDER)
+        let i32 fw = (self.w - 4 * u / 100) * self.value / 100
         if fw > 0
-            gui_fill_rect(self.x + 2, self.y + 2, fw, 14, self.color)
+            gui_fill_rect(self.x + 2 * u / 100, self.y + 2 * u / 100, fw, 14 * u / 100, self.color)
         self.dirty = false
 
 // ===== ListBox：字符串列表（滚轮滚动，点击选中） =====
@@ -230,7 +242,7 @@ pub struct ListBox
             self.dirty = true
 
     fn void draw()
-        let i32 hgt = self.rows * LH + 8
+        let i32 hgt = self.rows * LH() + 8 * SC() / 100
         gui_fill_rect(self.x, self.y, self.w, hgt, C_PANEL)
         gui_rect(self.x, self.y, self.w, hgt, C_BORDER)
         let i32 n = length(self.items)
@@ -240,12 +252,12 @@ pub struct ListBox
         let i32 i = self.top
         while i < last
             let i32 row = i - self.top
-            let i32 ry = self.y + 4 + row * LH
+            let i32 ry = self.y + 4 * SC() / 100 + row * LH()
             if i == self.sel
-                gui_fill_rect(self.x + 2, ry - 1, self.w - 4, LH, C_ACCENT)
-                gui_draw_text(self.x + 8, ry, self.items[i], 0xFFFFFF)
+                gui_fill_rect(self.x + 2 * SC() / 100, ry - 1, self.w - 4 * SC() / 100, LH(), C_ACCENT)
+                gui_draw_text(self.x + 8 * SC() / 100, ry, self.items[i], 0xFFFFFF)
             else
-                gui_draw_text(self.x + 8, ry, self.items[i], C_TEXT)
+                gui_draw_text(self.x + 8 * SC() / 100, ry, self.items[i], C_TEXT)
             i++
         self.dirty = false
 
@@ -413,9 +425,9 @@ pub struct App
         while i < length(self.lists)
             if press and self.mx >= self.lists[i].x and self.mx < self.lists[i].x + self.lists[i].w
                 let i32 rows = length(self.lists[i].items)
-                let i32 hgt = self.lists[i].rows * LH + 8
+                let i32 hgt = self.lists[i].rows * LH() + 8 * SC() / 100
                 if self.my >= self.lists[i].y and self.my < self.lists[i].y + hgt
-                    let i32 row = (self.my - self.lists[i].y - 4) / LH
+                    let i32 row = (self.my - self.lists[i].y - 4 * SC() / 100) / LH()
                     let i32 idx = self.lists[i].top + row
                     if row >= 0 and idx < rows
                         self.lists[i].sel = idx

@@ -2305,8 +2305,11 @@ int64_t zfy_time_mktime(int64_t y, int64_t mo, int64_t d,
  *    支持中文/抗锯齿）；present 单次 BitBlt 提交整帧
  *  - 事件：环形队列（WndProc 生产、poll 消费），轮询模型 O(1)
  *  - 单线程模型：poll() 顺带泵消息，用户每帧至少 poll 一次
- *  - 颜色约定：zfy 侧 0xRRGGBB；帧缓冲 dword = (B<<16)|(G<<8)|R（DIB 内存序）
- *  - 固定客户区尺寸（Phase 2 再做 resize + DIB 重建 + damage 跟踪） */
+ *  - 颜色约定：zfy 侧 0xRRGGBB；帧缓冲 dword = 0x00RRGGBB（DIB 32bpp 内存序
+ *    为 B,G,R，小端 DWORD 恰好还原 RRGGBB——不做通道交换）
+ *  - DPI 感知：Per-Monitor V2（旧系统退回 SetProcessDPIAware），
+ *    open 的 w/h 按 dpi 缩放为物理像素，无 DWM 拉伸模糊；gui_dpi() 供布局缩放
+ *  - 可调窗口：WM_SIZE 时重建 DIB 并推 EV_SIZE 事件（x=新宽, y=新高） */
 #ifdef _WIN32
 #include <wchar.h>                     /* wcslen（GUI 文本转换） */
 
@@ -2323,6 +2326,7 @@ static volatile long g_gui_qh = 0, g_gui_qt = 0;   /* head=读, tail=写 */
 #define GUI_EV_RUP   5
 #define GUI_EV_KEY   6
 #define GUI_EV_WHEEL 7
+#define GUI_EV_SIZE  8
 
 static HWND    g_gui_hwnd = NULL;
 static HDC     g_gui_win_dc = NULL;
@@ -2331,6 +2335,7 @@ static HBITMAP g_gui_bmp = NULL, g_gui_oldbmp = NULL;
 static HFONT   g_gui_font = NULL, g_gui_oldfont = NULL;
 static uint32_t *g_gui_fb = NULL;
 static int g_gui_w = 0, g_gui_h = 0;
+static int g_gui_dpi = 96;
 static volatile int g_gui_alive = 0, g_gui_should_close = 0;
 
 static void gui_push_ev(int64_t t, int64_t x, int64_t y, int64_t k) {
@@ -2341,8 +2346,40 @@ static void gui_push_ev(int64_t t, int64_t x, int64_t y, int64_t k) {
     g_gui_qt = nxt;
 }
 
+/* 重建 DIB 帧缓冲（open 首建与 WM_SIZE 缩放共用） */
+static void gui_recreate_surface(int w, int h) {
+    if (!g_gui_mem) return;
+    if (g_gui_bmp) {
+        SelectObject(g_gui_mem, g_gui_oldbmp);
+        DeleteObject(g_gui_bmp);
+        g_gui_bmp = NULL;
+    }
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;            /* top-down：原点左上 */
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_gui_bmp = CreateDIBSection(g_gui_mem, &bi, DIB_RGB_COLORS, (void **)&g_gui_fb, NULL, 0);
+    g_gui_oldbmp = (HBITMAP)SelectObject(g_gui_mem, g_gui_bmp);
+    g_gui_w = w; g_gui_h = h;
+    if (g_gui_fb) memset(g_gui_fb, 0, (size_t)w * (size_t)h * 4);
+}
+
 static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_SIZE:
+        /* 最小化不重建；尺寸变化时换新 DIB 并通知业务层重布局 */
+        if (g_gui_alive && wp != SIZE_MINIMIZED) {
+            int nw = LOWORD(lp), nh = HIWORD(lp);
+            if (nw > 0 && nh > 0 && (nw != g_gui_w || nh != g_gui_h)) {
+                gui_recreate_surface(nw, nh);
+                gui_push_ev(GUI_EV_SIZE, nw, nh, 0);
+            }
+        }
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hw, &ps);
@@ -2402,31 +2439,38 @@ int32_t zfy_gui_open(int32_t w, int32_t h, char *title_utf8) {
         class_registered = 1;
     }
     wchar_t *wt = gui_utf8_to_wide(title_utf8 ? title_utf8 : "zfy");
-    /* 固定尺寸：客户区精确为 w x h（无 thickframe，Phase 2 再支持 resize） */
+    /* DPI 感知（进程级一次性）：Per-Monitor V2 优先，旧系统退回 SetProcessDPIAware。
+       之后 w/h 是物理像素，DWM 不再拉伸——文字与像素逐一对齐，不糊 */
+    typedef BOOL (WINAPI *SPDACfn)(void *);
+    SPDACfn spdac = (SPDACfn)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                                    "SetProcessDpiAwarenessContext");
+    if (spdac) spdac((void *)(INT_PTR)-4);       /* PER_MONITOR_AWARE_V2 */
+    else SetProcessDPIAware();
+    {
+        HDC sdc = GetDC(NULL);
+        g_gui_dpi = GetDeviceCaps(sdc, LOGPIXELSX);
+        ReleaseDC(NULL, sdc);
+    }
+    if (g_gui_dpi <= 0) g_gui_dpi = 96;
+    w = w * g_gui_dpi / 96;                /* 逻辑尺寸 → 物理尺寸 */
+    h = h * g_gui_dpi / 96;
+    /* 可调尺寸窗口：客户区初始为 w x h */
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX | WS_THICKFRAME;
     RECT rc = { 0, 0, w, h };
-    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 0);
+    AdjustWindowRect(&rc, style, 0);
     g_gui_hwnd = CreateWindowW(L"ZfyGuiWindow", wt,
-                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                               style,
                                CW_USEDEFAULT, CW_USEDEFAULT,
                                rc.right - rc.left, rc.bottom - rc.top,
                                NULL, NULL, GetModuleHandleW(NULL), NULL);
     free(wt);
     if (!g_gui_hwnd) return -4;
-    g_gui_w = w; g_gui_h = h;
     g_gui_win_dc = GetDC(g_gui_hwnd);
     g_gui_mem = CreateCompatibleDC(g_gui_win_dc);
-    BITMAPINFO bi;
-    memset(&bi, 0, sizeof(bi));
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;            /* top-down：原点左上，与 UI 坐标一致 */
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    g_gui_bmp = CreateDIBSection(g_gui_mem, &bi, DIB_RGB_COLORS, (void **)&g_gui_fb, NULL, 0);
-    g_gui_oldbmp = (HBITMAP)SelectObject(g_gui_mem, g_gui_bmp);
-    /* 字体：微软雅黑 16px（覆盖中英文）；SetBkMode 在 draw_text 内保持透明 */
-    g_gui_font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+    gui_recreate_surface(w, h);            /* DIB + g_gui_w/h */
+    /* 字体：微软雅黑 16 逻辑px × DPI（覆盖中英文）；SetBkMode 在 draw_text 内保持透明 */
+    g_gui_font = CreateFontW(-16 * g_gui_dpi / 96, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
     g_gui_oldfont = (HFONT)SelectObject(g_gui_mem, g_gui_font);
@@ -2457,6 +2501,7 @@ int32_t zfy_gui_alive(void)        { return g_gui_alive; }
 int32_t zfy_gui_should_close(void) { return g_gui_should_close; }
 int32_t zfy_gui_w(void)            { return g_gui_w; }
 int32_t zfy_gui_h(void)            { return g_gui_h; }
+int32_t zfy_gui_dpi(void)          { return g_gui_dpi; }
 
 void zfy_gui_close(void) {
     if (g_gui_hwnd) { DestroyWindow(g_gui_hwnd); g_gui_hwnd = NULL; }
@@ -2482,18 +2527,21 @@ void zfy_gui_fill_rect(int32_t rx, int32_t ry, int32_t rw, int32_t rh, uint32_t 
     int x1 = (rx + rw) > g_gui_w ? g_gui_w : (rx + rw);
     int y1 = (ry + rh) > g_gui_h ? g_gui_h : (ry + rh);
     if (x0 >= x1 || y0 >= y1) return;
-    uint32_t pix = ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
+    /* DIB 32bpp 小端 DWORD 恰为 0x00RRGGBB——直接用，不换通道 */
+    uint32_t pix = 0xFF000000u | rgb;
+    int span = x1 - x0;
     for (int y = y0; y < y1; y++) {
         uint32_t *row = g_gui_fb + (size_t)y * g_gui_w + x0;
-        for (int x = x0; x < x1; x++) row[x] = pix;
+        for (int x = 0; x < span; x++) row[x] = pix;
     }
 }
 
 void zfy_gui_draw_text(int32_t tx, int32_t ty, char *utf8, uint32_t rgb) {
     if (!g_gui_mem) return;
     wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
-    COLORREF old = SetTextColor(g_gui_mem,
-        (COLORREF)((rgb & 0xFF) | (rgb & 0xFF00) | (((rgb >> 16) & 0xFF) << 16)));
+    /* COLORREF = 0x00BBGGRR：R 在低字节，与 0xRRGGBB 相反，需交换 */
+    COLORREF cr = ((rgb >> 16) & 0xFF) | (rgb & 0xFF00) | ((rgb & 0xFF) << 16);
+    COLORREF old = SetTextColor(g_gui_mem, cr);
     TextOutW(g_gui_mem, tx, ty, wt, (int)wcslen(wt));
     SetTextColor(g_gui_mem, old);
     free(wt);
@@ -2516,6 +2564,7 @@ int32_t zfy_gui_alive(void) { return 0; }
 int32_t zfy_gui_should_close(void) { return 1; }
 int32_t zfy_gui_w(void) { return 0; }
 int32_t zfy_gui_h(void) { return 0; }
+int32_t zfy_gui_dpi(void) { return 96; }
 void zfy_gui_close(void) {}
 void zfy_gui_title(char *s) { (void)s; }
 void zfy_gui_present(void) {}
