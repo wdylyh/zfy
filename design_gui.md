@@ -87,10 +87,21 @@ Slider、ProgressBar、ListBox、MenuBar。参照 gui_demo.zfy 的 Button 写法
     cond（和 for update）在 ldepth=0 下检查，"最后使用即 move"把条件里的
     字符串实参误判为可 move（store null 清槽），下一轮迭代 load null 段错误。
     修复：条件与 update 子句检查时同样提升 ldepth
-- [ ] M4：多窗口、图标、MenuBar 组件
+- [x] M4（v3.4.0）：多窗口、图标、MenuBar 全部完成
   - resize 已完成（v3.3.9）：WS_THICKFRAME 可调窗口 + WM_SIZE 重建 DIB +
     EV_SIZE 事件；业务每帧比对 gui_w()/gui_h() 自行重排（calculator 即范例）
   - 剪贴板已完成（v3.3.10，见 M3）；Checkbox 已完成（v3.3.10）
+  - **多窗口（v3.4.0）**：runtime 窗口状态数组（≤8 窗）+ WndProc 经
+    GWLP_USERDATA 找回窗口，每窗独立 DIB/字体/事件环形队列；绘制类 API
+    作用于"当前窗口"（gui_select 切换）；gui_open 保持 0=成功兼容语义，
+    句柄经 gui_self() 取；gui_alive_any() 判全灭。gui_multi_test.zfy 入回归
+  - **图标**：gui_set_icon(path)（LoadImage LR_LOADFROMFILE + WM_SETICON
+    大小双设）；demos/zfy.ico
+  - **MenuBar**：Menu（title/items/x/tw/sel/clicks/open）+ App.add_menu/
+    layout_menus/menu_bar_h/menu_item_at/menu_item_w/draw_menu_bar；
+    点击标题开合下拉、条目命中回写 sel+clicks++（业务读差值）、空白处点击
+    全关；悬停高亮随 EV_MOVE 刷新。notepad 升级菜单栏版（文件/编辑）
+  - 顺带修 App.step 不刷新 t0 的 CPU 空转（每帧开始 self.t0 = tick_ms()）
 - [x] M4a（v3.3.9）渲染正确性修复（计算器 demo 实测暴露，PrintWindow+像素聚类定位）：
   - **fill_rect 双重偏移**：row 指针已含 +x0，循环又从 x0 起 → 所有矩形右移自身
     x 倍（按钮重合的根源）；改为 `for x in 0..span`

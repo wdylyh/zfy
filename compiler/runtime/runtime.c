@@ -2315,8 +2315,6 @@ int64_t zfy_time_mktime(int64_t y, int64_t mo, int64_t d,
 
 typedef struct { int64_t t, x, y, k; } gui_ev;
 #define GUI_EVQ 256
-static gui_ev g_gui_q[GUI_EVQ];
-static volatile long g_gui_qh = 0, g_gui_qt = 0;   /* head=读, tail=写 */
 
 /* 事件类型常量（与 stdlib/gui.zfy 保持一致） */
 #define GUI_EV_MOVE  1
@@ -2333,105 +2331,120 @@ static volatile long g_gui_qh = 0, g_gui_qt = 0;   /* head=读, tail=写 */
  *   GUI_KEY_CTRL | 'C'  —— Ctrl 组合键（VK 大写字母） */
 #define GUI_KEY_EXT  0x10000000
 #define GUI_KEY_CTRL 0x20000000
-#define GUI_EV_SIZE  8
 
-static HWND    g_gui_hwnd = NULL;
-static HDC     g_gui_win_dc = NULL;
-static HDC     g_gui_mem = NULL;
-static HBITMAP g_gui_bmp = NULL, g_gui_oldbmp = NULL;
-static HFONT   g_gui_font = NULL, g_gui_oldfont = NULL;
-static uint32_t *g_gui_fb = NULL;
-static int g_gui_w = 0, g_gui_h = 0;
-static int g_gui_dpi = 96;
-static volatile int g_gui_alive = 0, g_gui_should_close = 0;
+/* 多窗口（v3.4）：窗口状态集中管理，WndProc 经 GWLP_USERDATA 找回窗口。
+ * 绘制类 API 作用于"当前窗口" g_cur（gui_select 切换）；gui_open 保持
+ * 返回 0=成功 的兼容语义，句柄经 zfy_gui_self() 取。 */
+#define GUI_MAXWIN 8
+typedef struct {
+    int used;
+    HWND hwnd;
+    HDC win_dc, mem;
+    HBITMAP bmp, oldbmp;
+    HFONT font, oldfont;
+    uint32_t *fb;
+    int w, h, dpi;
+    volatile int alive, should_close;
+    gui_ev q[GUI_EVQ];
+    volatile long qh, qt;
+} gui_win;
+static gui_win g_wins[GUI_MAXWIN];
+static gui_win *g_cur = NULL;
 
-static void gui_push_ev(int64_t t, int64_t x, int64_t y, int64_t k) {
-    long nxt = (g_gui_qt + 1) % GUI_EVQ;
-    if (nxt == g_gui_qh) return;          /* 队列满：丢弃新事件（UI 帧率高不会积压） */
-    g_gui_q[g_gui_qt].t = t; g_gui_q[g_gui_qt].x = x;
-    g_gui_q[g_gui_qt].y = y; g_gui_q[g_gui_qt].k = k;
-    g_gui_qt = nxt;
+static void gui_push_ev(gui_win *w, int64_t t, int64_t x, int64_t y, int64_t k) {
+    long nxt = (w->qt + 1) % GUI_EVQ;
+    if (nxt == w->qh) return;              /* 队列满：丢弃新事件 */
+    w->q[w->qt].t = t; w->q[w->qt].x = x;
+    w->q[w->qt].y = y; w->q[w->qt].k = k;
+    w->qt = nxt;
 }
 
 /* 重建 DIB 帧缓冲（open 首建与 WM_SIZE 缩放共用） */
-static void gui_recreate_surface(int w, int h) {
-    if (!g_gui_mem) return;
-    if (g_gui_bmp) {
-        SelectObject(g_gui_mem, g_gui_oldbmp);
-        DeleteObject(g_gui_bmp);
-        g_gui_bmp = NULL;
+static void gui_recreate_surface(gui_win *w, int nw, int nh) {
+    if (!w->mem) return;
+    if (w->bmp) {
+        SelectObject(w->mem, w->oldbmp);
+        DeleteObject(w->bmp);
+        w->bmp = NULL;
     }
     BITMAPINFO bi;
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;            /* top-down：原点左上 */
+    bi.bmiHeader.biWidth = nw;
+    bi.bmiHeader.biHeight = -nh;           /* top-down：原点左上 */
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
-    g_gui_bmp = CreateDIBSection(g_gui_mem, &bi, DIB_RGB_COLORS, (void **)&g_gui_fb, NULL, 0);
-    g_gui_oldbmp = (HBITMAP)SelectObject(g_gui_mem, g_gui_bmp);
-    g_gui_w = w; g_gui_h = h;
-    if (g_gui_fb) memset(g_gui_fb, 0, (size_t)w * (size_t)h * 4);
+    w->bmp = CreateDIBSection(w->mem, &bi, DIB_RGB_COLORS, (void **)&w->fb, NULL, 0);
+    w->oldbmp = (HBITMAP)SelectObject(w->mem, w->bmp);
+    w->w = nw; w->h = nh;
+    if (w->fb) memset(w->fb, 0, (size_t)nw * (size_t)nh * 4);
+}
+
+static gui_win *gui_win_of(HWND hw) {
+    return (gui_win *)(INT_PTR)GetWindowLongPtrW(hw, GWLP_USERDATA);
 }
 
 static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
+    gui_win *w = gui_win_of(hw);
+    if (!w) return DefWindowProcW(hw, msg, wp, lp);   /* 创建期消息 */
     switch (msg) {
     case WM_SIZE:
         /* 最小化不重建；尺寸变化时换新 DIB 并通知业务层重布局 */
-        if (g_gui_alive && wp != SIZE_MINIMIZED) {
+        if (w->alive && wp != SIZE_MINIMIZED) {
             int nw = LOWORD(lp), nh = HIWORD(lp);
-            if (nw > 0 && nh > 0 && (nw != g_gui_w || nh != g_gui_h)) {
-                gui_recreate_surface(nw, nh);
-                gui_push_ev(GUI_EV_SIZE, nw, nh, 0);
+            if (nw > 0 && nh > 0 && (nw != w->w || nh != w->h)) {
+                gui_recreate_surface(w, nw, nh);
+                gui_push_ev(w, GUI_EV_SIZE, nw, nh, 0);
             }
         }
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hw, &ps);
-        if (g_gui_mem)
-            BitBlt(dc, 0, 0, g_gui_w, g_gui_h, g_gui_mem, 0, 0, SRCCOPY);
+        if (w->mem)
+            BitBlt(dc, 0, 0, w->w, w->h, w->mem, 0, 0, SRCCOPY);
         EndPaint(hw, &ps);
         return 0;
     }
     case WM_ERASEBKGND:
         return 1;                          /* 防闪烁：擦背景交给 present */
     case WM_MOUSEMOVE:
-        gui_push_ev(GUI_EV_MOVE, (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0);
+        gui_push_ev(w, GUI_EV_MOVE, (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0);
         return 0;
-    case WM_LBUTTONDOWN: gui_push_ev(GUI_EV_LDOWN, (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
-    case WM_LBUTTONUP:   gui_push_ev(GUI_EV_LUP,   (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
-    case WM_RBUTTONDOWN: gui_push_ev(GUI_EV_RDOWN, (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
-    case WM_RBUTTONUP:   gui_push_ev(GUI_EV_RUP,   (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
+    case WM_LBUTTONDOWN: gui_push_ev(w, GUI_EV_LDOWN, (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
+    case WM_LBUTTONUP:   gui_push_ev(w, GUI_EV_LUP,   (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
+    case WM_RBUTTONDOWN: gui_push_ev(w, GUI_EV_RDOWN, (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
+    case WM_RBUTTONUP:   gui_push_ev(w, GUI_EV_RUP,   (int16_t)(lp & 0xFFFF), (int16_t)(lp >> 16), 0); return 0;
     case WM_MOUSEWHEEL:
-        gui_push_ev(GUI_EV_WHEEL, 0, 0, (int16_t)(wp >> 16));
+        gui_push_ev(w, GUI_EV_WHEEL, 0, 0, (int16_t)(wp >> 16));
         return 0;
     case WM_KEYDOWN: {
         int vk = (int)wp;
         /* Ctrl+C/V/A/X：WM_CHAR 只会送出控制码，这里统一成显式组合键事件 */
         if ((vk == 'C' || vk == 'V' || vk == 'A' || vk == 'X')
             && (GetKeyState(VK_CONTROL) < 0)) {
-            gui_push_ev(GUI_EV_KEY, 0, 0, GUI_KEY_CTRL | vk);
+            gui_push_ev(w, GUI_EV_KEY, 0, 0, GUI_KEY_CTRL | vk);
             return 0;
         }
         /* 导航/编辑键不走 WM_CHAR，显式推送 */
         if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN
             || vk == VK_DELETE || vk == VK_HOME || vk == VK_END) {
-            gui_push_ev(GUI_EV_KEY, 0, 0, GUI_KEY_EXT | vk);
+            gui_push_ev(w, GUI_EV_KEY, 0, 0, GUI_KEY_EXT | vk);
         }
         return 0;
     }
     case WM_CHAR:
-        gui_push_ev(GUI_EV_KEY, 0, 0, (int64_t)wp);
+        gui_push_ev(w, GUI_EV_KEY, 0, 0, (int64_t)wp);
         return 0;
     case WM_CLOSE:
-        g_gui_should_close = 1;
+        w->should_close = 1;
         DestroyWindow(hw);
         return 0;
     case WM_DESTROY:
-        g_gui_alive = 0;
-        PostQuitMessage(0);
+        w->alive = 0;
+        w->used = 0;
+        w->hwnd = NULL;
         return 0;
     }
     return DefWindowProcW(hw, msg, wp, lp);
@@ -2446,7 +2459,10 @@ static wchar_t *gui_utf8_to_wide(const char *s) {
 }
 
 int32_t zfy_gui_open(int32_t w, int32_t h, char *title_utf8) {
-    if (g_gui_alive) return -1;            /* 已开窗 */
+    gui_win *wslot = NULL;
+    for (int i = 0; i < GUI_MAXWIN; i++)
+        if (!g_wins[i].used) { wslot = &g_wins[i]; break; }
+    if (!wslot) return -5;                 /* 窗口数达上限 */
     if (w <= 0 || h <= 0) return -2;
     static int class_registered = 0;
     if (!class_registered) {
@@ -2460,7 +2476,6 @@ int32_t zfy_gui_open(int32_t w, int32_t h, char *title_utf8) {
         if (!RegisterClassW(&wc)) return -3;
         class_registered = 1;
     }
-    wchar_t *wt = gui_utf8_to_wide(title_utf8 ? title_utf8 : "zfy");
     /* DPI 感知（进程级一次性）：Per-Monitor V2 优先，旧系统退回 SetProcessDPIAware。
        之后 w/h 是物理像素，DWM 不再拉伸——文字与像素逐一对齐，不糊 */
     typedef BOOL (WINAPI *SPDACfn)(void *);
@@ -2468,69 +2483,95 @@ int32_t zfy_gui_open(int32_t w, int32_t h, char *title_utf8) {
                                                     "SetProcessDpiAwarenessContext");
     if (spdac) spdac((void *)(INT_PTR)-4);       /* PER_MONITOR_AWARE_V2 */
     else SetProcessDPIAware();
+    int dpi = 96;
     {
         HDC sdc = GetDC(NULL);
-        g_gui_dpi = GetDeviceCaps(sdc, LOGPIXELSX);
+        dpi = GetDeviceCaps(sdc, LOGPIXELSX);
         ReleaseDC(NULL, sdc);
     }
-    if (g_gui_dpi <= 0) g_gui_dpi = 96;
-    w = w * g_gui_dpi / 96;                /* 逻辑尺寸 → 物理尺寸 */
-    h = h * g_gui_dpi / 96;
+    if (dpi <= 0) dpi = 96;
+    w = w * dpi / 96;                      /* 逻辑尺寸 → 物理尺寸 */
+    h = h * dpi / 96;
+    wchar_t *wt = gui_utf8_to_wide(title_utf8 ? title_utf8 : "zfy");
     /* 可调尺寸窗口：客户区初始为 w x h */
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
                 | WS_MAXIMIZEBOX | WS_THICKFRAME;
     RECT rc = { 0, 0, w, h };
     AdjustWindowRect(&rc, style, 0);
-    g_gui_hwnd = CreateWindowW(L"ZfyGuiWindow", wt,
-                               style,
-                               CW_USEDEFAULT, CW_USEDEFAULT,
-                               rc.right - rc.left, rc.bottom - rc.top,
-                               NULL, NULL, GetModuleHandleW(NULL), NULL);
+    HWND hwnd = CreateWindowW(L"ZfyGuiWindow", wt,
+                              style,
+                              CW_USEDEFAULT, CW_USEDEFAULT,
+                              rc.right - rc.left, rc.bottom - rc.top,
+                              NULL, NULL, GetModuleHandleW(NULL), NULL);
     free(wt);
-    if (!g_gui_hwnd) return -4;
-    g_gui_win_dc = GetDC(g_gui_hwnd);
-    g_gui_mem = CreateCompatibleDC(g_gui_win_dc);
-    gui_recreate_surface(w, h);            /* DIB + g_gui_w/h */
+    if (!hwnd) return -4;
+    memset(wslot, 0, sizeof(*wslot));
+    wslot->hwnd = hwnd;
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)wslot);
+    wslot->win_dc = GetDC(hwnd);
+    wslot->mem = CreateCompatibleDC(wslot->win_dc);
+    gui_recreate_surface(wslot, w, h);     /* DIB + w/h */
     /* 字体：微软雅黑 16 逻辑px × DPI（覆盖中英文）；SetBkMode 在 draw_text 内保持透明 */
-    g_gui_font = CreateFontW(-16 * g_gui_dpi / 96, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-    g_gui_oldfont = (HFONT)SelectObject(g_gui_mem, g_gui_font);
-    SetBkMode(g_gui_mem, TRANSPARENT);
-    g_gui_should_close = 0;
-    g_gui_alive = 1;
-    ShowWindow(g_gui_hwnd, SW_SHOW);
-    UpdateWindow(g_gui_hwnd);
+    wslot->font = CreateFontW(-16 * dpi / 96, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    wslot->oldfont = (HFONT)SelectObject(wslot->mem, wslot->font);
+    SetBkMode(wslot->mem, TRANSPARENT);
+    wslot->dpi = dpi;
+    wslot->should_close = 0;
+    wslot->alive = 1;
+    wslot->used = 1;
+    g_cur = wslot;
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
     return 0;
 }
 
-/* 泵消息（非阻塞）+ 取一事件；返回 1=取到，0=无 */
+/* 泵消息（非阻塞）+ 从当前窗口队列取一事件；返回 1=取到，0=无 */
 int32_t zfy_gui_poll(int64_t *t, int64_t *x, int64_t *y, int64_t *k) {
+    if (!g_cur) return 0;
     MSG msg;
     while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
-        if (msg.message == WM_QUIT) { g_gui_alive = 0; break; }
+        if (msg.message == WM_QUIT) {
+            for (int i = 0; i < GUI_MAXWIN; i++) g_wins[i].alive = 0;
+            break;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    if (g_gui_qh == g_gui_qt) return 0;
-    *t = g_gui_q[g_gui_qh].t; *x = g_gui_q[g_gui_qh].x;
-    *y = g_gui_q[g_gui_qh].y; *k = g_gui_q[g_gui_qh].k;
-    g_gui_qh = (g_gui_qh + 1) % GUI_EVQ;
+    if (!g_cur || g_cur->qh == g_cur->qt) return 0;
+    *t = g_cur->q[g_cur->qh].t; *x = g_cur->q[g_cur->qh].x;
+    *y = g_cur->q[g_cur->qh].y; *k = g_cur->q[g_cur->qh].k;
+    g_cur->qh = (g_cur->qh + 1) % GUI_EVQ;
     return 1;
 }
 
-int32_t zfy_gui_alive(void)        { return g_gui_alive; }
-int32_t zfy_gui_should_close(void) { return g_gui_should_close; }
-int32_t zfy_gui_w(void)            { return g_gui_w; }
-int32_t zfy_gui_h(void)            { return g_gui_h; }
-int32_t zfy_gui_dpi(void)          { return g_gui_dpi; }
+int32_t zfy_gui_alive(void)        { return g_cur ? g_cur->alive : 0; }
+int32_t zfy_gui_should_close(void) { return g_cur ? g_cur->should_close : 1; }
+int32_t zfy_gui_alive_any(void) {
+    for (int i = 0; i < GUI_MAXWIN; i++)
+        if (g_wins[i].used && g_wins[i].alive) return 1;
+    return 0;
+}
+int32_t zfy_gui_self(void) {
+    for (int i = 0; i < GUI_MAXWIN; i++)
+        if (g_cur == &g_wins[i]) return i + 1;
+    return 0;
+}
+void zfy_gui_select(int64_t id) {
+    if (id >= 1 && id <= GUI_MAXWIN && g_wins[id - 1].used)
+        g_cur = &g_wins[id - 1];
+}
+int32_t zfy_gui_w(void)            { return g_cur ? g_cur->w : 0; }
+int32_t zfy_gui_h(void)            { return g_cur ? g_cur->h : 0; }
+int32_t zfy_gui_dpi(void)          { return g_cur ? g_cur->dpi : 96; }
 
 /* ---- 剪贴板（CF_UNICODETEXT，UTF-8 进出） ----
  * clip_get 返回写入 buf 的字节数（不含 \0）；-1=打开失败/无文本；-2=缓冲不足。
  * 失败时 buf 保持原样。调用频率低，无额外分配。 */
 int32_t zfy_gui_clip_get(char *buf, int32_t cap) {
     if (!buf || cap <= 0) return -1;
-    if (!OpenClipboard(g_gui_hwnd)) return -1;
+    if (!OpenClipboard(NULL)) return -1;
     HANDLE h = GetClipboardData(CF_UNICODETEXT);
     if (!h) { CloseClipboard(); return -1; }
     wchar_t *w = (wchar_t *)GlobalLock(h);
@@ -2558,61 +2599,81 @@ void zfy_gui_clip_set(char *utf8) {
     if (!w) { GlobalFree(h); return; }
     MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, wlen);
     GlobalUnlock(h);
-    if (!OpenClipboard(g_gui_hwnd)) { GlobalFree(h); return; }
+    if (!OpenClipboard(NULL)) { GlobalFree(h); return; }
     EmptyClipboard();
     if (SetClipboardData(CF_UNICODETEXT, h) == NULL) GlobalFree(h);
     CloseClipboard();
 }
 
 void zfy_gui_close(void) {
-    if (g_gui_hwnd) { DestroyWindow(g_gui_hwnd); g_gui_hwnd = NULL; }
-    g_gui_alive = 0;
+    if (g_cur && g_cur->hwnd) {
+        HWND hw = g_cur->hwnd;
+        g_cur->hwnd = NULL;
+        g_cur->alive = 0;
+        g_cur->used = 0;
+        DestroyWindow(hw);
+    }
 }
 
 void zfy_gui_title(char *title_utf8) {
-    if (!g_gui_hwnd) return;
+    if (!g_cur || !g_cur->hwnd) return;
     wchar_t *wt = gui_utf8_to_wide(title_utf8 ? title_utf8 : "");
-    SetWindowTextW(g_gui_hwnd, wt);
+    SetWindowTextW(g_cur->hwnd, wt);
     free(wt);
 }
 
+/* 窗口图标（当前窗口）：path 为 .ico/.png 等系统可加载文件；失败静默 */
+void zfy_gui_set_icon(char *path_utf8) {
+    if (!g_cur || !g_cur->hwnd || !path_utf8) return;
+    wchar_t *wp = gui_utf8_to_wide(path_utf8);
+    HICON big = (HICON)LoadImageW(NULL, wp, IMAGE_ICON, 0, 0,
+                                  LR_LOADFROMFILE | LR_DEFAULTSIZE);
+    HICON small = (HICON)LoadImageW(NULL, wp, IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXSMICON),
+                                    GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE);
+    free(wp);
+    if (big)   SendMessageW(g_cur->hwnd, WM_SETICON, ICON_BIG, (LPARAM)big);
+    if (small) SendMessageW(g_cur->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small);
+}
+
 void zfy_gui_present(void) {
-    if (g_gui_win_dc && g_gui_mem)
-        BitBlt(g_gui_win_dc, 0, 0, g_gui_w, g_gui_h, g_gui_mem, 0, 0, SRCCOPY);
+    if (g_cur && g_cur->win_dc && g_cur->mem)
+        BitBlt(g_cur->win_dc, 0, 0, g_cur->w, g_cur->h, g_cur->mem, 0, 0, SRCCOPY);
 }
 
 void zfy_gui_fill_rect(int32_t rx, int32_t ry, int32_t rw, int32_t rh, uint32_t rgb) {
-    if (!g_gui_fb) return;
+    if (!g_cur || !g_cur->fb) return;
+    int gw = g_cur->w, gh = g_cur->h;
     /* 裁剪到客户区 */
     int x0 = rx < 0 ? 0 : rx, y0 = ry < 0 ? 0 : ry;
-    int x1 = (rx + rw) > g_gui_w ? g_gui_w : (rx + rw);
-    int y1 = (ry + rh) > g_gui_h ? g_gui_h : (ry + rh);
+    int x1 = (rx + rw) > gw ? gw : (rx + rw);
+    int y1 = (ry + rh) > gh ? gh : (ry + rh);
     if (x0 >= x1 || y0 >= y1) return;
     /* DIB 32bpp 小端 DWORD 恰为 0x00RRGGBB——直接用，不换通道 */
     uint32_t pix = 0xFF000000u | rgb;
     int span = x1 - x0;
     for (int y = y0; y < y1; y++) {
-        uint32_t *row = g_gui_fb + (size_t)y * g_gui_w + x0;
+        uint32_t *row = g_cur->fb + (size_t)y * gw + x0;
         for (int x = 0; x < span; x++) row[x] = pix;
     }
 }
 
 void zfy_gui_draw_text(int32_t tx, int32_t ty, char *utf8, uint32_t rgb) {
-    if (!g_gui_mem) return;
+    if (!g_cur || !g_cur->mem) return;
     wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
     /* COLORREF = 0x00BBGGRR：R 在低字节，与 0xRRGGBB 相反，需交换 */
     COLORREF cr = ((rgb >> 16) & 0xFF) | (rgb & 0xFF00) | ((rgb & 0xFF) << 16);
-    COLORREF old = SetTextColor(g_gui_mem, cr);
-    TextOutW(g_gui_mem, tx, ty, wt, (int)wcslen(wt));
-    SetTextColor(g_gui_mem, old);
+    COLORREF old = SetTextColor(g_cur->mem, cr);
+    TextOutW(g_cur->mem, tx, ty, wt, (int)wcslen(wt));
+    SetTextColor(g_cur->mem, old);
     free(wt);
 }
 
 int32_t zfy_gui_text_w(char *utf8) {
-    if (!g_gui_mem) return 0;
+    if (!g_cur || !g_cur->mem) return 0;
     wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
     SIZE sz;
-    if (!GetTextExtentPoint32W(g_gui_mem, wt, (int)wcslen(wt), &sz)) sz.cx = 0;
+    if (!GetTextExtentPoint32W(g_cur->mem, wt, (int)wcslen(wt), &sz)) sz.cx = 0;
     free(wt);
     return (int32_t)sz.cx;
 }
@@ -2630,6 +2691,10 @@ int32_t zfy_gui_clip_get(char *buf, int32_t cap) { (void)buf; (void)cap; return 
 void zfy_gui_clip_set(char *utf8) { (void)utf8; }
 void zfy_gui_close(void) {}
 void zfy_gui_title(char *s) { (void)s; }
+int32_t zfy_gui_alive_any(void) { return 0; }
+int32_t zfy_gui_self(void) { return 0; }
+void zfy_gui_select(int64_t id) { (void)id; }
+void zfy_gui_set_icon(char *s) { (void)s; }
 void zfy_gui_present(void) {}
 void zfy_gui_fill_rect(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e) { (void)a; (void)b; (void)c; (void)d; (void)e; }
 void zfy_gui_draw_text(int32_t a, int32_t b, char *s, uint32_t c) { (void)a; (void)b; (void)s; (void)c; }

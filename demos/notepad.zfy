@@ -1,11 +1,11 @@
-// notepad.zfy — zfy GUI M3 记事本 demo
-// 组件：TextArea（多行编辑）+ Button 工具条 + 状态栏
-// 功能：编辑多行文本 / 新建 / 复制到剪贴板 / 从剪贴板粘贴 / 插入时间 / 字数统计
+// notepad.zfy — zfy GUI M4 记事本（菜单栏版）
+// 组件：MenuBar（文件/编辑）+ TextArea + 状态栏 + 窗口图标
+// 功能：编辑多行文本 / 新建 / 复制 / 粘贴 / 插入时间 / 退出 / 字数统计
 //       响应式：拖拽窗口边缘缩放，编辑区与状态栏随尺寸重排
 mod gui;
 mod widgets;
-use widgets::{App, TextArea, Button, Label}
-use gui::{gui_fill_rect, gui_present, gui_alive, gui_w, gui_h, gui_clip_set, gui_clip_get, gui_frame_sleep}
+use widgets::{App, TextArea, Menu, Label}
+use gui::{gui_present, gui_alive, gui_w, gui_h, gui_clip_set, gui_clip_get, gui_frame_sleep, gui_set_icon}
 
 // 字符数（按 UTF-8 码点粗算）
 fn i32 char_count(let string s)
@@ -35,97 +35,68 @@ fn main()
     if rc != 0
         output("open fail rc=", rc)
         return 1
+    gui_set_icon("zfy.ico")
+
+    let Menu mFile = Menu()
+    mFile.title = "文件"
+    mFile.items = "新建", "退出"
+    let Menu mEdit = Menu()
+    mEdit.title = "编辑"
+    mEdit.items = "复制", "粘贴", "插入时间"
+    app.add_menu(mFile)
+    app.add_menu(mEdit)
+    app.layout_menus()
 
     let TextArea ta = TextArea()
-    ta.set_text("zfy 记事本\n\n试试：输入中英文 / 回车换行 / Ctrl+V 粘贴 / 方向键移动光标")
-
-    let Button bNew = Button()
-    bNew.text = "新建"
-    let Button bCopy = Button()
-    bCopy.text = "复制"
-    let Button bPaste = Button()
-    bPaste.text = "粘贴"
-    let Button bTime = Button()
-    bTime.text = "插入时间"
+    ta.set_text("zfy 记事本\n\n菜单栏：文件/编辑（点击打开下拉）\n支持中英文输入、回车换行、Ctrl+V、方向键移动光标")
+    app.add_text(ta)
 
     let Label stat = Label()
     stat.text = ""
-
-    app.add_text(ta)
-    app.add_button(bNew)
-    app.add_button(bCopy)
-    app.add_button(bPaste)
-    app.add_button(bTime)
     app.add_label(stat)
 
-    // 按钮 click 计数快照（差值 = 本轮新点击）
-    let i32 c0 = 0
-    let i32 c1 = 0
-    let i32 c2 = 0
-    let i32 c3 = 0
     let string last = ""          // 上次统计文本，变化才刷状态栏
     let i32 pw = 0
     let i32 ph = 0
 
     while app.alive()
+        // 菜单动作（clicks 差值 + sel 项索引）
+        if app.menus[0].clicks > 0
+            // 文件菜单
+            if app.menus[0].sel == 0
+                app.texts[0].set_text("")
+                app.texts[0].dirty = true
+            if app.menus[0].sel == 1
+                app.quit = true
+            app.menus[0].clicks = 0
+        if app.menus[1].clicks > 0
+            // 编辑菜单
+            if app.menus[1].sel == 0
+                gui_clip_set(app.texts[0].text())
+            if app.menus[1].sel == 1
+                let string cb = gui_clip_get()
+                if cb != ""
+                    app.texts[0].insert_at_cursor(cb)
+                    app.texts[0].dirty = true
+            if app.menus[1].sel == 2
+                let datetime dt = localtime(now())
+                let string stamp = cast(dt.year, string) + "-" + cast(dt.month, string) + "-" + cast(dt.day, string) + " " + cast(dt.hour, string) + ":" + cast(dt.minute, string)
+                app.texts[0].insert_at_cursor(stamp)
+                app.texts[0].dirty = true
+            app.menus[1].clicks = 0
+
         // 响应式布局：窗口尺寸变化时重排
         if gui_w() != pw or gui_h() != ph
             pw = gui_w()
             ph = gui_h()
-            let i32 u = pw * 0 / 100          // noop 占位，保持块结构简单
-            // 工具条按钮：4 个等宽
-            let i32 bw = 68
-            let i32 bh = 28
-            app.buttons[0].x = 8
-            app.buttons[0].y = 8
-            app.buttons[0].w = bw
-            app.buttons[0].h = bh
-            app.buttons[1].x = 8 + bw + 6
-            app.buttons[1].y = 8
-            app.buttons[1].w = bw
-            app.buttons[1].h = bh
-            app.buttons[2].x = 8 + (bw + 6) * 2
-            app.buttons[2].y = 8
-            app.buttons[2].w = bw
-            app.buttons[2].h = bh
-            app.buttons[3].x = 8 + (bw + 6) * 3
-            app.buttons[3].y = 8
-            app.buttons[3].w = bw + 20
-            app.buttons[3].h = bh
-            // 编辑区铺满剩余空间
             app.texts[0].x = 8
-            app.texts[0].y = 44
+            app.texts[0].y = app.menu_bar_h() + 6
             app.texts[0].w = pw - 16
-            app.texts[0].h = ph - 72
-            // 状态栏贴底
+            app.texts[0].h = ph - app.menu_bar_h() - 40
             app.labels[0].x = 8
             app.labels[0].y = ph - 26
             app.labels[0].bg_w = pw - 16
             app.invalidate_all()
-
-        // 复制
-        if app.buttons[1].clicks > c1
-            c1 = app.buttons[1].clicks
-            gui_clip_set(app.texts[0].text())
-        // 粘贴
-        if app.buttons[2].clicks > c2
-            c2 = app.buttons[2].clicks
-            let string cb = gui_clip_get()
-            if cb != ""
-                app.texts[0].insert_at_cursor(cb)
-                app.texts[0].dirty = true
-        // 插入时间
-        if app.buttons[3].clicks > c3
-            c3 = app.buttons[3].clicks
-            let datetime dt = localtime(now())
-            let string stamp = cast(dt.year, string) + "-" + cast(dt.month, string) + "-" + cast(dt.day, string) + " " + cast(dt.hour, string) + ":" + cast(dt.minute, string)
-            app.texts[0].insert_at_cursor(stamp)
-            app.texts[0].dirty = true
-        // 新建（清空）
-        if app.buttons[0].clicks > c0
-            c0 = app.buttons[0].clicks
-            app.texts[0].set_text("")
-            app.texts[0].dirty = true
 
         // 状态栏：文本变化才重算
         let string cur = app.texts[0].text()

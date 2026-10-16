@@ -1,0 +1,82 @@
+// gui_multi_test.zfy — 多窗口冒烟（自动开关窗，可入回归）
+// 断言：双窗各自 alive/尺寸/绘制不崩/select 切换绘制正确/关闭后 alive_any=0
+mod gui;
+
+use gui::{gui_open, gui_alive, gui_alive_any, gui_close, gui_self, gui_select, gui_w, gui_h, gui_dpi, gui_fill_rect, gui_draw_text, gui_present, gui_poll, Event}
+
+fn void pump_frames(let i32 n)
+    let i32 f = 0
+    while f < n
+        let Event e = Event()
+        while gui_poll(ref e)
+            f = f + 0          // 事件本测试不消费
+        gui_present()
+        f++
+
+fn main()
+    // 窗 1
+    let i32 rc = gui_open(320, 200, "multi A")
+    if rc != 0
+        output("FAIL open A rc=", rc)
+        return 1
+    let i32 idA = gui_self()
+    if idA < 1
+        output("FAIL self A=", idA)
+        return 1
+    if gui_w() != 320 * gui_dpi() / 96
+        output("FAIL w A=", gui_w())
+        return 1
+    gui_fill_rect(0, 0, gui_w(), gui_h(), 0x304050)
+    gui_draw_text(20, 40, "窗口 A", 0xFFFFFF)
+    gui_present()
+
+    // 窗 2（打开后自动成为当前窗口）
+    rc = gui_open(240, 160, "multi B")
+    if rc != 0
+        output("FAIL open B rc=", rc)
+        return 1
+    let i32 idB = gui_self()
+    if idB == idA
+        output("FAIL same id")
+        return 1
+    if gui_w() != 240 * gui_dpi() / 96
+        output("FAIL w B=", gui_w())
+        return 1
+    gui_fill_rect(0, 0, gui_w(), gui_h(), 0x503040)
+    gui_draw_text(20, 40, "窗口 B", 0xFFFFFF)
+    gui_present()
+
+    pump_frames(10)
+    if not gui_alive_any()
+        output("FAIL any alive")
+        return 1
+
+    // 切回 A 画第二帧，再切回 B
+    gui_select(idA)
+    if not gui_alive()
+        output("FAIL A alive after select")
+        return 1
+    gui_fill_rect(0, 0, gui_w(), gui_h(), 0x304050)
+    gui_draw_text(20, 70, "A frame2", 0xFFFFFF)
+    gui_present()
+    gui_select(idB)
+    gui_fill_rect(0, 0, gui_w(), gui_h(), 0x503040)
+    gui_draw_text(20, 70, "B frame2", 0xFFFFFF)
+    gui_present()
+    pump_frames(10)
+
+    // 关 B，A 仍活；关 A 后 any=0
+    gui_close()
+    pump_frames(5)
+    gui_select(idA)
+    if not gui_alive()
+        output("FAIL A alive after B close")
+        return 1
+    gui_close()
+    pump_frames(5)
+    if gui_alive_any()
+        output("FAIL any alive after all close")
+        return 1
+
+    output("gui multi PASS: idA=", idA, " idB=", idB, " dpi=", gui_dpi())
+    return 0

@@ -69,6 +69,12 @@ extern "C"
     i32 zfy_gui_clip_get(let string buf, let i32 cap)
     // 剪贴板：写入 UTF-8 文本（替换现有内容）
     void zfy_gui_clip_set(let string s)
+    // 多窗口：存活判定（任意窗口）/ 当前窗口句柄 / 切换当前窗口
+    i32 zfy_gui_alive_any()
+    i32 zfy_gui_self()
+    void zfy_gui_select(let i64 id)
+    // 当前窗口图标（.ico 等文件路径；失败静默）
+    void zfy_gui_set_icon(let string path)
 
 // ===== 包装（zfy 侧友好形态） =====
 
@@ -114,6 +120,21 @@ pub fn void gui_close()
 
 pub fn void gui_title(let string t)
     zfy_gui_title(t)
+
+// ===== 多窗口（v3.4） =====
+// 约定：gui_open 打开后新窗口即成为"当前窗口"；绘制/事件 API 作用于当前窗口。
+// gui_open 返回值保持 0=成功 的兼容语义，窗口句柄用 gui_self() 取（1..8）。
+pub fn bool gui_alive_any()
+    return zfy_gui_alive_any() == 1
+
+pub fn i32 gui_self()
+    return zfy_gui_self()
+
+pub fn void gui_select(let i64 id)
+    zfy_gui_select(id)
+
+pub fn void gui_set_icon(let string path)
+    zfy_gui_set_icon(path)
 
 pub fn void gui_present()
     zfy_gui_present()
