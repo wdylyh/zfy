@@ -1,0 +1,134 @@
+// demos/calculator.zfy —— zfy GUI 计算器（v3.3.8 组件层演示）
+// 四则状态机：数字连续输入 → 运算符左累积 → = 出结果；C 复位；除 0 报错。
+// 整数运算（i64），关闭窗口即退出。
+mod gui;
+mod widgets;
+use widgets::{App, Label, Button}
+use gui::{gui_frame_sleep}
+
+// 按键布局（j 0..15）：
+//   7 8 9 ÷ / 4 5 6 × / 1 2 3 − / C 0 = +
+// op 码：0=+ 1=− 2=× 3=÷
+
+fn i64 apply(let i64 a, let i64 b, let i32 op)
+    if op == 0
+        return a + b
+    if op == 1
+        return a - b
+    if op == 2
+        return a * b
+    return a / b
+
+fn main()
+    let App app = App()
+    if app.open(258, 300, "zfy 计算器") != 0
+        output("无法创建窗口")
+        return 1
+
+    let Label title = Label(x=16, y=8, text="zfy 计算器（整数运算）")
+    app.add_label(title)
+    let Label expr = Label(x=16, y=34, text="")      // 已累积的运算式
+    app.add_label(expr)
+    let Label disp = Label(x=16, y=58, text="0")     // 当前输入 / 结果
+    app.add_label(disp)
+
+    // 16 个按键，4x4 网格
+    let string[] keys = "7", "8", "9", "÷", "4", "5", "6", "×", "1", "2", "3", "−", "C", "0", "=", "+"
+    let i32[] dig = 7, 8, 9, -1, 4, 5, 6, -1, 1, 2, 3, -1, -1, 0, -1, -1
+    let i32[] opv = -1, -1, -1, 3, -1, -1, -1, 2, -1, -1, -1, 1, -1, -1, -2, 0
+    // opv：普通键 -1，等号 -2，运算符 0..3
+
+    let i32 j = 0
+    while j < 16
+        let i32 col = j % 4
+        let i32 row = j / 4
+        let Button b = Button(x=16 + col * 58, y=88 + row * 50, w=52, h=44, text=keys[j])
+        app.add_button(b)
+        j++
+
+    let i32[] prev = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
+    // 计算器状态
+    let i64 acc = 0          // 累积值
+    let i64 cur = 0          // 当前输入值
+    let i32 op = -1          // 待执行运算（-1 无）
+    let bool entering = false
+
+    while app.alive()
+        app.t0 = tick_ms()
+
+        // 找出本帧被点击的按键
+        j = 0
+        while j < 16
+            if app.buttons[j].clicks != prev[j]
+                prev[j] = app.buttons[j].clicks
+                if dig[j] >= 0
+                    // 数字：连续输入累积，否则重新开始
+                    if entering
+                        cur = cur * 10 + cast(dig[j], i64)
+                    else
+                        cur = cast(dig[j], i64)
+                        entering = true
+                    app.labels[2].text = cast(cur, string)
+                    app.labels[2].dirty = true
+                else
+                    if opv[j] == -2
+                        // 等号：结算挂起运算
+                        if op != -1
+                            if op == 3 and cur == 0
+                                app.labels[2].text = "错误：除以 0"
+                                acc = 0
+                                cur = 0
+                                op = -1
+                            else
+                                acc = apply(acc, cur, op)
+                                app.labels[2].text = cast(acc, string)
+                                cur = acc
+                                op = -1
+                            app.labels[1].text = ""
+                            entering = false
+                            app.labels[1].dirty = true
+                            app.labels[2].dirty = true
+                    else
+                        if opv[j] >= 0
+                            // 运算符：有旧运算先结算，再挂新运算
+                            let bool bad = false
+                            if op == -1
+                                acc = cur
+                            else
+                                if entering
+                                    if op == 3 and cur == 0
+                                        bad = true
+                                    else
+                                        acc = apply(acc, cur, op)
+                                        cur = acc
+                            if bad
+                                app.labels[2].text = "错误：除以 0"
+                                app.labels[1].text = ""
+                                acc = 0
+                                cur = 0
+                                op = -1
+                            else
+                                app.labels[2].text = cast(acc, string)
+                                app.labels[1].text = cast(acc, string) + " " + keys[j]
+                                op = opv[j]
+                            entering = false
+                            app.labels[1].dirty = true
+                            app.labels[2].dirty = true
+                        else
+                            // C：全部复位
+                            acc = 0
+                            cur = 0
+                            op = -1
+                            entering = false
+                            app.labels[1].text = ""
+                            app.labels[2].text = "0"
+                            app.labels[1].dirty = true
+                            app.labels[2].dirty = true
+            j++
+
+        app.step()
+        gui_frame_sleep(app.t0)
+
+    app.close()
+    return 0
