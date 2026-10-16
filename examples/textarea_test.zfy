@@ -1,0 +1,120 @@
+// examples/textarea_test.zfy —— TextArea 多行编辑逻辑测试（headless，可入回归）
+// 断言：set_text/text 往返、插入、Enter 拆行、Backspace 合行、方向键跨行、
+//       Delete 合行、Home/End、UTF-8 码点对齐。全部通过 exit 0。
+mod gui;
+mod widgets;
+use widgets::{TextArea}
+use gui::{KEY_EXT}
+
+let i32 fails = 0
+
+fn void chk(let bool ok, let string msg)
+    if not ok
+        output("FAIL ", msg)
+        fails = fails + 1
+
+fn main()
+    // 1) 单行基础
+    let TextArea t = TextArea(x=0, y=0, w=200, h=100)
+    t.set_text("hello")
+    chk(length(t.lines) == 1, "set_text single line")
+    chk(t.text() == "hello", "text roundtrip")
+    chk(t.cx == 0 and t.cy == 0, "cursor reset")
+
+    // 2) 多行往返
+    t.set_text("ab\ncd\nef")
+    chk(length(t.lines) == 3, "split 3 lines")
+    chk(t.text() == "ab\ncd\nef", "multiline roundtrip")
+
+    // 3) 打字插入
+    t.set_text("hello")
+    chk(t.handle_key(88) == true, "insert returns true")   // 'X'
+    chk(t.lines[0] == "Xhello", "insert at 0")
+    chk(t.cx == 1, "cx after insert")
+    t.set_text("he")
+    let bool r = false
+    r = t.handle_key(KEY_EXT + 0x23)                            // End 到行尾
+    r = t.handle_key(108)                                       // 'l'
+    r = t.handle_key(108)
+    chk(t.lines[0] == "hell", "append two")
+
+    // 4) Enter 拆行
+    t.set_text("abcd")
+    r = t.handle_key(KEY_EXT + 0x27)                            // Right
+    r = t.handle_key(KEY_EXT + 0x27)                            // Right -> cx=2
+    r = t.handle_key(13)                                        // Enter
+    chk(length(t.lines) == 2 and t.lines[0] == "ab" and t.lines[1] == "cd", "enter splits")
+    chk(t.cy == 1 and t.cx == 0, "cursor after enter")
+    chk(t.text() == "ab\ncd", "text after enter")
+
+    // 5) Backspace 行首合并
+    r = t.handle_key(8)                                         // 行首：合并到上一行
+    chk(length(t.lines) == 1 and t.lines[0] == "abcd", "backspace merges")
+    chk(t.cy == 0 and t.cx == 2, "cursor at merge point")
+
+    // 6) Backspace 删字符（cx=2 删的是 'b'）
+    r = t.handle_key(8)
+    chk(t.lines[0] == "acd", "backspace deletes")
+
+    // 7) 方向键跨行
+    t.set_text("ab\ncdef")
+    r = t.handle_key(KEY_EXT + 0x25)                            // Left：0,0 -> 上一行不存在，行内 cx=0 不动
+    chk(t.cy == 0 and t.cx == 0, "left at home stays")
+    t.cx = 2
+    r = t.handle_key(KEY_EXT + 0x25)                            // 行首 Left -> 上一行末尾
+    chk(t.cy == 0, "left at line start stays on first")
+    t.cy = 1
+    t.cx = 0
+    r = t.handle_key(KEY_EXT + 0x25)                            // 行首 Left -> 上一行末尾
+    chk(t.cy == 0 and t.cx == 2, "left wraps to prev line end")
+    r = t.handle_key(KEY_EXT + 0x27)                            // 行尾 Right -> 下一行行首
+    chk(t.cy == 1 and t.cx == 0, "right wraps to next line start")
+    r = t.handle_key(KEY_EXT + 0x26)                            // Up：cx<=上行宽则保持
+    chk(t.cy == 0 and t.cx == 0, "up keeps column")
+    r = t.handle_key(KEY_EXT + 0x24)                            // Home
+    chk(t.cx == 0, "home after up")
+    t.cx = 4
+    r = t.handle_key(KEY_EXT + 0x28)                            // Down：cx 超下行宽则钳到行尾
+    chk(t.cy == 1 and t.cx == 4, "down clamps to line end")
+
+    // 8) Home / End
+    r = t.handle_key(KEY_EXT + 0x24)
+    chk(t.cx == 0, "home")
+    r = t.handle_key(KEY_EXT + 0x23)
+    chk(t.cx == 4, "end")
+
+    // 9) Delete：删字符 + 行尾吞并
+    t.set_text("ab\ncd")
+    t.cy = 0
+    t.cx = 1
+    r = t.handle_key(KEY_EXT + 0x2E)                            // 删 'b'
+    chk(t.lines[0] == "a", "delete char")
+    t.cx = 1                                                // 行尾
+    r = t.handle_key(KEY_EXT + 0x2E)                            // 吞并下一行
+    chk(length(t.lines) == 1 and t.lines[0] == "acd", "delete merges next line")
+
+    // 10) UTF-8 码点对齐（中文 3 字节）
+    t.set_text("你好")
+    chk(length(t.lines[0]) == 6, "utf8 bytes")
+    r = t.handle_key(KEY_EXT + 0x23)                            // End -> cx=6
+    r = t.handle_key(KEY_EXT + 0x25)                            // Left -> cx=3（对齐'好'起点）
+    chk(t.cx == 3, "left aligns codepoint")
+    r = t.handle_key(8)                                         // 退格删整个 '你'（3 字节一个码点）
+    chk(t.lines[0] == "好", "backspace removes whole codepoint")
+    chk(t.cx == 0, "cx after utf8 backspace")
+
+    // 11) 滚动钳制（headless 下 vis_rows 用 h=100/LH=22 -> 4 行）
+    t.set_text("1\n2\n3\n4\n5\n6\n7\n8")
+    t.cy = 7
+    t.cx = 0
+    t.clamp_scroll()
+    chk(t.top > 0, "scroll follows cursor down")
+    t.cy = 0
+    t.clamp_scroll()
+    chk(t.top == 0, "scroll follows cursor up")
+
+    if fails == 0
+        output("textarea_test: all PASS")
+        return 0
+    output(fails, " failures")
+    return 1

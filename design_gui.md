@@ -79,10 +79,18 @@ Slider、ProgressBar、ListBox、MenuBar。参照 gui_demo.zfy 的 Button 写法
   examples/widgets_test.zfy 自动断言（状态机+渲染+damage）、demos/widgets_demo.zfy
   交互演示。语言侧配套：元素方法调用 arr[i].m()、元素字段复合赋值（编译器修复
   mod 内方法 struct 参数 E3001 + mir 取址泛化）
-- [ ] M3：L3 应用框架 + 两个真实小软件（记事本/计算器）
-- [ ] M4：resize、剪贴板、多窗口、图标、Checkbox/MenuBar 组件
-  - **resize 已完成（v3.3.9）**：WS_THICKFRAME 可调窗口 + WM_SIZE 重建 DIB +
+- [x] M3（v3.3.10）：TextArea 多行编辑组件（光标/拆合行/滚动/UTF-8 码点对齐/
+  Ctrl+V→insert_at_cursor）+ Checkbox + 剪贴板（gui_clip_set/get，CF_UNICODETEXT
+  ↔ UTF-8）+ demos/notepad.zfy 记事本（编辑/新建/复制/粘贴/插入时间/字数统计/
+  响应式布局）。计算器（v3.3.9）+ 记事本 = 两个真实小软件达成
+  - 配套编译器修复：**while 条件表达式绕过循环 move 门禁**——SWhile/SFor 的
+    cond（和 for update）在 ldepth=0 下检查，"最后使用即 move"把条件里的
+    字符串实参误判为可 move（store null 清槽），下一轮迭代 load null 段错误。
+    修复：条件与 update 子句检查时同样提升 ldepth
+- [ ] M4：多窗口、图标、MenuBar 组件
+  - resize 已完成（v3.3.9）：WS_THICKFRAME 可调窗口 + WM_SIZE 重建 DIB +
     EV_SIZE 事件；业务每帧比对 gui_w()/gui_h() 自行重排（calculator 即范例）
+  - 剪贴板已完成（v3.3.10，见 M3）；Checkbox 已完成（v3.3.10）
 - [x] M4a（v3.3.9）渲染正确性修复（计算器 demo 实测暴露，PrintWindow+像素聚类定位）：
   - **fill_rect 双重偏移**：row 指针已含 +x0，循环又从 x0 起 → 所有矩形右移自身
     x 倍（按钮重合的根源）；改为 `for x in 0..span`

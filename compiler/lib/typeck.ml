@@ -1977,11 +1977,12 @@ and last_use env n (p : pos) =
 
 (* 自动 move 候选：聚合类型（string/数组/列表）局部非 const 变量、
    未被 move 过、且此后不再出现。
-   循环门禁（new.md 2026-10-11 bug 报告）：last_use 按源码位置判"之后"，
-   而循环体内的使用每次运行期迭代都执行——把循环内的使用点判成
-   "最后使用"并 move（store null 清槽）后，下一轮迭代读到 null 崩溃
-   （静态位置相同，pos_after 不成立）。故循环体内（任意深度）的
-   实参/赋值一律不自动 move，走克隆 *)
+   循环门禁（new.md 2026-10-11 bug 报告；2026-10-16 扩展到循环条件/update）：
+   last_use 按源码位置判"之后"，而循环条件/循环体内的使用每次运行期迭代
+   都执行——把循环内的使用点判成"最后使用"并 move（store null 清槽）后，
+   下一轮迭代读到 null 崩溃（静态位置相同，pos_after 不成立）。
+   故循环体、while/for 条件、for update（任意深度）内的实参/赋值
+   一律不自动 move，走克隆 *)
 and auto_moveable env n (p : pos) =
   env.ldepth = 0
   && (match lookup_var env n with
@@ -3679,7 +3680,11 @@ and check_stmt env (st : stmt) : tstmt =
     in
     mk (SIfK (tc, tb, eb))
   | SWhile (cond, body, p) ->
+    (* 条件与循环体一样每轮迭代执行：自动 move 门禁（ldepth）必须覆盖，
+       否则"最后使用"误判清槽 → 下一轮迭代读到 null 崩溃（2026-10-16） *)
+    env.ldepth <- env.ldepth + 1;
     let tc = check_expr env cond in
+    env.ldepth <- env.ldepth - 1;
     ignore (coerce p tc TBool);
     push_scope env;
     env.ldepth <- env.ldepth + 1;
@@ -3698,9 +3703,21 @@ and check_stmt env (st : stmt) : tstmt =
           | FIExpr (e, p') -> { s = SExprK (check_expr env e); spos = p' })
         inits
     in
-    let tc = check_expr env cond in
+    let tc =
+      (* 同 SWhile：for 条件每轮执行，自动 move 门禁覆盖 *)
+      env.ldepth <- env.ldepth + 1;
+      let t = check_expr env cond in
+      env.ldepth <- env.ldepth - 1;
+      t
+    in
     ignore (coerce p tc TBool);
-    let up_stmts = List.map (check_for_update env) updates in
+    let up_stmts =
+      (* update 子句同样每轮执行 *)
+      env.ldepth <- env.ldepth + 1;
+      let us = List.map (check_for_update env) updates in
+      env.ldepth <- env.ldepth - 1;
+      us
+    in
     env.ldepth <- env.ldepth + 1;
     let tb = check_block env body in
     env.ldepth <- env.ldepth - 1;

@@ -2328,6 +2328,13 @@ static volatile long g_gui_qh = 0, g_gui_qt = 0;   /* head=读, tail=写 */
 #define GUI_EV_WHEEL 7
 #define GUI_EV_SIZE  8
 
+/* EV_KEY 的 k 值分区（避免与 WM_CHAR 码元 <0x110000 冲突）：
+ *   GUI_KEY_EXT  | VK   —— 方向键/Delete/Home/End 等（WM_KEYDOWN）
+ *   GUI_KEY_CTRL | 'C'  —— Ctrl 组合键（VK 大写字母） */
+#define GUI_KEY_EXT  0x10000000
+#define GUI_KEY_CTRL 0x20000000
+#define GUI_EV_SIZE  8
+
 static HWND    g_gui_hwnd = NULL;
 static HDC     g_gui_win_dc = NULL;
 static HDC     g_gui_mem = NULL;
@@ -2400,6 +2407,21 @@ static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL:
         gui_push_ev(GUI_EV_WHEEL, 0, 0, (int16_t)(wp >> 16));
         return 0;
+    case WM_KEYDOWN: {
+        int vk = (int)wp;
+        /* Ctrl+C/V/A/X：WM_CHAR 只会送出控制码，这里统一成显式组合键事件 */
+        if ((vk == 'C' || vk == 'V' || vk == 'A' || vk == 'X')
+            && (GetKeyState(VK_CONTROL) < 0)) {
+            gui_push_ev(GUI_EV_KEY, 0, 0, GUI_KEY_CTRL | vk);
+            return 0;
+        }
+        /* 导航/编辑键不走 WM_CHAR，显式推送 */
+        if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN
+            || vk == VK_DELETE || vk == VK_HOME || vk == VK_END) {
+            gui_push_ev(GUI_EV_KEY, 0, 0, GUI_KEY_EXT | vk);
+        }
+        return 0;
+    }
     case WM_CHAR:
         gui_push_ev(GUI_EV_KEY, 0, 0, (int64_t)wp);
         return 0;
@@ -2503,6 +2525,45 @@ int32_t zfy_gui_w(void)            { return g_gui_w; }
 int32_t zfy_gui_h(void)            { return g_gui_h; }
 int32_t zfy_gui_dpi(void)          { return g_gui_dpi; }
 
+/* ---- 剪贴板（CF_UNICODETEXT，UTF-8 进出） ----
+ * clip_get 返回写入 buf 的字节数（不含 \0）；-1=打开失败/无文本；-2=缓冲不足。
+ * 失败时 buf 保持原样。调用频率低，无额外分配。 */
+int32_t zfy_gui_clip_get(char *buf, int32_t cap) {
+    if (!buf || cap <= 0) return -1;
+    if (!OpenClipboard(g_gui_hwnd)) return -1;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (!h) { CloseClipboard(); return -1; }
+    wchar_t *w = (wchar_t *)GlobalLock(h);
+    if (!w) { CloseClipboard(); return -1; }
+    int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (need <= 0 || need > cap) {
+        GlobalUnlock(h);
+        CloseClipboard();
+        return -2;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, need, NULL, NULL);
+    GlobalUnlock(h);
+    CloseClipboard();
+    return need - 1;                       /* 不含 \0 */
+}
+
+/* clip_set：把 UTF-8 文本放入剪贴板（替换现有内容；\n 由调用方自行决定格式） */
+void zfy_gui_clip_set(char *utf8) {
+    if (!utf8) utf8 = "";
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wlen <= 0) return;
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (size_t)wlen * sizeof(wchar_t));
+    if (!h) return;
+    wchar_t *w = (wchar_t *)GlobalLock(h);
+    if (!w) { GlobalFree(h); return; }
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, wlen);
+    GlobalUnlock(h);
+    if (!OpenClipboard(g_gui_hwnd)) { GlobalFree(h); return; }
+    EmptyClipboard();
+    if (SetClipboardData(CF_UNICODETEXT, h) == NULL) GlobalFree(h);
+    CloseClipboard();
+}
+
 void zfy_gui_close(void) {
     if (g_gui_hwnd) { DestroyWindow(g_gui_hwnd); g_gui_hwnd = NULL; }
     g_gui_alive = 0;
@@ -2565,6 +2626,8 @@ int32_t zfy_gui_should_close(void) { return 1; }
 int32_t zfy_gui_w(void) { return 0; }
 int32_t zfy_gui_h(void) { return 0; }
 int32_t zfy_gui_dpi(void) { return 96; }
+int32_t zfy_gui_clip_get(char *buf, int32_t cap) { (void)buf; (void)cap; return -1; }
+void zfy_gui_clip_set(char *utf8) { (void)utf8; }
 void zfy_gui_close(void) {}
 void zfy_gui_title(char *s) { (void)s; }
 void zfy_gui_present(void) {}

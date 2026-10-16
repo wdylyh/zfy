@@ -2562,6 +2562,8 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_gui_fill_rect(i32, i32, i32, i32, i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_draw_text(i32, i32, ptr, i32)\n";
   Buffer.add_string g.mbuf "declare i32 @zfy_gui_text_w(ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_clip_get(ptr, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_clip_set(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   (* output 运行时函数 *)

@@ -2,7 +2,7 @@
 // 断言：开窗/alive/绘图不崩/poll 泵消息/关闭后 alive=0；全部通过 exit 0
 mod gui;
 
-use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, Event, EV_MOVE, EV_LDOWN, EV_KEY}
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, gui_clip_set, gui_clip_get, Event, EV_MOVE, EV_LDOWN, EV_KEY}
 
 fn main()
     let i32 rc = gui_open(480, 300, "zfy gui smoke")
@@ -50,6 +50,12 @@ fn main()
     let i32 twl = tw * 96 / gui_dpi()
     if twl < 60 or twl > 300
         output("FAIL text width=", twl, " (logical, dpi=", gui_dpi(), ")")
+        return 1
+    // 剪贴板往返（CF_UNICODETEXT ↔ UTF-8）
+    gui_clip_set("zfy 剪贴板 ✓ 123")
+    let string cb = gui_clip_get()
+    if cb != "zfy 剪贴板 ✓ 123"
+        output("FAIL clipboard roundtrip: [", cb, "]")
         return 1
     output("gui smoke PASS: 90 帧, move 事件 ", moves, ", key 事件 ", keys, ", text_w=", tw)
     return 0
