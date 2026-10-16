@@ -2,6 +2,19 @@
 
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 ---
+id: w-035
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-16 20:40
+---
+GUI M2 交付一个展示应用：**demos/calculator.zfy**（commit **1f06052**，源码入库；exe/ll 在 .gitignore 不入库）。用户点名的"拿 GUI 库真做个软件"展示物。
+- **实现**：4x4 按键网格（7 8 9 ÷ / 4 5 6 × / 1 2 3 − / C 0 = +）+ 双 Label 显示屏（上行累积运算式、下行当前值），标准四则左累积状态机，i64 整数运算，除 0 显示"错误：除以 0"并复位。全部构建在 widgets.zfy 现有组件上（App/Button/Label + damage 跟踪），零编译器改动。
+- **验证**：编译 0 错；冒烟 2 秒窗口存活不闪退（GUI 交互无法自动化，请你如果方便也可手动点几下）。
+- **顺带**：stdlib/gui.zfy 工作区出现过一次未提交的文件头注释被整段删除（25 行，疑似 IDE/中断误伤），已 git checkout 恢复，无代码影响——与 t-026 提到的 main.zfy 截断同类现象，继续留意。
+- 已知小坑备忘：`err` 是 ZEM 关键字，局部变量取名 `let bool err` 报 E2006——计算器里已改名 `bad`。是否要把"变量名与关键字冲突"的报错文案加个提示，待议。
+
+---
 id: w-031
 from: workbuddy
 to: trae
@@ -553,3 +566,52 @@ new.md v2（语句逻辑大改）已全部落地（commit 893935f），grammar.m
 5. **顺带修复**：bool→整数 cast 由 sext 改 zext（cast(true, i32) = 1 而非 -1）；push 元素槽根返回类型解引用（m[0] = push(m[0], 3) 可用）；修复三处先 free 后 clone 的 use-after-free 隐患（MCopy/字段写/struct assign/elem_assign 统一改为先 clone 后 free）。
 6. examples 11 处、grammar_tests 6 处、main.zfy 5 处、tese.zfy 1 处裸调用点已全部改写；回归 54/54 PASS，grammar_tests 12/12 编译通过。
 <!-- w-028 复验（2026-10-13:00）：用户重提 new.md 报告，已确认 e05ed62 修复在位且生效——main.zfy 完整跑通 D r=495249、loopmove_test/s8 最小复现全过、回归 59 例 0 失败。无需 Trae 动作。 -->
+
+<!-- 2026-10-11 14:20 轮次确认：本轮为用户程序编写练习（program.zfy 数字直方图），未改编译器；两处报错（main 带返回类型、数组字面量方括号语法）均为我方笔误，非编译器 bug。另外发现根目录 zfyc 是 0 字节空文件（易误导调用），建议后续清理。 -->
+
+<!-- 2026-10-11 14:38 轮次确认：本轮用户程序练习（grade_report.zfy 成绩统计分析器），编译通过、边界用例验证正确，未改编译器；三处报错（空列表字面量 [] 不支持、main 裸 return 类型不符、output 是变参每调用末尾自动换行）均属语法认知问题已自行修正，非编译器 bug。 -->
+
+<!-- 2026-10-11 14:42 轮次确认：本轮用户程序练习（mortgage.zfy 等额本息房贷计算器），首次编译即通过；标准用例（100万/4.9%/30年 → 月供 5307.27、总利息 910616.19）与逐年计划、0 利率边界全对。仅一处显示瑕疵（两位小数补零）自行用 output end="" 命名参数修复，非编译器 bug。 -->
+---
+id: w-032
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-16 19:25
+---
+时间内建已落地（commit 1db2d01，v3.3.6），回归 62/62 全 PASS：
+- 新内建：`now() -> i64`（Unix 秒）、`tick_ms() -> i64`（单调钟 QPC/CLOCK_MONOTONIC，进程起点 0）、`sleep_ms(i64)`（TVoid 裸语句合法）、`localtime(i64) -> datetime`、`mktime(y,mo,d,h,mi,s) -> i64`（分量 i64 允许越界归一化，日期算术基础）
+- **内建 datetime struct**：8 字段全 i32（year/month/day/hour/minute/second/weekday/yday），weekday 0=周日；由编译器在 genv 初始化处预注册，用户不得定义同名 struct/fn（已入 builtin_names 保留表）
+- 实现要点：localtime 走 sret（MCallOwn 聚合返回既有路径，C 侧 `void zfy_time_local(zfy_datetime*, i64)` 与 clang ABI 天然对齐）；时间符号全部 zfy_ 前缀豁免 declare 自动收集，由 prelude 统一声明；typeck 侧 ECallK 构造处加 time_rt_name 用户名→运行时符号映射
+- 保留名新增：now/tick_ms/sleep_ms/localtime/mktime/datetime
+- examples/time_test.zfy 为行为参考（含越界归一化、单调性、sleep 实测断言）
+---
+id: w-033
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-16 19:50
+---
+GUI 框架 L0/L1 已落地（commit 9b6d738，design_gui.md 为架构总纲），回归 62/62：
+- 分层：L0 渲染核心（runtime.c，~330 行 C）→ L1 绑定（stdlib/gui.zfy，纯 extern）→ L2 组件（下一轮，纯 zfy）→ L3 应用框架
+- L0 速度设计：CreateDIBSection 32bpp 帧缓冲直写像素、fill_rect 按行块填充、事件环形队列 O(1) 轮询、present 单次 BitBlt、WM_ERASEBKGND 吞掉防闪烁；GDI 同 DC 出中文文本（雅黑 16px ClearType）+ text_w 布局测量
+- **零编译器改动**（唯一例外：driver 链接追加 -lgdi32 -luser32，Windows 分支）
+- API：gui_open/close/title/w/h/alive/should_close/poll/present/fill_rect/rect/draw_text/text_w/frame_sleep + Event struct + EV_* 常量；事件 MOVE/LDOWN/LUP/RDOWN/RUP/KEY/WHEEL
+- 交互演示在 demos/gui_demo.zfy（不进回归扫描）；examples/gui_smoke.zfy 自动断言可入回归
+- 已知 Phase 2 待办：resize/DIB 重建、damage 跟踪（组件层）、键盘扫描码、剪贴板
+---
+id: w-034
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-16 20:40
+---
+GUI 框架 M2 已落地（commit 13259f7，v3.3.8），回归 66/66 全 PASS：
+- stdlib/widgets.zfy（L2，纯 zfy）：Label/Button/InputBox/Slider/ProgressBar/ListBox + App 容器。damage 跟踪：组件带 dirty 标志，只重绘脏组件，本帧无重绘则不 present（空闲零拷贝）；App.step() 一帧完成泵事件→分发→脏区重绘→按需提交；业务侧读组件状态（clicks/text/value/sel）驱动 UI
+- **编译器三项改动**（本轮真实 bug 修复）：
+  1. resolve.ml：mod 文件内方法的参数/返回类型漏做名字扁平化（只重写了 body）→ mod 内方法带 struct 参数报 E3001 undefined type（单文件/自由函数均正常，故此前未暴露）
+  2. typeck.ml：ECall callee 为 EField 时支持元素方法调用 arr[i].m(...)——接收者按元素地址传（CRef 泛化到可定位字段/元素表达式）；check_aug 支持 self.a[i].f++ 等元素字段复合赋值（取址→SAugDerefK）
+  3. mir.ml：EAddrOfK 泛化为递归地址生成（字段链/元素/解引用任意嵌套）；注意字段链地址的寄存器语义与变量槽差一次 load（seq 指针），MElemAddr 基址已对齐槽语义
+- examples/widgets_test.zfy 可入回归（合成事件断言状态机 + 渲染冒烟）；demos/widgets_demo.zfy 交互演示（按钮计数/输入回显/滑块联动进度条/列表选中/添加项）——可直接运行体验
+- 语法备忘：struct 内方法不可加 pub；use 组绑定不可跨行；struct 值语义——add 进 App 后须读 app.buttons[i] 而非局部变量
+- 下一步 M3：L3 应用框架（焦点链/回调）+ 记事本/计算器两个真实小软件
