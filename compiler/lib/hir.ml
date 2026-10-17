@@ -150,6 +150,9 @@ and tstmt_kind =
     (* 指针解引用复合赋值：p* op= v（p 表达式, 运算, 右值）；p*++ 亦归此 *)
   | SUnsafeK of tblock
     (* unsafe 块：仅标记作用域（typeck 时放开指针算术门禁），降码时透明展开 *)
+  | SBlockK of tblock
+    (* 透明块（v3.6 for-in 降码承载）：纯顺序组合，无独立作用域/栈帧。
+       mir/llvmgen 平铺为指令序列 *)
 
 and tblock = tstmt list
 

@@ -753,6 +753,9 @@ and parse_let_head p =
     | (Ident _, _) ->
       (match peek2 p with
        | (Ident _, _) -> Some (parse_ty ~allow_fun:true p)
+       (* 跨文件类型名的数组/列表/指针/错误值/泛型后缀：Video[] / T* / T! / Box<i32> *)
+       | (LBracket, _) | (Star, _) | (Bang, _) | (Lt, _) ->
+         Some (parse_ty ~allow_fun:true p)
        | _ -> None)
     | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty ~allow_fun:true p)
     | _ -> None
@@ -1006,7 +1009,14 @@ and parse_stmt p =
     SWhile (cond, body, tp)
   | Keyword KFor ->
     ignore (next p);
-    parse_for p tp
+    (* for-in 遍历（v3.6）：for x in seq { }（与三段式 for 并存） *)
+    (match peek p, peek2 p with
+     | (Ident name, _), (Keyword KIn, _) ->
+       ignore (next p); ignore (next p);
+       let seqx = parse_expr p in
+       let body = parse_block p in
+       SForIn (name, seqx, body, tp)
+     | _ -> parse_for p tp)
   | Keyword KOutput ->
     ignore (next p);
     parse_output p tp
@@ -1152,11 +1162,8 @@ and parse_input p tp =
             | (Ident _, _) ->
               (match peek2 p with
                | (Ident _, _) -> Some (parse_ty p)
+               | (LBracket, _) | (Star, _) | (Bang, _) | (Lt, _) -> Some (parse_ty p)
                | _ -> None)
-      | (Ident _, _) ->
-        (match peek2 p with
-         | (Ident _, _) -> Some (parse_ty p)
-         | _ -> None)
             | _ -> None
           in
           let ty =
@@ -1338,6 +1345,7 @@ let rec parse_struct_fields p facc macc =
       | (Ident _, _) ->
         (match peek2 p with
          | (Ident _, _) -> Some (parse_ty p)
+         | (LBracket, _) | (Star, _) | (Bang, _) | (Lt, _) -> Some (parse_ty p)
          | _ -> None)
       | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty p)
       | _ -> None
@@ -1682,6 +1690,7 @@ and parse_item p =
       | (Ident _, _) ->
         (match peek2 p with
          | (Ident _, _) -> Some (parse_ty p)
+         | (LBracket, _) | (Star, _) | (Bang, _) | (Lt, _) -> Some (parse_ty p)
          | _ -> None)
       | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty p)
       | _ -> None

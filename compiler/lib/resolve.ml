@@ -118,7 +118,7 @@ let resolve (main : program) (main_dir : string)
 
   (* ---- 阶段1：模块树构建（含文件模块加载与 include 环检测） ---- *)
   let stack : (string * string) list ref = ref [] in   (* (规范路径, 模块名) *)
-  let loaded : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+  let loaded : (string, modt) Hashtbl.t = Hashtbl.create 8 in
   let read_parse path =
     try
       let src = read_file path in
@@ -240,23 +240,30 @@ let resolve (main : program) (main_dir : string)
            let ring = List.map snd (!stack @ [ (norm, name) ]) in
            collect RDriver p
              ("circular module dependency: " ^ String.concat " -> " ring)
-         end else if Hashtbl.mem loaded norm then
-           collect RDriver p
-             (Printf.sprintf "name conflict: module file %s is loaded by more than one mod declaration" path)
-         else begin
-           Hashtbl.replace loaded norm ();
-           let c = mk_mod (modt.mpath @ [ name ]) (Filename.dirname path) in
-           c.parent <- Some modt;
-           modt.children <- modt.children @ [ (name, c) ];
-           let body =
-             fixup_uses (Filename.dirname path) (anc_mod_names modt)
-               (read_parse path)
+         end else begin
+           (* 同一模块文件被多处 mod 声明引用（如 main 与 store 都 mod model）：
+              共享已加载的模块节点，挂到当前 mod 的 children——两处 use 经各自
+              父链解析到同一棵子树，类型身份唯一（此前按 E5009 拒绝，但跨文件
+              类型名解析器不可见，用户无法绕开，属真实项目结构缺陷） *)
+           let c =
+             match Hashtbl.find_opt loaded norm with
+             | Some prev -> prev
+             | None ->
+               let c = mk_mod (modt.mpath @ [ name ]) (Filename.dirname path) in
+               c.parent <- Some modt;
+               Hashtbl.replace loaded norm c;
+               let body =
+                 fixup_uses (Filename.dirname path) (anc_mod_names modt)
+                   (read_parse path)
+               in
+               (stack := !stack @ [ (norm, name) ];
+                List.iter (fun x -> add_item c x false) body;
+                (match List.rev !stack with
+                 | _ :: r -> stack := List.rev r
+                 | [] -> ()));
+               c
            in
-           stack := !stack @ [ (norm, name) ];
-           List.iter (fun x -> add_item c x false) body;
-           (match List.rev !stack with
-            | _ :: r -> stack := List.rev r
-            | [] -> ())
+           modt.children <- modt.children @ [ (name, c) ]
          end)
     | IFn f -> add_local modt f.name pub "fn" f.pos; modt.raw <- modt.raw @ [ it ]
     | IStruct s -> add_local modt s.name pub "struct" s.pos; modt.raw <- modt.raw @ [ it ]
@@ -353,25 +360,32 @@ let resolve (main : program) (main_dir : string)
                  fail (Printf.sprintf "unresolved path: '%s' not found (first segment must be a local submodule, a use binding, or an ancestor's submodule)"
                          s))))
   in
+  (* 共享模块节点（同一文件被多处 mod 引用）只处理一次——物理相等去重，
+     否则同一 use 绑定沿两条父链各登记一遍误报 E5009 *)
+  let seen_binds : modt list ref = ref [] in
+  let phys_eq a b = a == b in
   let rec resolve_binds (m : modt) : unit =
-    List.iter
-      (function
-        | IUseP { binds; _ } ->
-          List.iter
-            (fun (local, segs, bpos) ->
-              match resolve_path m segs bpos with
-              | Some bv ->
-                if List.exists (fun (n, _, _) -> n = local) m.locals
-                   || Hashtbl.mem m.binds local then
-                  collect RDriver bpos
-                    (Printf.sprintf "name conflict: use binding '%s' already defined in module %s"
-                       local (module_str m))
-                else Hashtbl.replace m.binds local bv
-              | None -> ())
-            binds
-        | _ -> ())
-      m.raw;
-    List.iter (fun (_, c) -> resolve_binds c) m.children
+    if not (List.exists (phys_eq m) !seen_binds) then begin
+      seen_binds := m :: !seen_binds;
+      List.iter
+        (function
+          | IUseP { binds; _ } ->
+            List.iter
+              (fun (local, segs, bpos) ->
+                match resolve_path m segs bpos with
+                | Some bv ->
+                  if List.exists (fun (n, _, _) -> n = local) m.locals
+                     || Hashtbl.mem m.binds local then
+                    collect RDriver bpos
+                      (Printf.sprintf "name conflict: use binding '%s' already defined in module %s"
+                         local (module_str m))
+                  else Hashtbl.replace m.binds local bv
+                | None -> ())
+              binds
+          | _ -> ())
+        m.raw;
+      List.iter (fun (_, c) -> resolve_binds c) m.children
+    end
   in
   resolve_binds root;
 
@@ -598,6 +612,8 @@ let resolve (main : program) (main_dir : string)
            p)
       | SReduce (a, b, c, p) ->
         SReduce (rw_expr m a, rw_expr m b, rw_expr m c, p)
+      | SForIn (n, sx, b, p) ->
+        SForIn (n, rw_expr m sx, rw_block m b, p)
       | SUnsafe (b, p) -> SUnsafe (rw_block m b, p)
       | SBreak _ | SContinue _ -> s
     in
@@ -606,7 +622,8 @@ let resolve (main : program) (main_dir : string)
       { f with fty = rw_ty m f.fty; fdefault = Option.map (rw_expr m) f.fdefault }
     in
     let out : item list ref = ref [] in
-    let emit_item (m : modt) (it : item) : unit =
+    let seen_emit : modt list ref = ref [] in   (* emit 阶段独立去重表 *)
+    let rec emit_item (m : modt) (it : item) : unit =
       match it with
       | IFn f ->
         out := IFn { name = flat_prefix m.mpath ^ f.name;
@@ -646,7 +663,10 @@ let resolve (main : program) (main_dir : string)
       | IUse _ | IUseP _ | IMod _ | IModFile _ | IPub _ -> ()
     in
     let rec emit_tree (m : modt) ~(is_root : bool) : unit =
-      List.iter
+      (* 共享模块节点只 emit 一次（同 resolve_binds 的物理相等去重） *)
+      if is_root || not (List.exists (fun v -> v == m) !seen_emit) then begin
+        if not is_root then seen_emit := m :: !seen_emit;
+        List.iter
         (function
           | IMod (name, _, _) | IModFile (name, _) ->
             (match child_opt m name with
@@ -661,6 +681,7 @@ let resolve (main : program) (main_dir : string)
                 "legacy use (file.zfy) is only allowed at file top level, not inside mod"
           | it -> emit_item m it)
         m.raw
+      end
     in
     emit_tree root ~is_root:true;
     (* 阶段3 内部（resolve_name 改写）也会收集错误：失败则整体拒绝输出，

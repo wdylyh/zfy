@@ -1,0 +1,69 @@
+// v3.6 容器轮：map/set/for-in/列表内建（headless 逻辑测试）
+fn bool is_even(let i32 x)
+    return x % 2 == 0
+fn i32 add2(let i32 a, let i32 b)
+    return a + b
+fn i32 cmp_desc(let i32 a, let i32 b)
+    return b - a
+
+fn main()
+    // ---- map<string, i32> ----
+    let map<string, i32> ages
+    ages["alice"] = 30
+    ages["bob"] = 25
+    output(ages["alice"] ?? -1)      // 30
+    output(ages["carol"] ?? -1)      // -1（缺失）
+    output(map_len(ages))            // 2
+    output(map_has(ages, "bob"))     // true
+    output(map_has(ages, "carol"))   // false
+    ages["alice"] = 31
+    output(ages["alice"] ?? -1)      // 31（覆盖）
+    output(map_del(ages, "bob"))     // true
+    output(map_len(ages))            // 1
+    // ---- map<i32, f64> / map<i32, string> ----
+    let map<i32, f64> prices
+    prices[1] = 3.5
+    prices[2] = 7.25
+    output(prices[2] ?? 0.0)         // 7.25
+    let map<i32, string> names
+    names[1] = "one"
+    output(names[1] ?? "?")          // one
+    // ---- set<i32> ----
+    let set<i32> seen
+    set_add(seen, 1)
+    set_add(seen, 2)
+    set_add(seen, 1)
+    output(set_len(seen))            // 2
+    output(contains(seen, 2))        // true
+    output(contains(seen, 9))        // false
+    output(set_del(seen, 1))         // true
+    output(set_len(seen))            // 1
+    // ---- for-in ----
+    let i32[] xs = 3, 1, 2
+    for x in xs
+        output(x)                    // 3 1 2
+    for c in "ab"
+        output(c)                    // a b
+    for k in ages
+        output(k)                    // alice
+    for s in seen
+        output(s)                    // 2
+    // ---- 内建算法 ----
+    let i32[] s1 = sort(xs)
+    output(s1)                       // [1, 2, 3]
+    let i32[] r1 = reverse(xs)
+    output(r1)                       // [2, 1, 3]
+    output(xs)                       // [3, 1, 2]（值语义，原表不动）
+    let string[] ws = "b", "a"
+    output(join(ws, "-"))            // b-a
+    output(contains(xs, 1))          // true
+    let i32[] ev = filter(xs, is_even)
+    output(ev)                       // [2]
+    let i32 total = fold(s1, add2, 0)
+    output(total)                    // 6
+    output(any(xs, is_even))         // true
+    output(all(xs, is_even))         // false
+    let i32[] d1 = sort_by(xs, cmp_desc)
+    output(d1)                       // [3, 2, 1]
+    output(keys(ages))               // [alice]
+    output(values(prices))           // [3.5, 7.25]

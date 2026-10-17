@@ -1,6 +1,14 @@
-# zfy 语言规范（v3.5.0，2026-10-17）
+# zfy 语言规范（v3.6.0，2026-10-17）
 
 > 本版每一节都经过编译器实测校准（examples 全回归通过）。
+> 与 v3.5.0 的主要差异（v3.6.0 容器轮）：
+> **内建容器 map<K,V> / set<T>**（§19）——哈希表键值容器与集合，键限
+> string/整数(≤64)，值限 ≤64 位标量/string；`m[k]` 读产 `V!`（缺失
+> NOT_FOUND）走 `??` 解包，`m[k] = v` 写入；**for-in 遍历**——
+> `for x in xs { }` 支持 列表/数组(变量)/string(产 char)/map(产键)/
+> set(产元素)，循环变量类型自动推断；**列表算法内建**——sort/reverse/
+> join/contains/filter/any/all/sort_by/fold（谓词/比较器传函数名）。
+>
 > 与 v3.4.0 的主要差异（v3.5.0 DX 改进轮）：
 > **行尾自动续行**——行尾是二元运算符/复合赋值/逗号/`.`/`::`/and/or/not/
 > xor 等词素时，下一行自动并入当前表达式（不产生 INDENT，无需括号包裹）；
@@ -10,6 +18,13 @@
 > stdlib，与显式 mod 完全一致，显式声明优先）；
 > **panic 带位置**——运行期 panic（含数组越界/切片越界等 runtime 内部
 > 触发）输出 `  at 源文件:行号`（编译器每语句入口写入位置追踪全局）；
+> **错误报告与自动修复**——报错带全局递增序号 `[N]` 与上下文源码行
+> （详见 §16.1）；undefined variable/function 附 did-you-mean 建议；
+> 四类"唯一语义"错误自动修复（唯一候选改名、传统类型别名、范围内
+> 整数字面量窄化插 cast、char→整数槽插 cast）：非交互（脚本）自动
+> 修复全部（内存，源文件不动）照常产出 exe；交互（终端）报告全部
+> 错误后询问要修的序号（空格/逗号分隔），选中项直接写回源文件后
+> 重编译（详见 §16.1）；超界整数字面量从"静默回绕"改为报 E3155；
 > **组件层 DX**——App.add_* 全部返回组件索引 i32（值语义容器：add 后
 > 业务读写走 app.xxx[idx].field，勿读局部变量）；TextArea 空 lines 时
 > place_cursor/insert_at_cursor/handle_key 自动初始化为单空行（不再
@@ -653,6 +668,71 @@ fn main()
 | `push(xs, 1)` 裸语句 | E3189（v3.1 新增） | `xs = push(xs, 1)`（push 返回列表） |
 | `remove(xs, 0)` 裸语句 | E3189（v3.1 新增） | `let i32 v = remove(xs, 0)`（返回被删元素） |
 | `cast(pi, i32)` 裸语句（旧重绑定） | E3189（v3.1：特例已删除） | `pi = cast(pi, i32)` 或 `let i32 n = cast(pi, i32)` |
+| `let i32 x = 7000000000`（超界字面量） | E3155（v3.5 起不再静默回绕；范围内窄化则自动插 cast，§16.1） | `let i64 x = 7000000000` 或 `let i32 x = cast(7000000000, i32)` |
+| `let i32 c = 'A'`（char 落整数槽） | 自动修复：插 cast（v3.5，§16.1） | 直接写（等价 `cast('A', i32)`=65） |
+
+### 16.1 错误报告格式与自动修复（v3.5）
+
+**报错格式**：每条错误带全局递增序号 `[N]`（按文件→行→列排序编号，
+一次编译内连续），后跟错误码、行号、文件名与原因，并附出错行上下文
+（上下各 2 行共 5 行 + `^` 指示列）。超过 30 条折叠，保留汇总行。
+
+```
+zfy:error[2][E3011] in 5 of main.zfy because (undefined variable: cont (did you mean 'count'? auto-fixed))
+let i32 n = cont
+             ^
+```
+
+undefined variable/function 报错附 did-you-mean 建议（最小编辑距离，
+≤3 字符容 1 错、其余容 2；候选并列时只提示不修）。
+
+**自动修复**：四类"唯一语义"错误（修复方式唯一、无歧义）由编译器
+自动修复，报错照常输出（文案含 `auto-fixed`），且报告顶部先罗列将
+被自动修复的序号：
+
+```
+zfy: auto-fixable: error(s) [2] [3] will be repaired automatically
+zfy:error[1][E3005] ...
+zfy:error[2][E3101] ...
+```
+
+| 类别 | 触发示例 | 自动修复动作 | 修复后 |
+|---|---|---|---|
+| undefined variable 唯一候选 | `let i32 n = cont`（作用域内有 `count`） | 改名 `cont` → `count` | `let i32 n = count` |
+| undefined function 唯一候选 | `shwo(x)`（有 `show`） | 改名 `shwo` → `show` | `show(x)` |
+| 传统类型别名 | `let int q = 1` | 别名迁移 | `let i32 q = 1` |
+| 范围内整数字面量窄化 | `let i8 x = 100`（值在 i8 范围） | 插 cast | `let i8 x = cast(100, i8)` |
+| char→整数槽 | `let i32 c = 'A'` | 按码点插 cast | `let i32 c = cast('A', i32)` |
+
+别名映射全表：`int`→`i32`、`short`→`i16`、`long`→`i128`、
+`signed`→`i32`、`unsigned`→`u32`、`ulong`→`u128`、`float`→`f32`、
+`double`→`f64`、`byte`→`i8`。
+
+**产出规则（v3.5.1 交互式修复）**：
+
+- **非交互场景**（stdin 非终端，如脚本/管道；可用 `ZFY_FIX=all` 强制）
+  → 自动修复全部（内存补丁重跑 ≤4 轮，**源文件不动**），照常产出
+  可执行文件，stderr 打印修复明细
+  `zfy: note: auto-fixed N error(s):`（每条带序号/错误码/行号/文案）。
+- **交互场景**（终端运行，或 `ZFY_FIX=ask` 强制）→ 照常报告全部错误
+  （顶部罗列可自动修复的序号）**且不退出**，提示
+  `zfy: enter error number(s) to auto-fix (space/comma separated; Enter = all, q = none):`
+  ——输入要修复的**序号**（空格与逗号分隔均支持，可混用，如
+  `1, 3` 或 `1 3`；直接回车=全部，`q`=不修），选中项**直接写回源
+  文件**（改名与 cast 插入都改文件）后自动重编译；不可修错误照常
+  留存，全部可修则产出 exe 并打印修复明细。
+- `ZFY_FIX=ask`/`all` 环境变量可强制指定模式（脚本/测试用）。
+
+**行为变化（v3.5）**：超界整数字面量落窄槽不再静默回绕，改为报
+E3155 要求显式 cast——
+
+```
+let i32 x = 7000000000   // E3155：字面量超 i32 范围，须 cast(…, i32) 或改 i64
+let u8 y = -1            // E3155：负值不在 u8 范围
+```
+
+例外：u64/u128 上下文的 hex 字面量（如 `0xC2B2AE3D27D4EB4F`）按位型
+语义接受，不查符号位。
 
 ## 17. 已知限制
 
@@ -882,3 +962,77 @@ fn main()
   `app.buttons[i].x = 5`、`app.buttons[i].clicks++` 均支持，v3.3.8）。
 - 字符串实参在 **while 条件里传函数**：旧编译器（< v3.3.10）段错误
   （自动 move 循环误判），现版本安全；文档存档供排查旧二进制。
+
+## 19. 内建容器 map / set 与 for-in（v3.6.0）
+
+### 19.1 map<K, V>
+
+```zfy
+let map<string, i32> ages        // 裸声明即空表（h 槽惰性分配）
+ages["alice"] = 30               // 写入（覆盖语义）
+let i32 a = ages["alice"] ?? -1  // 读产 i32!：缺失 = NOT_FOUND，须 ?? 解包
+output(map_len(ages))            // 元素数
+output(map_has(ages, "bob"))     // 是否有键 -> bool
+output(map_del(ages, "bob"))     // 删除（返回是否存在）
+output(keys(ages))               // 键列表 list<K>（新分配）
+output(values(ages))             // 值列表 list<V>（新分配）
+```
+
+- **键类型**：string 或整数（i8~i64/u8~u64）。整数键统一按 i64 位模式存储。
+- **值类型**：≤64 位标量（整数/浮点）或 string。string 值深拷贝（值语义）。
+- 整体赋值/传参为**值语义深拷贝**（`m2 = m1` 后互不影响）；
+  作用域退出自动释放。键插入顺序不保证（哈希桶序）。
+- `m[k]` 只能作用于**局部变量**（字段链 `bag.m[k]` 暂不支持）。
+- `m[k] op= v` 不支持（读侧是 T!，请 `m[k] = (m[k] ?? 0) + 1`）。
+
+### 19.2 set<T>
+
+```zfy
+let set<i32> seen
+set_add(seen, 1)                 // 插入（重复无效果）
+output(contains(seen, 1))        // 成员判定 -> bool（set_has 同义）
+output(set_len(seen))
+set_del(seen, 1)                 // 删除
+for x in seen { ... }            // 遍历产元素
+```
+
+元素类型同 map 键（string/整数）。内部即 map<T, i32>（值恒 1），
+`set_add`/`contains`/`set_del`/`keys` 对 set 同样适用。
+
+### 19.3 for-in 遍历
+
+```zfy
+for x in xs { ... }              // 列表/数组（数组须为变量）：x 为元素类型
+for c in "ab" { ... }            // string：c 为 char
+for k in m { ... }               // map：k 为键类型
+for x in s { ... }               // set：x 为元素类型
+```
+
+- 循环变量类型自动推断、每轮为元素的**独立深拷贝**（循环体内修改不影响
+  原序列）；序列表达式只求值一次（拷入临时槽）。与三段式 `for` 并存。
+- 循环变量作用域同 `for` 头变量：循环结束后仍可见（值为最后一轮元素）。
+
+### 19.4 列表算法内建（全部返回新列表，原列表不动）
+
+| 内建 | 形态 | 说明 |
+|---|---|---|
+| `sort(xs)` | `list<T> -> list<T>` | 升序；T 限整数/浮点/string |
+| `reverse(xs)` | `list<T> -> list<T>` | 倒序（元素深拷贝） |
+| `join(xs, sep)` | `(list<string>, string) -> string` | 拼接 |
+| `contains(xs, v)` | `(list<T>, T) -> bool` | 成员判定 |
+| `filter(xs, pred)` | `(list<T>, fn(T)->bool) -> list<T>` | 按谓词筛选 |
+| `any(xs, pred)` / `all(xs, pred)` | `-> bool` | 存在/全部满足 |
+| `sort_by(xs, cmp)` | `(list<T>, fn(T,T)->i32) -> list<T>` | 自定义比较器排序 |
+| `fold(xs, f, init)` | `(list<T>, fn(T,T)->T, T) -> T` | 左归并 |
+
+- 谓词/比较器/归并函数**传函数名**（类型须与元素精确匹配）；内部经
+  C ABI thunk 适配。`fold` 不叫 `reduce`（`reduce` 是 frac 缩减关键字）。
+- 结果为表达式临时时语句末自动释放；赋给变量即接管所有权。
+- 定长数组不能直接作为这些内建的实参（先赋给列表变量）。
+
+### 19.5 已知限制（v3.6.0）
+
+- 键/值不支持 struct、frac、i128/u128、f16/f128、bool、char 值。
+- map/set 无字面量语法；构造靠裸声明 + 逐条写入。
+- `m[k]` 读在语句位置直接丢弃会报"丢弃 T! 值"（须 `??`）。
+- filter/any/all/sort_by/fold 的函数实参不能是函数指针变量（须函数名）。

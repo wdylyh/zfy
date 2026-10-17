@@ -1688,6 +1688,550 @@ zfy_seq *zfy_seq_clone(const zfy_seq *src) {
     return s;
 }
 
+/* ---------- 哈希表 map<K,V> / set<T>（v3.6 容器轮） ----------
+ * 语言侧 map$<ktag>$<vtag> / set$<ktag> 是内建泛型 struct（单 ptr 字段 h），
+ * 槽指针即本节函数的 m** 参数（h 懒分配）。键两类：i（整数/char 按 i64 位
+ * 模式）、s（string）。值统一 8 字节：整数/bool/char/ptr 按 i64 位模式存
+ * （窄整数读回由 LLVM 截断），f32 存 float 位模式（零扩展）、f64 存 double
+ * 位模式、string 存 strdup 堆指针。链式哈希 + FNV-1a/splitmix64。 */
+
+typedef struct zfy_ment {
+    struct zfy_ment *next;
+    unsigned long long hash;
+    long long k_i;          /* ktag=i：键位模式 */
+    char *k_s;              /* ktag=s：键串（表所有） */
+    unsigned long long val; /* 值 8 字节位模式 */
+} zfy_ment;
+
+typedef struct zfy_map {
+    zfy_ment **buckets;
+    long long nbuckets;
+    long long size;
+    int kstr;               /* 1 = string 键 */
+    int vstr;               /* 1 = string 值（首 put 时确定，释放/克隆用） */
+} zfy_map;
+
+static unsigned long long zfy_mix64(unsigned long long x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31; return x;
+}
+
+static unsigned long long zfy_hash_key(const zfy_map *m, long long ki, const char *ks) {
+    if (!m->kstr) return zfy_mix64((unsigned long long)ki);
+    unsigned long long h = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)ks; *p; p++) {
+        h ^= *p; h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int zfy_key_eq(const zfy_map *m, const zfy_ment *e, long long ki, const char *ks) {
+    if (m->kstr) return strcmp(e->k_s, ks) == 0;
+    return e->k_i == ki;
+}
+
+static zfy_map *zfy_map_alloc(int kstr) {
+    zfy_map *m = (zfy_map *)malloc(sizeof(zfy_map));
+    if (!m) zfy_die("map: 内存分配失败");
+    m->buckets = NULL; m->nbuckets = 0; m->size = 0;
+    m->kstr = kstr; m->vstr = 0;
+    return m;
+}
+
+static void zfy_map_put_raw(zfy_map **mp, long long ki, const char *ks,
+                            unsigned long long v, int vstr) {
+    zfy_map *m = *mp;
+    if (!m) { m = zfy_map_alloc(ks != NULL); *mp = m; }
+    if (vstr) m->vstr = 1;
+    if (m->nbuckets == 0 || m->size * 4 >= m->nbuckets * 3) {
+        long long nn = m->nbuckets ? m->nbuckets * 2 : 16;
+        zfy_ment **nb = (zfy_ment **)calloc((size_t)nn, sizeof(zfy_ment *));
+        if (!nb) zfy_die("map: 内存分配失败");
+        for (long long b = 0; b < m->nbuckets; b++) {
+            zfy_ment *e = m->buckets[b];
+            while (e) {
+                zfy_ment *nx = e->next;
+                unsigned long long idx = e->hash & (unsigned long long)(nn - 1);
+                e->next = nb[idx]; nb[idx] = e;
+                e = nx;
+            }
+        }
+        free(m->buckets); m->buckets = nb; m->nbuckets = nn;
+    }
+    const char *ks2 = m->kstr ? ks : NULL;
+    unsigned long long h = zfy_hash_key(m, ki, ks2);
+    unsigned long long idx = h & (unsigned long long)(m->nbuckets - 1);
+    for (zfy_ment *e = m->buckets[idx]; e; e = e->next) {
+        if (e->hash == h && zfy_key_eq(m, e, ki, ks2)) {
+            /* 值为 string：旧值释放（覆盖语义） */
+            if (m->vstr) free((void *)(unsigned long long)e->val);
+            e->val = v;
+            return;
+        }
+    }
+    zfy_ment *e = (zfy_ment *)malloc(sizeof(zfy_ment));
+    if (!e) zfy_die("map: 内存分配失败");
+    e->next = m->buckets[idx];
+    e->hash = h;
+    e->k_i = ki;
+    e->k_s = m->kstr ? zfy_strdup(ks) : NULL;
+    e->val = v;
+    m->buckets[idx] = e;
+    m->size++;
+}
+
+/* 整数键 put（值按 i64 位模式：整数/bool/char/ptr） */
+void zfy_map_put_i_i64(zfy_map **mp, long long k, long long v) {
+    zfy_map_put_raw(mp, k, NULL, (unsigned long long)v, 0);
+}
+/* 浮点值 put：按位模式存 */
+void zfy_map_put_i_f32(zfy_map **mp, long long k, float v) {
+    union { float f; unsigned long long u; } c;
+    c.u = 0; c.f = v;
+    zfy_map_put_raw(mp, k, NULL, c.u, 0);
+}
+void zfy_map_put_i_f64(zfy_map **mp, long long k, double v) {
+    union { double d; unsigned long long u; } c;
+    c.d = v;
+    zfy_map_put_raw(mp, k, NULL, c.u, 0);
+}
+/* string 值 put：strdup 拷入（值语义），旧值释放 */
+void zfy_map_put_i_str(zfy_map **mp, long long k, char *v) {
+    zfy_map_put_raw(mp, k, NULL, (unsigned long long)(size_t)zfy_strdup(v), 1);
+}
+/* string 键四件套 */
+void zfy_map_put_s_i64(zfy_map **mp, const char *k, long long v) {
+    zfy_map_put_raw(mp, 0, k, (unsigned long long)v, 0);
+}
+void zfy_map_put_s_f32(zfy_map **mp, const char *k, float v) {
+    union { float f; unsigned long long u; } c;
+    c.u = 0; c.f = v;
+    zfy_map_put_raw(mp, 0, k, c.u, 0);
+}
+void zfy_map_put_s_f64(zfy_map **mp, const char *k, double v) {
+    union { double d; unsigned long long u; } c;
+    c.d = v;
+    zfy_map_put_raw(mp, 0, k, c.u, 0);
+}
+void zfy_map_put_s_str(zfy_map **mp, const char *k, char *v) {
+    zfy_map_put_raw(mp, 0, k, (unsigned long long)(size_t)zfy_strdup(v), 1);
+}
+
+/* 读：按值种类写入 err.value（与 LLVM MErrValue 约定一致：
+ * 整数 → sext i64、浮点 → double、string → strdup 所有权副本）；
+ * 缺失产 NOT_FOUND 错误。空表/未分配直接报缺失（nbuckets=0 时掩码无意义） */
+static zfy_ment *zfy_map_find_raw(zfy_map **mp, long long ki, const char *ks) {
+    zfy_map *m = *mp;
+    if (!m || m->size == 0) return NULL;
+    const char *ks2 = m->kstr ? ks : NULL;
+    unsigned long long h = zfy_hash_key(m, ki, ks2);
+    unsigned long long idx = h & (unsigned long long)(m->nbuckets - 1);
+    for (zfy_ment *e = m->buckets[idx]; e; e = e->next)
+        if (e->hash == h && zfy_key_eq(m, e, ki, ks2)) return e;
+    return NULL;
+}
+
+static void get_ok_i(zfy_err *out, unsigned long long v) {
+    out->code = ZFY_EOK; out->msg = NULL; out->value.i = (long long)v;
+}
+static void get_ok_f32(zfy_err *out, unsigned long long v) {
+    union { unsigned u; float f; } c;
+    c.u = (unsigned)v;
+    out->code = ZFY_EOK; out->msg = NULL; out->value.d = (double)c.f;
+}
+static void get_ok_f64(zfy_err *out, unsigned long long v) {
+    union { unsigned long long u; double d; } c;
+    c.u = v;
+    out->code = ZFY_EOK; out->msg = NULL; out->value.d = c.d;
+}
+static void get_ok_str(zfy_err *out, unsigned long long v) {
+    out->code = ZFY_EOK; out->msg = NULL;
+    out->value.p = zfy_strdup((const char *)(size_t)v);
+}
+
+#define MAP_MISS(out) err_set(out, ZFY_ENOT_FOUND, "map: 键不存在")
+
+void zfy_map_get_err_i_i64(zfy_err *out, zfy_map **mp, long long k) {
+    zfy_ment *e = zfy_map_find_raw(mp, k, NULL);
+    if (e) get_ok_i(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_i_f32(zfy_err *out, zfy_map **mp, long long k) {
+    zfy_ment *e = zfy_map_find_raw(mp, k, NULL);
+    if (e) get_ok_f32(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_i_f64(zfy_err *out, zfy_map **mp, long long k) {
+    zfy_ment *e = zfy_map_find_raw(mp, k, NULL);
+    if (e) get_ok_f64(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_i_str(zfy_err *out, zfy_map **mp, long long k) {
+    zfy_ment *e = zfy_map_find_raw(mp, k, NULL);
+    if (e) get_ok_str(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_s_i64(zfy_err *out, zfy_map **mp, const char *k) {
+    zfy_ment *e = zfy_map_find_raw(mp, 0, k);
+    if (e) get_ok_i(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_s_f32(zfy_err *out, zfy_map **mp, const char *k) {
+    zfy_ment *e = zfy_map_find_raw(mp, 0, k);
+    if (e) get_ok_f32(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_s_f64(zfy_err *out, zfy_map **mp, const char *k) {
+    zfy_ment *e = zfy_map_find_raw(mp, 0, k);
+    if (e) get_ok_f64(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_s_str(zfy_err *out, zfy_map **mp, const char *k) {
+    zfy_ment *e = zfy_map_find_raw(mp, 0, k);
+    if (e) get_ok_str(out, e->val); else MAP_MISS(out);
+}
+
+/* has / del / len / clear / clone / free */
+static int zfy_map_has_raw(zfy_map **mp, long long ki, const char *ks) {
+    zfy_map *m = *mp;
+    if (!m) return 0;
+    const char *ks2 = m->kstr ? ks : NULL;
+    unsigned long long h = zfy_hash_key(m, ki, ks2);
+    unsigned long long idx = h & (unsigned long long)(m->nbuckets - 1);
+    for (zfy_ment *e = m->buckets[idx]; e; e = e->next)
+        if (e->hash == h && zfy_key_eq(m, e, ki, ks2)) return 1;
+    return 0;
+}
+int zfy_map_has_i(zfy_map **mp, long long k) { return zfy_map_has_raw(mp, k, NULL); }
+int zfy_map_has_s(zfy_map **mp, const char *k) { return zfy_map_has_raw(mp, 0, k); }
+
+static int zfy_map_del_raw(zfy_map **mp, long long ki, const char *ks) {
+    zfy_map *m = *mp;
+    if (!m) return 0;
+    const char *ks2 = m->kstr ? ks : NULL;
+    unsigned long long h = zfy_hash_key(m, ki, ks2);
+    unsigned long long idx = h & (unsigned long long)(m->nbuckets - 1);
+    for (zfy_ment **pp = &m->buckets[idx]; *pp; pp = &(*pp)->next) {
+        zfy_ment *e = *pp;
+        if (e->hash == h && zfy_key_eq(m, e, ki, ks2)) {
+            *pp = e->next;
+            if (m->vstr) free((void *)(unsigned long long)e->val);
+            if (e->k_s) free(e->k_s);
+            free(e);
+            m->size--;
+            return 1;
+        }
+    }
+    return 0;
+}
+int zfy_map_del_i(zfy_map **mp, long long k) { return zfy_map_del_raw(mp, k, NULL); }
+int zfy_map_del_s(zfy_map **mp, const char *k) { return zfy_map_del_raw(mp, 0, k); }
+
+long long zfy_map_len(zfy_map **mp) { return *mp ? (*mp)->size : 0; }
+int zfy_map_has_any(zfy_map **mp) { return *mp != NULL; }
+
+void zfy_map_clear(zfy_map **mp) {
+    zfy_map *m = *mp;
+    if (!m) return;
+    for (long long b = 0; b < m->nbuckets; b++) {
+        zfy_ment *e = m->buckets[b];
+        while (e) {
+            zfy_ment *nx = e->next;
+            if (m->vstr) free((void *)(unsigned long long)e->val);
+            if (e->k_s) free(e->k_s);
+            free(e);
+            e = nx;
+        }
+    }
+    free(m->buckets);
+    m->buckets = NULL; m->nbuckets = 0; m->size = 0;
+}
+
+/* 深拷贝（整体赋值值语义）：值/键串全 strdup */
+static zfy_map *zfy_map_clone_raw(zfy_map *src) {
+    if (!src) return NULL;
+    zfy_map *m = zfy_map_alloc(src->kstr);
+    m->vstr = src->vstr;
+    for (long long b = 0; b < src->nbuckets; b++) {
+        for (zfy_ment *e = src->buckets[b]; e; e = e->next)
+            zfy_map_put_raw(&m, e->k_i, e->k_s, e->val, m->vstr);
+    }
+    return m;
+}
+void zfy_map_assign(zfy_map **dst, zfy_map **src) {
+    zfy_map *old = *dst;
+    *dst = zfy_map_clone_raw(*src);
+    /* 旧表释放（src 可能就是 dst 自身——克隆后释放原表安全） */
+    if (old) {
+        for (long long b = 0; b < old->nbuckets; b++) {
+            zfy_ment *e = old->buckets[b];
+            while (e) {
+                zfy_ment *nx = e->next;
+                if (old->vstr) free((void *)(unsigned long long)e->val);
+                if (e->k_s) free(e->k_s);
+                free(e);
+                e = nx;
+            }
+        }
+        free(old->buckets);
+        free(old);
+    }
+}
+
+void zfy_map_free(zfy_map **mp) {
+    zfy_map *m = *mp;
+    if (!m) return;
+    for (long long b = 0; b < m->nbuckets; b++) {
+        zfy_ment *e = m->buckets[b];
+        while (e) {
+            zfy_ment *nx = e->next;
+            if (m->vstr) free((void *)(unsigned long long)e->val);
+            if (e->k_s) free(e->k_s);
+            free(e);
+            e = nx;
+        }
+    }
+    free(m->buckets);
+    free(m);
+    *mp = NULL;
+}
+
+/* 迭代器（for-in map 产键）：{ map, bucket, entry } 三字句柄 */
+typedef struct {
+    zfy_map *m;
+    long long b;
+    zfy_ment *e;
+} zfy_miter;
+
+void *zfy_map_iter(zfy_map **mp) {
+    zfy_map *m = *mp;
+    if (!m) return NULL;
+    zfy_miter *it = (zfy_miter *)malloc(sizeof(zfy_miter));
+    if (!it) zfy_die("map: 内存分配失败");
+    it->m = m; it->b = 0; it->e = NULL;
+    return it;
+}
+
+int zfy_map_next(void *itv, void *kout) {
+    zfy_miter *it = (zfy_miter *)itv;
+    if (!it) return 0;
+    if (!it->e) {
+        while (it->b < it->m->nbuckets && !it->m->buckets[it->b]) it->b++;
+        if (it->b >= it->m->nbuckets) { free(it); return 0; }
+        it->e = it->m->buckets[it->b];
+    }
+    zfy_ment *e = it->e;
+    it->e = e->next;
+    if (it->m->kstr)
+        *(char **)kout = e->k_s;
+    else
+        *(long long *)kout = e->k_i;
+    return 1;
+}
+
+/* keys(m)：键列表（string 键逐个 strdup，kind=1 深拷贝语义安全） */
+zfy_seq *zfy_map_keys(zfy_map **mp) {
+    zfy_map *m = *mp;
+    long long n = m ? m->size : 0;
+    zfy_seq *s = zfy_seq_new_k(n, n > 0 ? n : 1, 8, m && m->kstr ? 1 : 0, NULL);
+    long long i = 0;
+    if (m) {
+        for (long long b = 0; b < m->nbuckets; b++) {
+            for (zfy_ment *e = m->buckets[b]; e; e = e->next) {
+                void *slot = (char *)s->data + i * 8;
+                if (m->kstr) {
+                    char *cp = zfy_strdup(e->k_s);
+                    memcpy(slot, &cp, 8);
+                } else {
+                    memcpy(slot, &e->k_i, 8);
+                }
+                i++;
+            }
+        }
+    }
+    return s;
+}
+
+/* values(m)：值列表（vstr 时逐个 strdup；velemsz 4=f32 位模式 / 8=其余）。
+ * 元素 kind 0（标量位模式）；string 值 kind=1 深拷贝语义 */
+zfy_seq *zfy_map_values(zfy_map **mp, int vstr, int velemsz) {
+    zfy_map *m = *mp;
+    long long n = m ? m->size : 0;
+    zfy_seq *s = zfy_seq_new_k(n, n > 0 ? n : 1, velemsz, vstr ? 1 : 0, NULL);
+    long long i = 0;
+    if (m) {
+        for (long long b = 0; b < m->nbuckets; b++) {
+            for (zfy_ment *e = m->buckets[b]; e; e = e->next) {
+                void *slot = (char *)s->data + i * velemsz;
+                if (vstr) {
+                    char *cp = zfy_strdup((const char *)(unsigned long long)e->val);
+                    memcpy(slot, &cp, velemsz);
+                } else {
+                    memcpy(slot, &e->val, velemsz);
+                }
+                i++;
+            }
+        }
+    }
+    return s;
+}
+
+/* ---------- 容器算法内建（v3.6）：sort/reverse/join/contains ----------
+ * 全部返回新列表（值语义：原列表不动）。元素限 ≤64 位标量/string，
+ * 排序比较按元素种类分派（宏生成）；谓词/比较器为 C thunk（llvmgen 生成）。 */
+
+#define DEF_SORT(TAG, CMP_EXPR, DECL, ELEM_T)                              \
+static int zfy_cmp_##TAG(const void *a, const void *b) {                   \
+    DECL x = *(const ELEM_T *)a;                                           \
+    DECL y = *(const ELEM_T *)b;                                           \
+    return (CMP_EXPR);                                                     \
+}                                                                          \
+zfy_seq *zfy_sort_##TAG(zfy_seq *src) {                                    \
+    if (!src) return zfy_seq_new_k(0, 1, 8, 0, NULL);                      \
+    zfy_seq *s = zfy_seq_clone(src);                                       \
+    if (s->len > 1)                                                        \
+        qsort(s->data, (size_t)s->len, (size_t)s->elemsz, zfy_cmp_##TAG);  \
+    return s;                                                              \
+}
+
+#define STRCMP(a, b) strcmp((a), (b))
+DEF_SORT(i8, (x < y) ? -1 : (x > y), signed char, signed char)
+DEF_SORT(i16, (x < y) ? -1 : (x > y), short, short)
+DEF_SORT(i32, (x < y) ? -1 : (x > y), int, int)
+DEF_SORT(i64, (x < y) ? -1 : (x > y), long long, long long)
+DEF_SORT(u8, (x < y) ? -1 : (x > y), unsigned char, unsigned char)
+DEF_SORT(u16, (x < y) ? -1 : (x > y), unsigned short, unsigned short)
+DEF_SORT(u32, (x < y) ? -1 : (x > y), unsigned int, unsigned int)
+DEF_SORT(u64, (x < y) ? -1 : (x > y), unsigned long long, unsigned long long)
+DEF_SORT(f32, (x < y) ? -1 : (x > y), float, float)
+DEF_SORT(f64, (x < y) ? -1 : (x > y), double, double)
+DEF_SORT(str, STRCMP(x, y), char *, char *)
+
+zfy_seq *zfy_reverse(zfy_seq *src) {
+    if (!src) return zfy_seq_new_k(0, 1, 8, 0, NULL);
+    zfy_seq *s = zfy_seq_clone(src);
+    for (long long i = 0, j = s->len - 1; i < j; i++, j--) {
+        char tmp[16];
+        void *a = (char *)s->data + i * s->elemsz;
+        void *b = (char *)s->data + j * s->elemsz;
+        memcpy(tmp, a, (size_t)s->elemsz);
+        memcpy(a, b, (size_t)s->elemsz);
+        memcpy(b, tmp, (size_t)s->elemsz);
+    }
+    return s;
+}
+
+/* join(xs, sep)：string 列表拼接（元素 strdup 后释放），sep 可空串 */
+char *zfy_join(zfy_seq *src, const char *sep) {
+    if (!src) zfy_die("join: 源为空");
+    size_t sl = strlen(sep), total = 1;
+    for (long long i = 0; i < src->len; i++) {
+        char *e = *(char **)((char *)src->data + i * 8);
+        if (!e) zfy_die("join: 元素为空");
+        total += strlen(e) + (i > 0 ? sl : 0);
+    }
+    char *out = (char *)malloc(total);
+    if (!out) zfy_die("join: 内存分配失败");
+    char *p = out;
+    for (long long i = 0; i < src->len; i++) {
+        if (i > 0) { memcpy(p, sep, sl); p += sl; }
+        char *e = *(char **)((char *)src->data + i * 8);
+        size_t el = strlen(e);
+        memcpy(p, e, el); p += el;
+    }
+    *p = '\0';
+    return out;
+}
+
+#define DEF_CONTAINS(TAG, EQ_EXPR, ELEM_T)                                 \
+int zfy_contains_##TAG(zfy_seq *s, ELEM_T v) {                             \
+    if (!s) return 0;                                                      \
+    for (long long i = 0; i < s->len; i++) {                               \
+        ELEM_T x = *(ELEM_T *)((char *)s->data + i * s->elemsz);           \
+        if (EQ_EXPR) return 1;                                             \
+    }                                                                      \
+    return 0;                                                              \
+}
+
+DEF_CONTAINS(i8, x == v, signed char)
+DEF_CONTAINS(i16, x == v, short)
+DEF_CONTAINS(i32, x == v, int)
+DEF_CONTAINS(i64, x == v, long long)
+DEF_CONTAINS(u8, x == v, unsigned char)
+DEF_CONTAINS(u16, x == v, unsigned short)
+DEF_CONTAINS(u32, x == v, unsigned int)
+DEF_CONTAINS(u64, x == v, unsigned long long)
+DEF_CONTAINS(f32, x == v, float)
+DEF_CONTAINS(f64, x == v, double)
+DEF_CONTAINS(str, STRCMP(x, v) == 0, char *)
+
+/* 谓词/比较器 thunk：llvmgen 为每个 (函数, 元素类型) 生成 C ABI 适配器，
+ * 这里只消费统一签名（元素按指针传入）：
+ *   filter/any/all：i32 (*pred)(const void *elem)
+ *   sort_by：       i32 (*cmp)(const void *a, const void *b)
+ *   reduce：        T (*f)(T acc, T elem)（值传，按值种类宏生成） */
+zfy_seq *zfy_filter(zfy_seq *src, int (*pred)(const void *)) {
+    if (!src) zfy_die("filter: 源为空");
+    zfy_seq *s = zfy_seq_new_k(0, src->len > 0 ? src->len : 1, src->elemsz,
+                               src->kind, src->ops);
+    for (long long i = 0; i < src->len; i++) {
+        void *e = (char *)src->data + i * src->elemsz;
+        if (pred(e)) {
+            void *slot = (char *)s->data + s->len * s->elemsz;
+            elem_init(slot, e, s->kind, s->ops, s->elemsz);
+            s->len++;
+        }
+    }
+    return s;
+}
+
+int zfy_any(zfy_seq *s, int (*pred)(const void *)) {
+    if (!s) return 0;
+    for (long long i = 0; i < s->len; i++)
+        if (pred((char *)s->data + i * s->elemsz)) return 1;
+    return 0;
+}
+
+int zfy_all(zfy_seq *s, int (*pred)(const void *)) {
+    if (!s) return 0;
+    for (long long i = 0; i < s->len; i++)
+        if (!pred((char *)s->data + i * s->elemsz)) return 0;
+    return 1;
+}
+
+/* sort_by：clone 后按用户比较器（C thunk）排序，返回新表（值语义） */
+zfy_seq *zfy_sort_by(zfy_seq *src, int (*cmp)(const void *, const void *)) {
+    if (!src) return zfy_seq_new_k(0, 1, 8, 0, NULL);
+    zfy_seq *s = zfy_seq_clone(src);
+    if (s->len > 1)
+        qsort(s->data, (size_t)s->len, (size_t)s->elemsz, cmp);
+    return s;
+}
+
+#define DEF_REDUCE(TAG, ELEM_T)                                            \
+ELEM_T zfy_fold_##TAG(zfy_seq *s, ELEM_T (*f)(ELEM_T, ELEM_T), ELEM_T init) { \
+    if (!s) return init;                                                   \
+    ELEM_T acc = init;                                                     \
+    for (long long i = 0; i < s->len; i++)                                 \
+        acc = f(acc, *(ELEM_T *)((char *)s->data + i * s->elemsz));        \
+    return acc;                                                            \
+}
+
+DEF_REDUCE(i8, signed char)
+DEF_REDUCE(i16, short)
+DEF_REDUCE(i32, int)
+DEF_REDUCE(i64, long long)
+DEF_REDUCE(u8, unsigned char)
+DEF_REDUCE(u16, unsigned short)
+DEF_REDUCE(u32, unsigned int)
+DEF_REDUCE(u64, unsigned long long)
+DEF_REDUCE(f32, float)
+DEF_REDUCE(f64, double)
+/* string 归并：f 接管两个参数所有权（zfy 传参约定），结果串归调用方 */
+char *zfy_fold_str(zfy_seq *s, char *(*f)(char *, char *), char *init) {
+    if (!s) return init;
+    char *acc = init;
+    for (long long i = 0; i < s->len; i++) {
+        char *x = *(char **)((char *)s->data + i * s->elemsz);
+        acc = f(acc, zfy_strdup(x));
+    }
+    return acc;
+}
+
 /* remove(数组, idx, out)：把 idx 槽位填零值（长度不变）；被删元素
  * 深拷贝副本写入 out（v3 2026-10-11 表达式化，out 可为 NULL 仅删除）。
  * 元素内含堆资源先深拷贝再释放；越界报错 */
@@ -1739,12 +2283,15 @@ void zfy_seq_aug_range(zfy_seq *s, long long a, long long b, long long step,
     if (!s) zfy_die("复合赋值: 源为空");
     if (step == 0) zfy_die("切片步长不能为 0");
     if (step > 0) {
-        if (a < 0 || b >= s->len || a > b) zfy_die("切片区间越界");
+        /* 空区间合法（a > b 产出空序列；a == len 为空起点）——
+           ListBox.clear 等"清空容器"惯用法 xs[0, -1] 依赖此语义 */
+        if (a < 0 || a > s->len || (a < s->len && a <= b && b >= s->len))
+            zfy_die("切片区间越界");
     } else {
         /* 反向区间（new.md 2026-10-11）：a 递减到 b（闭区间），要求 a >= b */
         if (a >= s->len || b < 0 || a < b) zfy_die("切片区间越界");
     }
-    for (long long i = a; (step > 0 ? i <= b : i >= b); i += step) {
+    for (long long i = a; i < s->len && (step > 0 ? i <= b : i >= b); i += step) {
         void *slot = seq_at(s, i);
         if (is_float) {
             if (width == 4) {
@@ -1844,14 +2391,16 @@ zfy_seq *zfy_seq_slice(const zfy_seq *s, long long a, long long b,
     if (!s) zfy_die("切片: 源为空");
     if (step == 0) zfy_die("切片步长不能为 0");
     if (step > 0) {
-        if (a < 0 || b >= s->len || a > b) zfy_die("切片区间越界");
+        /* 空区间合法（a > b 产出空序列；a == len 为空起点）——清空惯用法 xs[0,-1] */
+        if (a < 0 || a > s->len || (a < s->len && a <= b && b >= s->len))
+            zfy_die("切片区间越界");
     } else {
         if (a >= s->len || b < 0 || a < b) zfy_die("切片区间越界");
     }
-    long long n = (step > 0 ? (b - a) / step : (a - b) / (-step)) + 1;
+    long long n = (a > b || a >= s->len) ? 0 : (step > 0 ? (b - a) / step : (a - b) / (-step)) + 1;
     zfy_seq *r = zfy_seq_new_k(n, n, s->elemsz, s->kind, s->ops);
     long long j = 0;
-    for (long long i = a; (step > 0 ? i <= b : i >= b); i += step, j++)
+    for (long long i = a; i < s->len && (step > 0 ? i <= b : i >= b); i += step, j++)
         elem_init(seq_at(r, j), seq_at(s, i), s->kind, s->ops, s->elemsz);
     return r;
 }
@@ -1881,15 +2430,17 @@ char *zfy_str_slice(const char *s, long long a, long long b, long long step) {
     long long n = (long long)strlen(s);
     if (step == 0) zfy_die("字符串切片步长不能为 0");
     if (step > 0) {
-        if (a < 0 || b >= n || a > b) zfy_die("字符串切片区间越界");
+        /* 空区间合法（a > b 产出空串；a == n 为空起点） */
+        if (a < 0 || a > n || (a < n && a <= b && b >= n))
+            zfy_die("字符串切片区间越界");
     } else {
         if (a >= n || b < 0 || a < b) zfy_die("字符串切片区间越界");
     }
-    long long cnt = (step > 0 ? (b - a) / step : (a - b) / (-step)) + 1;
+    long long cnt = (a > b || a >= n) ? 0 : (step > 0 ? (b - a) / step : (a - b) / (-step)) + 1;
     char *buf = (char *)malloc((size_t)cnt + 1);
     if (!buf) zfy_die("字符串切片: 内存分配失败");
     long long len = 0;
-    for (long long i = a; (step > 0 ? i <= b : i >= b); i += step)
+    for (long long i = a; i < n && (step > 0 ? i <= b : i >= b); i += step)
         buf[len++] = s[i];
     buf[len] = '\0';
     return buf;
@@ -2149,6 +2700,22 @@ zfy_seq *zfy_str_split_str(const char *s, const char *delim) {
    链接库（kernel32 的 GetModuleHandle/GetProcAddress 恒可用）；
    POSIX: getentropy()。
    熵源不可用属不可恢复错误，fail-fast die。 */
+
+/* ---- 控制台 UTF-8 统一（编码策略：进程内所有 string 均为 UTF-8 字节） ----
+ * Windows 控制台默认代码页（如 936/GBK）会导致 UTF-8 中文经 printf/fwrite
+ * 输出乱码、input() 键入字节为 GBK。进程加载时强制代码页 65001：
+ * 输出侧 UTF-8 字节直通、输入侧 ReadConsoleA 产 UTF-8 字节，与 string 内部
+ * 表示一致。GUI 侧本就 CP_UTF8 转换，不受影响。 */
+#ifdef _WIN32
+static void zfy_console_utf8_init(void) __attribute__((constructor));
+static void zfy_console_utf8_init(void) {
+    if (GetConsoleWindow() != NULL) {
+        SetConsoleOutputCP(65001);
+        SetConsoleCP(65001);
+    }
+}
+#endif
+
 void zfy_os_random_u64(unsigned long long *out) {
 #ifdef _WIN32
     typedef unsigned char (WINAPI *rng_fn)(void *, unsigned long);
@@ -2336,9 +2903,11 @@ typedef struct { int64_t t, x, y, k; } gui_ev;
 
 /* EV_KEY 的 k 值分区（避免与 WM_CHAR 码元 <0x110000 冲突）：
  *   GUI_KEY_EXT  | VK   —— 方向键/Delete/Home/End 等（WM_KEYDOWN）
+ *   GUI_KEY_SHIFT| EXT|VK —— Shift+导航（扩选用）
  *   GUI_KEY_CTRL | 'C'  —— Ctrl 组合键（VK 大写字母） */
 #define GUI_KEY_EXT  0x10000000
 #define GUI_KEY_CTRL 0x20000000
+#define GUI_KEY_SHIFT 0x40000000
 
 /* 多窗口（v3.4）：窗口状态集中管理，WndProc 经 GWLP_USERDATA 找回窗口。
  * 绘制类 API 作用于"当前窗口" g_cur（gui_select 切换）；gui_open 保持
@@ -2435,16 +3004,37 @@ static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             gui_push_ev(w, GUI_EV_KEY, 0, 0, GUI_KEY_CTRL | vk);
             return 0;
         }
-        /* 导航/编辑键不走 WM_CHAR，显式推送 */
+        /* 导航/编辑键不走 WM_CHAR，显式推送；Shift 按下时带 SHIFT 位（扩选） */
         if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN
             || vk == VK_DELETE || vk == VK_HOME || vk == VK_END) {
-            gui_push_ev(w, GUI_EV_KEY, 0, 0, GUI_KEY_EXT | vk);
+            int64_t mod = GUI_KEY_EXT;
+            if (GetKeyState(VK_SHIFT) < 0) mod |= GUI_KEY_SHIFT;
+            gui_push_ev(w, GUI_EV_KEY, 0, 0, mod | vk);
         }
         return 0;
     }
-    case WM_CHAR:
-        gui_push_ev(w, GUI_EV_KEY, 0, 0, (int64_t)wp);
+    case WM_CHAR: {
+        /* UTF-8 编码策略：WM_CHAR 送来的是 UTF-16 码元（中文一键一个码元，
+           >0x7F 的值经 widgets 的 cast(k, char) 会截断成乱码字节）。这里把
+           码元（含代理对）转成 UTF-8 字节序列，逐字节作为连续 KEY 事件入队
+           ——业务层逐字节追加即拼出正确 UTF-8 串，与 string 内部表示一致 */
+        static unsigned int pend_sur = 0;   /* 高代理暂存（键盘焦点唯一，进程级即可） */
+        unsigned int cp = (unsigned int)wp;
+        if (cp >= 0xD800 && cp <= 0xDBFF) { pend_sur = cp; return 0; }
+        if (cp >= 0xDC00 && cp <= 0xDFFF && pend_sur) {
+            cp = 0x10000u + ((pend_sur - 0xD800) << 10) + (cp - 0xDC00);
+            pend_sur = 0;
+        }
+        unsigned char u8[4];
+        int n;
+        if (cp < 0x80)      { u8[0] = (unsigned char)cp; n = 1; }
+        else if (cp < 0x800)  { u8[0] = 0xC0 | (cp >> 6); u8[1] = 0x80 | (cp & 0x3F); n = 2; }
+        else if (cp < 0x10000){ u8[0] = 0xE0 | (cp >> 12); u8[1] = 0x80 | ((cp >> 6) & 0x3F); u8[2] = 0x80 | (cp & 0x3F); n = 3; }
+        else { u8[0] = 0xF0 | (cp >> 18); u8[1] = 0x80 | ((cp >> 12) & 0x3F); u8[2] = 0x80 | ((cp >> 6) & 0x3F); u8[3] = 0x80 | (cp & 0x3F); n = 4; }
+        for (int i = 0; i < n; i++)
+            gui_push_ev(w, GUI_EV_KEY, 0, 0, (int64_t)u8[i]);
         return 0;
+    }
     case WM_CLOSE:
         w->should_close = 1;
         DestroyWindow(hw);
@@ -2686,6 +3276,118 @@ int32_t zfy_gui_text_w(char *utf8) {
     return (int32_t)sz.cx;
 }
 
+/* ---------- UI 打磨原语（v3.4.x：字号/圆角/线条/渐变） ---------- */
+
+static COLORREF gui_rgb(uint32_t rgb) {
+    /* 0xRRGGBB -> COLORREF 0x00BBGGRR */
+    return ((rgb >> 16) & 0xFF) | (rgb & 0xFF00) | ((rgb & 0xFF) << 16);
+}
+
+/* 设置当前字体：px 逻辑像素（内部 ×DPI），bold 非 0 为粗体。
+   影响后续 gui_draw_text / gui_text_w；px<=0 恢复默认 16。
+   按 (px,bold) 缓存 HFONT——组件每帧 draw 都会设置字体，不缓存则每帧 CreateFont。 */
+void zfy_gui_font(int32_t px, int32_t bold) {
+    if (!g_cur || !g_cur->mem) return;
+    if (px <= 0) px = 16;
+    /* 槽位表：每种 (px,bold) 一个 HFONT 常驻，不做单槽淘汰。
+       旧实现"单槽缓存 + DeleteObject(仍选入 DC 的旧字体)"在多字号
+       来回切换时触发 GDI 未定义行为（实测 <16px 渲染缺失/变黑）。 */
+    #define GUI_FONT_SLOTS 16
+    static HFONT fonts[GUI_FONT_SLOTS] = {0};
+    static int fpx[GUI_FONT_SLOTS];
+    static int fbold[GUI_FONT_SLOTS];
+    static int slot_n = 0;
+    int want = (bold != 0);
+    int i;
+    for (i = 0; i < GUI_FONT_SLOTS; i++) {
+        if (fonts[i] && fpx[i] == px && fbold[i] == want) {
+            SelectObject(g_cur->mem, fonts[i]);
+            return;
+        }
+    }
+    HFONT f = CreateFontW(-(int)px * g_cur->dpi / 96, 0, 0, 0,
+                          bold ? FW_SEMIBOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                          CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    if (!f) return;
+    /* 覆盖循环槽；旧字体可能仍被某窗口 DC 持有——不 DeleteObject，
+       GDI 句柄数量按字号种类计（个位数），无需回收 */
+    int slot = slot_n % GUI_FONT_SLOTS;
+    fonts[slot] = f; fpx[slot] = px; fbold[slot] = want;
+    slot_n++;
+    SelectObject(g_cur->mem, f);
+}
+
+/* 圆角矩形：fill=0 跳过填充，border=0 跳过描边（1px） */
+void zfy_gui_round_rect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r,
+                        uint32_t fill, uint32_t border) {
+    if (!g_cur || !g_cur->mem) return;
+    if (w <= 0 || h <= 0) return;
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+    if (r < 1) {
+        if (fill) zfy_gui_fill_rect(x, y, w, h, fill);
+        if (border) {
+            zfy_gui_fill_rect(x, y, w, 1, border);
+            zfy_gui_fill_rect(x, y + h - 1, w, 1, border);
+            zfy_gui_fill_rect(x, y, 1, h, border);
+            zfy_gui_fill_rect(x + w - 1, y, 1, h, border);
+        }
+        return;
+    }
+    HRGN rgn = CreateRoundRectRgn(x, y, x + w + 1, y + h + 1, r * 2, r * 2);
+    if (!rgn) return;
+    if (fill) {
+        HBRUSH bf = CreateSolidBrush(gui_rgb(fill));
+        FillRgn(g_cur->mem, rgn, bf);
+        DeleteObject(bf);
+    }
+    if (border) {
+        HBRUSH bb = CreateSolidBrush(gui_rgb(border));
+        FrameRgn(g_cur->mem, rgn, bb, 1, 1);
+        DeleteObject(bb);
+    }
+    DeleteObject(rgn);
+}
+
+/* 线段（GDI 硬边，1px） */
+void zfy_gui_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t rgb) {
+    if (!g_cur || !g_cur->mem) return;
+    HGDIOBJ oldpen = SelectObject(g_cur->mem, GetStockObject(DC_PEN));
+    COLORREF prev = SetDCPenColor(g_cur->mem, gui_rgb(rgb));
+    MoveToEx(g_cur->mem, x0, y0, NULL);
+    LineTo(g_cur->mem, x1, y1);
+    SetDCPenColor(g_cur->mem, prev);
+    SelectObject(g_cur->mem, oldpen);
+}
+
+/* 渐变矩形：c1->c2 像素线性插值，vertical 非 0 为纵向（DIB 直写，快） */
+void zfy_gui_fill_grad(int32_t rx, int32_t ry, int32_t rw, int32_t rh,
+                       uint32_t c1, uint32_t c2, int32_t vertical) {
+    if (!g_cur || !g_cur->fb) return;
+    int gw = g_cur->w, gh = g_cur->h;
+    int x0 = rx < 0 ? 0 : rx, y0 = ry < 0 ? 0 : ry;
+    int x1 = (rx + rw) > gw ? gw : (rx + rw);
+    int y1 = (ry + rh) > gh ? gh : (ry + rh);
+    if (x0 >= x1 || y0 >= y1) return;
+    int span = x1 - x0;
+    int steps = vertical ? (y1 - y0) : (x1 - x0);
+    if (steps < 1) steps = 1;
+    for (int y = y0; y < y1; y++) {
+        uint32_t *row = g_cur->fb + (size_t)y * gw + x0;
+        for (int x = x0; x < x1; x++) {
+            int t = vertical ? (y - y0) : (x - x0);
+            uint32_t r = ((c1 >> 16) & 0xFF) * (steps - 1 - t) / (steps - 1)
+                       + ((c2 >> 16) & 0xFF) * t / (steps - 1);
+            uint32_t g = ((c1 >> 8) & 0xFF) * (steps - 1 - t) / (steps - 1)
+                       + ((c2 >> 8) & 0xFF) * t / (steps - 1);
+            uint32_t b = (c1 & 0xFF) * (steps - 1 - t) / (steps - 1)
+                       + (c2 & 0xFF) * t / (steps - 1);
+            row[x - x0] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
 #else
 /* 非 Windows：桩实现（返回失败，UI 程序可优雅降级为 TUI） */
 int32_t zfy_gui_open(int32_t w, int32_t h, char *t) { (void)w; (void)h; (void)t; return -1; }
@@ -2699,6 +3401,10 @@ int32_t zfy_gui_clip_get(char *buf, int32_t cap) { (void)buf; (void)cap; return 
 void zfy_gui_clip_set(char *utf8) { (void)utf8; }
 void zfy_gui_close(void) {}
 void zfy_gui_title(char *s) { (void)s; }
+void zfy_gui_font(int32_t a, int32_t b) { (void)a; (void)b; }
+void zfy_gui_round_rect(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, uint32_t f, uint32_t g) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; }
+void zfy_gui_line(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e) { (void)a; (void)b; (void)c; (void)d; (void)e; }
+void zfy_gui_fill_grad(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e, uint32_t f, int32_t g) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; }
 int32_t zfy_gui_alive_any(void) { return 0; }
 int32_t zfy_gui_self(void) { return 0; }
 void zfy_gui_select(int64_t id) { (void)id; }

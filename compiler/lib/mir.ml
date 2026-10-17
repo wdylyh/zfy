@@ -482,8 +482,9 @@ let rec lexpr l (e : texpr) : operand =
      | Some d' when e.ety = TString -> add_temp l d' FStr
      | Some d' ->
        (match e.ety with
-        | TStruct _ -> add_temp l d' (FStruct e.ety)
-        | TList TString -> add_temp l d' (FSeq true)  (* read_lines 等运行时返回列表 *)
+       | TStruct _ -> add_temp l d' (FStruct e.ety)
+       | TList TString -> add_temp l d' (FSeq true)  (* read_lines 等运行时返回列表 *)
+       | TList _ -> add_temp l d' (FSeq false)       (* v3.6 容器内建返回的标量列表 *)
         | _ -> ())
      | _ -> ());
     (match d with
@@ -1099,6 +1100,9 @@ and lstmt_inner l (s : tstmt) : unit =
     l.unchecked <- true;
     lblock l b;
     l.unchecked <- saved
+  | SBlockK b ->
+    (* 透明块（v3.6 for-in 降码承载）：平铺，无独立作用域 *)
+    lblock l b
   | SExprK e ->
     (* 语句级 fail(code, msg)（w-009）：构造错误值后按 ? 失败路径终止
        函数（RAII 释放局部资源 + 错误值 memcpy 到 sret 返回槽 + ret
@@ -1340,6 +1344,7 @@ let rec collect_lets acc (stmts : tblock) =
         acc := (errslot, TStruct "Err") :: !acc;
         collect_lets acc blk
       | SWhileK (_, b) -> collect_lets acc b
+      | SBlockK b -> collect_lets acc b
       | SUnsafeK b -> collect_lets acc b
       | SForK (inits, _, _, b) ->
         List.iter

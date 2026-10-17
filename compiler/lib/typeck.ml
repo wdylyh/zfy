@@ -14,11 +14,12 @@ let collected : (pos * string) list ref = ref []
 
 (* 自动修复（本轮）：
    ① 语义级修复（编译继续）：字面量窄化/char→整数 在 coerce 内插入 cast，
-      文案登记进 autofixed（driver 作为 fix 条目报告，不进 errs）；
+      登记进 autofixed（报告 pos, 补丁 pos, 文案, 目标类型名）——driver
+      可据补丁 pos 把 cast 写回源文件（交互模式）；
    ② 改名修复（源码补丁重跑）：undefined variable/function 唯一候选、
       undefined type 传统别名 —— 登记进 fix_pos，driver 据此把对应错误
-      移入 fixes、对内存源码打补丁后递归重跑（源文件不动） *)
-let autofixed : (pos * string) list ref = ref []
+      移入 fixes、对源码打补丁（内存重跑或写回文件） *)
+let autofixed : (pos * pos * string * string) list ref = ref []
 let fix_pos : (string * int * int, int * string) Hashtbl.t = Hashtbl.create 8
 
 (* 整数值是否落在目标整数类型范围内（自动窄化判据） *)
@@ -371,6 +372,25 @@ let rec tag_of_zty (z : zty) : string =
   | TErr _ | TFunSig _ | TVar _ | TError ->
     assert false   (* 类型实参校验拦截；TError 不做泛型实参 *)
 
+(* ---------- 内建容器 map<K,V> / set<T>（v3.6） ----------
+ * 表示：单 ptr 字段的不透明句柄 struct（h = zfy_map*，null 起步惰性分配）。
+ * K/V 类型记入 gtargs；下标读写/内建由 typeck 分派为 runtime 调用。
+ * 键限 string/整数(≤64)；值限 ≤64 位标量/string；set 元素同键。 *)
+let is_map_struct (s : string) : bool =
+  String.length s > 4 && String.sub s 0 4 = "map$"
+
+let cont_kind (s : string) : string option =
+  if String.length s > 4 && String.sub s 0 4 = "map$" then Some "map"
+  else if String.length s > 4 && String.sub s 0 4 = "set$" then Some "set"
+  else None
+
+(* struct 名 -> (键类型, 值类型 option)（set 为 None） *)
+let cont_kv (g : genv) (s : string) (p : pos) : zty * zty option =
+  match Hashtbl.find_opt g.gtargs s, cont_kind s with
+  | Some (k :: v :: _), Some "map" -> (k, Some v)
+  | Some [ k ], Some "set" -> (k, None)
+  | _ -> terr p "internal error: %s is not a container struct" s
+
 (* zty -> AST 类型叶子（实例化 subst 用；数组/列表形态由 pseq 单独携带，
    不经 fty/pty 表达，故不会到达） *)
 let rec ast_of_zty (p : pos) (z : zty) : ty =
@@ -423,6 +443,58 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
     (* 函数类型统一表示为指针：TPtr (TFunSig ...)（与函数名引用/函数指针
        变量一致，LLVM 层均为 ptr） *)
     TPtr (TFunSig (List.map (fun pt -> conv_ty g pp pt) ptys, conv_ty g pp ret))
+  | TApp (("map" | "set") as kn, targs, pp) ->
+    (* 内建容器（v3.6）：map<K,V> / set<T>——单 ptr 字段句柄 struct，
+       幂等注册；变量裸声明（let map<string,i32> m）即全默认构造 h=null *)
+    let arg_zty ta =
+      let z = resolve (conv_ty g pp ta) in
+      (match z with
+       | TErr _ -> terr pp "T! cannot be a container type argument"
+       | TFrac _ -> terr pp "frac cannot be a container type argument"
+       | TFile -> terr pp "File cannot be a container type argument"
+       | TVar _ -> terr pp "a container type argument must be a concrete type"
+       | _ -> ());
+      z
+    in
+    let (kt, vt) =
+      match kn, targs with
+      | "map", [ kta; vta ] ->
+        let kz = arg_zty kta in
+        (match kz with
+         | TInt w when w <= 64 -> ()
+         | TUint w when w <= 64 -> ()
+         | TString -> ()
+         | _ -> terr pp "map key must be an integer (<=64-bit) or string");
+        let vz = arg_zty vta in
+        (match vz with
+         | TInt w when w <= 64 -> ()
+         | TUint w when w <= 64 -> ()
+         | TFloat 32 | TFloat 64 | TString -> ()
+         | _ -> terr pp "map value must be a scalar (<=64-bit) or string");
+        (kz, Some vz)
+      | "set", [ eta ] ->
+        let ez = arg_zty eta in
+        (match ez with
+         | TInt w when w <= 64 -> ()
+         | TUint w when w <= 64 -> ()
+         | TString -> ()
+         | _ -> terr pp "set element must be an integer (<=64-bit) or string");
+        (ez, None)
+      | "map", _ -> terr pp "map expects 2 type arguments: map<K, V>"
+      | _ -> terr pp "set expects 1 type argument: set<T>"
+    in
+    let mangle =
+      match vt with
+      | Some v -> "map$" ^ tag_of_zty kt ^ "$" ^ tag_of_zty v
+      | None -> "set$" ^ tag_of_zty kt
+    in
+    if not (Hashtbl.mem g.structs mangle) then begin
+      Hashtbl.replace g.structs mangle
+        { spacked = false; sfields = [ ("h", TPtr (TUint 8), None) ] };
+      Hashtbl.replace g.gtargs mangle
+        (match vt with Some v -> [ kt; v ] | None -> [ kt ])
+    end;
+    TStruct mangle
   | TApp (n, targs, pp) ->
     (* 泛型实例化 Box<i32, T*>（new2.md 第2条）：按模板展开注册具体
        struct，monomorphization 完全在 typeck 内完成 *)
@@ -899,6 +971,140 @@ and big_ok (digits : string) (unsigned : bool) : bool =
   else if String.length d < String.length mx then true
   else if String.length d > String.length mx then false
   else String.compare d mx <= 0
+
+(* map 键实参分派：string 原样；整数统一拓宽到 i64（运行时键槽 8 字节） *)
+and map_key_arg env p (tidx : texpr) : string * texpr =
+  match resolve tidx.ety with
+  | TString -> ("s", coerce p tidx TString)
+  | _ -> ("i", to_i64 tidx)
+
+(* map 值种类标签（运行时函数后缀）：整数统一 i64 位模式 *)
+and map_vtag p (vt : zty) : string =
+  match resolve vt with
+  | TInt _ | TUint _ -> "i64"
+  | TFloat 32 -> "f32"
+  | TFloat 64 -> "f64"
+  | TString -> "str"
+  | t -> terr p "unsupported map value type %s" (pp_zty t)
+
+(* map 实参（须为局部变量槽：struct 值传槽地址，即 zfy_map**） *)
+and map_self_arg env p (tb : texpr) : texpr =
+  match tb.e with
+  | EVarK _ -> tb
+  | _ -> terr p "map/set operations currently require a local variable (not a field chain or expression)"
+
+(* 内建容器调用分派（v3.6）：map/set 操作与列表算法内建。
+   返回 (运行时函数名, 签名)；None 走原路径。用户自定义同名函数优先 *)
+and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
+  if Hashtbl.mem env.g.fns name0 || Hashtbl.mem env.g.gfns name0 then None
+  else begin
+    let sig1 ps r =
+      Some (name0, { params = ps; prefs = List.map (fun _ -> false) ps;
+                     ret = r; runred = false })
+    in
+    let mkf nm ps r = match sig1 ps r with Some (_, s) -> Some (nm, s) | None -> None in
+    let seq_elem xs =
+      match resolve xs.ety with
+      | TList e -> e
+      | t -> terr p "%s expects a list as first argument, got %s" name0 (pp_zty t)
+    in
+    (* 整数键/值实参统一 i64 槽（运行时 8 字节） *)
+    let key_param kt =
+      match resolve kt with TString -> TString | _ -> TInt 64
+    in
+    match name0, targs with
+    | "set_add", [ s; x ] ->
+      (match resolve s.ety with
+       | TStruct sn when cont_kind sn = Some "set" ->
+         let (kt, _) = cont_kv env.g sn p in
+         let kf = (match resolve kt with TString -> "s" | _ -> "i") in
+         mkf ("zfy_set_add_" ^ kf) [ TStruct sn; key_param kt ] TVoid
+       | t -> terr p "set_add expects a set, got %s" (pp_zty t))
+    | ("map_len" | "set_len"), [ m ] ->
+      (match resolve m.ety with
+       | TStruct s when cont_kind s <> None -> mkf "zfy_map_len" [ TStruct s ] (TInt 64)
+       | t -> terr p "%s expects a map/set, got %s" name0 (pp_zty t))
+    | ("map_has" | "set_has" | "contains"), [ m; k ] ->
+      (match resolve m.ety with
+       | TStruct s when cont_kind s <> None ->
+         let (kt, _) = cont_kv env.g s p in
+         let kf = (match resolve kt with TString -> "s" | _ -> "i") in
+         mkf ("zfy_map_has_" ^ kf) [ TStruct s; key_param kt ] TBool
+       | TList _ ->
+         let e = seq_elem m in
+         let tag =
+           match resolve e with
+           | TInt w -> "i" ^ string_of_int w
+           | TUint w -> "u" ^ string_of_int w
+           | TFloat 32 -> "f32" | TFloat 64 -> "f64" | TString -> "str"
+           | t -> terr p "contains does not support element type %s" (pp_zty t)
+         in
+         (* 值实参按元素精确宽度（槽宽匹配运行时） *)
+         mkf ("zfy_contains_" ^ tag) [ TList e; e ] TBool
+       | t -> terr p "%s expects a map/set/list, got %s" name0 (pp_zty t))
+    | ("map_del" | "set_del"), [ m; k ] ->
+      (match resolve m.ety with
+       | TStruct s when cont_kind s <> None ->
+         let (kt, _) = cont_kv env.g s p in
+         let kf = (match resolve kt with TString -> "s" | _ -> "i") in
+         mkf ("zfy_map_del_" ^ kf) [ TStruct s; key_param kt ] TBool
+       | t -> terr p "%s expects a map/set, got %s" name0 (pp_zty t))
+    | "keys", [ m ] ->
+      (match resolve m.ety with
+       | TStruct s when cont_kind s <> None ->
+         let (kt, _) = cont_kv env.g s p in
+         mkf "zfy_map_keys" [ TStruct s ] (TList kt)
+       | t -> terr p "keys expects a map/set, got %s" (pp_zty t))
+    | "values", [ m ] ->
+      (match resolve m.ety with
+       | TStruct s when is_map_struct s ->
+         let (_, Some vt) = cont_kv env.g s p in
+         mkf "zfy_map_values" [ TStruct s ] (TList vt)
+       | t -> terr p "values expects a map, got %s" (pp_zty t))
+    | "sort", [ xs ] ->
+      let e = seq_elem xs in
+      let tag =
+        match resolve e with
+        | TInt w -> "i" ^ string_of_int w
+        | TUint w -> "u" ^ string_of_int w
+        | TFloat 32 -> "f32" | TFloat 64 -> "f64" | TString -> "str"
+        | t -> terr p "sort does not support element type %s" (pp_zty t)
+      in
+      mkf ("zfy_sort_" ^ tag) [ TList e ] (TList e)
+    | "reverse", [ xs ] ->
+      let e = seq_elem xs in
+      mkf "zfy_reverse" [ TList e ] (TList e)
+    | "join", [ xs; sep ] ->
+      (match resolve xs.ety, resolve sep.ety with
+       | TList TString, TString -> mkf "zfy_join" [ TList TString; TString ] TString
+       | _ -> terr p "join expects (list<string>, string)")
+    | ("filter" | "any" | "all") as kn, [ xs; pred ] ->
+      let e = seq_elem xs in
+      (match resolve e with
+       | TInt _ | TUint _ | TFloat _ | TString -> ()
+       | t -> terr p "%s does not support element type %s (predicate receives elements by value)" kn (pp_zty t));
+      let ret = if kn = "filter" then TList e else TBool in
+      mkf ("zfy_" ^ kn) [ TList e; TPtr (TFunSig ([ e ], TBool)) ] ret
+    | "sort_by", [ xs; cmp ] ->
+      let e = seq_elem xs in
+      (match resolve e with
+       | TInt _ | TUint _ | TFloat _ | TString -> ()
+       | t -> terr p "sort_by does not support element type %s" (pp_zty t));
+      mkf "zfy_sort_by" [ TList e; TPtr (TFunSig ([ e; e ], TInt 32)) ] (TList e)
+    | "fold", [ xs; f; init ] ->
+      (* 列表归并（v3.6）：reduce 是 frac 缩减关键字，故名 fold *)
+      let e = seq_elem xs in
+      let tag =
+        match resolve e with
+        | TInt w -> "i" ^ string_of_int w
+        | TUint w -> "u" ^ string_of_int w
+        | TFloat 32 -> "f32" | TFloat 64 -> "f64" | TString -> "str"
+        | t ->
+          terr p "fold supports integer/float/string elements, got %s" (pp_zty t)
+      in
+      mkf ("zfy_fold_" ^ tag) [ TList e; TPtr (TFunSig ([ e; e ], e)); e ] e
+    | _ -> None
+  end
 
 and check_expr env (e : expr) : texpr =
   let p = pos_of_expr e in
@@ -1583,6 +1789,21 @@ and check_expr env (e : expr) : texpr =
      | _ -> terr p' "unsupported callee expression")
   | EIndex (base, idx, p') ->
     let tb = check_expr env base in
+    (* map 读：m[k] 产 V!（缺失 = NOT_FOUND），须 ?? 解包后使用（v3.6） *)
+    (match resolve tb.ety with
+     | TStruct s when is_map_struct s ->
+       let marg = map_self_arg env p' tb in
+       (match cont_kv env.g s p' with
+        | (kt, Some vt) ->
+          ignore kt;
+          let tidx = check_expr env idx in
+          let (kf, karg) = map_key_arg env p' tidx in
+          let vtag = map_vtag p' vt in
+          mk (ECallK (Printf.sprintf "zfy_map_get_err_%s_%s" kf vtag,
+                      [ marg; karg ], [])) (TErr vt)
+        | (_, None) ->
+          terr p' "set does not support index read (use contains(s, x) / set_has)")
+     | _ ->
     let ti = to_i64 (check_expr env idx) in
     (* poison：毒底数/毒下标静默通过（n4） *)
     if resolve tb.ety = TError then mk (ESeqGetK (tb, ti)) TError
@@ -1601,7 +1822,7 @@ and check_expr env (e : expr) : texpr =
          terr p' "pointer subscript p[i] is only allowed inside an unsafe block";
        let addr = mk (EBinK (BAdd, tb, ti)) (TPtr t) in
        mk (EDerefK addr) t
-     | t -> terr p' "type %s does not support index access" (pp_zty t))
+     | t -> terr p' "type %s does not support index access" (pp_zty t)))
   | ESlice (base, a, b, step, p') ->
     let tb = check_expr env base in
     (match resolve tb.ety with
@@ -1821,6 +2042,9 @@ and try_method env name p' args =
 and check_call env p np name0 targs origs modes =
   let name = ref name0 in
   let sig_ =
+    match container_call env p name0 targs with
+    | Some (n2, s2) -> name := n2; s2
+    | None ->
     if name0 = "abs" then begin
       (* abs 重载（v3.2）：整数→同宽整数（llvmgen 内联 sub+select），
          浮点→同宽浮点（llvmgen 走 @fabs/@fabsf）；其余类型报错。
@@ -1989,6 +2213,8 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
     List.fold_left uses_of_expr acc inits
   | SDeclList ss -> List.fold_left uses_of_stmt acc ss
   | SAssign (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
+  | SForIn (_, sx, b, _) ->
+    List.fold_left uses_of_stmt (uses_of_expr acc sx) b
   | SAssignList (a, bs, _) ->
     List.fold_left uses_of_expr (uses_of_expr acc a) bs
   | SAug (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
@@ -2595,9 +2821,9 @@ and coerce p (te : texpr) (want : zty) : texpr =
            v (pp_zty tgt)
        | ECharK _ ->
          autofixed := !autofixed @
-           [(p, Printf.sprintf
+           [(p, te.epos, Printf.sprintf
                "type mismatch: expected %s, got char (char code used as ord(c); auto-fixed: cast inserted)"
-               (pp_zty tgt))];
+               (pp_zty tgt), pp_zty tgt)];
          { e = ECastK (te, want); ety = want; epos = te.epos }
        | _ -> unify p te.ety want; te)
     | TVar _, _ | _, TVar _ -> unify p te.ety want; te
@@ -2624,9 +2850,9 @@ and coerce p (te : texpr) (want : zty) : texpr =
         (match te.e with
          | EIntK v when int_fits v b ->
            autofixed := !autofixed @
-             [(p, Printf.sprintf
+             [(p, te.epos, Printf.sprintf
                  "narrowing conversion from %s to %s (literal %Ld fits target range; auto-fixed: cast inserted)"
-                 (pp_zty a) (pp_zty b) v)];
+                 (pp_zty a) (pp_zty b) v, pp_zty b)];
            { e = ECastK (te, want); ety = want; epos = te.epos }
          | _ ->
            terr p "narrowing conversion from %s to %s requires an explicit cast"
@@ -2646,9 +2872,9 @@ and coerce p (te : texpr) (want : zty) : texpr =
     | TChar, (TInt _ | TUint _) ->
       (* 自动修复②：char → 整数槽：插入 cast（码点数值，ord 语义）继续编译 *)
       autofixed := !autofixed @
-        [(p, Printf.sprintf
+        [(p, te.epos, Printf.sprintf
             "type mismatch: expected %s, got %s (char code used as ord(c); auto-fixed: cast inserted)"
-            (pp_zty b) (pp_zty a))];
+            (pp_zty b) (pp_zty a), pp_zty b)];
       { e = ECastK (te, want); ety = want; epos = te.epos }
     | _ ->
       terr p "type mismatch: expected %s, got %s (numeric conversion requires an explicit cast)"
@@ -3471,9 +3697,31 @@ and check_stmt env (st : stmt) : tstmt =
               | t -> terr ip "string index assignment requires a char, got %s" (pp_zty t));
              mk (SStrSetK ({ e = EVarK l.lslot; ety = l.lty; epos = ap },
                            ti, trhs))
+           | TStruct s when is_map_struct s ->
+             (* m[k] = v（v3.6）：分派 runtime put（键 int→i64/string；
+                整数值统一按 i64 位模式） *)
+             if l.lconst then
+               terr ap "cannot modify a constant map %s" arr;
+             let marg = { e = EVarK l.lslot; ety = l.lty; epos = ap } in
+             let tidx = check_expr env idx in
+             let trhs = check_expr env rhs in
+             (match cont_kv env.g s ap with
+              | (_, Some vt) ->
+                let (kf, karg) = map_key_arg env ap tidx in
+                let vtag = map_vtag ap vt in
+                let varg =
+                  match resolve vt with
+                  | TInt _ | TUint _ ->
+                    let tv = coerce ip trhs vt in
+                    { e = ECastK (tv, TInt 64); ety = TInt 64; epos = ip }
+                  | _ -> coerce ip trhs vt
+                in
+                mk (SExprK { e = ECallK (Printf.sprintf "zfy_map_put_%s_%s" kf vtag,
+                                          [ marg; karg; varg ], []);
+                             ety = TVoid; epos = p })
+              | (_, None) ->
+                terr ap "set does not support index assignment (use set_add(s, x))")
            | TPtr t ->
-             (* 指针下标写入（自动解引用，无越界检查）：p[i] = v 等同于
-                先按元素步进地址（p+i）再解引用写入；强制 unsafe（new2.md #8） *)
              if l.lconstp then
                terr ap "cannot write through pointer-to-const %s (declared T* const)" arr;
              if not env.in_unsafe then
@@ -3827,6 +4075,86 @@ and check_stmt env (st : stmt) : tstmt =
     let tb = check_block env body in
     env.ldepth <- env.ldepth - 1;
     mk (SForK (init_stmts, tc, up_stmts, tb))
+  | SForIn (name, seqx, body, p) ->
+    (* for x in xs { }（v3.6）：xs 支持 列表/数组(变量)/string/map(产键)。
+       降码：序列入临时槽（表达式只求值一次）+ 索引循环；循环变量每轮
+       由元素读深拷贝（循环体内不自动 move），与手写三段式等价 *)
+    let mkx k ety = { e = k; ety; epos = p } in
+    let fresh nm lty : local =
+      declare env nm { lconst = false; lty; lslot = ""; lunred = false;
+                       lconstp = false };
+      (match lookup_var env nm with Some l -> l | None -> assert false)
+    in
+    let ts = check_expr env seqx in
+    let hoists, itv, elem =
+      match resolve ts.ety with
+      | TList e ->
+        let it = fresh (name ^ "$seq") (TList e) in
+        let h =
+          match ts.e with
+          | ECallK _ ->
+            (* 运行时返回的新 seq：所有权接管，免深拷贝 *)
+            SDeclK (false, it.lslot, TList e, ts, false)
+          | _ ->
+            SSeqCopyK (false, it.lslot, e, 0L, ts, true)
+        in
+        ([ { s = h; spos = p } ], mkx (EVarK it.lslot) (TList e), e)
+      | TArray (e, _) ->
+        (match ts.e with
+         | EVarK _ -> ([], ts, e)
+         | _ ->
+           terr p "for-in over an array requires an array variable")
+      | TString ->
+        let it = fresh (name ^ "$seq") TString in
+        ([ { s = SDeclK (false, it.lslot, TString, ts, false); spos = p } ],
+         mkx (EVarK it.lslot) TString, TChar)
+      | TStruct s when cont_kind s <> None ->
+        let (kt, _) = cont_kv env.g s p in
+        let marg = map_self_arg env p ts in
+        let keys_call =
+          mkx (ECallK ("zfy_map_keys", [ marg ], [])) (TList kt) in
+        let ks = fresh (name ^ "$keys") (TList kt) in
+        ([ { s = SDeclK (false, ks.lslot, TList kt, keys_call, false);
+             spos = p } ],
+         mkx (EVarK ks.lslot) (TList kt), kt)
+      | t ->
+        terr p "for-in requires a list/array/string/map, got %s" (pp_zty t)
+    in
+    let iv = fresh (name ^ "$i") (TInt 64) in
+    let ivx = mkx (EVarK iv.lslot) (TInt 64) in
+    let ev = fresh name elem in
+    (* 索引变量声明（槽分配 + 初始化 0）必须落在 inits *)
+    let hoists =
+      hoists @ [ { s = SDeclK (false, iv.lslot, TInt 64,
+                               mkx (EIntK 0L) (TInt 64), false);
+                  spos = p } ]
+    in
+    let cond =
+      (* length 语义：列表/数组 = ESeqLenK（i32，升位）；string = str_len
+         调用（i64）——与手写 length() 的降码一致 *)
+      let lenx =
+        match resolve itv.ety with
+        | TString ->
+          mkx (ECallK ("str_len", [ itv ], [])) (TInt 64)
+        | _ ->
+          let len32 = mkx (ESeqLenK itv) (TInt 32) in
+          mkx (ECastK (len32, TInt 64)) (TInt 64)
+      in
+      mkx (EBinK (BLt, ivx, lenx)) TBool in
+    env.ldepth <- env.ldepth + 1;
+    let tb = check_block env body in
+    env.ldepth <- env.ldepth - 1;
+    let elem_get =
+      match resolve itv.ety with
+      | TString -> mkx (ECallK ("zfy_str_char", [ itv; ivx ], [])) TChar
+      | _ -> mkx (ESeqGetK (itv, ivx)) elem
+    in
+    mk (SForK (hoists, cond,
+               [ { s = SAugVarK (iv.lslot, TInt 64, BAdd,
+                                 mkx (EIntK 1L) (TInt 64), false);
+                  spos = p } ],
+               { s = SDeclK (false, ev.lslot, elem, elem_get, false);
+                 spos = p } :: tb))
   | SOutput (args, sep, end_, p) ->
     let targs = List.map (check_expr env) args in
     List.iter
@@ -3965,7 +4293,7 @@ and pos_of_stmt = function
   | SAug (_, _, _, p)
   | SInc (_, p) | SDec (_, p)
   | SReturn (_, p) | SIf (_, _, _, p)
-  | SWhile (_, _, p) | SFor (_, _, _, _, p) | SReduce (_, _, _, p)
+  | SWhile (_, _, p) | SFor (_, _, _, _, p) | SForIn (_, _, _, p) | SReduce (_, _, _, p)
   | SOutput (_, _, _, p) | SInput (_, _, p)
   | SSeqDecl (_, _, _, _, _, _, _, _, p)
   | SUnsafe (_, p)

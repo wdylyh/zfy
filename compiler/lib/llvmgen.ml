@@ -1000,6 +1000,60 @@ let gen_input fc name (ty : zty) delim =
 (* 9d：i128 判定（extern "C" 的 __int128 ABI 适配用） *)
 let is_i128 = function TInt 128 | TUint 128 -> true | _ -> false
 
+(* ---------- v3.6 容器谓词/比较器 thunk ----------
+ * C ABI（元素按指针传入）→ zfy 函数（按值）适配器：
+ *   filter/any/all 谓词：i32 (ptr)——load 元素值后调用，TBool zext i32
+ *   sort_by 比较器：     i32 (ptr, ptr)
+ * 按 (函数名, 签名) 缓存去重；定义体在 gen_program 末尾统一落盘 *)
+let thunk_buf = Buffer.create 1024
+let thunk_cache : (string, string) Hashtbl.t = Hashtbl.create 8
+let thunk_cnt = ref 0
+
+let zfy_thunk (fname : string) (ptys : zty list) (ret : zty) : string =
+  let key = fname ^ "#" ^ String.concat "," (List.map Hir.pp_zty ptys) in
+  match Hashtbl.find_opt thunk_cache key with
+  | Some tn -> tn
+  | None ->
+    incr thunk_cnt;
+    let tn = Printf.sprintf "zfy.thunk.%d" !thunk_cnt in
+    let b = Buffer.create 256 in
+    Buffer.add_string b (Printf.sprintf "define internal i32 @\"%s\"(" tn);
+    List.iteri
+      (fun i _ ->
+        Buffer.add_string b
+          (if i = 0 then "ptr %a0" else Printf.sprintf ", ptr %%a%d" i))
+      ptys;
+    Buffer.add_string b ") {\n";
+    List.iteri
+      (fun i t ->
+        Buffer.add_string b
+          (Printf.sprintf "  %%v%d = load %s, ptr %%a%d\n" i (ll_ty t) i))
+      ptys;
+    Buffer.add_string b (Printf.sprintf "  %%r = call %s @%s(" (ll_ty ret) fname);
+    List.iteri
+      (fun i t ->
+        Buffer.add_string b
+          (if i = 0 then ll_ty t else Printf.sprintf ", %s" (ll_ty t));
+        Buffer.add_string b (Printf.sprintf " %%v%d" i))
+      ptys;
+    Buffer.add_string b ")\n";
+    (match Typeck.resolve ret with
+     | TBool -> Buffer.add_string b "  %z = zext i1 %r to i32\n  ret i32 %z\n"
+     | TInt 32 -> Buffer.add_string b "  ret i32 %r\n"
+     | _ -> ());
+    Buffer.add_string b "}\n";
+    Buffer.add_string thunk_buf (Buffer.contents b);
+    Hashtbl.replace thunk_cache key tn;
+    tn
+
+(* 运行时 i32 布尔返回集（v3.6）：gen_call 做 icmp ne 0 → i1 *)
+let bool_i32_rts =
+  [ "zfy_map_has_i"; "zfy_map_has_s"; "zfy_map_del_i"; "zfy_map_del_s";
+    "zfy_contains_i8"; "zfy_contains_i16"; "zfy_contains_i32";
+    "zfy_contains_i64"; "zfy_contains_u8"; "zfy_contains_u16";
+    "zfy_contains_u32"; "zfy_contains_u64"; "zfy_contains_f32";
+    "zfy_contains_f64"; "zfy_contains_str" ]
+
 let gen_call fc dst name (args : operand list) (ret_ty : zty) =
   if name = "zfy_stoi_wide" then begin
     (* string → 128 位整数 fail-fast 转换（t-016 遗留修复）：运行时以
@@ -1026,6 +1080,62 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
   end
   else
   match name, args with
+  | "zfy_set_add_i", [ s; v ] ->
+    (* set_add（v3.6）：map put 值恒 1 *)
+    (match dst with
+     | _ ->
+       let (sp, _) = ptr_of fc s in
+       let (vv, _) = val_of fc v in
+       emitf fc "  call void @zfy_map_put_i_i64(ptr %s, i64 %s, i64 1)" sp vv)
+  | "zfy_set_add_s", [ s; v ] ->
+    (match dst with
+     | _ ->
+       let (sp, _) = ptr_of fc s in
+       let (vv, _) = val_of fc v in
+       emitf fc "  call void @zfy_map_put_s_i64(ptr %s, ptr %s, i64 1)" sp vv)
+  | "zfy_map_values", [ m ] ->
+    (* 值列表（v3.6）：vstr/元素宽度由返回类型推导（常量实参注入） *)
+    (match dst, ret_ty with
+     | Some d, TList vt ->
+       let (mp, _) = ptr_of fc m in
+       let vstr, w =
+         match Typeck.resolve vt with
+         | TString -> (1, 8)
+         | TInt w | TUint w -> (0, w / 8)
+         | TFloat 32 -> (0, 4)
+         | TFloat 64 -> (0, 8)
+         | _ -> lerr None "zfy_map_values: unsupported value type"
+       in
+       emitf fc "  %s = call ptr @zfy_map_values(ptr %s, i32 %d, i32 %d)"
+         d mp vstr w
+     | _ -> lerr None "zfy_map_values: missing destination")
+  | (("zfy_filter" | "zfy_any" | "zfy_all" | "zfy_sort_by") as bn), [ seq; pred ] ->
+    (* 谓词/比较器 thunk（v3.6）：实参须为函数名（EFunPtrK 落 @名 寄存器） *)
+    (match dst with
+     | None -> ()
+     | Some d ->
+       let (sp, _) = val_of fc seq in
+       let (pv, _) = val_of fc pred in
+       if String.length pv = 0 || pv.[0] <> '@' then
+         lerr None "%s: predicate/comparator must be a function name" bn
+       else begin
+         let fname = String.sub pv 1 (String.length pv - 1) in
+         let (ptys, pret) =
+           match Typeck.resolve pred.oty with
+           | TPtr (TFunSig (ps, r)) -> (ps, r)
+           | _ -> lerr None "%s: predicate type error" bn
+         in
+         let tn = zfy_thunk fname ptys pret in
+         match bn with
+         | "zfy_filter" ->
+           emitf fc "  %s = call ptr @zfy_filter(ptr %s, ptr @\"%s\")" d sp tn
+         | "zfy_sort_by" ->
+           emitf fc "  %s = call ptr @zfy_sort_by(ptr %s, ptr @\"%s\")" d sp tn
+         | _ ->
+           let r = fresh_r fc in
+           emitf fc "  %s = call i32 @%s(ptr %s, ptr @\"%s\")" r bn sp tn;
+           emitf fc "  %s = icmp ne i32 %s, 0" d r
+       end)
   | "abs", [ a ] ->
     (* abs 重载（v3.2）：无符号=恒等；有符号=内联 sub+icmp+select（规避
        C abs 的 32 位截断，i128 同样适用）；浮点=@fabs。is_rt_name 已排除
@@ -1153,6 +1263,11 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
       in
       match ret_ty, dst with
       | TVoid, _ -> emitf fc "  call void %s(%s)" callee args_str
+      | TBool, Some d when List.mem name bool_i32_rts ->
+        (* 运行时 i32 布尔（has/del/contains）：icmp 转 i1（v3.6） *)
+        let r = fresh_r fc in
+        emitf fc "  %s = call i32 %s(%s)" r callee args_str;
+        emitf fc "  %s = icmp ne i32 %s, 0" d r
       | rt, Some d when is_ext && is_i128 rt ->
         (* 9d：extern i128 返回值按 <2 x i64> 接收后 bitcast（clang win32 ABI） *)
         let r = fresh_r fc in
@@ -2418,6 +2533,12 @@ let gen_struct_type_def (_ : gctx) (sd : sdef) : string =
 (* 生成 @zfy_struct_free_<名>(ptr)：逐字段释放堆资源
    （string/seq/嵌套 struct 递归；运行时 free 函数均 NULL 安全） *)
 let gen_struct_free_fn (sd : sdef) : string =
+  (* 内建容器 map$/set$（v3.6）：句柄 struct 整体走 runtime 深释放 *)
+  if Typeck.is_map_struct sd.sname || (String.length sd.sname > 4 && String.sub sd.sname 0 4 = "set$") then
+    Printf.sprintf
+      "define void @zfy_struct_free_%s(ptr %%p) {\n  call void @zfy_map_free(ptr %%p)\n  ret void\n}\n"
+      sd.sname
+  else begin
   let b = Buffer.create 128 in
   let emit : 'a. ('a, unit, string, unit) format4 -> 'a =
     fun fmt -> Printf.ksprintf (fun s -> Buffer.add_string b (s ^ "\n")) fmt
@@ -2445,12 +2566,19 @@ let gen_struct_free_fn (sd : sdef) : string =
     sd.sfields;
   Buffer.add_string b "  ret void\n}\n";
   Buffer.contents b
+  end
 
 (* 生成 @zfy_struct_assign_<名>(ptr dst, ptr src)：逐字段深拷贝
    （string strdup / seq clone / 嵌套 struct 递归 assign）。顺序：先拷贝
    新值、后释放 dst 旧资源（src 可能引用 dst 自身字段，先释放会悬垂）。
    运行时 free/strdup/clone 均 NULL 安全，无需判空分支 *)
 let gen_struct_assign_fn (sd : sdef) : string =
+  (* 内建容器 map$/set$（v3.6）：整体深拷贝（值语义） *)
+  if Typeck.is_map_struct sd.sname || (String.length sd.sname > 4 && String.sub sd.sname 0 4 = "set$") then
+    Printf.sprintf
+      "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n  call void @zfy_map_assign(ptr %%dst, ptr %%src)\n  ret void\n}\n"
+      sd.sname
+  else begin
   let b = Buffer.create 256 in
   let emit : 'a. ('a, unit, string, unit) format4 -> 'a =
     fun fmt -> Printf.ksprintf (fun s -> Buffer.add_string b (s ^ "\n")) fmt
@@ -2490,6 +2618,7 @@ let gen_struct_assign_fn (sd : sdef) : string =
     sd.sfields;
   Buffer.add_string b "  ret void\n}\n";
   Buffer.contents b
+  end
 
 let gen_program (m : mir) : string =
   let g =
@@ -2581,6 +2710,10 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare i32 @zfy_gui_self()\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_select(i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_set_icon(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_font(i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_round_rect(i32, i32, i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_line(i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_fill_grad(i32, i32, i32, i32, i32, i32, i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   (* output 运行时函数 *)
@@ -2728,6 +2861,74 @@ let gen_program (m : mir) : string =
     "declare ptr @zfy_file_read_lines(ptr)\n";
   Buffer.add_string g.mbuf
     "declare void @zfy_file_write_file_err(ptr sret(%err.i64), ptr, ptr)\n";
+  (* 内建容器 map/set 与列表算法（v3.6） *)
+  List.iter
+    (fun s -> Buffer.add_string g.mbuf s)
+    [ "declare void @zfy_map_put_i_i64(ptr, i64, i64)\n";
+      "declare void @zfy_map_put_i_f32(ptr, i64, float)\n";
+      "declare void @zfy_map_put_i_f64(ptr, i64, double)\n";
+      "declare void @zfy_map_put_i_str(ptr, i64, ptr)\n";
+      "declare void @zfy_map_put_s_i64(ptr, ptr, i64)\n";
+      "declare void @zfy_map_put_s_f32(ptr, ptr, float)\n";
+      "declare void @zfy_map_put_s_f64(ptr, ptr, double)\n";
+      "declare void @zfy_map_put_s_str(ptr, ptr, ptr)\n";
+      "declare void @zfy_map_get_err_i_i64(ptr sret(%err.i64), ptr, i64)\n";
+      "declare void @zfy_map_get_err_i_f32(ptr sret(%err.f32), ptr, i64)\n";
+      "declare void @zfy_map_get_err_i_f64(ptr sret(%err.f64), ptr, i64)\n";
+      "declare void @zfy_map_get_err_i_str(ptr sret(%err.str), ptr, i64)\n";
+      "declare void @zfy_map_get_err_s_i64(ptr sret(%err.i64), ptr, ptr)\n";
+      "declare void @zfy_map_get_err_s_f32(ptr sret(%err.f32), ptr, ptr)\n";
+      "declare void @zfy_map_get_err_s_f64(ptr sret(%err.f64), ptr, ptr)\n";
+      "declare void @zfy_map_get_err_s_str(ptr sret(%err.str), ptr, ptr)\n";
+      "declare i32 @zfy_map_has_i(ptr, i64)\n";
+      "declare i32 @zfy_map_has_s(ptr, ptr)\n";
+      "declare i32 @zfy_map_del_i(ptr, i64)\n";
+      "declare i32 @zfy_map_del_s(ptr, ptr)\n";
+      "declare i64 @zfy_map_len(ptr)\n";
+      "declare void @zfy_map_clear(ptr)\n";
+      "declare void @zfy_map_assign(ptr, ptr)\n";
+      "declare void @zfy_map_free(ptr)\n";
+      "declare ptr @zfy_map_keys(ptr)\n";
+      "declare ptr @zfy_map_values(ptr, i32, i32)\n";
+      "declare ptr @zfy_sort_i8(ptr)\n";
+      "declare ptr @zfy_sort_i16(ptr)\n";
+      "declare ptr @zfy_sort_i32(ptr)\n";
+      "declare ptr @zfy_sort_i64(ptr)\n";
+      "declare ptr @zfy_sort_u8(ptr)\n";
+      "declare ptr @zfy_sort_u16(ptr)\n";
+      "declare ptr @zfy_sort_u32(ptr)\n";
+      "declare ptr @zfy_sort_u64(ptr)\n";
+      "declare ptr @zfy_sort_f32(ptr)\n";
+      "declare ptr @zfy_sort_f64(ptr)\n";
+      "declare ptr @zfy_sort_str(ptr)\n";
+      "declare ptr @zfy_reverse(ptr)\n";
+      "declare ptr @zfy_join(ptr, ptr)\n";
+      "declare i32 @zfy_contains_i8(ptr, i8)\n";
+      "declare i32 @zfy_contains_i16(ptr, i16)\n";
+      "declare i32 @zfy_contains_i32(ptr, i32)\n";
+      "declare i32 @zfy_contains_i64(ptr, i64)\n";
+      "declare i32 @zfy_contains_u8(ptr, i8)\n";
+      "declare i32 @zfy_contains_u16(ptr, i16)\n";
+      "declare i32 @zfy_contains_u32(ptr, i32)\n";
+      "declare i32 @zfy_contains_u64(ptr, i64)\n";
+      "declare i32 @zfy_contains_f32(ptr, float)\n";
+      "declare i32 @zfy_contains_f64(ptr, double)\n";
+      "declare i32 @zfy_contains_str(ptr, ptr)\n";
+      "declare ptr @zfy_filter(ptr, ptr)\n";
+      "declare i32 @zfy_any(ptr, ptr)\n";
+      "declare i32 @zfy_all(ptr, ptr)\n";
+      "declare ptr @zfy_sort_by(ptr, ptr)\n";
+      "declare i8 @zfy_fold_i8(ptr, ptr, i8)\n";
+      "declare i16 @zfy_fold_i16(ptr, ptr, i16)\n";
+      "declare i32 @zfy_fold_i32(ptr, ptr, i32)\n";
+      "declare i64 @zfy_fold_i64(ptr, ptr, i64)\n";
+      "declare i8 @zfy_fold_u8(ptr, ptr, i8)\n";
+      "declare i16 @zfy_fold_u16(ptr, ptr, i16)\n";
+      "declare i32 @zfy_fold_u32(ptr, ptr, i32)\n";
+      "declare i64 @zfy_fold_u64(ptr, ptr, i64)\n";
+      "declare float @zfy_fold_f32(ptr, ptr, float)\n";
+      "declare double @zfy_fold_f64(ptr, ptr, double)\n";
+      "declare ptr @zfy_fold_str(ptr, ptr, ptr)\n" ];
   (* 函数 *)
   let fbuf = Buffer.create 4096 in
   Hashtbl.reset user_fns;
@@ -2803,4 +3004,8 @@ let gen_program (m : mir) : string =
    | Some rt ->
      lerr None "main's return type must be void, i32 or i64, got %s" (Hir.pp_zty rt)
    | None -> ());
+  (* v3.6 容器谓词/比较器 thunk 定义（gen_call 期间累积） *)
+  Buffer.add_string g.mbuf (Buffer.contents thunk_buf);
+  Hashtbl.reset thunk_cache;
+  Buffer.reset thunk_buf;
   Buffer.contents g.mbuf ^ Buffer.contents fbuf
