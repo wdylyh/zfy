@@ -165,6 +165,56 @@ let resolve (main : program) (main_dir : string)
       in
       up dir 6
   in
+  (* ---- 分组 use 的 stdlib 回退（v3.5 DX）----
+     use widgets::{App, ...} 首段无本地 mod 声明时，若 find_mod_file 命中
+     （本目录/父链 stdlib），隐式注入 mod 声明——与显式 `mod widgets;`
+     语义完全一致。先全局收集去重，再统一插到 item 列表最前。
+     对主文件与每个加载的模块文件都生效（stdlib 内部互相 use 同样受益）。 *)
+  let fixup_uses dir (skip : string list) items =
+    let declared =
+      List.fold_left
+        (fun acc it ->
+           match it with
+           | IMod (n, _, _) | IModFile (n, _) -> n :: acc
+           | _ -> acc)
+        [] items
+    in
+    let implicit =
+      List.fold_left
+        (fun acc it ->
+           match it with
+           | IUseP { binds; _ } ->
+             List.fold_left
+               (fun acc2 (_, segs, _) ->
+                  match segs with
+                  | s :: _ :: _ ->
+                    if List.mem s acc2 || List.mem s declared
+                       || List.mem s skip then acc2
+                    else
+                      (match find_mod_file dir s with
+                       | Some _ -> s :: acc2
+                       | None -> acc2)
+                  | _ -> acc2)
+               acc binds
+           | _ -> acc)
+        [] items
+    in
+    List.map
+      (fun n -> IModFile (n, { file = "<implicit>"; line = 0; col = 0 }))
+      (List.rev implicit)
+    @ items
+  in
+  (* modt 祖先链上所有可见 mod 名（含各级 children）：隐式注入去重用——
+     祖先已有同名 mod（如 root 显式 `mod gui;`）时不再注入，交给祖先链解析 *)
+  let anc_mod_names (m : modt) : string list =
+    let rec up acc (mm : modt) =
+      let acc = List.fold_left (fun a (n, _) -> n :: a) acc mm.children in
+      match mm.parent with
+      | Some p -> up acc p
+      | None -> acc
+    in
+    up [] m
+  in
   let rec add_item modt it pub =
     match it with
     | IPub (it2, _) -> add_item modt it2 true
@@ -198,7 +248,10 @@ let resolve (main : program) (main_dir : string)
            let c = mk_mod (modt.mpath @ [ name ]) (Filename.dirname path) in
            c.parent <- Some modt;
            modt.children <- modt.children @ [ (name, c) ];
-           let body = read_parse path in
+           let body =
+             fixup_uses (Filename.dirname path) (anc_mod_names modt)
+               (read_parse path)
+           in
            stack := !stack @ [ (norm, name) ];
            List.iter (fun x -> add_item c x false) body;
            (match List.rev !stack with
@@ -220,7 +273,7 @@ let resolve (main : program) (main_dir : string)
     | IUse _ | IUseP _ -> modt.raw <- modt.raw @ [ it ]
     | IMod _ | IModFile _ -> assert false
   in
-  List.iter (fun it -> add_item root it false) main;
+  List.iter (fun it -> add_item root it false) (fixup_uses root.dir [] main);
 
   (* ---- 阶段2：use 名字绑定解析（存在性 + 可见性 + 冲突） ---- *)
   let rec find_mod (m : modt) (mpath : string list) : modt option =

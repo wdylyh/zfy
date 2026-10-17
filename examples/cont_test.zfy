@@ -1,0 +1,41 @@
+// cont_test —— 行尾运算符自动续行 + use 分组折行（v3.5 DX）
+// 期望输出：6 / a-bc-d / true / 12 / 3 / true / 2
+use random::{
+    Random,
+    seed_from_i64,
+}
+fn string mk(let string a, let string b, let string c, let string d)
+    return a + "-" + b +
+           c + "-" + d
+
+fn main()
+    let i32 s = 1 +
+                2 +
+                3
+    output(s)
+    output(mk("a", "b",
+              "c", "d"))
+    let bool big = 1 < 2 and
+                   3 < 4
+    output(big)
+    let i32 t = 0
+    t = s *
+        2
+    output(t)
+    let i32 acc2 = 0
+    for let i32 i = 0, i < 3, i++
+        acc2 += i
+    output(acc2)
+    let i32 arrv = 10
+    output(arrv ==
+           10)
+    let Random rng = seed_from_i64(42)
+    let i64 r1 = rng.int_range(0, 1000)
+    let Random rng2 = seed_from_i64(42)
+    let i64 r2 = rng2.int_range(0, 1000)
+    if r1 != r2
+        return 1
+    if r1 < 0 or r1 >= 1000
+        return 1
+    output(2)
+    return 0

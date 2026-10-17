@@ -296,33 +296,44 @@ pub struct App
     fn void close()
         gui_close()
 
-    fn void add_label(let Label l)
+    // add_* 返回组件索引（v3.5 DX）：App 为值语义容器——add 进去的是副本，
+    // 之后业务读写一律走 app.xxx[idx].field，不要读局部变量
+    fn i32 add_label(let Label l)
         self.labels = push(self.labels, l)
+        return length(self.labels) - 1
 
-    fn void add_button(let Button b)
+    fn i32 add_button(let Button b)
         self.buttons = push(self.buttons, b)
+        return length(self.buttons) - 1
 
-    fn void add_input(let InputBox ib)
+    fn i32 add_input(let InputBox ib)
         self.inputs = push(self.inputs, ib)
+        return length(self.inputs) - 1
 
-    fn void add_slider(let Slider s)
+    fn i32 add_slider(let Slider s)
         self.sliders = push(self.sliders, s)
+        return length(self.sliders) - 1
 
-    fn void add_bar(let ProgressBar p)
+    fn i32 add_bar(let ProgressBar p)
         self.bars = push(self.bars, p)
+        return length(self.bars) - 1
 
-    fn void add_list(let ListBox lb)
+    fn i32 add_list(let ListBox lb)
         self.lists = push(self.lists, lb)
+        return length(self.lists) - 1
 
-    fn void add_text(let TextArea t)
+    fn i32 add_text(let TextArea t)
         self.texts = push(self.texts, t)
+        return length(self.texts) - 1
 
-    fn void add_checkbox(let Checkbox c)
+    fn i32 add_checkbox(let Checkbox c)
         self.checks = push(self.checks, c)
+        return length(self.checks) - 1
 
-    fn void add_menu(let Menu m)
+    fn i32 add_menu(let Menu m)
         self.menus = push(self.menus, m)
         self.menu_dirty = true
+        return length(self.menus) - 1
 
     // 关闭全部下拉（点击空白/打开新菜单/选中项后调用）
     fn void close_menus()
@@ -623,6 +634,14 @@ pub struct App
         let i32 mbh = LH() + 6 * u / 100
         if length(self.menus) == 0
             return
+        // 自愈布局（v3.5 DX）：任一菜单 tw<=0（未调 layout_menus）时先补齐
+        // 标题 x/tw——否则标题画得出（gui_draw_text 不用 tw）却点不中（命中用 x+tw）
+        let i32 nl = 0
+        while nl < length(self.menus)
+            if self.menus[nl].tw <= 0
+                self.layout_menus()
+                break
+            nl++
         let i32 nopen = 0
         let i32 i = 0
         while i < length(self.menus)
@@ -879,8 +898,10 @@ pub struct TextArea
             self.focus = f
             self.dirty = true
 
-    // 鼠标点击定位光标
+    // 鼠标点击定位光标（空 lines 时自动初始化为单空行，v3.5 DX 防越界）
     fn void place_cursor(let i32 mx, let i32 my)
+        if length(self.lines) == 0
+            self.set_text("")
         let i32 pad = 4 * SC() / 100
         let i32 row = (my - self.y - pad) / LH()
         if row < 0
@@ -906,6 +927,8 @@ pub struct TextArea
     // 替换第 cy 行并重建数组的通用入口都不需要——直接改 self.lines[cy]
     // 光标处插入多行文本（\n 拆行；空串无操作），供 Ctrl+V 与业务侧复用
     fn void insert_at_cursor(let string clip)
+        if length(self.lines) == 0
+            self.set_text("")
         let i32 nl = length(self.lines)
         let string ln = self.lines[self.cy]
         if clip != ""
@@ -937,6 +960,8 @@ pub struct TextArea
         self.clamp_scroll()
 
     fn bool handle_key(let i64 k)
+        if length(self.lines) == 0
+            self.set_text("")
         let i32 nl = length(self.lines)
         let string ln = self.lines[self.cy]
         let i32 n = length(ln)

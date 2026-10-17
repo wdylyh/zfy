@@ -72,6 +72,11 @@ typedef struct zfy_err {
 /* panic 用户处理器（panic_handler(f) 注册；签名 (i32, string) -> void） */
 static void (*zfy_panic_handler)(int32_t, char *) = NULL;
 
+/* panic 位置追踪（v3.5 DX）：编译器在每条语句入口写当前 file/line，
+   zfy_panic 打印 "  at file:line"（runtime 内部越界/除零等同样带位置） */
+int zfy_cur_line = 0;
+const char *zfy_cur_file = NULL;
+
 void zfy_set_panic_handler(void (*h)(int32_t, char *)) {
     zfy_panic_handler = h;
 }
@@ -89,6 +94,9 @@ void zfy_panic(int32_t code, char *msg) {
         fprintf(stderr, "panic: %s\n", msg ? msg : "");
     } else {
         fprintf(stderr, "panic: %s (code %d)\n", msg ? msg : "", code);
+    }
+    if (zfy_cur_line > 0 && !zfy_panic_handler) {
+        fprintf(stderr, "  at %s:%d\n", zfy_cur_file ? zfy_cur_file : "?", zfy_cur_line);
     }
     exit(101);
 }

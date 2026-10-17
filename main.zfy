@@ -1,168 +1,371 @@
-// t14.zfy —— big_sqrt 第 3 段：内层求 digit 循环
+// notepad.zfy —— 单文件记事本（zfy v3.4.0）
+// 菜单完全自绘，不用任何局部 string[] 数组（避开可能的局部数组 bug）
+// 编译：zfyc build notepad.zfy
 
-fn i32[] big_trim(let i32[] a)
-    let i32[] out
-    let i64 i = 0
-    let i64 n = length(a)
-    while i < n and a[i] == 0
-        i++
-    if i == n
-        out = push(out, 0)
-        return out
+mod gui;
+mod widgets;
+
+use gui::{gui_w, gui_h, gui_dpi, gui_frame_sleep, gui_clip_set, gui_clip_get, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present}
+use widgets::{App, TextArea, Label, C_TEXT, C_PANEL, C_BORDER, C_HOT, C_ACCENT}
+
+fn string base_name(let string path)
+    let i32 n = length(path)
+    let i32 i = n - 1
+    while i >= 0
+        let char c = path[i]
+        if c == '/' or c == '\\'
+            return path[i + 1, n - 1]
+        i--
+    return path
+
+fn i32 count_lines(let string s)
+    let i32 n = length(s)
+    let i32 lines = 1
+    let i32 i = 0
     while i < n
-        out = push(out, a[i])
+        if s[i] == '\n'
+            lines++
         i++
+    return lines
+
+fn string i32_to_str(let i32 v)
+    if v == 0
+        return "0"
+    let bool neg = false
+    let i64 x = cast(v, i64)
+    if x < 0
+        neg = true
+        x = 0 - x
+    let char buf[] = '\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0'
+    let i32 k = 20
+    while x > 0
+        k--
+        buf[k] = chr(cast(ord('0') + cast(x % 10, i32), i32))
+        x = x / 10
+    let string out = ""
+    if neg
+        out += '-'
+    let i32 j = k
+    while j < 20
+        out += buf[j]
+        j++
     return out
 
-fn bool big_zero(let i32[] a)
-    return length(a) == 1 and a[0] == 0
+fn string pad2(let i32 v)
+    if v < 10
+        return "0" + i32_to_str(v)
+    return i32_to_str(v)
 
-fn i32[] big_mul_add(let i32[] a, let i32 m, let i32 add)
-    let i32[] out
-    if big_zero(a) and m == 0
-        out = push(out, add)
-        return big_trim(out)
-    let i32[] rev
-    let i64 i = length(a) - 1
-    while i >= 0
-        rev = push(rev, a[i])
-        i--
-    let i32 carry = add
-    let i32[] outr
-    let i64 j = 0
-    while j < length(rev)
-        let i32 t = rev[j] * m + carry
-        outr = push(outr, t % 10)
-        carry = t / 10
-        j++
-    while carry > 0
-        outr = push(outr, carry % 10)
-        carry = carry / 10
-    let i64 k = length(outr) - 1
-    while k >= 0
-        out = push(out, outr[k])
-        k--
-    return big_trim(out)
+fn string pad4(let i32 v)
+    if v < 10
+        return "000" + i32_to_str(v)
+    if v < 100
+        return "00" + i32_to_str(v)
+    if v < 1000
+        return "0" + i32_to_str(v)
+    return i32_to_str(v)
 
-fn i32 big_cmp(let i32[] a, let i32[] b)
-    if length(a) < length(b)
-        return 0 - 1
-    if length(a) > length(b)
-        return 1
-    let i64 i = 0
-    while i < length(a)
-        if a[i] < b[i]
-            return 0 - 1
-        if a[i] > b[i]
-            return 1
-        i++
-    return 0
+fn string fmt_time(let i64 ts)
+    let datetime d = localtime(ts)
+    return (pad4(d.year) + "-" + pad2(d.month) + "-" + pad2(d.day) + " "
+          + pad2(d.hour) + ":" + pad2(d.minute) + ":" + pad2(d.second))
 
-fn i32[] big_sub(let i32[] a, let i32[] b)
-    let i32[] ar
-    let i64 i = length(a) - 1
-    while i >= 0
-        ar = push(ar, a[i])
-        i--
-    let i32[] br
-    let i64 j = length(b) - 1
-    while j >= 0
-        br = push(br, b[j])
-        j--
-    let i32[] outr
-    let i32 borrow = 0
-    let i64 k = 0
-    while k < length(ar)
-        let i32 av = ar[k]
-        let i32 bv = 0
-        if k < length(br)
-            bv = br[k]
-        let i32 t = av - bv - borrow
-        if t < 0
-            t = t + 10
-            borrow = 1
-        else
-            borrow = 0
-        outr = push(outr, t)
-        k++
-    let i32[] out
-    let i64 m2 = length(outr) - 1
-    while m2 >= 0
-        out = push(out, outr[m2])
-        m2--
-    return big_trim(out)
-
-fn string big_sqrt(let i32[] N, let i64 want)
-    output("  S1 enter\n")
-    let i32[] groups
-    let i64 n = length(N)
-    let i64 first = n % 2
-    if first == 0
-        first = 2
-    let i32 g0 = 0
-    let i64 i = 0
-    while i < first
-        g0 = g0 * 10 + N[i]
-        i++
-    groups = push(groups, g0)
-    while i < n
-        let i32 g = N[i] * 10 + N[i + 1]
-        groups = push(groups, g)
-        i = i + 2
-    output("  S2 grouped glen=", length(groups), "\n")
-
-    let i32[] rem
-    rem = push(rem, 0)
-    let i32[] r
-    r = push(r, 0)
-    let string digits = ""
-    let i64 gi = 0
-    let i64 produced = 0
-    output("  S4 loop start\n")
-    while produced < want
-        let i32 g = 0
-        if gi < length(groups)
-            g = groups[gi]
-        let i32[] cur = big_mul_add(rem, 100, g)
-        let i32[] r20 = big_mul_add(r, 20, 0)
-        output("    L4 r20 len=", length(r20), "\n")
-        let i32 d = 9
-        let bool found = false
-        let i32[] chosen
-        chosen = push(chosen, 0)
-        output("    L5 chosen init\n")
-        while d >= 0 and not found
-            let i32[] t = big_mul_add(r20, d, d * d)
-            output("      M1 d=", d, " t len=", length(t), "\n")
-            if big_cmp(t, cur) <= 0
-                chosen = t
-                found = true
-            else
-                d--
-        output("    L6 d=", d, " found=", found, "\n")
-        if not found
-            d = 0
-        rem = big_sub(cur, chosen)
-        output("    L7 rem done\n")
-        r = big_mul_add(r, 10, d)
-        output("    L8 r done\n")
-        digits = digits + cast(d + 48, string)
-        output("    L9 digits=", digits, "\n")
-        produced++
-        gi++
-        if produced >= 3
-            return digits
-    return digits
+fn string status_text(let string nm, let i32 lines, let i32 chars)
+    return nm + "   |   " + i32_to_str(lines) + " 行   |   " + i32_to_str(chars) + " 字符"
 
 fn main()
-    output("A\n")
-    let i32[] N
-    N = push(N, 2)
-    let i64 e = 0
-    while e < 4
-        N = big_mul_add(N, 10, 0)
-        e++
-    output("B N len=", length(N), "\n")
-    output("C call\n")
-    let string r = big_sqrt(N, 4)
-    output("D r=", r, "\n")
+    let App app = App()
+    if app.open(820, 620, "zfy 记事本") != 0
+        return 1
+
+    let i32 dpi = gui_dpi()
+    let i32 sc = dpi / 96
+    if sc < 1
+        sc = 1
+    let i32 menu_h = 30 * sc
+    let i32 status_h = 24 * sc
+
+    // ---- 编辑区 ----
+    let TextArea ta = TextArea(x=0, y=0, w=100, h=100)
+    ta.set_text("")
+    let i32 _idx1 = app.add_text(ta)
+
+    // ---- 状态栏 ----
+    let Label status = Label(x=0, y=0, text="未命名   |   1 行   |   0 字符", color=C_TEXT, bg_w=100)
+    let i32 _idx2 = app.add_label(status)
+
+    // ---- 菜单：硬编码标题和条目（不用数组）----
+    let string t0 = "文件"
+    let string t1 = "编辑"
+    let string f0 = "新建"
+    let string f1 = "打开"
+    let string f2 = "保存"
+    let string f3 = "另存为"
+    let string f4 = "退出"
+    let string e0 = "复制"
+    let string e1 = "粘贴"
+    let string e2 = "剪切"
+    let string e3 = "插入时间"
+    let i32 nf = 5          // 文件菜单条目数
+    let i32 ne = 4          // 编辑菜单条目数
+
+    let i32 m_open = -1
+    let i32 m_hover_item = -1
+    let i32 click_lock = 0
+
+    // ---- 布局 ----
+    app.texts[0].x = 0
+    app.texts[0].y = menu_h
+    app.texts[0].w = gui_w()
+    app.texts[0].h = gui_h() - menu_h - status_h
+    app.texts[0].focus = true
+    app.texts[0].dirty = true
+    app.labels[0].x = 6 * sc
+    app.labels[0].y = gui_h() - status_h + 3 * sc
+    app.labels[0].bg_w = gui_w()
+    app.labels[0].dirty = true
+    app.invalidate_all()
+
+    // ---- 文档状态 ----
+    let string cur_path = ""
+    let string cur_name = "未命名"
+    let bool doc_dirty = false
+    let string last_snap = app.texts[0].text()
+    let i32 last_w = gui_w()
+    let i32 last_h = gui_h()
+    let i32 last_dpi = dpi
+    let bool my_prev_down = false
+
+    // ---- 主循环 ----
+    while app.alive()
+        if gui_w() != last_w or gui_h() != last_h or gui_dpi() != last_dpi
+            last_w = gui_w()
+            last_h = gui_h()
+            last_dpi = gui_dpi()
+            sc = last_dpi / 96
+            if sc < 1
+                sc = 1
+            menu_h = 30 * sc
+            status_h = 24 * sc
+            app.texts[0].x = 0
+            app.texts[0].y = menu_h
+            app.texts[0].w = last_w
+            app.texts[0].h = last_h - menu_h - status_h
+            app.texts[0].dirty = true
+            app.labels[0].x = 6 * sc
+            app.labels[0].y = last_h - status_h + 3 * sc
+            app.labels[0].bg_w = last_w
+            app.labels[0].dirty = true
+            app.invalidate_all()
+
+        app.step()
+
+        let i32 mx = app.mx
+        let i32 my = app.my
+        let bool down = app.ldown
+        let bool clicked = down and not my_prev_down
+        if click_lock > 0
+            click_lock--
+
+        // 菜单栏几何
+        let i32 tx0 = 8 * sc
+        let i32 tw0 = gui_text_w(t0) + 20 * sc
+        let i32 tx1 = tx0 + tw0
+        let i32 tw1 = gui_text_w(t1) + 20 * sc
+        let i32 item_h = 22 * sc
+        let i32 panel_y = menu_h
+        let i32 fpanel_w = 100 * sc
+        let i32 epanel_w = 100 * sc
+
+        // 悬停条目
+        m_hover_item = -1
+        if m_open == 0
+            if mx >= tx0 and mx < tx0 + fpanel_w and my >= panel_y
+                let i32 r = (my - panel_y) / item_h
+                if r >= 0 and r < nf
+                    m_hover_item = r
+        if m_open == 1
+            if mx >= tx1 and mx < tx1 + epanel_w and my >= panel_y
+                let i32 r = (my - panel_y) / item_h
+                if r >= 0 and r < ne
+                    m_hover_item = r
+
+        // 点击
+        if clicked and click_lock == 0
+            if my < menu_h
+                if mx >= tx0 and mx < tx0 + tw0
+                    if m_open == 0
+                        m_open = -1
+                    else
+                        m_open = 0
+                    click_lock = 1
+                else if mx >= tx1 and mx < tx1 + tw1
+                    if m_open == 1
+                        m_open = -1
+                    else
+                        m_open = 1
+                    click_lock = 1
+                else
+                    m_open = -1
+                    click_lock = 1
+            else if m_open == 0 and m_hover_item >= 0
+                let i32 it = m_hover_item
+                m_open = -1
+                click_lock = 1
+                if it == 0
+                    app.texts[0].set_text("")
+                    app.texts[0].dirty = true
+                    cur_path = ""
+                    cur_name = "未命名"
+                    doc_dirty = false
+                    last_snap = ""
+                else if it == 1
+                    output("输入要打开的路径: ")
+                    let string p = ""
+                    input(p)
+                    if length(p) > 0 and exists(p)
+                        let string! rf = read_file(p)
+                        let string body = rf ?? ""
+                        app.texts[0].set_text(body)
+                        app.texts[0].dirty = true
+                        cur_path = p
+                        cur_name = base_name(p)
+                        doc_dirty = false
+                        last_snap = body
+                else if it == 2
+                    if length(cur_path) == 0
+                        output("输入保存路径: ")
+                        let string p2 = ""
+                        input(p2)
+                        if length(p2) > 0
+                            cur_path = p2
+                            cur_name = base_name(p2)
+                    if length(cur_path) > 0
+                        let i64! wn = write_file(cur_path, app.texts[0].text())
+                        let i64 written = wn ?? -1
+                        if written >= 0
+                            doc_dirty = false
+                            last_snap = app.texts[0].text()
+                else if it == 3
+                    output("输入另存为路径: ")
+                    let string p3 = ""
+                    input(p3)
+                    if length(p3) > 0
+                        let i64! wn2 = write_file(p3, app.texts[0].text())
+                        let i64 written2 = wn2 ?? -1
+                        if written2 >= 0
+                            cur_path = p3
+                            cur_name = base_name(p3)
+                            doc_dirty = false
+                            last_snap = app.texts[0].text()
+                else if it == 4
+                    app.close()
+                    continue
+            else if m_open == 1 and m_hover_item >= 0
+                let i32 it = m_hover_item
+                m_open = -1
+                click_lock = 1
+                if it == 0
+                    gui_clip_set(app.texts[0].text())
+                else if it == 1
+                    let string cb = gui_clip_get()
+                    if cb != ""
+                        app.texts[0].insert_at_cursor(cb)
+                        app.texts[0].dirty = true
+                        doc_dirty = true
+                else if it == 2
+                    gui_clip_set(app.texts[0].text())
+                    app.texts[0].set_text("")
+                    app.texts[0].dirty = true
+                    doc_dirty = true
+                else if it == 3
+                    app.texts[0].insert_at_cursor(fmt_time(now()))
+                    app.texts[0].dirty = true
+                    doc_dirty = true
+            else
+                if m_open >= 0
+                    m_open = -1
+                    click_lock = 1
+
+        // ---- 自绘菜单栏 ----
+        gui_fill_rect(0, 0, gui_w(), menu_h, C_PANEL)
+        gui_fill_rect(0, menu_h - 1, gui_w(), 1, C_BORDER)
+        if m_open == 0
+            gui_fill_rect(tx0, 0, tw0, menu_h, C_ACCENT)
+        else
+            if my >= 0 and my < menu_h and mx >= tx0 and mx < tx0 + tw0
+                gui_fill_rect(tx0, 0, tw0, menu_h, C_HOT)
+        gui_draw_text(tx0 + 10 * sc, (menu_h - 20 * sc) / 2, t0, C_TEXT)
+        if m_open == 1
+            gui_fill_rect(tx1, 0, tw1, menu_h, C_ACCENT)
+        else
+            if my >= 0 and my < menu_h and mx >= tx1 and mx < tx1 + tw1
+                gui_fill_rect(tx1, 0, tw1, menu_h, C_HOT)
+        gui_draw_text(tx1 + 10 * sc, (menu_h - 20 * sc) / 2, t1, C_TEXT)
+
+        // ---- 下拉面板（硬编码每条）----
+        if m_open == 0
+            let i32 ph = nf * item_h + 4 * sc
+            gui_fill_rect(tx0, panel_y, fpanel_w, ph, C_PANEL)
+            gui_rect(tx0, panel_y, fpanel_w, ph, C_BORDER)
+            let i32 iy0 = panel_y + 2 * sc
+            if m_hover_item == 0
+                gui_fill_rect(tx0 + 1, iy0, fpanel_w - 2, item_h, C_HOT)
+            gui_draw_text(tx0 + 10 * sc, iy0 + 2 * sc, f0, C_TEXT)
+            let i32 iy1 = iy0 + item_h
+            if m_hover_item == 1
+                gui_fill_rect(tx0 + 1, iy1, fpanel_w - 2, item_h, C_HOT)
+            gui_draw_text(tx0 + 10 * sc, iy1 + 2 * sc, f1, C_TEXT)
+            let i32 iy2 = iy1 + item_h
+            if m_hover_item == 2
+                gui_fill_rect(tx0 + 1, iy2, fpanel_w - 2, item_h, C_HOT)
+            gui_draw_text(tx0 + 10 * sc, iy2 + 2 * sc, f2, C_TEXT)
+            let i32 iy3 = iy2 + item_h
+            if m_hover_item == 3
+                gui_fill_rect(tx0 + 1, iy3, fpanel_w - 2, item_h, C_HOT)
+            gui_draw_text(tx0 + 10 * sc, iy3 + 2 * sc, f3, C_TEXT)
+            let i32 iy4 = iy3 + item_h
+            if m_hover_item == 4
+                gui_fill_rect(tx0 + 1, iy4, fpanel_w - 2, item_h, C_HOT)
+            gui_draw_text(tx0 + 10 * sc, iy4 + 2 * sc, f4, C_TEXT)
+        if m_open == 1
+            let i32 ph = ne * item_h + 4 * sc
+            gui_fill_rect(tx1, panel_y, epanel_w, ph, C_PANEL)
+            gui_rect(tx1, panel_y, epanel_w, ph, C_BORDER)
+            let i32 jy0 = panel_y + 2 * sc
+            if m_hover_item == 0
+                gui_fill_rect(tx1 + 1, jy0, epanel_w - 2, item_h, C_HOT)
+            gui_draw_text(tx1 + 10 * sc, jy0 + 2 * sc, e0, C_TEXT)
+            let i32 jy1 = jy0 + item_h
+            if m_hover_item == 1
+                gui_fill_rect(tx1 + 1, jy1, epanel_w - 2, item_h, C_HOT)
+            gui_draw_text(tx1 + 10 * sc, jy1 + 2 * sc, e1, C_TEXT)
+            let i32 jy2 = jy1 + item_h
+            if m_hover_item == 2
+                gui_fill_rect(tx1 + 1, jy2, epanel_w - 2, item_h, C_HOT)
+            gui_draw_text(tx1 + 10 * sc, jy2 + 2 * sc, e2, C_TEXT)
+            let i32 jy3 = jy2 + item_h
+            if m_hover_item == 3
+                gui_fill_rect(tx1 + 1, jy3, epanel_w - 2, item_h, C_HOT)
+            gui_draw_text(tx1 + 10 * sc, jy3 + 2 * sc, e3, C_TEXT)
+        gui_present()
+
+        // ---- 状态栏 ----
+        let string snap = app.texts[0].text()
+        if snap != last_snap
+            last_snap = snap
+            doc_dirty = true
+            app.texts[0].dirty = true
+        let string mark = ""
+        if doc_dirty
+            mark = " *"
+        let string want = status_text(cur_name + mark, count_lines(snap), length(snap))
+        if app.labels[0].text != want
+            app.labels[0].text = want
+            app.labels[0].dirty = true
+
+        my_prev_down = down
+        gui_frame_sleep(tick_ms())
+
+    app.close()
+    return 0

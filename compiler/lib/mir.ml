@@ -52,6 +52,9 @@ type instr =
        生成 ret void；仅 TErr 返回类型的函数） *)
   | MPanic of operand option * operand
     (* panic(code?, msg)：调用 zfy_panic 不可恢复终止（不返回）；后继为死块 *)
+  | MSetLoc of string * int
+    (* panic 行号追踪（v3.5 DX）：每条语句入口写全局 @zfy_cur_line/@zfy_cur_file，
+       zfy_panic（含 runtime 内部越界/除零等）打印 "  at file:line" *)
   | MAlloca of string * zty                      (* 变量槽（入口块统一分配�?*)
   | MFracNew of string * zty * operand * operand (* 分数字面量：�? frac 类型, 分子, 分母 *)
   | MNorm of string * zty                        (* frac 槽约分：调用 zfy_frac_norm_<suf> *)
@@ -822,6 +825,7 @@ let rec lblock l (stmts : tblock) : unit =
   List.iter (lstmt l) stmts
 
 and lstmt l (s : tstmt) : unit =
+  emit l (MSetLoc (s.spos.file, s.spos.line));
   l.stmt_temps <- [];
   lstmt_inner l s;
   finish_stmt_temps l
@@ -1494,7 +1498,10 @@ let uses_of (i : instr) : string list =
   | MErrFillErr (_, v, _) -> operand_names v
   | MErrFillOut (v, _) -> operand_names v
   | MPanic (c, m) ->
-    (match c with Some o -> operand_names o | None -> []) @ operand_names m
+    (match c with
+     | Some c -> operand_names c @ operand_names m
+     | None -> operand_names m)
+  | MSetLoc _ -> []
   | MAlloca _ -> []
   | MFracNew (_, _, a, b) -> operand_names a @ operand_names b
   | MNorm _ -> []

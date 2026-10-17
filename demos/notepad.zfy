@@ -43,17 +43,17 @@ fn main()
     let Menu mEdit = Menu()
     mEdit.title = "编辑"
     mEdit.items = "复制", "粘贴", "插入时间"
-    app.add_menu(mFile)
-    app.add_menu(mEdit)
+    let i32 _idx1 = app.add_menu(mFile)
+    let i32 _idx2 = app.add_menu(mEdit)
     app.layout_menus()
 
     let TextArea ta = TextArea()
     ta.set_text("zfy 记事本\n\n菜单栏：文件/编辑（点击打开下拉）\n支持中英文输入、回车换行、Ctrl+V、方向键移动光标")
-    app.add_text(ta)
+    let i32 _idx3 = app.add_text(ta)
 
     let Label stat = Label()
     stat.text = ""
-    app.add_label(stat)
+    let i32 _idx4 = app.add_label(stat)
 
     let string last = ""          // 上次统计文本，变化才刷状态栏
     let i32 pw = 0

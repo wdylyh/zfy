@@ -1,0 +1,286 @@
+// notepad.zfy —— 单文件记事本（zfy v3.4.0）
+// 编译：zfyc build test.zfy
+
+mod gui;
+mod widgets;
+
+use gui::{gui_w, gui_h, gui_dpi, gui_text_w, gui_frame_sleep, gui_clip_set, gui_clip_get}
+use widgets::{App, TextArea, Label, Menu, C_TEXT}
+
+// ---- 小工具（顶层函数）----
+
+fn string base_name(let string path)
+    let i32 n = length(path)
+    let i32 i = n - 1
+    while i >= 0
+        let char c = path[i]
+        if c == '/' or c == '\\'
+            return path[i + 1, n - 1]
+        i--
+    return path
+
+fn i32 count_lines(let string s)
+    let i32 n = length(s)
+    let i32 lines = 1
+    let i32 i = 0
+    while i < n
+        if s[i] == '\n'
+            lines++
+        i++
+    return lines
+
+fn string i32_to_str(let i32 v)
+    if v == 0
+        return "0"
+    let bool neg = false
+    let i64 x = cast(v, i64)
+    if x < 0
+        neg = true
+        x = 0 - x
+    let char buf[] = '\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0'
+    let i32 k = 20
+    while x > 0
+        k--
+        buf[k] = chr(cast(ord('0') + cast(x % 10, i32), i32))
+        x = x / 10
+    let string out = ""
+    if neg
+        out += '-'
+    let i32 j = k
+    while j < 20
+        out += buf[j]
+        j++
+    return out
+
+fn string pad2(let i32 v)
+    if v < 10
+        return "0" + i32_to_str(v)
+    return i32_to_str(v)
+
+fn string pad4(let i32 v)
+    if v < 10
+        return "000" + i32_to_str(v)
+    if v < 100
+        return "00" + i32_to_str(v)
+    if v < 1000
+        return "0" + i32_to_str(v)
+    return i32_to_str(v)
+
+fn string fmt_time(let i64 ts)
+    let datetime d = localtime(ts)
+    return (pad4(d.year) + "-" + pad2(d.month) + "-" + pad2(d.day) + " "
+          + pad2(d.hour) + ":" + pad2(d.minute) + ":" + pad2(d.second))
+
+fn string status_text(let string nm, let i32 lines, let i32 chars)
+    return nm + "   |   " + i32_to_str(lines) + " 行   |   " + i32_to_str(chars) + " 字符"
+
+// ---- 主程序 ----
+
+fn main()
+    let App app = App()
+    if app.open(820, 620, "zfy 记事本") != 0
+        return 1
+
+    let i32 dpi = gui_dpi()
+    let i32 sc = dpi / 96
+    if sc < 1
+        sc = 1
+    let i32 menu_h = app.menu_bar_h()
+    let i32 status_h = 24 * dpi / 96
+
+    // ---- 菜单栏 ----
+    let string file_items[] = "新建", "打开", "保存", "另存为", "退出"
+    let string edit_items[] = "复制", "粘贴", "剪切", "插入时间"
+    let Menu m_file = Menu("文件", file_items)
+    let Menu m_edit = Menu("编辑", edit_items)
+    let i32 _idx1 = app.add_menu(m_file)
+    let i32 _idx2 = app.add_menu(m_edit)
+
+    // ---- 编辑区 ----
+    let TextArea ta = TextArea(x=0, y=0, w=100, h=100)
+    ta.set_text("第一行\n第二行\n第三行")
+    let i32 _idx3 = app.add_text(ta)
+
+    // ---- 状态栏 ----
+    let Label status = Label(x=0, y=0, text="未命名   |   1 行   |   0 字符", color=C_TEXT, bg_w=100)
+    let i32 _idx4 = app.add_label(status)
+
+    // ---- 首帧布局（物理像素）----
+    let i32 lw = gui_w()
+    let i32 lh = gui_h()
+    app.texts[0].x = 0
+    app.texts[0].y = menu_h
+    app.texts[0].w = lw
+    app.texts[0].h = lh - menu_h - status_h
+    app.texts[0].dirty = true
+    app.labels[0].x = 6 * sc
+    app.labels[0].y = lh - status_h + 3 * sc
+    app.labels[0].bg_w = lw
+    app.labels[0].dirty = true
+
+    // 菜单项排布（手动设 x）
+    let i32 mx = 0
+    let i32 mi2 = 0
+    while mi2 < length(app.menus)
+        app.menus[mi2].x = mx
+        mx = mx + gui_text_w(app.menus[mi2].title) + 24 * sc
+        mi2++
+
+    app.invalidate_all()
+
+    // ---- 文档状态 ----
+    let string cur_path = ""
+    let string cur_name = "未命名"
+    let bool doc_dirty = false
+    let string last_snap = app.texts[0].text()
+    let i32 prev_file = 0
+    let i32 prev_edit = 0
+    let i32 last_w = gui_w()
+    let i32 last_h = gui_h()
+    let i32 last_dpi = dpi
+
+    // ---- 主循环 ----
+    while app.alive()
+        // 窗口尺寸/DPI 变化 -> 重排
+        if gui_w() != last_w or gui_h() != last_h or gui_dpi() != last_dpi
+            last_w = gui_w()
+            last_h = gui_h()
+            last_dpi = gui_dpi()
+            sc = last_dpi / 96
+            if sc < 1
+                sc = 1
+            status_h = 24 * last_dpi / 96
+            app.texts[0].x = 0
+            app.texts[0].y = menu_h
+            app.texts[0].w = last_w
+            app.texts[0].h = last_h - menu_h - status_h
+            app.texts[0].dirty = true
+            app.labels[0].x = 6 * sc
+            app.labels[0].y = last_h - status_h + 3 * sc
+            app.labels[0].bg_w = last_w
+            app.labels[0].dirty = true
+
+            // 菜单项重排
+            let i32 mx2 = 0
+            let i32 mi3 = 0
+            while mi3 < length(app.menus)
+                app.menus[mi3].x = mx2
+                mx2 = mx2 + gui_text_w(app.menus[mi3].title) + 24 * sc
+                mi3++
+
+            app.invalidate_all()
+
+        // ---- 文件菜单 ----
+        if m_file.clicks != prev_file
+            prev_file = m_file.clicks
+            let i32 sel = m_file.sel
+            if sel == 0
+                app.texts[0].set_text("")
+                app.texts[0].dirty = true
+                cur_path = ""
+                cur_name = "未命名"
+                doc_dirty = false
+                last_snap = ""
+            else if sel == 1
+                output("输入要打开的路径: ")
+                let string p = ""
+                input(p)
+                if length(p) > 0 and exists(p)
+                    let string! rf = read_file(p)
+                    let string body = rf ?? ""
+                    app.texts[0].set_text(body)
+                    app.texts[0].dirty = true
+                    cur_path = p
+                    cur_name = base_name(p)
+                    doc_dirty = false
+                    last_snap = body
+                else
+                    app.labels[0].text = "打开失败: " + p
+                    app.labels[0].dirty = true
+            else if sel == 2
+                if length(cur_path) == 0
+                    output("输入保存路径: ")
+                    let string p2 = ""
+                    input(p2)
+                    if length(p2) > 0
+                        cur_path = p2
+                        cur_name = base_name(p2)
+                if length(cur_path) > 0
+                    let i64! wn = write_file(cur_path, app.texts[0].text())
+                    let i64 written = wn ?? -1
+                    if written >= 0
+                        doc_dirty = false
+                        last_snap = app.texts[0].text()
+                    else
+                        app.labels[0].text = "保存失败: " + cur_path
+                        app.labels[0].dirty = true
+            else if sel == 3
+                output("输入另存为路径: ")
+                let string p3 = ""
+                input(p3)
+                if length(p3) > 0
+                    let i64! wn2 = write_file(p3, app.texts[0].text())
+                    let i64 written2 = wn2 ?? -1
+                    if written2 >= 0
+                        cur_path = p3
+                        cur_name = base_name(p3)
+                        doc_dirty = false
+                        last_snap = app.texts[0].text()
+                    else
+                        app.labels[0].text = "保存失败: " + p3
+                        app.labels[0].dirty = true
+            else if sel == 4
+                app.close()
+                continue
+
+        // ---- 编辑菜单 ----
+        if m_edit.clicks != prev_edit
+            prev_edit = m_edit.clicks
+            let i32 sel2 = m_edit.sel
+            if sel2 == 0
+                gui_clip_set(app.texts[0].text())
+                app.labels[0].text = "已复制到剪贴板"
+                app.labels[0].dirty = true
+            else if sel2 == 1
+                let string cb = gui_clip_get()
+                if cb != ""
+                    app.texts[0].insert_at_cursor(cb)
+                    app.texts[0].dirty = true
+                    doc_dirty = true
+            else if sel2 == 2
+                gui_clip_set(app.texts[0].text())
+                app.texts[0].set_text("")
+                app.texts[0].dirty = true
+                doc_dirty = true
+            else if sel2 == 3
+                app.texts[0].insert_at_cursor(fmt_time(now()))
+                app.texts[0].dirty = true
+                doc_dirty = true
+
+        // ---- 一帧 ----
+        app.step()
+                // 在 app.step() 之后
+        let i32 di = 0
+        while di < length(app.menus)
+            output("[MENU] ", di, " title=", app.menus[di].title,
+                   " x=", app.menus[di].x, " open=", app.menus[di].open,
+                   " sel=", app.menus[di].sel, " clicks=", app.menus[di].clicks, "\n")
+            di++
+        // ---- 脏标记 + 状态栏 ----
+        let string snap = app.texts[0].text()
+        if snap != last_snap
+            last_snap = snap
+            doc_dirty = true
+            app.texts[0].dirty = true
+        let string mark = ""
+        if doc_dirty
+            mark = " *"
+        let string want = status_text(cur_name + mark, count_lines(snap), length(snap))
+        if app.labels[0].text != want
+            app.labels[0].text = want
+            app.labels[0].dirty = true
+
+        gui_frame_sleep(tick_ms())
+
+    app.close()
+    return 0

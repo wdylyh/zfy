@@ -13,12 +13,14 @@ type lexer = {
   mutable col : int;
   mutable indents : int list;   (* 缩进栈，栈顶在前 *)
   mutable paren_depth : int;    (* 括号深度 > 0 时忽略换行与缩进 *)
+  mutable brace_depth : int;    (* use 分组 a::b::{...} 的花括号计数（配对 paren_depth） *)
+  mutable pend_cont : bool;     (* 上一行以二元运算符结尾：下一行自动续行，不做缩进测量 *)
   mutable at_line_start : bool; (* 当前是否处于行首缩进判定点 *)
 }
 
 let make src file =
   { src; file; i = 0; line = 1; col = 1; indents = [ 0 ];
-    paren_depth = 0; at_line_start = true }
+    paren_depth = 0; brace_depth = 0; pend_cont = false; at_line_start = true }
 
 let peek l k =
   let j = l.i + k in
@@ -301,6 +303,23 @@ let tokenize ?(file = "") src =
       in
       close ()
     end
+    else if l.at_line_start && l.paren_depth = 0 && l.pend_cont then begin
+      (* 自动续行（v3.5 DX）：上一行以二元运算符/逗号等结尾，本行并入上一
+         表达式——不做缩进测量、不产生 Indent/Dedent/Newline *)
+      skip_line_noise l;
+      if l.i >= String.length l.src then begin
+        l.pend_cont <- false; l.at_line_start <- true; loop ()
+      end
+      else if l.src.[l.i] = '\n' then begin
+        (* 续行中的空行：保持续行状态 *)
+        advance l 1; l.at_line_start <- true; loop ()
+      end
+      else begin
+        l.pend_cont <- false;
+        l.at_line_start <- false;
+        loop ()
+      end
+    end
     else if l.at_line_start && l.paren_depth = 0 then begin
       (* 行首：测量缩进 *)
       let col0 = l.col in
@@ -348,10 +367,22 @@ let tokenize ?(file = "") src =
         match l.src.[l.i] with
         | '\n' ->
           if l.paren_depth = 0 then begin
-            (* 抑制连续换行 *)
-            (match !acc with
-             | (Newline, _) :: _ | (Indent, _) :: _ | (Dedent, _) :: _ -> ()
-             | _ -> push Newline (pos l));
+            let cont =
+              match !acc with
+              | (Newline, _) :: _ | (Indent, _) :: _ | (Dedent, _) :: _ -> false
+              | (t, _) :: _ -> Tokens.is_line_cont t
+              | [] -> false
+            in
+            if cont then
+              (* 行尾二元运算符/逗号等（v3.5 DX）：自动续行，不产生 Newline *)
+              l.pend_cont <- true
+            else begin
+              (* 抑制连续换行 *)
+              (match !acc with
+               | (Newline, _) :: _ | (Indent, _) :: _ | (Dedent, _) :: _ -> ()
+               | _ -> push Newline (pos l));
+              l.pend_cont <- false
+            end;
             l.at_line_start <- true
           end;
           advance l 1;
@@ -416,6 +447,13 @@ let tokenize ?(file = "") src =
                   (match t with
                    | LParen | LBracket -> l.paren_depth <- l.paren_depth + 1
                    | RParen | RBracket -> l.paren_depth <- max 0 (l.paren_depth - 1)
+                   | LBrace when (match !acc with (Colon, _) :: _ -> true | _ -> false) ->
+                     (* use 分组 a::b::{...}（v3.5 DX）：花括号也抑制换行，组内可折行 *)
+                     l.brace_depth <- l.brace_depth + 1;
+                     l.paren_depth <- l.paren_depth + 1
+                   | RBrace when l.brace_depth > 0 ->
+                     l.brace_depth <- l.brace_depth - 1;
+                     l.paren_depth <- max 0 (l.paren_depth - 1)
                    | _ -> ());
                   push t p
                 | None ->

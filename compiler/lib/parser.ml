@@ -1546,7 +1546,12 @@ and parse_item p =
                in
                let acc = (local, segs @ [ orig ], opos) :: acc in
                match peek p with
-               | (Comma, _) -> ignore (next p); go_binds acc
+               | (Comma, _) ->
+                 ignore (next p);
+                 (* 允许尾逗号（v3.5 DX）：{ a, b, } —— 与折行配合 *)
+                 (match fst (peek p) with
+                  | RBrace -> ignore (next p); List.rev acc
+                  | _ -> go_binds acc)
                | (RBrace, _) -> ignore (next p); List.rev acc
                | (_, tp') -> err tp' "expected ',' or '}' to end the use group"
              in

@@ -107,6 +107,20 @@ let pp_token = function
   | Dot -> "."
   | Newline -> "\\n" | Indent -> "INDENT" | Dedent -> "DEDENT" | Eof -> "EOF"
 
+(* 行尾续行判定（v3.5 DX）：行尾是这些 token 时，下一行自动并入当前表达式
+   （不产生 Newline，下一行不做缩进测量）。覆盖二元运算符、复合赋值、逗号、
+   成员/路径点等所有"行尾必未完"的词素。
+   注意：? / ! 不在内（expr? 传播、T! 类型后缀在行尾是合法完结）；
+   ?? 也不在内——行尾 ?? 是"解包块"语法（失败路径缩进块），不是续行。 *)
+let is_line_cont = function
+  | Plus | Minus | Star | Slash | Percent | Pow
+  | Amp | Pipe | Tilde | Shl | Shr
+  | Eq | Ne | Lt | Gt | Le | Ge
+  | Assign | PlusAssign | MinusAssign | StarAssign | SlashAssign
+  | PercentAssign | Comma | Dot | Colon -> true
+  | Keyword (KAnd | KOr | KNot | KXor) -> true
+  | _ -> false
+
 (* 单词类型名（声明处类型位以 Ident 出现的名字）：
    基础类型 bool/char/string/void + 宽度类型 i8..i128 / u8..u128 / f16..f128 *)
 let type_names =

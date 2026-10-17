@@ -27,11 +27,11 @@ fn main()
         return 1
 
     let Label title = Label(x=12, y=8, text="zfy 计算器（整数运算）")
-    app.add_label(title)
+    let i32 _idx1 = app.add_label(title)
     let Label expr = Label(x=12, y=34, text="")      // 已累积的运算式
-    app.add_label(expr)
+    let i32 _idx2 = app.add_label(expr)
     let Label disp = Label(x=12, y=62, text="0")     // 当前输入 / 结果
-    app.add_label(disp)
+    let i32 _idx3 = app.add_label(disp)
 
     // 16 个按键
     let string[] keys = "7", "8", "9", "÷", "4", "5", "6", "×", "1", "2", "3", "−", "C", "0", "=", "+"
@@ -42,7 +42,7 @@ fn main()
     let i32 j = 0
     while j < 16
         let Button b = Button(x=0, y=0, w=10, h=10, text=keys[j])
-        app.add_button(b)
+        let i32 _idx4 = app.add_button(b)
         j++
 
     let i32[] prev = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0

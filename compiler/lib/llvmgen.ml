@@ -65,6 +65,7 @@ type gctx = {
   mbuf : Buffer.t;                 (* 模块级定义（全局常量等） *)
   mutable nstr : int;
   globals : (string, unit) Hashtbl.t;  (* 顶层变量槽（'@' 前缀）去重表 *)
+  srcfiles : (string, string) Hashtbl.t; (* panic 行号（v3.5 DX）：文件名 → 常量全局名 *)
   structs : sdef list;             (* struct 定义表（布局与辅助函数生成用） *)
 }
 
@@ -1742,6 +1743,18 @@ let gen_instr fc (i : instr) : unit =
     in
     let (mv, _) = val_of fc msg in
     emitf fc "  call void @zfy_panic(i32 %s, ptr %s)" cv mv
+  | MSetLoc (file, line) ->
+    (* panic 行号追踪（v3.5 DX）：语句入口写全局，zfy_panic 打印 at file:line *)
+    let gp =
+      match Hashtbl.find_opt fc.g.srcfiles file with
+      | Some g' -> g'
+      | None ->
+        let g' = intern_string fc.g file in
+        Hashtbl.replace fc.g.srcfiles file g';
+        g'
+    in
+    emitf fc "  store i32 %d, ptr @zfy_cur_line" line;
+    emitf fc "  store ptr %s, ptr @zfy_cur_file" gp
   | MAlloca (name, ty) ->
     if String.length name > 0 && name.[0] = '@' then begin
       (* 顶层变量槽：模块级 global 定义（零初始化即 zfy 零值），去重 *)
@@ -2481,7 +2494,7 @@ let gen_struct_assign_fn (sd : sdef) : string =
 let gen_program (m : mir) : string =
   let g =
     { mbuf = Buffer.create 512; nstr = 0; globals = Hashtbl.create 16;
-      structs = m.mstructs }
+      srcfiles = Hashtbl.create 4; structs = m.mstructs }
   in
   (* 显式声明模块 triple：与 clang --target=x86_64-w64-mingw32 的推断一致，
      消除链接阶段 "overriding the module target triple" 警告（w-015 #8） *)
@@ -2623,6 +2636,8 @@ let gen_program (m : mir) : string =
   (* ZEM 错误模型运行时：panic / 错误值构造（sret 写 TErr 聚合） /
      错误码查找 / T! 输入；sret 参数为首个 ptr（布局由调用方槽决定） *)
   Buffer.add_string g.mbuf "declare void @zfy_panic(i32, ptr)\n";
+  Buffer.add_string g.mbuf "@zfy_cur_line = external global i32\n";
+  Buffer.add_string g.mbuf "@zfy_cur_file = external global ptr\n";
   Buffer.add_string g.mbuf "declare void @zfy_set_panic_handler(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_stoi_err(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_stod_err(ptr, ptr)\n";
