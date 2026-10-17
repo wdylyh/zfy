@@ -1,0 +1,20 @@
+// 自动修复回归（本轮新特性）：唯一语义错误编译器自动修复并照常产出 exe
+// ① char → 整数槽（插入 cast，ord 码点语义）② 传统别名 int → i32 迁移
+// ③ undefined variable 唯一候选自动改名 ④ undefined function 唯一候选自动改名
+// 编译时 stderr 会输出 auto-fixed 明细；本文件源码保持"错误"原样入库
+fn void show(let i32 x)
+    output(x)
+
+fn main()
+    let i32 count = 7
+    output(cont)          // 自动修复 → count
+    shwo(3)               // 自动修复 → show
+    let int q = 5         // 自动修复 → let i32 q = 5
+    let i32 c = 'A'       // 自动修复 → cast 插入（65）
+    output(q + c)
+    let i32 bad = 0
+    if count != 7
+        bad = 1
+    if c != 65
+        bad = 1
+    return bad

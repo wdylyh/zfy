@@ -12,6 +12,31 @@ let terr p fmt =
    driver 在检查结束后统一读取报告；非空时不进入后续阶段 *)
 let collected : (pos * string) list ref = ref []
 
+(* 自动修复（本轮）：
+   ① 语义级修复（编译继续）：字面量窄化/char→整数 在 coerce 内插入 cast，
+      文案登记进 autofixed（driver 作为 fix 条目报告，不进 errs）；
+   ② 改名修复（源码补丁重跑）：undefined variable/function 唯一候选、
+      undefined type 传统别名 —— 登记进 fix_pos，driver 据此把对应错误
+      移入 fixes、对内存源码打补丁后递归重跑（源文件不动） *)
+let autofixed : (pos * string) list ref = ref []
+let fix_pos : (string * int * int, int * string) Hashtbl.t = Hashtbl.create 8
+
+(* 整数值是否落在目标整数类型范围内（自动窄化判据） *)
+let int_fits (v : int64) (t : zty) : bool =
+  match t with
+  | TInt 8 -> v >= -128L && v <= 127L
+  | TInt 16 -> v >= -32768L && v <= 32767L
+  | TInt 32 -> v >= -2147483648L && v <= 2147483647L
+  | TInt 64 -> true
+  | TInt 128 | TUint 128 -> true
+  | TUint 8 -> v >= 0L && v <= 255L
+  | TUint 16 -> v >= 0L && v <= 65535L
+  | TUint 32 -> v >= 0L && v <= 4294967295L
+  (* u64/u128：位型语义——≥2^63 的 hex 字面量以负 int64 存储，不查符号 *)
+  | TUint 64 -> true
+  | TUint 128 -> true
+  | _ -> false
+
 (* 9d：extern "C" 函数名名单（i128 参数按引用传、返回值按 <2 x i64> 接收，
    与 clang win32 的 __int128 ABI 一致） *)
 let extern_fns : (string, unit) Hashtbl.t = Hashtbl.create 8
@@ -253,12 +278,61 @@ let with_suggestion env name base =
   | Some s -> Printf.sprintf "%s (did you mean '%s'?)" base s
   | None -> base
 
+(* 唯一语义建议（自动修复判据）：候选集合同 suggest_name，取最小编辑
+   距离且该距离上候选唯一（并列 ≥2 个语义不明，不自动修） *)
+let suggest_unique env name =
+  let cands = Hashtbl.create 32 in
+  let add k = if k <> name then Hashtbl.replace cands k () in
+  List.iter (fun sc -> Hashtbl.iter (fun k _ -> add k) sc) env.scopes;
+  Hashtbl.iter (fun k _ -> add k) env.g.fns;
+  Hashtbl.iter (fun k _ -> add k) env.g.gfns;
+  Hashtbl.iter (fun k _ -> add k) env.g.structs;
+  Hashtbl.iter (fun k _ -> add k) env.g.aliases;
+  List.iter (fun (k, _) -> add k) builtin_fns_aux;
+  List.iter add str_builtin_names;
+  let lim_of k = if String.length k <= 3 then 1 else 2 in
+  let best = ref None and bestd = ref max_int and ties = ref 0 in
+  Hashtbl.iter
+    (fun k () ->
+      let lim = lim_of k in
+      let d = edit_distance name k in
+      if d > 0 && d <= lim then
+        if d < !bestd then begin bestd := d; best := Some k; ties := 1 end
+        else if d = !bestd then incr ties)
+    cands;
+  if !ties = 1 then !best else None
+
+(* undefined variable/function：唯一候选 → 登记改名修复（报错文案带
+   auto-fixed，driver 将其移入 fixes 并打源码补丁重跑）；否则原文案 *)
+let undef_fix env p name kind =
+  let base = Printf.sprintf "undefined %s: %s" kind name in
+  match suggest_unique env name with
+  | Some s ->
+    Hashtbl.replace fix_pos (p.file, p.line, p.col) (String.length name, s);
+    terr p "%s (did you mean '%s'? auto-fixed)" base s
+  | None ->
+    terr p "%s" (with_suggestion env name base)
+
+(* 传统标量类型别名 → 现行宽度名（w-015 别名废止的唯一映射迁移） *)
+let legacy_type_alias =
+  [ "int", "i32"; "short", "i16"; "long", "i128"; "signed", "i32";
+    "unsigned", "u32"; "ulong", "u128"; "float", "f32"; "double", "f64";
+    "byte", "i8" ]
+
+(* undefined type：传统别名 → 登记改名修复；否则原文案 *)
+let undef_type_fix p s =
+  match List.assoc_opt s legacy_type_alias with
+  | Some newname ->
+    Hashtbl.replace fix_pos (p.file, p.line, p.col) (String.length s, newname);
+    terr p "undefined type: %s (legacy alias for '%s'; auto-fixed)" s newname
+  | None -> terr p "undefined type: %s" s
+
 (* 泛型函数调用钩子（check_program 内装配）：按已检查实参（texpr）推断
    实例化后返回 mangled 名；未装配时（不应发生）直接报未定义 *)
 let generic_call_hook
     : (env -> string -> texpr list -> pos -> string) ref =
   ref (fun env name _ p ->
-    terr p "%s" (with_suggestion env name (Printf.sprintf "undefined function: %s" name)))
+    terr p "%s" (undef_fix env p name "function"))
 
 (* 声明变量：同名 shadowing 或兄弟作用域重用时分配新槽位名
    （不同声明绝不能共享 LLVM 槽位：宽度不同会 stack 腐败，RAII 槽位冲突） *)
@@ -341,7 +415,7 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
         | None ->
           (match Hashtbl.find_opt g.structs s with
            | Some _ -> TStruct s
-           | None -> terr pp "undefined type: %s" s)))
+           | None -> undef_type_fix pp s)))
   | TPtr (t', pp) -> TPtr (conv_ty g pp t')
   | TPtrC (t', pp) -> TPtr (conv_ty g pp t')   (* const 性在槽级跟踪（lconstp） *)
   | TErr (t', pp) -> TErr (conv_ty g pp t')
@@ -569,7 +643,7 @@ and field_zero (env : env) (p : pos) (ft : zty) : texpr =
    base 为指针 TPtr(TStruct) 时自动解引用（p.x 等同于先解引用再取字段 x） *)
 and find_field (env : env) p (s : string) (seg : string) : int * zty =
   match Hashtbl.find_opt env.g.structs s with
-  | None -> terr p "undefined type: %s" s
+  | None -> undef_type_fix p s
   | Some sd ->
     let rec go i = function
       | [] ->
@@ -865,13 +939,13 @@ and check_expr env (e : expr) : texpr =
                 (match errcode_const seg with
                  | Some v -> mk (EIntK v) (TInt 32)
                  | None -> terr p' "undefined error code: ErrCode.%s" seg)
-              | _ -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
+              | _ -> terr p' "%s" (undef_fix env p' name "variable")))
         | None ->
           (* 名字是函数（本文件/extern 声明）：引用为函数指针值 *)
           (match Hashtbl.find_opt env.g.fns name with
            | Some sig' ->
              mk (EFunPtrK name) (TPtr (TFunSig (sig'.params, sig'.ret)))
-           | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))))
+           | None -> terr p' "%s" (undef_fix env p' name "variable"))))
   | EBin (op, l, r, p') ->
     let tl = check_expr env l in
     let tr = check_expr env r in
@@ -1234,7 +1308,7 @@ and check_expr env (e : expr) : texpr =
           mk (EUnK (UBitNot, t1)) t1.ety))
   | ECall (callee, args, p') ->
     (match callee with
-     | EVar (name, _) ->
+     | EVar (name, np) ->
        (match name with
         | "length" | "find" | "trim" | "split" | "replace" | "prec"
         | "utf8_len" | "utf8_char_at" | "utf8_sub" ->
@@ -1254,7 +1328,7 @@ and check_expr env (e : expr) : texpr =
               | Some s ->
                 terr p' "panic_handler signature must be (i32, string) -> void, got (%s) -> %s"
                   (String.concat ", " (List.map pp_zty s.params)) (pp_zty s.ret)
-              | None -> terr fp "%s" (with_suggestion env fname (Printf.sprintf "undefined function: %s" fname)))
+              | None -> terr fp "%s" (undef_fix env fp fname "function"))
            | _ -> terr p' "panic_handler expects a function name argument: panic_handler(fn)")
         | "open" ->
           (* open(path, mode) -> File!（design_fileio.md）：失败产 ErrCode.IO
@@ -1479,15 +1553,15 @@ and check_expr env (e : expr) : texpr =
                          | _ ->
                            (* 普通/未知函数调用：走统一实参分派（自动 move/copy/ref） *)
                            let (targs, origs, modes) = check_args_modes env args in
-                           check_call env p' name targs origs modes)
+                           check_call env p' np name targs origs modes)
                       | None ->
                         (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
                         let (targs, origs, modes) = check_args_modes env args in
-                        check_call env p' name targs origs modes)
+                        check_call env p' np name targs origs modes)
                    | None ->
                      (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
                      let (targs, origs, modes) = check_args_modes env args in
-                     check_call env p' name targs origs modes)))))
+                     check_call env p' np name targs origs modes)))))
      | EField (b, seg, pp) ->
        (* 元素/表达式接收者的方法调用（v3.3.8）：arr[i].m(...) / a.b[i].m(...)。
           基为 struct（或 struct 指针）且 seg 命中方法表 → 脱糖为
@@ -1744,7 +1818,7 @@ and try_method env name p' args =
      | None -> None)
   | _ -> None
 
-and check_call env p name0 targs origs modes =
+and check_call env p np name0 targs origs modes =
   let name = ref name0 in
   let sig_ =
     if name0 = "abs" then begin
@@ -1780,9 +1854,8 @@ and check_call env p name0 targs origs modes =
            let mangled = !generic_call_hook env name0 targs p in
            name := mangled;
            Hashtbl.find env.g.fns mangled
-         end else terr p "%s" (with_suggestion env name0 (Printf.sprintf "undefined function: %s" name0)))
-  in
-  if List.length sig_.params <> List.length targs then
+         end else terr np "%s" (undef_fix env np name0 "function"))
+  in  if List.length sig_.params <> List.length targs then
     terr p "function %s expects %d arguments, got %d"
       !name (List.length sig_.params) (List.length targs);
   (* ref 参数/实参匹配（new2.md #1）：ref 参数必须 f(ref x)，反之亦然。
@@ -2268,7 +2341,7 @@ and check_struct_new env p name (args : call_arg list) : texpr =
   | None ->
     if Hashtbl.mem env.g.gstructs name then
       check_struct_new_generic env p name args
-    else terr p "undefined type: %s" name
+    else undef_type_fix p name
   | Some sd ->
     let nfields = List.length sd.sfields in
     let pos_args =
@@ -2512,6 +2585,21 @@ and coerce p (te : texpr) (want : zty) : texpr =
          codegen 无对应分发报 E4025 内部错误（if 2**0） *)
       terr p "arithmetic result cannot be used as %s (explicit comparison or conversion required)"
         (pp_zty b)
+    | TVar _, ((TInt _ | TUint _) as tgt) ->
+      (* 自动修复①补：整数字面量的范围守卫——超界不再静默回绕报 E3155；
+         char 字面量落整数槽登记自动 cast（ord 语义） *)
+      (match te.e with
+       | EIntK v when not (int_fits v tgt) ->
+         terr p
+           "narrowing conversion from %Ld to %s requires an explicit cast (literal out of range)"
+           v (pp_zty tgt)
+       | ECharK _ ->
+         autofixed := !autofixed @
+           [(p, Printf.sprintf
+               "type mismatch: expected %s, got char (char code used as ord(c); auto-fixed: cast inserted)"
+               (pp_zty tgt))];
+         { e = ECastK (te, want); ety = want; epos = te.epos }
+       | _ -> unify p te.ety want; te)
     | TVar _, _ | _, TVar _ -> unify p te.ety want; te
     | _, TFrac e when (match te.e with EIntK _ | EFloatK _ -> true | _ -> false) ->
       (* 数值字面量提升为分数（实参/返回等表达式上下文，与声明初值一致；
@@ -2531,8 +2619,18 @@ and coerce p (te : texpr) (want : zty) : texpr =
       if safe then
         { e = ECastK (te, want); ety = want; epos = te.epos }
       else
-        terr p "narrowing conversion from %s to %s requires an explicit cast"
-          (pp_zty a) (pp_zty b)
+        (* 自动修复①：整数字面量窄化但值落在目标范围内 → 插入 cast
+           继续编译（登记 autofixed，driver 报告为自动修复项） *)
+        (match te.e with
+         | EIntK v when int_fits v b ->
+           autofixed := !autofixed @
+             [(p, Printf.sprintf
+                 "narrowing conversion from %s to %s (literal %Ld fits target range; auto-fixed: cast inserted)"
+                 (pp_zty a) (pp_zty b) v)];
+           { e = ECastK (te, want); ety = want; epos = te.epos }
+         | _ ->
+           terr p "narrowing conversion from %s to %s requires an explicit cast"
+             (pp_zty a) (pp_zty b))
     (* 定长数组 -> 动态长度数组参数（TList 运行期与 TArray 同构） *)
     | TArray (ea, _), TList eb when ea = eb ->
       (* 定长数组 -> 列表（TList 运行期与 TArray 同构；struct/嵌套元素
@@ -2545,6 +2643,13 @@ and coerce p (te : texpr) (want : zty) : texpr =
         (pp_zty a) (pp_zty b)
     | _, TErr _ when a <> TVoid ->
       { e = EErrOkK te; ety = want; epos = te.epos }
+    | TChar, (TInt _ | TUint _) ->
+      (* 自动修复②：char → 整数槽：插入 cast（码点数值，ord 语义）继续编译 *)
+      autofixed := !autofixed @
+        [(p, Printf.sprintf
+            "type mismatch: expected %s, got %s (char code used as ord(c); auto-fixed: cast inserted)"
+            (pp_zty b) (pp_zty a))];
+      { e = ECastK (te, want); ety = want; epos = te.epos }
     | _ ->
       terr p "type mismatch: expected %s, got %s (numeric conversion requires an explicit cast)"
         (pp_zty b) (pp_zty a)
@@ -2888,7 +2993,7 @@ and assign_var env p name =
     if l.lconst then
       terr p "cannot assign to constant %s (declared const)" name;
     l.lslot
-  | None -> terr p "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))
+  | None -> terr p "%s" (undef_fix env p name "variable")
 
 (* 9c：解引用写目标若为指向 const 的指针变量（T const*）则报错 *)
 and check_constp env (pe : expr) p =
@@ -2954,7 +3059,7 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           let trhs = coerce ip trhs t in
           SAugDerefK (addr, bop, trhs)
         | t -> terr ap "augmented assignment target does not support indexing: %s" (pp_zty t))
-     | None -> terr ap "%s" (with_suggestion env arr (Printf.sprintf "undefined variable: %s" arr)))
+     | None -> terr ap "%s" (undef_fix env ap arr "variable"))
   | EIndex (base, idx, ip) ->
     (* 元素复合赋值槽根泛化（w-014 #3）：bag.xs[i] += v / xs[i]++（ref）等 *)
     let root = seq_slot_root env base "augmented index-assignment target" in
@@ -3002,7 +3107,7 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
              let trhs = coerce sp trhs e in
              SAugSliceK (l.lslot, e, ta, tb', ts, bop, trhs))
         | t -> terr ap "augmented assignment target does not support slicing: %s" (pp_zty t))
-     | None -> terr ap "%s" (with_suggestion env arr (Printf.sprintf "undefined variable: %s" arr)))
+     | None -> terr ap "%s" (undef_fix env ap arr "variable"))
   | EVar (name, p') ->
     (match lookup_var env name with
      | Some l ->
@@ -3059,8 +3164,8 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
                    terr p' "struct field augmented assignment supports only numeric scalar fields, got %s"
                      (pp_zty t))
               | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
-           | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
-        | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
+           | None -> terr p' "%s" (undef_fix env p' name "variable"))
+        | None -> terr p' "%s" (undef_fix env p' name "variable")))
   | EDeref (pe, dp) ->
     (* p* op= v / p*++ / p*--：解引用复合赋值（仅数值标量/指针目标；
        string 例外：p^ += v 走 concat + 引用槽整体替换，w-020） *)
@@ -3131,7 +3236,7 @@ and check_unwrap env p (a : expr) (blk : block) target =
          if l.lconst then terr p "cannot assign to constant %s (declared const)" name;
          unify p elem l.lty;
          (l.lslot, l.lty)
-       | None -> terr p "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
+       | None -> terr p "%s" (undef_fix env p name "variable"))
     | `Discard -> ("", elem)
     | `Return ->
       (* return a ?? 块：函数须返回 T!，块元素与 T! 元素一致 *)
@@ -3384,7 +3489,7 @@ and check_stmt env (st : stmt) : tstmt =
               | t' ->
                 terr ap "dereference assignment supports only scalar/pointer types (for now), got %s" (pp_zty t'))
            | t -> terr ap "type %s does not support index assignment" (pp_zty t))
-        | None -> terr ap "%s" (with_suggestion env arr (Printf.sprintf "undefined variable: %s" arr)))
+        | None -> terr ap "%s" (undef_fix env ap arr "variable"))
      | EIndex (base, idx, ip), _ ->
        (* 元素写入槽根泛化（w-014 #3）：字段链 bag.xs[i] / ref 参数解引用
           xs[i] / 嵌套元素槽 a[i][j]（EAddrOfK 元素槽地址）。
@@ -3538,8 +3643,8 @@ and check_stmt env (st : stmt) : tstmt =
                    mk (SFieldSetK ({ e = EVarK l.lslot; ety = l.lty; epos = p' },
                                    idxs, l.lty, trhs))
                  | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
-              | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
-           | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
+              | None -> terr p' "%s" (undef_fix env p' name "variable"))
+           | None -> terr p' "%s" (undef_fix env p' name "variable")))
      | _ -> terr p "unsupported assignment target")
   | SAssignList (lhs, exprs, p) ->
     (* 序列字面量整体赋值（w-014 #3）：a = 1, 2, 3 / bag.xs = 1, 2 /
@@ -3597,8 +3702,8 @@ and check_stmt env (st : stmt) : tstmt =
                                       idxs, l.lty, mk_lit e elems))
                     | t -> terr p' "sequence literal assignment requires an array/list field, got %s" (pp_zty t))
                  | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
-              | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
-           | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
+              | None -> terr p' "%s" (undef_fix env p' name "variable"))
+           | None -> terr p' "%s" (undef_fix env p' name "variable")))
      | EDeref (pe, dp) ->
        (* ref 参数整体赋值：xs = 1, 2 / xs = 新表 *)
        check_constp env pe dp;
@@ -3808,7 +3913,7 @@ and check_stmt env (st : stmt) : tstmt =
                Hashtbl.remove env.moved l.lslot;  (* 写入：move 状态解除 *)
                check_input_ty p' l.lty;
                { tname = l.lslot; tnew = false; tty = l.lty }
-             | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name))))
+             | None -> terr p' "%s" (undef_fix env p' name "variable")))
         targets
     in
     mk (SInputK (ttargets, tdelim))
@@ -3828,7 +3933,7 @@ and check_stmt env (st : stmt) : tstmt =
              let tx = { e = EVarK l.lslot; ety = TFrac e; epos = p' } in
              mk (SReduceK (tx, tc, ts))
            | t -> terr p' "reduce requires a frac-typed variable, got %s" (pp_zty t))
-        | None -> terr p' "%s" (with_suggestion env name (Printf.sprintf "undefined variable: %s" name)))
+        | None -> terr p' "%s" (undef_fix env p' name "variable"))
      | _ -> terr p "reduce's first argument must be a frac-typed local variable")
   | SBreak p ->
     ignore p;

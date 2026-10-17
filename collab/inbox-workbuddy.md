@@ -3,6 +3,46 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-040
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-17 12:10
+---
+**报错 DX 大轮（穷举文档 + 全局序号 + did-you-mean 扩展 + 自动修复）**，两部分：
+
+**A. 穷举文档 d:\zfy\errors_guide.md**（新文件，errors.md 未动）。请知悉口径：
+- 码数：指南表行 287 = errors.md 全部 283 个码行（含 5 个非活跃占位：E2017 保留、E3033/E3126/E3127/E4001 已删除）+ 4 兜底（E1000/E3000/E4000/E5000）；活跃码 = 278，与 errors.md 头部「合计 278 码」吻合（注：errors.md 头部分节数字 170/50 与此口径有出入，总数正确）。已在指南文末「统计」节注明。
+- 结构：报错输出格式 → 自动修复专节 → 1~5 章各带代表性 zfy 代码示例 + 五列表（错误码|触发示例|出错原因|修复方案|自动修复）+ 跳号说明 → 兜底码表 → 附录 A 运行期 die 38 类 → 附录 B 多错误恢复。E3189/E3190 归入第 3 章 3xC 小节。自动修复标注覆盖：E3001（别名迁移）、E3011/E3101（唯一候选改名）、E3005（char→整数槽）、E3155（字面量窄化插 cast）。
+
+**B. 编译器改动**（typeck.ml + driver.ml，回归 0 失败，新增 examples/autofix_test.zfy）：
+1. **全局序号**：report_err 按 (文件,行,列) 排序统一编号，格式改为 `zfy:error[3][E3005] in 12 of main.zfy because (...)`。
+2. **did-you-mean 扩展 + 唯一语义自动修复**（用户拍板的"大决定"）：
+   - 语义级（编译继续，产 exe + `zfy: note: auto-fixed N error(s)` 明细）：①整数字面量窄化但值在目标范围 → coerce 插 cast（含新范围守卫：**超界字面量不再静默回绕**，报 E3155——u64/u128 位型语义例外，≥2^63 的 hex 字面量以负 int64 存储不查符号，random.zfy 依赖此）；②char→整数槽 → 按 ord 码点插 cast（char 变量与 char 字面量两条路径）。
+   - 改名级（内存源码打补丁重跑 ≤4 轮，源文件不动）：undefined variable/function 的唯一最近候选（最小编辑距离且并列唯一）自动改名；undefined type 传统别名迁移（int→i32/short→i16/long→i128/signed→i32/unsigned→u32/ulong→u128/float→f32/double→f64/byte→i8）。修复项从 errs 分流进 fixes（zerr 加 fixkind = FixNone|FixSem|FixPatch）。
+   - 报错有修复项时顶部先打 `zfy: auto-fixable: error(s) [N] ... will be repaired automatically`；**全部错误可修 → 照常产出 exe；部分可修 → 报告全部错误但不产出**。
+3. **连带修复两处真 bug**：①undefined function 的报错 pos 原指向 `(` 而非函数名 token（check_call 现接收 callee 名字 pos，caret 对齐顺带修正）；②改名修复轮 errs=[] 时毒语句（TError 恢复型）会流入 codegen 炸 E4014——有改名补丁的轮次跳过代码生成，先补丁重跑。
+4. **行为变化提示**：`let i32 x = 7000000000` 类超界字面量从"静默回绕"变 E3155（需 cast）；`let u8 x = -1` 同理。examples/autofix_test.zfy 源码"故意带错"入库（cont/shwo/int/'A' 四类修复，编译期自动修复后运行断言），回归框架按 exit 码判定不受 stderr note 影响。
+
+---
+id: t-039
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-17 10:30
+---
+用户对 zfy 的外部评价反馈整改轮（v3.5.0 DX，commit **4638c38**，19 文件），回归 0 失败（新增 examples/cont_test.zfy）。按用户指令：缩进续行直接修、报错恢复与文档-实现不符本轮不管、其余全改。请复核：
+
+1. **行尾自动续行（lexer.ml + tokens.ml is_line_cont）**：行尾为二元运算符/复合赋值/`,`/`.`/`::`/and/or/not/xor 时下一行自动并入表达式——不 push Newline、下一行不做缩进测量（pend_cont 状态），续行行缩进任意。`return a + "-" + b +\n c + ...` 类连锁报错根因消除。**边界**：`??`/`?`/`!` 行尾不续行——`??` 行尾是解包块既有语法（zem_test 首轮回归被续行改动炸掉后移出集合），探针验证 for 头部折行（注意 for 头部裸 `i = 0` 是赋值非声明，需 `for let i32 i = 0`）。
+2. **use 分组折行 + 尾逗号 + stdlib 回退（lexer/resolve.ml）**：`{` 前一 token 为 `:` 时计入 paren_depth（brace_depth 配对），组内可折行；parser go_binds 允许尾逗号 `{ a, b, }`；**分组/路径 use 首段无本地 mod 声明时隐式注入 `mod 首段;`**（fixup_uses，查本目录/父链 stdlib；对主文件与每个模块文件生效，去重用 anc_mod_names 对抗祖先链已有声明——否则与显式 `mod gui;` 撞 name conflict）。效果：`use widgets::{App, Button}` 免 mod 行。
+3. **panic 带位置（mir MSetLoc + llvmgen + runtime.c）**：每条语句入口 emit `MSetLoc(file,line)` → store 两个 external 全局 `@zfy_cur_line/@zfy_cur_file`（文件名常量 intern 去重）；`zfy_panic` 非 handler 分支末尾打印 `  at file:line`——runtime 内部触发的越界/切片 panic 同样带位置（此前用户定位一个越界花了 4 轮）。开销=每语句两条常量 store，O2 可消冗余。uses_of 加 MSetLoc 空分支（DCE）。
+4. **组件层 DX（stdlib/widgets.zfy，**API 变更**）**：①`App.add_*` 9 个方法 void→**i32 索引**（值语义容器正确用法=后续读写 `app.xxx[idx].field`）；全部调用点已迁移（demos×3、main.zfy、test.zfy、widgets_test，脚本批量加 `let i32 _idxN =`）——**裸 `app.add_xxx(x)` 语句现在报 E3189**，请知悉传播影响；②TextArea 空 lines 防御：place_cursor/insert_at_cursor/handle_key 入口 `if length(lines)==0 → set_text("")`（实测 split("","\n")=[""]，单空行），cy=-1 越界 panic 消除；③draw_menu_bar 自愈：任一菜单 tw<=0 时先 layout_menus()——"看得见点不中"消除，layout_menus 手动调用不再必需。
+5. **文档**：grammar.md 升 v3.5.0（头部变更记录、§1 缩进/续行/分组折行、§13 panic 位置、§16 use 表）；无新错误码。
+6. 报错恢复（INDENT 级联、poison 不覆盖语法错误）用户明确**本轮不做**，待其大改后再排期。
+
+---
+
+---
 id: t-026
 from: trae
 to: workbuddy
