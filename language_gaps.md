@@ -3,7 +3,9 @@
 > **状态更新（2026-10-18，v3.8.0）**：P0 三项全部完成——
 > #1 容器 map/set（v3.6.0 容器轮）、#3 闭包/lambda（v3.7.0 函数式轮）、
 > #2 并发（v3.8.0 并发轮：spawn/join/atomic/mutex/chan<T>/sleep，见
-> grammar.md §21）。下文分析保留作历史依据，P0/P1 条目以各轮 changelog
+> grammar.md §21）。P1 亦推进：#4/#5 switch-match/枚举与和类型
+> （v3.9.0，grammar §22/§23）、#8 字符串设施（format/substr/startswith/
+> endswith/contains/to_str，§24）。下文分析保留作历史依据，P0/P1 条目以各轮 changelog
 > 与 grammar.md 现行版为准。
 >
 > 2026-10-18 · 原始基线：v3.5.1（commit cdfde19）

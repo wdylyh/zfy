@@ -140,6 +140,11 @@ type genv = { fns : (string, fn_sig) Hashtbl.t;
                    泛型构造/调用推断时反向匹配用 *)
               gstructpos : (string, pos) Hashtbl.t;
                 (* 循环嵌套检测报错位置 *)
+              enums : (string, (string * zty list * int list) list * string) Hashtbl.t;
+                (* enum 表（v3.9）：枚举名 -> (变体表[名, 载荷类型, 槽映射],
+                   struct mangle 名 enum$<名>)——统一编译为 tag+载荷 struct；
+                   载荷字段按类型分槽（同类型变体载荷共享槽），槽映射把每个
+                   变体的第 j 载荷映射到字段序（不含 tag 偏移） *)
               closigs : (string, zty list * zty) Hashtbl.t }
                 (* 闭包类型签名（v3.7）：closure$... mangled 名 -> (参数, 返回) *)
 
@@ -211,7 +216,8 @@ let time_rt_name = function
    须定义在下方 let rec 大递归链之前（field_chain 会引用它） *)
 let str_builtin_names =
   [ "length"; "find"; "trim"; "split"; "replace"; "prec";
-    "utf8_len"; "utf8_char_at"; "utf8_sub" ]
+    "utf8_len"; "utf8_char_at"; "utf8_sub";
+    "startswith"; "endswith"; "substr"; "to_str"; "format" ]
 
 (* 期望类型提示（new2.md 第2条）：声明/字段上下文把已知的期望类型传给
    泛型推断，字面量实参按期望落型（如 Box<i32> a = Box(7) 中 7 → i32
@@ -511,9 +517,12 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
        (match Hashtbl.find_opt g.aliases s with
         | Some t' -> t'
         | None ->
-          (match Hashtbl.find_opt g.structs s with
-           | Some _ -> TStruct s
-           | None -> undef_type_fix pp s)))
+          (match Hashtbl.find_opt g.enums s with
+           | Some (_, mangle) -> TStruct mangle
+           | None ->
+             (match Hashtbl.find_opt g.structs s with
+              | Some _ -> TStruct s
+              | None -> undef_type_fix pp s))))
   | TPtr (t', pp) -> TPtr (conv_ty g pp t')
   | TPtrC (t', pp) -> TPtr (conv_ty g pp t')   (* const 性在槽级跟踪（lconstp） *)
   | TErr (t', pp) -> TErr (conv_ty g pp t')
@@ -1141,6 +1150,10 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
        | t -> terr p "%s expects a map/set, got %s" name0 (pp_zty t))
     | ("map_has" | "set_has" | "contains"), [ m; k ] ->
       (match resolve m.ety with
+       | TString ->
+         (* contains(string, sub)：子串包含（v3.9 与容器键包含共用名；
+            外层按此签名统一 coerce 实参） *)
+         mkf "zfy_str_contains" [ TString; TString ] TBool
        | TStruct s when cont_kind s <> None ->
          let (kt, _) = cont_kv env.g s p in
          let kf = (match resolve kt with TString -> "s" | _ -> "i") in
@@ -1621,6 +1634,80 @@ and wrap_fn_as_clo env p fname (ptys : zty list) (ret : zty) =
                  [ { e = EFunPtrK wname; ety = TPtr (TUint 8); epos = p } ]);
     ety = TStruct mangle; epos = p }
 
+(* enum 变体构造（v3.9）：名字形如 枚举.变体——零载荷可裸名（args_opt=None），
+   带载荷须括号实参；构造 = enum$<名> struct 全字段构造（tag + 实参 + 补零） *)
+and check_enum_ctor env (name : string) (p' : pos) (args_opt : call_arg list option) :
+  texpr option =
+  let mk k ty = { e = k; ety = ty; epos = p' } in
+  match String.index_opt name '.' with
+  | Some i ->
+    let en = String.sub name 0 i in
+    let vn = String.sub name (i + 1) (String.length name - i - 1) in
+    (match Hashtbl.find_opt env.g.enums en with
+     | Some (variants, mangle) ->
+       let rec find_v = function
+         | (v, ptys, sm) :: rest ->
+           if v = vn then Some (ptys, sm) else find_v rest
+         | [] -> None
+       in
+       (match find_v variants with
+        | Some (ptys, slotmap) ->
+          let rec tag_of k = function
+            | (v, _, _) :: rest -> if v = vn then k else tag_of (k + 1) rest
+            | [] -> 0
+          in
+          let tag = tag_of 0 variants in
+          let (sd : sdefk) = Hashtbl.find env.g.structs mangle in
+          let nfields = List.length sd.sfields in
+          if List.length ptys <> List.length slotmap then
+            terr p' "internal: enum %s.%s slot map mismatch" en vn;
+          let targs =
+            match args_opt with
+            | Some a when List.length a <> List.length ptys ->
+              terr p' "variant %s.%s expects %d payload value(s), got %d"
+                en vn (List.length ptys) (List.length a)
+            | Some a ->
+              List.map
+                (fun (ca : call_arg) ->
+                  match ca with
+                  | CPos e | CCopy e -> check_expr env e
+                  | CMove _ ->
+                    terr p' "variant construction does not support move arguments"
+                  | CRef _ ->
+                    terr p' "variant construction does not support ref arguments"
+                  | CNamed (n2, _) ->
+                    terr p' "variant construction does not support named argument %s=" n2)
+                a
+            | None ->
+              if ptys <> [] then
+                terr p' "variant %s.%s has a payload — write %s.%s(...)" en vn en vn
+              else []
+          in
+          (* 字段槽填充：tag=0 恒填，载荷按槽映射落位，其余零值 *)
+          let vals = Array.make nfields None in
+          vals.(0) <- Some (mk (EIntK (Int64.of_int tag)) (TInt 32));
+          List.iteri
+            (fun j ta ->
+              let slot = List.nth slotmap j + 1 in
+              vals.(slot) <- Some (coerce p' ta (List.nth sd.sfields slot
+                                            |> fun (_, t, _) -> t)))
+            targs;
+          let fvals =
+            Array.to_list
+              (Array.mapi
+                 (fun i v ->
+                   match v with
+                   | Some tv -> tv
+                   | None ->
+                     let (_, t, _) = List.nth sd.sfields i in
+                     zero_of env p' t)
+                 vals)
+          in
+          Some { e = EStructNewK (mangle, fvals); ety = TStruct mangle; epos = p' }
+        | None -> None)
+     | None -> None)
+  | None -> None
+
 and check_expr env (e : expr) : texpr =
   let p = pos_of_expr e in
   let mk k ty = { e = k; ety = ty; epos = p } in
@@ -1690,7 +1777,11 @@ and check_expr env (e : expr) : texpr =
                 (match errcode_const seg with
                  | Some v -> mk (EIntK v) (TInt 32)
                  | None -> terr p' "undefined error code: ErrCode.%s" seg)
-              | _ -> terr p' "%s" (undef_fix env p' name "variable")))
+              | _ ->
+                (* 枚举变体裸名（v3.9）：零载荷变体 Shape.Empty *)
+                (match check_enum_ctor env name p' None with
+                 | Some te -> te
+                 | None -> terr p' "%s" (undef_fix env p' name "variable"))))
         | None ->
           (* 名字是函数（本文件/extern 声明）：引用为函数指针值 *)
           (match Hashtbl.find_opt env.g.fns name with
@@ -2062,7 +2153,8 @@ and check_expr env (e : expr) : texpr =
      | EVar (name, np) ->
        (match name with
         | "length" | "find" | "trim" | "split" | "replace" | "prec"
-        | "utf8_len" | "utf8_char_at" | "utf8_sub" ->
+        | "utf8_len" | "utf8_char_at" | "utf8_sub"
+        | "startswith" | "endswith" | "substr" | "to_str" | "format" ->
           (* 函数式内建：支持命名参数 count=，位置参数在前 *)
           check_builtin env p' name args
         | "panic_handler" ->
@@ -2326,9 +2418,12 @@ and check_expr env (e : expr) : texpr =
                            let (targs, origs, modes) = check_args_modes env args in
                            check_call env p' np name targs origs modes)
                       | None ->
-                        (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
-                        let (targs, origs, modes) = check_args_modes env args in
-                        check_call env p' np name targs origs modes)
+                        (* 枚举变体构造（v3.9）：Shape.Circle(x, y) *)
+                        (match check_enum_ctor env name p' (Some args) with
+                         | Some te -> te
+                         | None ->
+                           let (targs, origs, modes) = check_args_modes env args in
+                           check_call env p' np name targs origs modes))
                    | None ->
                      (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
                      let (targs, origs, modes) = check_args_modes env args in
@@ -2879,6 +2974,17 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
   | SUnsafe (blk, _) -> List.fold_left uses_of_stmt acc blk
   (* 嵌套函数体在自身作用域内检查；捕获不触发外层 auto move *)
   | SFn _ -> acc
+  | SMatch (sx, arms, _) ->
+    let acc = uses_of_expr acc sx in
+    List.fold_left
+      (fun acc (a : marm) ->
+        let acc =
+          match a.mpat with
+          | PWild | PVar _ -> acc   (* 变体绑定不触发外层 auto move *)
+          | PLit e -> uses_of_expr acc e
+        in
+        List.fold_left uses_of_stmt acc a.mbody)
+      acc arms
 
 (* 变量 n 在位置 p 之后是否不再出现（最后使用判定，保守） *)
 and last_use env n (p : pos) =
@@ -3078,6 +3184,20 @@ and deref_refs (refs : string list) (body : block) : block =
     | SUnsafe (blk, p) -> SUnsafe (List.map rs blk, p)
     | SBreak _ | SContinue _ -> s
     | SForIn _ | SFn _ -> s
+    | SMatch (sx, arms, p) ->
+      SMatch
+        (re sx,
+         List.map
+           (fun (a : marm) ->
+             { mpat =
+                 (match a.mpat with
+                  | PWild -> PWild
+                  | PLit e -> PLit (re e)
+                  | PVar (vn, bs, vp) -> PVar (vn, bs, vp));
+               mbody = List.map rs a.mbody;
+               mpos = a.mpos })
+           arms,
+         p)
   in
   List.map rs body
 
@@ -3565,6 +3685,41 @@ and check_builtin env p name (args : call_arg list) =
     (match char_or_str x "argument 2" with
      | `Char tc -> { e = ECallK ("zfy_str_trim", [ ts; tc ], []); ety = TString; epos = p }
      | `Str tx -> { e = ECallK ("zfy_str_trim_str", [ ts; tx ], []); ety = TString; epos = p })
+  | "startswith", [ s; p2 ], [] ->
+    let ts = str_of s "argument 1" in
+    let tp2 = str_of p2 "argument 2" in
+    { e = ECallK ("zfy_str_startswith", [ ts; tp2 ], []); ety = TBool; epos = p }
+  | "endswith", [ s; p2 ], [] ->
+    let ts = str_of s "argument 1" in
+    let tp2 = str_of p2 "argument 2" in
+    { e = ECallK ("zfy_str_endswith", [ ts; tp2 ], []); ety = TBool; epos = p }
+  | "substr", [ s; a; n ], [] ->
+    (* substr(s, start, len)：字节区间深拷贝（越界截断；v3.9 新增，与
+       utf8_sub 的码点语义并存） *)
+    let ts = str_of s "argument 1" in
+    let ta = to_i64 (check_expr env a) in
+    let tn = to_i64 (check_expr env n) in
+    { e = ECallK ("zfy_str_sub", [ ts; ta; tn ], []); ety = TString; epos = p }
+  | "to_str", [ x ], [] ->
+    (* to_str(x)：标量/bool/char 显式转 string（复用 output 的转换表）；
+       未定整型字面量（TVar）默认 i64 *)
+    let tx = check_expr env x in
+    let tx =
+      match resolve tx.ety with
+      | TVar _ -> { tx with ety = if floaty_texpr tx then TFloat 64 else TInt 64 }
+      | _ -> tx
+    in
+    (match resolve tx.ety with
+     | TBool | TChar | TInt _ | TUint _ | TFloat _ | TFrac _ -> to_string_of tx
+     | t -> terr p "to_str expects a scalar/bool/char/frac, got %s" (pp_zty t))
+  | "format", [ fmt; args ], [] ->
+    (* format(fmt, args)：args 为 string 列表，逐个替换 "{}" 占位 *)
+    let tf = str_of fmt "argument 1" in
+    (match check_expr env args |> fun ta -> resolve ta.ety with
+     | TList TString ->
+       let ta = check_expr env args in
+       { e = ECallK ("zfy_str_format", [ tf; ta ], []); ety = TString; epos = p }
+     | t -> terr p "format's second argument must be a string list, got %s" (pp_zty t))
   | "split", [ s; x ], [] ->
     (* split(s, x)：按分隔符切分，返回 string 列表（一等值，可 length/下标/遍历）。
        '\0' 分隔符编译期拒绝：C 串无内嵌 NUL，永远匹配不到（w-020） *)
@@ -4771,6 +4926,90 @@ and check_stmt env (st : stmt) : tstmt =
                   spos = p } ],
                { s = SDeclK (false, ev.lslot, elem, elem_get, false);
                  spos = p } :: tb))
+  | SMatch (scrut, arms, p) ->
+    (* match 分发（v3.9）：降码 = scrut 入临时槽（值拷贝一次）+ tag/相等
+       比较 if 链；变体绑定为载荷字段深拷贝声明（SBlockK 透明块承载） *)
+    let mkx k ty = { e = k; ety = ty; epos = p } in
+    let tscr = check_expr env scrut in
+    let (ename, variants, mangle) =
+      match resolve tscr.ety with
+      | TStruct s when String.length s > 5 && String.sub s 0 5 = "enum$" ->
+        let en = String.sub s 5 (String.length s - 5) in
+        (match Hashtbl.find_opt env.g.enums en with
+         | Some (vs, mg) -> (en, vs, mg)
+         | None -> terr p "internal: enum %s not registered" en)
+      | _ -> ("", [], "")
+    in
+    let is_enum = ename <> "" in
+    let fresh nm lty : local =
+      declare env nm { lconst = false; lty; lslot = ""; lunred = false;
+                       lconstp = false };
+      (match lookup_var env nm with Some l -> l | None -> assert false)
+    in
+    let mv = fresh "match$scr" tscr.ety in
+    let mvx = mkx (EVarK mv.lslot) tscr.ety in
+    let tagx = mkx (EFieldK (mvx, 0)) (TInt 32) in
+    let rec build i : tstmt list =
+      if i >= List.length arms then []
+      else begin
+        let arm = List.nth arms i in
+        let ap = arm.mpos in
+        let checked_body () : tblock =
+          check_block env arm.mbody
+        in
+        match arm.mpat with
+        | PWild -> checked_body ()
+        | PLit e ->
+          let te = check_expr env e in
+          let cond = mkx (EBinK (BEq, mvx, coerce ap te tscr.ety)) TBool in
+          [ mk (SIfK (cond, checked_body (), build (i + 1))) ]
+        | PVar (vname, binds, vp) ->
+          if not is_enum then
+            terr ap "match over a non-enum value supports literal and '_' patterns only";
+          let vn =
+            if String.contains vname '.' then
+              let en' = String.sub vname 0 (String.index vname '.') in
+              if en' <> ename then
+                terr vp "pattern %s does not belong to enum %s" vname ename;
+              let n = String.length vname in
+              String.sub vname (String.index vname '.' + 1) (n - String.index vname '.' - 1)
+            else vname
+          in
+          let rec tag_of k = function
+            | (v, _, _) :: rest -> if v = vn then k else tag_of (k + 1) rest
+            | [] -> terr vp "enum %s has no variant %s" ename vn
+          in
+          let tag = tag_of 0 variants in
+          let rec find_v k = function
+            | (v, ptys, sm) :: rest ->
+              if v = vn then (ptys, sm) else find_v (k + 1) rest
+            | [] -> assert false
+          in
+          let (_tag2, (ptys, slotmap)) = (tag, find_v 0 variants) in
+          if List.length binds > List.length ptys then
+            terr vp "variant %s.%s has %d payload value(s), got %d binding(s)"
+              ename vn (List.length ptys) (List.length binds);
+          let (sd : sdefk) = Hashtbl.find env.g.structs mangle in
+          let bind_decls =
+            List.mapi
+              (fun j bn ->
+                let slot = List.nth slotmap j + 1 in
+                let (_, ft, _) = List.nth sd.sfields slot in
+                let bv = fresh bn ft in
+                let fv = mkx (EFieldK (mvx, slot)) ft in
+                { s = SDeclK (false, bv.lslot, ft, coerce ap fv ft, false);
+                  spos = ap })
+              binds
+          in
+          let cond =
+            mkx (EBinK (BEq, tagx, mkx (EIntK (Int64.of_int tag)) (TInt 32))) TBool
+          in
+          [ mk (SIfK (cond, bind_decls @ checked_body (), build (i + 1))) ]
+      end
+    in
+    let chain = build 0 in
+    mk (SBlockK ({ s = SDeclK (false, mv.lslot, tscr.ety, tscr, false); spos = p }
+                 :: chain))
   | SOutput (args, sep, end_, p) ->
     let targs = List.map (check_expr env) args in
     List.iter
@@ -4937,6 +5176,7 @@ and pos_of_stmt = function
   | SSeqDecl (_, _, _, _, _, _, _, _, p)
   | SUnsafe (_, p)
   | SFn (_, _, _, _, _, p)
+  | SMatch (_, _, p)
   | SBreak p
   | SContinue p -> p
   | SDeclList ss -> (match ss with s :: _ -> pos_of_stmt s | [] -> { file = ""; line = 0; col = 0 })
@@ -5001,6 +5241,7 @@ let check_program (prog : program) : hir =
       aliases = Hashtbl.create 16;
       gstructs = Hashtbl.create 8; gfns = Hashtbl.create 8;
       gtargs = Hashtbl.create 8; gstructpos = Hashtbl.create 8;
+      enums = Hashtbl.create 8;
       closigs = Hashtbl.create 16 } in
   (* 内建 Err struct（解包块内 err 变量的类型）：code + msg。
      ErrCode 为虚拟常量命名空间（编译期查表），无对应 struct *)
@@ -5234,6 +5475,54 @@ let check_program (prog : program) : hir =
             (* 9d：登记 extern 名单——llvmgen 对 i128 参数/返回值做 ABI 适配 *)
             Hashtbl.replace extern_fns f.ename ())
           funcs
+      | IEnum { name; variants; pos } ->
+        (* enum（v3.9）：注册 enum$<名> struct = tag + 类型槽字段；
+           载荷按类型分槽（Rect(f64,f64) 占两个 f64 槽，Named(string)
+           用 string 槽——不同变体载荷类型可不同） *)
+        if Hashtbl.mem g.enums name then
+          terr pos "duplicate enum definition: %s" name;
+        if Hashtbl.mem g.structs name || Hashtbl.mem fn_names name
+           || List.mem name builtin_names then
+          terr pos "%s conflicts with an existing struct/function/builtin name" name;
+        let mangle = "enum$" ^ name in
+        (* 槽 = (类型, 同型内序号)：Rect(f64,f64) 占 (f64,0)+(f64,1)，
+           Circle(f64) 复用 (f64,0)，Named(string) 用 (string,0) *)
+        let slot_keys : (zty * int) list ref = ref [] in
+        let ensure_slot t k =
+          let rec go i = function
+            | [] -> slot_keys := !slot_keys @ [ (t, k) ]; List.length !slot_keys - 1
+            | (t2, k2) :: rest ->
+              if k2 = k && resolve t2 = resolve t then i else go (i + 1) rest
+          in
+          go 0 !slot_keys
+        in
+        let variants' =
+          List.map
+            (fun (vn, pys) ->
+              let used = Hashtbl.create 4 in
+              let (zts, maps) =
+                List.fold_right
+                  (fun t (zs, ms) ->
+                    let zt = resolve (conv_ty g pos t) in
+                    let k = (match Hashtbl.find_opt used zt with
+                             | Some k -> k | None -> 0) in
+                    Hashtbl.replace used zt (k + 1);
+                    (zt :: zs, ensure_slot zt k :: ms))
+                  pys ([], [])
+              in
+              (vn, zts, maps))
+            variants
+        in
+        let sfields =
+          ("tag", TInt 32, None) ::
+          List.mapi
+            (fun i (t, _) -> (Printf.sprintf "f%d" i, t, None))
+            !slot_keys
+        in
+        Hashtbl.replace g.structs mangle { spacked = false; sfields };
+        Hashtbl.replace g.gtargs mangle [];
+        Hashtbl.replace g.gstructpos mangle pos;
+        Hashtbl.replace g.enums name (variants', mangle)
       | IUse _ | IUseP _ | IMod _ | IModFile _ | IPub _ | IDecl _
       | IStruct _ | ITypeAlias _ -> ())
     prog;
@@ -5375,12 +5664,18 @@ let check_program (prog : program) : hir =
                  隐式 return 0） *)
               if name <> "main" &&
                  (match sig_.ret with TVoid -> false | _ -> true) then begin
-                let has_ret =
+                let rec has_return (sl : tstmt list) =
                   List.exists (fun (s : tstmt) ->
                     match s.s with
                     | SReturnK _ -> true
-                    | SUnwrapBlockK (_, true, _, _, _, _, _) -> true   (* return a ?? 块 *)
-                    | _ -> false) tbody
+                    | SUnwrapBlockK (_, true, _, _, _, _, _) -> true
+                    | SIfK (_, a, b) -> has_return a || has_return b
+                    | SBlockK b | SUnsafeK b -> has_return b
+                    | SWhileK (_, b) | SForK (_, _, _, b) -> has_return b
+                    | _ -> false) sl
+                in
+                let has_ret =
+                  has_return tbody
                   ||
                   (match List.rev tbody with
                    | { s = SExprK _; _ } :: _ -> true
@@ -5650,6 +5945,7 @@ let check_program (prog : program) : hir =
       | SDerefSetK (p, v) -> SDerefSetK (fix_texpr p, fix_texpr v)
       | SAugDerefK (p, op, v) -> SAugDerefK (fix_texpr p, op, fix_texpr v)
       | SUnsafeK b -> SUnsafeK (List.map fix_stmt b)
+      | SBlockK b -> SBlockK (List.map fix_stmt b)
       | k -> k
     in
     { s = s'; spos = s.spos }

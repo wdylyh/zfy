@@ -1,0 +1,7 @@
+enum Color
+    Red
+    Green
+
+fn main()
+  let Color c = Color.Red
+  output(1)

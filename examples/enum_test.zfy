@@ -1,0 +1,66 @@
+// enum / match 测试（v3.9.0 P1 轮）
+// 简单枚举：零载荷变体（tag 比较分发）
+enum Color
+    Red
+    Green
+    Blue
+
+// 和类型：带载荷变体（tag + 载荷 struct，构造 = Shape.变体(实参)）
+enum Shape
+    Empty
+    Circle(f64)
+    Rect(f64, f64)
+    Named(string)
+
+fn main()
+  // 1. 简单枚举：构造 + 全变体 match
+  let Color c = Color.Green
+  match c
+    Color.Red => output("red")
+    Color.Green => output("green")
+    Color.Blue => output("blue")
+
+  // 2. 和类型单载荷：match 绑定（载荷深拷贝声明）
+  let Shape s1 = Shape.Circle(2.0)
+  let f64 a1 = 0.0
+  match s1
+    Shape.Circle(r) => a1 = 3.14159 * r * r
+    Shape.Rect(w, h) => a1 = w * h
+    Shape.Empty => a1 = 0.0
+  output(a1)   // 12.56636
+
+  // 3. 双载荷 + _ 通配
+  let Shape s2 = Shape.Rect(3.0, 4.0)
+  match s2
+    Shape.Rect(w, h) => output(w * h)   // 12
+    _ => output(-1.0)
+
+  // 4. string 载荷：深拷贝与绑定
+  let Shape s3 = Shape.Named("box")
+  match s3
+    Shape.Named(n) => output(n + "=7")
+    _ => output("other")
+
+  // 5. 零载荷变体裸名（不带括号）
+  let Shape s4 = Shape.Empty
+  match s4
+    Shape.Empty => output("empty")
+    _ => output("not empty")
+
+  // 6. arm 块体（=> 后换行缩进块，多语句）
+  let Shape s5 = Shape.Circle(1.0)
+  match s5
+    Shape.Circle(r) =>
+      output(r + 1.0)
+      output(2)
+    _ => output(0)
+
+  // 7. match 里 return 传播（函数形式验证）
+  let Shape s6 = Shape.Rect(2.0, 5.0)
+  output(shape_area(s6))   // 10
+
+fn f64 shape_area(let Shape s)
+  match s
+    Shape.Circle(r) => return 3.14159 * r * r
+    Shape.Rect(w, h) => return w * h
+    _ => return 0.0

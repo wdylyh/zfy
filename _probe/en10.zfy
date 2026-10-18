@@ -1,0 +1,9 @@
+enum Shape
+    Empty
+    Circle(f64)
+
+fn main()
+  let Shape s = Shape.Circle(2.0)
+  output("y")
+  match s
+    _ => output(1)

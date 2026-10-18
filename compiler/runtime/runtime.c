@@ -3786,3 +3786,60 @@ void zfy_chan_recv_err_str(zfy_err *o, void **s) { (void)o; (void)s; MAP_MISS(o)
 void zfy_chan_close(void **s) { (void)s; }
 long long zfy_chan_len(void **s) { (void)s; return 0; }
 #endif
+
+/* ---------- 字符串设施补齐（v3.9.2）---------- */
+
+/* startswith / endswith / contains：均返回 0/1 */
+int zfy_str_startswith(const char *s, const char *p) {
+    size_t n = strlen(p);
+    return strncmp(s, p, n) == 0;
+}
+
+int zfy_str_endswith(const char *s, const char *p) {
+    size_t ls = strlen(s), lp = strlen(p);
+    if (lp > ls) return 0;
+    return strcmp(s + (ls - lp), p) == 0;
+}
+
+int zfy_str_contains(const char *s, const char *sub) {
+    return strstr(s, sub) != NULL;
+}
+
+/* substr(s, start, len)：字节区间深拷贝（start/len 越界截断到串边界） */
+char *zfy_str_sub(const char *s, long long start, long long len) {
+    long long ls = (long long)strlen(s);
+    if (start < 0) { len += start; start = 0; }
+    if (start > ls) start = ls;
+    if (len < 0) len = 0;
+    if (start + len > ls) len = ls - start;
+    char *out = (char *)malloc((size_t)len + 1);
+    if (!out) zfy_die("内存分配失败");
+    memcpy(out, s + start, (size_t)len);
+    out[len] = '\0';
+    return out;
+}
+
+/* format(fmt, args)：把 string 列表 args 逐个替换 fmt 中的 "{}" 占位。
+ * 占位多于实参 = 剩余 "{}" 原样保留；实参多于占位 = 忽略余项。 */
+char *zfy_str_format(const char *fmt, zfy_seq *args) {
+    size_t cap = strlen(fmt) + 16;
+    if (args) cap += (size_t)args->len * 8;
+    char *out = (char *)malloc(cap);
+    if (!out) zfy_die("内存分配失败");
+    size_t o = 0;
+    long long ai = 0;
+    for (const char *p = fmt; *p; p++) {
+        if (p[0] == '{' && p[1] == '}' && args && ai < args->len) {
+            const char *v = *(char **)((char *)args->data + ai * args->elemsz);
+            size_t vl = strlen(v);
+            if (o + vl + 1 > cap) { cap = (o + vl + 1) * 2; out = (char *)realloc(out, cap); }
+            memcpy(out + o, v, vl); o += vl;
+            ai++; p++;
+        } else {
+            if (o + 2 > cap) { cap = cap * 2; out = (char *)realloc(out, cap); }
+            out[o++] = *p;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}

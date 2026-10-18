@@ -1,0 +1,32 @@
+// 字符串设施补充测试（v3.9.0 P1 轮新增：startswith/endswith/contains/substr/to_str/format）
+fn main()
+  let string s = "hello zfy"
+
+  // 1. startswith / endswith / contains
+  output(startswith(s, "hello"))   // true
+  output(startswith(s, "zfy"))     // false
+  output(endswith(s, "zfy"))       // true
+  output(contains(s, "lo z"))      // true
+  output(contains(s, "xyz"))       // false
+
+  // 2. substr（字节区间，越界截断）
+  output(substr(s, 6, 3))          // zfy
+  output(substr(s, 6, 100))        // zfy（len 截断）
+  output(substr(s, -3, 3))         // zfy（start 前移）
+  output(substr(s, 100, 3))        // 空行（start 越界 = 空串）
+
+  // 3. to_str：标量转串并与 + 拼接
+  output(to_str(42) + "!" + to_str(true))
+  output(to_str(3.5) + "|" + to_str('c'))
+
+  // 4. format：string 列表逐个替换 {} 占位
+  let string[] parts = "a", "b", "c"
+  output(format("x={} y={} z={}", parts))
+  output(format("no args {} kept", parts))
+
+  // 5. 与既有设施组合：split/join/trim/find
+  let string[] words = split("one,two,three", ",")
+  output(length(words))            // 3
+  output(join(words, "+"))         // one+two+three
+  output(trim("  pad  ", ' '))     // pad
+  output(find(s, "zfy") ?? -1)     // 6（0 起下标；find 产 T!，?? 解包）

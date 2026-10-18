@@ -1,0 +1,9 @@
+enum Color
+    Red
+    Green
+
+fn main()
+  let Color c = Color.Red
+  match c
+    Color.Red => output("r")
+    Color.Green => output("g")

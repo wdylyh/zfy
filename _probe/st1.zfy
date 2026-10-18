@@ -1,0 +1,10 @@
+fn main()
+  let string s = "hello zfy"
+  output(startswith(s, "hello"))
+  output(endswith(s, "zfy"))
+  output(contains(s, "lo z"))
+  output(substr(s, 6, 3))
+  output(to_str(42) + "!" + to_str(true))
+  let string[] parts = "a", "b", "c"
+  output(format("x={} y={} z={}", parts))
+  output(format("no args {} kept", parts))

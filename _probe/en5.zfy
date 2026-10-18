@@ -1,0 +1,11 @@
+enum Shape
+    Empty
+    Circle(f64)
+
+fn main()
+  let Shape s = Shape.Circle(2.0)
+  let f64 area = 0.0
+  match s
+    Shape.Circle(r) => area = r * r
+    _ => area = 0.0
+  output(area)

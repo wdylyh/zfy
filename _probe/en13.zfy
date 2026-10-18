@@ -1,0 +1,10 @@
+enum Shape
+    Empty
+    Circle(f64)
+
+fn main()
+  let Shape s = Shape.Circle(2.0)
+  let f64 q = 3.0
+  output(q)
+  match s
+    _ => output(1)

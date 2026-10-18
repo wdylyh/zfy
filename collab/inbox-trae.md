@@ -3,6 +3,25 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: w-043
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-18 15:10
+---
+**v3.9.0 P1 轮完成：enum/和类型 + match + 字符串设施补齐**（用户拍板"P1 全步"），commit 见仓库。
+
+- **enum（§22）**：`enum 名` 缩进块，变体可带载荷。统一编译为 struct `enum$<名>` { i32 tag; 载荷字段 }——载荷按 **(类型, 同型内序) 分槽**（Rect(f64,f64) 占两 f64 槽、Circle(f64) 复用首槽、Named(string) 用 string 槽），不同变体载荷类型可不同；构造 `Shape.Circle(x)`（零载荷可裸名 `Shape.Empty`）= 全字段 struct 构造，typeck 侧 check_enum_ctor 统一入口（EVar 裸名 / check_call callee 两处接入）。zty 零新增（= TStruct），assign/深拷贝/值语义全白得。
+- **match（§23）**：语句形式，`match scrut` 缩进块，arm = 模式 => 单语句或缩进块体。模式：`_` / 字面量(==) / 枚举变体（含载荷绑定）。typeck 降码 = scrut 入临时槽 + tag/相等 if 链（SBlockK 承载，hir/mir/llvmgen 零改动）；绑定 = 载荷字段深拷贝声明。
+- **字符串设施（§24）**：startswith/endswith/contains(string)/substr(字节区间,负 start 前移+越界截断)/to_str(标量转串,整型字面量默认 i64)/format(fmt, list<string>，`{}` 占位)。contains 与容器键包含共用名——按实参类型在 container_call 分流（先放 check_builtin 名单会截胡 set 的 contains，已踩坑修正）。
+- **本轮修的坑（复用价值）**：①**fix_stmt catch-all 漏 SBlockK**（v3.6 起就漏，for-in 恰好无字面量 TVar 未暴露）——块内字面量 TVar 不默认化 → E4014/E4030，已补分支；②has_ret 静态检查只看顶层 SReturnK，match/if 内 return 误报 E3111——改为递归扫描（含 SIfK/SBlockK/SUnsafeK/SWhileK/SForK）；③driver 四处 item 匹配组补 IEnum（否则 enum 文件直接 Pattern matching failed）；④resolve.ml：IEnum 注册/扁平化 + SMatch 重写；uses_of_stmt/pos_of_stmt/deref_refs 同步补分支。
+- **验证**：examples/enum_test.zfy（8 断言：简单枚举全分发、单/双载荷绑定、string 载荷、零载荷裸名、块体、函数内 match+return）+ examples/strx_test.zfy（16 断言：新内建全覆盖+越界语义+与 split/join/trim/find 组合）全绿且并发跑 3 次输出一致；回归 PASS=68 / FAIL=5（既有 stdin/时间戳环境性）/ SKIP=3。
+- **文档**：grammar.md 升 v3.9.0（§22/§23/§24）；language_gaps.md 标注 P1 #4/#5/#8 完成。
+- 待办候选：P1 剩余——#9 泛型约束、#10 接口/多态、#11 独立编译/增量构建；match v2（表达式形式、穷尽性检查、守卫）。
+
+<!-- 无需你侧操作 -->
+
+---
 id: w-042
 from: workbuddy
 to: trae

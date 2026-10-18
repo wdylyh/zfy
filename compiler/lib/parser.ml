@@ -1015,6 +1015,45 @@ and check_bare_decl p =
               s s s s s)
   | _ -> ()
 
+(* match 模式（v3.9）：_ 通配 / 字面量（parse_expr，含负数）/ 枚举变体
+   （ident 或点路径，可选 (绑定名...) 载荷绑定） *)
+and parse_mpat p =
+  let (tk, tp) = peek p in
+  match tk with
+  | Ident "_" ->
+    ignore (next p); PWild
+  | Ident s ->
+    ignore (next p);
+    let name = ref s in
+    let rec dots () =
+      match peek p with
+      | (Dot, _) ->
+        ignore (next p);
+        name := !name ^ "." ^ expect_ident p "variant name";
+        dots ()
+      | _ -> ()
+    in
+    dots ();
+    (match peek p with
+     | (LParen, _) ->
+       ignore (next p);
+       let rec binds acc =
+         match peek p with
+         | (RParen, _) -> ignore (next p); List.rev acc
+         | _ ->
+           let n = expect_ident p "pattern binding name" in
+           (match peek p with
+            | (Comma, _) -> ignore (next p); binds (n :: acc)
+            | (RParen, _) -> ignore (next p); List.rev (n :: acc)
+            | (_, ep) -> err ep "expected ',' or ')' in pattern bindings")
+       in
+       PVar (!name, binds [], tp)
+     | _ -> PVar (!name, [], tp))
+  | IntLit _ | FloatLit _ | StrLit _ | CharLit _ | Keyword KTrue | Keyword KFalse
+  | Minus ->
+    PLit (parse_expr p)
+  | _ -> err tp "expected pattern: literal, enum variant, or '_'"
+
 and parse_stmt p =
   let (tk, tp) = peek p in
   match tk with
@@ -1036,6 +1075,40 @@ and parse_stmt p =
   | Keyword KIf ->
     ignore (next p);
     parse_if p tp
+  | Keyword KMatch ->
+    (* match 分发（v3.9）：match scrut 换行缩进块；
+       arm：`模式 => 语句` 或 `模式 =>` 换行缩进块 *)
+    ignore (next p);
+    let scrut = parse_expr p in
+    let rec skip_nl () =
+      match peek p with
+      | (Newline, _) -> ignore (next p); skip_nl ()
+      | _ -> ()
+    in
+    skip_nl ();
+    (match peek p with
+     | (Indent, _) ->
+       ignore (next p);
+       let rec arms acc =
+         match peek p with
+         | (Dedent, _) -> ignore (next p); List.rev acc
+         | (Eof, _) -> List.rev acc
+         | (Newline, _) -> ignore (next p); arms acc
+         | _ ->
+           let pat = parse_mpat p in
+           expect p FatArrow "=>";
+           (match peek p with
+            | (Newline, _) ->
+              ignore (next p);
+              let blk = parse_block p in
+              arms ({ mpat = pat; mbody = blk; mpos = tp } :: acc)
+            | _ ->
+              let st = parse_stmt p in
+              arms ({ mpat = pat; mbody = [ st ]; mpos = tp } :: acc))
+       in
+       SMatch (scrut, arms [], tp)
+     | (_, ep) ->
+       err ep "match requires a newline and an indented arm block (one 'pattern => body' per arm)")
   | Keyword KWhile ->
     ignore (next p);
     let cond = parse_expr p in
@@ -1771,6 +1844,42 @@ and parse_item p =
              end_of_stmt p;
              IUseP { binds = [ (first, [ first ], tp) ]; pos = tp })))
 
+  | Keyword KEnum ->
+    (* enum 枚举与和类型（v3.9）：enum 名 缩进块——每行一个变体：
+       `变体名`（零载荷）或 `变体名(类型, ...)`（带载荷）；
+       统一编译为 tag+载荷 struct，变体序号即 tag（见 ast.IEnum 注释） *)
+    ignore (next p);
+    let name = expect_ident p "enum name" in
+    let rec go acc =
+      skip_trivia p;
+      match peek p with
+      | (Indent, _) -> ignore (next p); go acc
+      | (Dedent, _) -> ignore (next p); List.rev acc
+      | (Eof, _) -> List.rev acc
+      | (Newline, _) -> ignore (next p); go acc
+      | _ ->
+        let vname = expect_ident p "enum variant name" in
+        let payload =
+          match peek p with
+          | (LParen, _) ->
+            ignore (next p);
+            let rec go2 acc2 =
+              match peek p with
+              | (RParen, _) -> ignore (next p); List.rev acc2
+              | _ ->
+                let t = parse_ty p in
+                (match peek p with
+                 | (Comma, _) -> ignore (next p); go2 (t :: acc2)
+                 | (RParen, _) -> ignore (next p); List.rev (t :: acc2)
+                 | (_, tp') -> err tp' "expected ',' or ')' to end the payload type list")
+            in
+            go2 []
+          | _ -> []
+        in
+        end_of_stmt p;
+        go ((vname, payload) :: acc)
+    in
+    IEnum { name; variants = go []; pos = tp }
   | Keyword KStruct ->
     (* struct 声明：struct [packed] 名字 缩进块（字段：类型 名字 [= 默认值]，
        或 类型 名字[N] / 类型 名字[]） *)

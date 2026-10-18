@@ -1,0 +1,29 @@
+enum Color
+    Red
+    Blue
+    Green
+
+enum Shape
+    Empty
+    Circle(f64)
+    Rect(f64, f64)
+
+fn main()
+  let Shape s = Shape.Circle(2.0)
+  let f64 area = 0.0
+  match s
+    Shape.Circle(r) => area = r * 3.14159 * r
+    Shape.Rect(w, h) => area = w * h
+    Shape.Empty => area = 0.0
+  output(area)
+
+  let Shape t = Shape.Rect(3.0, 4.0)
+  match t
+    Shape.Rect(w, h) => output(w * h)
+    _ => output(-1.0)
+
+  let Color c = Color.Green
+  match c
+    Color.Red => output("red")
+    Color.Green => output("green")
+    Color.Blue => output("blue")

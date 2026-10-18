@@ -89,6 +89,7 @@ let pos_of_item (it : item) : pos =
   | IUseP u -> u.pos
   | IFn f -> f.pos
   | IStruct s -> s.pos
+  | IEnum e -> e.pos
   | IMod (_, _, p) | IModFile (_, p) | IPub (_, p) -> p
   | IExtern e -> e.pos
   | ITypeAlias a -> a.pos
@@ -267,6 +268,7 @@ let resolve (main : program) (main_dir : string)
          end)
     | IFn f -> add_local modt f.name pub "fn" f.pos; modt.raw <- modt.raw @ [ it ]
     | IStruct s -> add_local modt s.name pub "struct" s.pos; modt.raw <- modt.raw @ [ it ]
+    | IEnum e -> add_local modt e.name pub "enum" e.pos; modt.raw <- modt.raw @ [ it ]
     | ITypeAlias a -> add_local modt a.name pub "alias" a.pos; modt.raw <- modt.raw @ [ it ]
     | IExtern e ->
       List.iter (fun fn -> add_local modt fn.ename pub "extern" fn.epos) e.funcs;
@@ -626,6 +628,21 @@ let resolve (main : program) (main_dir : string)
       | SUnsafe (b, p) -> SUnsafe (rw_block m b, p)
       | SFn (nm, params, ret, fr, body, p) ->
         SFn (nm, params, Option.map (rw_ty m) ret, fr, rw_block m body, p)
+      | SMatch (sx, arms, p) ->
+        SMatch
+          (rw_expr m sx,
+           List.map
+             (fun (a : marm) ->
+               { mpat =
+                   (match a.mpat with
+                    | PWild -> PWild
+                    | PLit e -> PLit (rw_expr m e)
+                    | PVar (vn, bs, vp) ->
+                           PVar (resolve_name m vn a.mpos, bs, vp));
+                 mbody = rw_block m a.mbody;
+                 mpos = a.mpos })
+             arms,
+           p)
       | SBreak _ | SContinue _ -> s
     in
     let rw_param m pr = { pr with pty = rw_ty m pr.pty } in
@@ -660,6 +677,12 @@ let resolve (main : program) (main_dir : string)
                                  mret = Option.map (rw_ty m) mth.mret;
                                  mbody = rw_block m mth.mbody })
                              s.methods } :: !out
+      | IEnum e ->
+        out := IEnum { name = flat_prefix m.mpath ^ e.name;
+                       variants =
+                         List.map (fun (vn, pys) -> (vn, List.map (rw_ty m) pys))
+                           e.variants;
+                       pos = e.pos } :: !out
       | ITypeAlias a ->
         out := ITypeAlias { name = flat_prefix m.mpath ^ a.name;
                             ty = rw_ty m a.ty; pos = a.pos } :: !out

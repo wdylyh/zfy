@@ -2884,6 +2884,11 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare ptr @zfy_str_append_n(ptr, ptr, i64)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split(ptr, i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_str_split_str(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_str_startswith(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_str_endswith(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_str_contains(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_str_sub(ptr, i64, i64)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_str_format(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_seq_slice(ptr, i64, i64, i64)\n";
   (* frac 运行时函数声明（12 后缀 × add/sub/mul/div + 比较 + reduce/print） *)
   let sufs = [ "i8"; "i16"; "i32"; "i64"; "i128"; "u8"; "u16"; "u32"; "u64";

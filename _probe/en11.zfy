@@ -1,0 +1,7 @@
+enum Shape
+    Empty
+    Circle(f64)
+
+fn main()
+  output(1)
+  let Shape s = Shape.Circle(2.0)

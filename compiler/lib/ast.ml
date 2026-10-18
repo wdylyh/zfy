@@ -126,6 +126,18 @@ and stmt =
        按命名 lambda 处理：定义处创建闭包（隐式值捕获所在函数局部变量），
        名字绑定为局部闭包值变量。仅语句位置（顶层 fn 走 IFn）；参数用
        lparam 形状（param 定义在 stmt 之后，无法前向引用） *)
+  | SMatch of expr * marm list * pos
+    (* match 分发（v3.9）：match scrut 缩进块，每 arm `模式 => 语句或块`。
+       模式：_ 通配 / 字面量（== 比较）/ 枚举变体（变体路径 + (绑定名...)）；
+       降码为 tag/相等比较 if 链（typeck 内展开，hir/mir 无新构造） *)
+
+(* match 模式（v3.9） *)
+and mpat =
+  | PWild                                   (* _：匹配一切 *)
+  | PLit of expr                            (* 字面量/表达式模式：按 == 比较 *)
+  | PVar of string * string list * pos      (* 枚举变体：变体路径名, 载荷绑定名 *)
+
+and marm = { mpat : mpat; mbody : block; mpos : pos }
 
 (* for 头部初始化项：let 声明（let (类型)? (frac)? (const)? (unred)? 名 = 值，
    类型可省时由初值推断）或占位表达式（孤立变量名，如 for i, i<5, i++ 的 i，
@@ -214,6 +226,11 @@ type item =
     (* type 别名：type 名 = 类型（可含函数类型） *)
   | IDecl of stmt * pos
     (* 顶层声明：仅允许 const 标量（编译期常量，使用处内联，不生成运行时槽） *)
+  | IEnum of { name : string; variants : (string * ty list) list; pos : pos }
+    (* enum 枚举与和类型（v3.9）：enum 名 { 变体, 变体(载荷类型...), ... }——
+       简单枚举 = 全部变体零载荷；统一编译为 struct enum$<名>
+       { i32 tag; 载荷字段并集 f0..fn }，变体序号即 tag；
+       变体构造 `名.变体(实参)` = struct 构造；判别/解构用 match（§23） *)
   | IPub of item * pos
     (* pub 修饰：仅模块内顶层合法（root 顶层 pub 被 resolve 忽略） *)
 

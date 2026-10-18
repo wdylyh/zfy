@@ -1,0 +1,4 @@
+fn main()
+  let i64[] xs = 1, 2
+  for v in xs
+    output(v)

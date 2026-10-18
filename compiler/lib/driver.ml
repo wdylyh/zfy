@@ -585,14 +585,14 @@ let expand_uses (main : program) (main_dir : string)
           (function
             | IFn f -> own := (f.name, ns ^ mname ^ "." ^ f.name) :: !own
             | IMod _ | IUse _ | IUseP _ | IModFile _ | IPub _ | IDecl _
-            | IStruct _ | IExtern _ | ITypeAlias _ -> ())
+            | IStruct _ | IEnum _ | IExtern _ | ITypeAlias _ -> ())
           its2
       in
       List.iter
         (function
           | IFn f -> own := (f.name, ns ^ f.name) :: !own
           | IMod (m, its2, _) -> go_mod m its2
-          | IUse _ | IUseP _ | IModFile _ | IPub _ | IDecl _ | IStruct _
+          | IUse _ | IUseP _ | IModFile _ | IPub _ | IDecl _ | IStruct _ | IEnum _
           | IExtern _ | ITypeAlias _ -> ())
         its
     in
@@ -610,7 +610,7 @@ let expand_uses (main : program) (main_dir : string)
           | IFn f -> emit_fn (ns_mod ^ f.name) f.pos f.params f.ret f.body
           | IMod (_, _, p) ->
             raise (CompileError (Some p, "nested modules are not allowed"))
-          | IDecl _ | IUse _ | IUseP _ | IModFile _ | IPub _ | IStruct _
+          | IDecl _ | IUse _ | IUseP _ | IModFile _ | IPub _ | IStruct _ | IEnum _
           | IExtern _ | ITypeAlias _ -> ())
         its2
     in
@@ -721,7 +721,7 @@ let expand_uses (main : program) (main_dir : string)
   List.iter
     (function
       | IUse _ | IUseP _ | IModFile _ | IPub _ -> ()
-      | (IFn _ | IMod _ | IDecl _ | IStruct _ | IExtern _ | ITypeAlias _) as it ->
+      | (IFn _ | IMod _ | IDecl _ | IStruct _ | IEnum _ | IExtern _ | ITypeAlias _) as it ->
         out := it :: !out)
     main;
   List.rev !out

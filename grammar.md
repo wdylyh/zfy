@@ -1,6 +1,11 @@
-# zfy 语言规范（v3.8.0，2026-10-18）
+# zfy 语言规范（v3.9.0，2026-10-18）
 
 > 本版每一节都经过编译器实测校准（examples 全回归通过）。
+> 与 v3.8.0 的主要差异（v3.9.0 P1 轮）：
+> **枚举与和类型（§22）**——`enum` 变体（可带载荷）、`变体(实参)` 构造、
+> **match 分发（§23）**——字面量/变体/`_` 模式 + 载荷绑定；
+> **字符串设施（§24）**——startswith/endswith/contains/substr/to_str/format。
+>
 > 与 v3.7.0 的主要差异（v3.8.0 并发轮）：
 > **并发（§21）**——`spawn`/`join` 线程（收闭包/函数名）、原子内建
 > `atomic_load/store/add/inc`（32/64 位）、`mutex_new/lock/unlock`、
@@ -1182,3 +1187,82 @@ output(chan_len(ch))                  // 当前排队数
 - `sleep(ms)`：休眠指定毫秒。
 - 已知限制 v1：join 后句柄置空；mutex/chan 不回收（生命周期 = 进程）；
   output 多线程交错不保证；无逃逸分析（引用捕获跨线程逃逸 = UB）。
+
+## 22. 枚举与和类型（v3.9.0）
+
+### 22.1 定义
+
+```
+enum Color                     // 简单枚举：全部零载荷变体
+    Red
+    Green
+    Blue
+
+enum Shape                     // 和类型：变体可带载荷（类型列表）
+    Empty
+    Circle(f64)
+    Rect(f64, f64)
+    Named(string)
+```
+
+- 变体载荷类型任意（标量/string/指针/列表；列表载荷 v1 限 1 个）。
+- 实现：统一编译为 struct `enum$<名>` { i32 tag; f0..fn }——载荷按
+  **类型分槽**（同类型变体载荷共享槽，`Rect(f64,f64)` 占两个 f64 槽），
+  因此不同变体载荷类型可以不同；值语义 assign/深拷贝按 struct 走。
+
+### 22.2 构造
+
+```
+let Color c = Color.Green      // 零载荷变体裸名（也可写 Color.Green()）
+let Shape s = Shape.Circle(2.0)
+let Shape s2 = Shape.Rect(3.0, 4.0)
+```
+
+- 构造 = tag + 载荷全字段 struct 构造，类型不符编译期报错。
+
+### 22.3 判别与解构
+
+变体判别/载荷提取统一走 match（§23）；v1 不直接暴露载荷字段名
+（tag 字段可用 `x.tag` 读取，返回 i32 序号）。
+
+## 23. match 分发（v3.9.0）
+
+### 23.1 语法
+
+```
+match scrut                    // 换行缩进块，每 arm 一行
+    模式 => 语句                // 单语句体
+    模式 =>                     // 或换行缩进块体（多语句）
+        语句...
+```
+
+### 23.2 模式
+
+- `_`：通配（匹配一切，常作兜底）。
+- 字面量/表达式：`1`、`"str"`、`'c'`、`true`、`-1`——按 `==` 比较
+  （scrutinee 为标量/string/bool/char 时用）。
+- 枚举变体：`Shape.Circle(r)`（载荷绑定名列表）、`Shape.Empty`（零载荷）、
+  裸变体名 `Circle(r)`（scrutinee 类型已知时）。
+- 绑定 = 对应载荷字段的深拷贝声明（值语义）。
+
+### 23.3 语义
+
+- 降码 = scrutinee 求值一次入临时槽 + tag/相等比较 if 链；首个命中
+  arm 执行，其后 arm 跳过。
+- 穷尽性 v1 不强制：无 `_` 且无命中 = 跳过（不报错）。
+- match 是语句（v1）；带值场景在 arm 中对预声明变量赋值或 return。
+- match 内 return/break/continue 正常传播。
+
+## 24. 字符串设施补充（v3.9.0）
+
+| 内建 | 签名 | 说明 |
+|---|---|---|
+| startswith | (string, string) -> bool | 前缀判定 |
+| endswith | (string, string) -> bool | 后缀判定 |
+| contains | (string, string) -> bool | 子串包含（与容器键包含共用名，按实参类型分流） |
+| substr | (string, i64, i64) -> string | 字节区间 [start, start+len) 深拷贝；负 start 前移、越界截断 |
+| to_str | (标量/bool/char/frac) -> string | 显式转串（整数字面量默认 i64；float 格式同 output） |
+| format | (string, list<string>) -> string | 把列表元素逐个替换 `{}` 占位；占位多于实参 = 剩余 `{}` 原样保留 |
+
+- 既有设施（v3.5 以前）：length/find/trim/split/replace/utf8_*；
+  列表 join(list<string>, sep)（v3.6）。

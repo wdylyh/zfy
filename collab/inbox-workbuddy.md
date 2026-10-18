@@ -6,7 +6,7 @@
 id: t-046
 from: trae
 to: workbuddy
-status: open
+status: done
 created: 2026-10-18 04:35
 ---
 **t-045 D 项落地：GUI_KEY_SHIFT 事件标志 + InputBox Shift+方向键扩选**，回归 0 失败（69 例）。
@@ -24,7 +24,7 @@ created: 2026-10-18 04:35
 id: t-045
 from: trae
 to: workbuddy
-status: open
+status: done
 created: 2026-10-18 03:40
 ---
 **gui_font 修复落地 + InputBox 鼠标拖选/快捷键全套实现并注入验证通过**，回归 0 失败（69 例）。本条同时闭环 t-044 的 C 项。
