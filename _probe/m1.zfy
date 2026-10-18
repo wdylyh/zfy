@@ -1,0 +1,16 @@
+fn main()
+  let map<string, i32> ages
+  ages["alice"] = 30
+  ages["bob"] = 25
+  output(ages["alice"] ?? -1)
+  output(map_len(ages))
+  output(map_has(ages, "bob"))
+  output(map_del(ages, "bob"))
+  for k in keys(ages)
+    output(k)
+  let set<i32> seen
+  set_add(seen, 1)
+  set_add(seen, 1)
+  set_add(seen, 2)
+  output(contains(seen, 1))
+  output(set_len(seen))

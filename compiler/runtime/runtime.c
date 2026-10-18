@@ -3545,3 +3545,244 @@ void zfy_gui_fill_rect(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e) {
 void zfy_gui_draw_text(int32_t a, int32_t b, char *s, uint32_t c) { (void)a; (void)b; (void)s; (void)c; }
 int32_t zfy_gui_text_w(char *s) { (void)s; return 0; }
 #endif
+
+/* ==================================================================
+ * 并发（v3.8.0）：线程 / 互斥锁 / 原子操作 / channel
+ * 约定：
+ *   - 线程/互斥/channel 句柄 = 单 ptr 字段 struct（{ptr h}），
+ *     操作函数收槽地址（void**）解一层取 h（与 map 同款）；
+ *   - spawn 收闭包句柄（解一层 = env 块地址，首字段 = code），
+ *     线程体直接调 code(env)；env 堆块生命周期 = 进程，
+ *     天然适配线程（无 GC，无所有权回收问题）；
+ *   - 原子操作直接作用于变量地址（&g 取址），限 32/64 位整型；
+ *   - channel 为无界队列（send 不阻塞），recv 阻塞直至有值或
+ *     关闭且排空（后者产 NOT_FOUND 错误值，与 map 缺键同款）；
+ *   - 已知限制 v1：join 后句柄置 null（重复 join 报错）；
+ *     mutex/chan 不回收（生命周期 = 进程）；map/列表等容器
+ *     非线程安全，跨线程共享须用 mutex 外部保护。
+ * ================================================================== */
+#ifdef _WIN32
+#include <process.h>
+
+/* ---- 线程 ---- */
+static unsigned __stdcall zfy_thr_proc(void *p) {
+    void *env = p;                       /* env 块：首字段 = code */
+    void *code = *(void **)env;
+    ((void (*)(void *))code)(env);
+    return 0;
+}
+void zfy_thread_spawn(void **out, void *clo_slot) {
+    void *env = *(void **)clo_slot;      /* 闭包句柄解一层 = env 块 */
+    uintptr_t th = _beginthreadex(NULL, 0, zfy_thr_proc, env, 0, NULL);
+    if (th == 0) zfy_die("spawn: 线程创建失败");
+    *out = (void *)th;
+}
+void zfy_thread_join(void **slot) {
+    void *h = *slot;
+    if (!h) zfy_die("join: 线程句柄为空（重复 join？）");
+    WaitForSingleObject((HANDLE)h, INFINITE);
+    CloseHandle((HANDLE)h);
+    *slot = NULL;
+}
+
+/* ---- 互斥锁（CRITICAL_SECTION） ---- */
+void zfy_mutex_new(void **out) {
+    CRITICAL_SECTION *cs = (CRITICAL_SECTION *)malloc(sizeof(CRITICAL_SECTION));
+    if (!cs) zfy_die("mutex_new: 分配失败");
+    InitializeCriticalSection(cs);
+    *out = cs;
+}
+void zfy_mutex_lock(void **slot) {
+    void *h = *slot;
+    if (!h) zfy_die("lock: 互斥锁未初始化（先 mutex_new）");
+    EnterCriticalSection((CRITICAL_SECTION *)h);
+}
+void zfy_mutex_unlock(void **slot) {
+    void *h = *slot;
+    if (!h) zfy_die("unlock: 互斥锁未初始化（先 mutex_new）");
+    LeaveCriticalSection((CRITICAL_SECTION *)h);
+}
+
+/* ---- 原子操作（作用于变量地址；返回旧值语义与
+ * Interlocked 家族一致：add 返回加前旧值） ---- */
+int32_t zfy_atomic_load_32(void *p) {
+    return InterlockedCompareExchange((volatile long *)p, 0, 0);
+}
+void zfy_atomic_store_32(void *p, int32_t v) {
+    InterlockedExchange((volatile long *)p, (long)v);
+}
+int32_t zfy_atomic_add_32(void *p, int32_t v) {
+    return (int32_t)InterlockedExchangeAdd((volatile long *)p, (long)v);
+}
+int64_t zfy_atomic_load_64(void *p) {
+    return InterlockedCompareExchange64((volatile long long *)p, 0, 0);
+}
+void zfy_atomic_store_64(void *p, int64_t v) {
+    InterlockedExchange64((volatile long long *)p, v);
+}
+int64_t zfy_atomic_add_64(void *p, int64_t v) {
+    return InterlockedExchangeAdd64((volatile long long *)p, v);
+}
+
+/* 原子自增（void 返回：语句级可用，免值丢弃检查） */
+void zfy_atomic_inc_32(void *p) {
+    InterlockedExchangeAdd((volatile long *)p, 1);
+}
+void zfy_atomic_inc_64(void *p) {
+    InterlockedExchangeAdd64((volatile long long *)p, 1);
+}
+
+/* ---- 睡眠 ---- */
+void zfy_sleep_ms(long long ms) { Sleep((DWORD)ms); }
+
+/* ---- channel：无界队列（链表）+ CS/CONDVAR ---- */
+typedef struct zfy_chan_node {
+    struct zfy_chan_node *next;
+    long long i;                         /* 标量值 / f32/f64 位模式 */
+    void *p;                             /* string 堆串（接管所有权） */
+} zfy_chan_node;
+typedef struct {
+    CRITICAL_SECTION cs;
+    CONDITION_VARIABLE cv;
+    zfy_chan_node *head, *tail;
+    long long len;
+    int closed;
+} zfy_chan;
+
+void zfy_chan_new(void **out) {
+    zfy_chan *c = (zfy_chan *)malloc(sizeof(zfy_chan));
+    if (!c) zfy_die("chan_new: 分配失败");
+    InitializeCriticalSection(&c->cs);
+    InitializeConditionVariable(&c->cv);
+    c->head = c->tail = NULL;
+    c->len = 0;
+    c->closed = 0;
+    *out = c;
+}
+static void chan_push(zfy_chan *c, long long i, void *p) {
+    zfy_chan_node *n = (zfy_chan_node *)malloc(sizeof(zfy_chan_node));
+    if (!n) zfy_die("chan_send: 分配失败");
+    n->next = NULL;
+    n->i = i;
+    n->p = p;
+    EnterCriticalSection(&c->cs);
+    if (c->closed) {
+        LeaveCriticalSection(&c->cs);
+        free(n);
+        if (p) free(p);
+        zfy_die("chan_send: channel 已关闭");
+    }
+    if (c->tail) c->tail->next = n; else c->head = n;
+    c->tail = n;
+    c->len++;
+    LeaveCriticalSection(&c->cs);
+    WakeConditionVariable(&c->cv);
+}
+void zfy_chan_send_i64(void **slot, long long v) { chan_push((zfy_chan *)*slot, v, NULL); }
+void zfy_chan_send_f32(void **slot, float v) {
+    long long b = 0; memcpy(&b, &v, 4);
+    chan_push((zfy_chan *)*slot, b, NULL);
+}
+void zfy_chan_send_f64(void **slot, double v) {
+    long long b = 0; memcpy(&b, &v, 8);
+    chan_push((zfy_chan *)*slot, b, NULL);
+}
+void zfy_chan_send_str(void **slot, char *v) {
+    chan_push((zfy_chan *)*slot, 0, zfy_strdup(v));   /* 深拷贝，队列接管 */
+}
+
+/* 阻塞接收：取出写 *out_i/*out_p（string 转移所有权给调用方）；
+ * 返回 1 = 成功，0 = 已关闭且排空（编译器侧据此产 NOT_FOUND） */
+static int chan_pop(zfy_chan *c, long long *out_i, void **out_p) {
+    EnterCriticalSection(&c->cs);
+    while (!c->head && !c->closed)
+        SleepConditionVariableCS(&c->cv, &c->cs, INFINITE);
+    if (!c->head) {                       /* closed 且排空 */
+        LeaveCriticalSection(&c->cs);
+        return 0;
+    }
+    zfy_chan_node *n = c->head;
+    c->head = n->next;
+    if (!c->head) c->tail = NULL;
+    c->len--;
+    LeaveCriticalSection(&c->cs);
+    *out_i = n->i;
+    *out_p = n->p;
+    free(n);
+    return 1;
+}
+int zfy_chan_recv_raw(void **slot, long long *out_i, void **out_p) {
+    return chan_pop((zfy_chan *)*slot, out_i, out_p);
+}
+
+/* 错误值形态 recv（与 map get_err 同款：out = zfy_err* 首参）：
+ * 编译器按 vtag 选择具体实例，失败产 NOT_FOUND */
+/* recv_err_*：成功时直接把队列节点值写入 out（string 转移所有权，
+ * 不经 get_ok_str 二次 strdup 免泄漏）；失败 = NOT_FOUND（closed 且排空） */
+void zfy_chan_recv_err_i64(zfy_err *out, void **slot) {
+    long long i; void *p;
+    if (chan_pop((zfy_chan *)*slot, &i, &p)) err_ok_i(out, (unsigned long long)i);
+    else MAP_MISS(out);
+}
+void zfy_chan_recv_err_f32(zfy_err *out, void **slot) {
+    long long i; void *p;
+    if (chan_pop((zfy_chan *)*slot, &i, &p)) get_ok_f32(out, (unsigned long long)i);
+    else MAP_MISS(out);
+}
+void zfy_chan_recv_err_f64(zfy_err *out, void **slot) {
+    long long i; void *p;
+    if (chan_pop((zfy_chan *)*slot, &i, &p)) get_ok_f64(out, (unsigned long long)i);
+    else MAP_MISS(out);
+}
+void zfy_chan_recv_err_str(zfy_err *out, void **slot) {
+    long long i; void *p;
+    if (chan_pop((zfy_chan *)*slot, &i, &p)) {
+        out->code = ZFY_EOK; out->msg = NULL;
+        out->value.p = p;             /* 所有权移交（send 时 strdup 过） */
+    } else MAP_MISS(out);
+}
+
+void zfy_chan_close(void **slot) {
+    zfy_chan *c = (zfy_chan *)*slot;
+    if (!c) zfy_die("chan_close: channel 未初始化");
+    EnterCriticalSection(&c->cs);
+    c->closed = 1;
+    LeaveCriticalSection(&c->cs);
+    WakeAllConditionVariable(&c->cv);
+}
+long long zfy_chan_len(void **slot) {
+    zfy_chan *c = (zfy_chan *)*slot;
+    if (!c) zfy_die("chan_len: channel 未初始化");
+    EnterCriticalSection(&c->cs);
+    long long n = c->len;
+    LeaveCriticalSection(&c->cs);
+    return n;
+}
+
+#else
+/* 非 Windows：桦实现（调用即终止，zfy v1 并发仅支持 Windows） */
+void zfy_thread_spawn(void **o, void *c) { (void)o; (void)c; zfy_die("spawn: 仅支持 Windows"); }
+void zfy_thread_join(void **s) { (void)s; zfy_die("join: 仅支持 Windows"); }
+void zfy_mutex_new(void **o) { (void)o; zfy_die("mutex: 仅支持 Windows"); }
+void zfy_mutex_lock(void **s) { (void)s; }
+void zfy_mutex_unlock(void **s) { (void)s; }
+int32_t zfy_atomic_load_32(void *p) { (void)p; return 0; }
+void zfy_atomic_store_32(void *p, int32_t v) { (void)p; (void)v; }
+int32_t zfy_atomic_add_32(void *p, int32_t v) { (void)p; (void)v; return 0; }
+int64_t zfy_atomic_load_64(void *p) { (void)p; return 0; }
+void zfy_atomic_store_64(void *p, int64_t v) { (void)p; (void)v; }
+int64_t zfy_atomic_add_64(void *p, int64_t v) { (void)p; (void)v; return 0; }
+void zfy_sleep_ms(long long ms) { (void)ms; }
+void zfy_chan_new(void **o) { (void)o; zfy_die("chan: 仅支持 Windows"); }
+void zfy_chan_send_i64(void **s, long long v) { (void)s; (void)v; }
+void zfy_chan_send_f32(void **s, float v) { (void)s; (void)v; }
+void zfy_chan_send_f64(void **s, double v) { (void)s; (void)v; }
+void zfy_chan_send_str(void **s, char *v) { (void)s; (void)v; }
+int zfy_chan_recv_raw(void **s, long long *oi, void **op) { (void)s; (void)oi; (void)op; return 0; }
+void zfy_chan_recv_err_i64(zfy_err *o, void **s) { (void)o; (void)s; MAP_MISS(o); }
+void zfy_chan_recv_err_f32(zfy_err *o, void **s) { (void)o; (void)s; MAP_MISS(o); }
+void zfy_chan_recv_err_f64(zfy_err *o, void **s) { (void)o; (void)s; MAP_MISS(o); }
+void zfy_chan_recv_err_str(zfy_err *o, void **s) { (void)o; (void)s; MAP_MISS(o); }
+void zfy_chan_close(void **s) { (void)s; }
+long long zfy_chan_len(void **s) { (void)s; return 0; }
+#endif

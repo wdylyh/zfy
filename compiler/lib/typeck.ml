@@ -419,13 +419,36 @@ let ensure_clo_struct (g : genv) (ret : zty) (ptys : zty list) : string =
   end;
   mangle
 
+(* ---------- 并发（v3.8）----------
+ * thread$ / mutex$ / chan$<elem>：单 ptr 字段不透明句柄 struct
+ * （h = Win32 HANDLE / CRITICAL_SECTION* / zfy_chan*）。
+ * chan<T> 元素限 ≤64 位标量/string（同 map 值限制）。
+ * 句柄可被闭包捕获（spawn(fn() => chan_send(ch, ...)) 的关键路径）。 *)
+let is_thr_struct (s : string) = s = "thread$"
+let is_mtx_struct (s : string) = s = "mutex$"
+let is_chan_struct (s : string) =
+  String.length s > 5 && String.sub s 0 5 = "chan$"
+
+(* 注册不透明句柄 struct（幂等；thread$/mutex$ 无类型实参，
+   chan$<elem> 的元素实参由 conv_ty 侧另行写入） *)
+let ensure_handle_struct (g : genv) (mangle : string) : string =
+  if not (Hashtbl.mem g.structs mangle) then begin
+    Hashtbl.replace g.structs mangle
+      { spacked = false; sfields = [ ("h", TPtr (TUint 8), None) ] };
+    if not (Hashtbl.mem g.gtargs mangle) then
+      Hashtbl.replace g.gtargs mangle []
+  end;
+  mangle
+
 (* zty 是否可作捕获字段（v1 限标量/string/bool/char/指针/闭包句柄；
    seq/struct/frac 捕获不支持——struct 捕获的深拷贝所有权链待后续） *)
 let rec cap_ty_ok (z : zty) : bool =
   match resolve z with
   | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString -> true
   | TPtr _ -> true
-  | TStruct s -> is_clo_struct s || is_map_struct s || cont_kind s <> None
+  | TStruct s ->
+    is_clo_struct s || is_map_struct s || cont_kind s <> None
+    || is_thr_struct s || is_mtx_struct s || is_chan_struct s
   | _ -> false
 
 (* struct 名 -> 闭包签名 *)
@@ -564,6 +587,21 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
             (pp_zty z))
       ptys';
     TStruct (ensure_clo_struct g ret' ptys')
+  | TApp ("chan", [ cta ], pp) ->
+    (* chan<T>（v3.8）：类型限同 map 值（≤64 位标量/string）；
+       单 ptr 句柄 struct，元素类型记 gtargs 供内建分派 *)
+    let ez = resolve (conv_ty g pp cta) in
+    (match ez with
+     | TInt w when w <= 64 -> ()
+     | TUint w when w <= 64 -> ()
+     | TFloat 32 | TFloat 64 | TString -> ()
+     | TErr _ | TFrac _ | TFile | TVar _ ->
+       terr pp "chan element cannot be %s" (pp_zty ez)
+     | _ -> terr pp "chan element must be a scalar (<=64-bit) or string");
+    let mangle = "chan$" ^ tag_of_zty ez in
+    ignore (ensure_handle_struct g mangle);
+    Hashtbl.replace g.gtargs mangle [ ez ];
+    TStruct mangle
   | TApp (n, targs, pp) ->
     (* 泛型实例化 Box<i32, T*>（new2.md 第2条）：按模板展开注册具体
        struct，monomorphization 完全在 typeck 内完成 *)
@@ -763,6 +801,12 @@ let rec zero_of (env : env) (p : pos) (t : zty) : texpr =
     { e = EFracNewK ({ e = EIntK 0L; ety = e; epos = p },
                      { e = EIntK 1L; ety = e; epos = p });
       ety = TFrac e; epos = p }
+  | TStruct s when is_chan_struct s ->
+    (* chan/mutex 句柄声明即构造（v3.8）：不做惰性 null 起步——句柄会被
+       闭包按值捕获，声明后再初始化会与捕获副本错开对象（死锁/失效） *)
+    { e = ECallK ("zfy_chan_new", [], []); ety = t; epos = p }
+  | TStruct s when is_mtx_struct s ->
+    { e = ECallK ("zfy_mutex_new", [], []); ety = t; epos = p }
   | TStruct s ->
     (* 裸构造等同 Name() 全默认构造：字段 default 优先、缺省退零值
        （与 check_decl 裸声明路径一致；此前只取零值会丢失嵌套字段的
@@ -1132,6 +1176,85 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
          let (_, Some vt) = cont_kv env.g s p in
          mkf "zfy_map_values" [ TStruct s ] (TList vt)
        | t -> terr p "values expects a map, got %s" (pp_zty t))
+    (* ---------- 并发内建（v3.8）：线程/互斥/原子/sleep/channel ---------- *)
+    | "spawn", [ f ] ->
+      (* spawn(闭包或函数名) -> thread$ 句柄；裸函数名（EFunPtrK）先注册
+         签名对应的闭包 struct，对齐处自动包 wrapper（与容器谓词同机制） *)
+      let cs =
+        match resolve f.ety with
+        | TStruct s when is_clo_struct s -> s
+        | TPtr (TFunSig (ps, r)) -> ensure_clo_struct env.g r ps
+        | _ -> terr p "spawn expects a lambda or function name (fn() -> void)"
+      in
+      mkf "zfy_thread_spawn" [ TStruct cs ]
+        (TStruct (ensure_handle_struct env.g "thread$"))
+    | "join", [ t ] ->
+      (match resolve t.ety with
+       | TStruct s when is_thr_struct s -> mkf "zfy_thread_join" [ TStruct s ] TVoid
+       | _ -> terr p "join expects a thread handle (the value returned by spawn)")
+    | "mutex_new", [] ->
+      mkf "zfy_mutex_new" [] (TStruct (ensure_handle_struct env.g "mutex$"))
+    | ("lock" | "unlock") as kn, [ m ] ->
+      (match resolve m.ety with
+       | TStruct s when is_mtx_struct s ->
+         mkf ("zfy_mutex_" ^ kn) [ TStruct s ] TVoid
+       | _ -> terr p "%s expects a mutex handle (from mutex_new)" kn)
+    | "atomic_load", [ x ] ->
+      (* 原子读：实参 &var（TPtr），限 32/64 位整数；返回变量类型 *)
+      (match resolve x.ety with
+       | TPtr ((TInt 32 | TUint 32) as e) -> mkf "zfy_atomic_load_32" [ x.ety ] e
+       | TPtr ((TInt 64 | TUint 64) as e) -> mkf "zfy_atomic_load_64" [ x.ety ] e
+       | _ -> terr p "atomic_load expects &var of a 32/64-bit integer")
+    | "atomic_store", [ x; v ] ->
+      (match resolve x.ety with
+       | TPtr ((TInt 32 | TUint 32) as e) ->
+         mkf "zfy_atomic_store_32" [ x.ety; e ] TVoid
+       | TPtr ((TInt 64 | TUint 64) as e) ->
+         mkf "zfy_atomic_store_64" [ x.ety; e ] TVoid
+       | _ -> terr p "atomic_store expects &var of a 32/64-bit integer")
+    | "atomic_add", [ x; v ] ->
+      (* 原子加：返回加前旧值（fetch_add 语义） *)
+      (match resolve x.ety with
+       | TPtr ((TInt 32 | TUint 32) as e) ->
+         mkf "zfy_atomic_add_32" [ x.ety; e ] e
+       | TPtr ((TInt 64 | TUint 64) as e) ->
+         mkf "zfy_atomic_add_64" [ x.ety; e ] e
+       | _ -> terr p "atomic_add expects &var of a 32/64-bit integer")
+    | "atomic_inc", [ x ] ->
+      (* 原子自增：void 返回（语句级可用，免值丢弃检查） *)
+      (match resolve x.ety with
+       | TPtr (TInt 32 | TUint 32) -> mkf "zfy_atomic_inc_32" [ x.ety ] TVoid
+       | TPtr (TInt 64 | TUint 64) -> mkf "zfy_atomic_inc_64" [ x.ety ] TVoid
+       | _ -> terr p "atomic_inc expects &var of a 32/64-bit integer")
+    | "sleep", [ ms ] -> mkf "zfy_sleep_ms" [ TInt 64 ] TVoid
+    | "chan_send", [ c; v ] ->
+      (match resolve c.ety with
+       | TStruct s when is_chan_struct s ->
+         (match Hashtbl.find_opt env.g.gtargs s with
+          | Some [ et ] ->
+            let vtag = map_vtag p et in
+            let vparam = (match resolve et with TString -> TString | _ -> TInt 64) in
+            mkf ("zfy_chan_send_" ^ vtag) [ TStruct s; vparam ] TVoid
+          | _ -> terr p "internal error: chan struct missing element type")
+       | _ -> terr p "chan_send expects a chan handle")
+    | "chan_recv", [ c ] ->
+      (* 阻塞接收：产 T!（closed 且排空 = NOT_FOUND），须 ?? 解包 *)
+      (match resolve c.ety with
+       | TStruct s when is_chan_struct s ->
+         (match Hashtbl.find_opt env.g.gtargs s with
+          | Some [ et ] ->
+            mkf (Printf.sprintf "zfy_chan_recv_err_%s" (map_vtag p et))
+              [ TStruct s ] (TErr et)
+          | _ -> terr p "internal error: chan struct missing element type")
+       | _ -> terr p "chan_recv expects a chan handle")
+    | "chan_close", [ c ] ->
+      (match resolve c.ety with
+       | TStruct s when is_chan_struct s -> mkf "zfy_chan_close" [ TStruct s ] TVoid
+       | _ -> terr p "chan_close expects a chan handle")
+    | "chan_len", [ c ] ->
+      (match resolve c.ety with
+       | TStruct s when is_chan_struct s -> mkf "zfy_chan_len" [ TStruct s ] (TInt 64)
+       | _ -> terr p "chan_len expects a chan handle")
     | "sort", [ xs ] ->
       let e = seq_elem xs in
       let tag =
@@ -1360,8 +1483,12 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
             | TVar _ -> if floaty_texpr te then TFloat 64 else TInt 64
             | _ -> rt0
           in
-          (* 尾表达式 → SReturnK（普通函数体同约定：SExprK 不产返回值） *)
-          (rt, [ { s = SReturnK (Some te); spos = lp } ])
+          (* 尾表达式 → SReturnK（普通函数体同约定：SExprK 不产返回值）；
+             void 尾表达式保留 SExprK（epilogue 产 ret void，避免
+             TRet (Some void) 发射非法 IR `ret void 0`） *)
+          (rt,
+           if resolve rt = TVoid then [ { s = SExprK te; spos = lp } ]
+           else [ { s = SReturnK (Some te); spos = lp } ])
         | LBlock (blk, Some _) ->
           env.fncur_ret <- (match ret0 with Some r -> r | None -> assert false);
           let tb = check_block env blk in
@@ -1481,8 +1608,13 @@ and wrap_fn_as_clo env p fname (ptys : zty list) (ret : zty) =
              fparams = (false, "$env", TPtr (TStruct clenv_name), false) ::
                         List.mapi (fun i t -> (false, Printf.sprintf "$a%d" i, t, false)) ptys;
              fret = ret; frunred = false;
-             fbody = [ { s = SReturnK (Some { e = ECallK (fname, args, []); ety = ret; epos = p });
-                         spos = p } ] } in
+             (* void 返回：尾调用保留 SExprK（SReturnK (Some void) 会发射
+                非法 IR `ret void 0`；与 check_lambda LExpr 同约定） *)
+             fbody = [ (if resolve ret = TVoid then
+                          { s = SExprK { e = ECallK (fname, args, []); ety = ret; epos = p }; spos = p }
+                        else
+                          { s = SReturnK (Some { e = ECallK (fname, args, []); ety = ret; epos = p });
+                            spos = p }) ] } in
   lambda_out_acc := !lambda_out_acc @ [ tf ];
   let mangle = ensure_clo_struct env.g ret ptys in
   { e = EClNewK (mangle, clenv_name,
@@ -3591,8 +3723,11 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
   let tinit =
     match init with
     | None ->
-      (* 裸声明 struct：等同 Name() 全默认构造，字段默认值生效（change.md 1.2） *)
+      (* 裸声明 struct：等同 Name() 全默认构造，字段默认值生效（change.md 1.2）；
+         chan$/mutex$ 句柄例外——声明即构造（zero_of 特判，避免与闭包
+         按值捕获的句柄副本错开对象） *)
       (match resolve want with
+       | TStruct s when is_chan_struct s || is_mtx_struct s -> zero_of env p want
        | TStruct s -> check_struct_new env p s []
        | _ -> zero_of env p want)
     | Some init ->

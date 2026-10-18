@@ -1,0 +1,4 @@
+MIR OK: 3 函数
+fn zfy.globals(0 参数) -> void, 1 块
+fn main(0 参数) -> i32, 7 块
+fn lambda$1(1 参数) -> void, 1 块

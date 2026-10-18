@@ -2940,6 +2940,37 @@ let gen_program (m : mir) : string =
     "declare void @zfy_file_write_file_err(ptr sret(%err.i64), ptr, ptr)\n";
   (* 闭包（v3.7）：env 堆块分配（不回收——生命周期 = 进程） *)
   Buffer.add_string g.mbuf "declare ptr @zfy_env_new(i64)\n";
+  (* 并发（v3.8）：线程/互斥/原子/sleep/channel。
+     句柄构造（spawn/mutex_new/chan_new）走 sret out 槽约定（首参写回） *)
+  List.iter
+    (fun s -> Buffer.add_string g.mbuf s)
+    [ "declare void @zfy_thread_spawn(ptr, ptr)\n";
+      "declare void @zfy_thread_join(ptr)\n";
+      "declare void @zfy_mutex_new(ptr)\n";
+      "declare void @zfy_mutex_lock(ptr)\n";
+      "declare void @zfy_mutex_unlock(ptr)\n";
+      "declare i32 @zfy_atomic_load_32(ptr)\n";
+      "declare void @zfy_atomic_store_32(ptr, i32)\n";
+      "declare i32 @zfy_atomic_add_32(ptr, i32)\n";
+      "declare i64 @zfy_atomic_load_64(ptr)\n";
+      "declare void @zfy_atomic_store_64(ptr, i64)\n";
+      "declare i64 @zfy_atomic_add_64(ptr, i64)\n";
+      "declare void @zfy_atomic_inc_32(ptr)
+";
+      "declare void @zfy_atomic_inc_64(ptr)
+";
+      "declare void @zfy_sleep_ms(i64)\n";
+      "declare void @zfy_chan_new(ptr)\n";
+      "declare void @zfy_chan_send_i64(ptr, i64)\n";
+      "declare void @zfy_chan_send_f32(ptr, float)\n";
+      "declare void @zfy_chan_send_f64(ptr, double)\n";
+      "declare void @zfy_chan_send_str(ptr, ptr)\n";
+      "declare void @zfy_chan_recv_err_i64(ptr sret(%err.i64), ptr)\n";
+      "declare void @zfy_chan_recv_err_f32(ptr sret(%err.f32), ptr)\n";
+      "declare void @zfy_chan_recv_err_f64(ptr sret(%err.f64), ptr)\n";
+      "declare void @zfy_chan_recv_err_str(ptr sret(%err.str), ptr)\n";
+      "declare void @zfy_chan_close(ptr)\n";
+      "declare i64 @zfy_chan_len(ptr)\n" ];
   (* 内建容器 map/set 与列表算法（v3.6） *)
   List.iter
     (fun s -> Buffer.add_string g.mbuf s)

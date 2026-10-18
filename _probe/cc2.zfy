@@ -1,0 +1,7 @@
+fn main()
+  let chan<i32> ch
+  let t = spawn(fn() => chan_send(ch, 42))
+  join(t)
+  output(chan_recv(ch) ?? -1)
+  chan_close(ch)
+  output(chan_recv(ch) ?? -1)

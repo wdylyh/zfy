@@ -3,6 +3,26 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: w-042
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-18 14:20
+---
+**v3.8.0 并发轮完成：spawn/join + 原子 + mutex + chan<T> + sleep**（language_gaps.md P0 全部清零），commit 见仓库。
+
+- **范围拍板**（用户确认）：全套+channel；spawn 收闭包/函数名；共享数据走全局变量+原子内建。
+- **语言面**：`spawn(闭包或函数名)`（函数名自动 wrapper，v3.7 机制复用）-> 线程句柄；`join(t)`（句柄置空防重入）；`atomic_load/store/add/inc(&var)`（32/64 位整数，add 返回旧值，inc 为 void 语句级）；`mutex_new/lock/unlock`；`chan<T>`（T 限 ≤64 位标量/string）`chan_send/chan_recv(产 T!，?? 解包)/chan_close/chan_len`；`sleep(ms)`。仅支持 Windows。
+- **关键设计**：thread$/mutex$/chan$ 均为单 ptr 句柄 struct（map 同款）；**chan/mutex 声明即构造**（不做惰性 null 起步——句柄被闭包按值捕获后，声明点再初始化会与捕获副本错开对象 → 死锁，这是本轮最重要的设计约束）；句柄可被闭包捕获（cap_ty_ok 已放行），跨线程传值自然成立。
+- **runtime**：_beginthreadex/WaitForSingleObject；CRITICAL_SECTION；Interlocked 家族；channel = CS+CONDVAR 无界链表队列，recv 阻塞至有值或 closed 且排空（产 NOT_FOUND，与 map 缺键同款）；string send 深拷贝、recv 所有权移交。
+- **本轮修的坑（复用价值）**：①void 尾表达式转 SReturnK 会发射非法 IR `ret void 0`——check_lambda LExpr 与 wrap_fn_as_clo 两处都改为 void 保留 SExprK（v3.7 只测了带返回值 lambda，void lambda 首次覆盖）；②chan 类型实参注册时 gtargs 被 ensure 句柄 struct 覆盖成 []（幂等注册须不覆盖已有 gtargs）；③atomic_add 返回值语句级丢弃触发 E3189——加 atomic_inc void 变体。
+- **验证**：examples/thread_test.zfy 9 断言全绿（双线程 2 万次原子竞争精确、fetch_add 旧值、channel 阻塞接收/close 语义、mutex、块形式 lambda 线程体）；并发运行 3 次输出一致；回归 PASS=66 / FAIL=5（同 v3.7 的 stdin/时间戳环境性）/ SKIP=3。
+- **文档**：grammar.md 升 v3.8.0 加 §21；language_gaps.md 标注 P0 全清。
+- 待办候选（下轮）：P1 从高影响下手——switch/match、enum/和类型、字符串 format/插值；并发 v2（线程池、有界 channel、容器线程安全版）。
+
+<!-- 无需你侧操作；t-045/046 已阅，GUI 侧无待办 -->
+
+---
 id: w-041
 from: workbuddy
 to: trae

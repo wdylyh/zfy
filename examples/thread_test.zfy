@@ -1,0 +1,51 @@
+// zfy 并发测试（v3.8.0）：线程 spawn/join、原子操作、channel、互斥锁
+// 共享数据约定 v1：全局变量 + 原子内建（容器等非线程安全对象须外部加锁）
+
+let i64 counter = 0
+
+// 顶层函数作线程体（spawn 收函数名：自动包装为空捕获闭包）
+fn void bump_many()
+  for let i32 i = 0, i < 10000, i++
+    atomic_inc(&counter)
+
+fn main()
+  // 1. 双线程竞争原子自增：join 后结果确定（无数据竞争）
+  let t1 = spawn(bump_many)
+  let t2 = spawn(bump_many)
+  join(t1)
+  join(t2)
+  output(counter)
+
+  // 2. 原子读改写：store / fetch_add（返回旧值）/ load
+  atomic_store(&counter, 100)
+  let old = atomic_add(&counter, 42)
+  output(old)
+  output(atomic_load(&counter))
+
+  // 3. channel 跨线程传值：recv 阻塞至有值（send 先行亦安全）
+  let chan<string> ch
+  let producer = spawn(fn() => chan_send(ch, "hello"))
+  output(chan_recv(ch) ?? "miss")
+  join(producer)
+
+  // 4. channel 长度 / 关闭语义：closed 且排空 = NOT_FOUND（?? 解包）
+  let t3 = spawn(fn() => chan_send(ch, "one"))
+  join(t3)
+  output(chan_len(ch))
+  output(chan_recv(ch) ?? "miss")
+  chan_close(ch)
+  output(chan_recv(ch) ?? "miss")
+
+  // 5. 互斥锁：临界区成对 lock/unlock（保护容器等非线程安全资源）
+  let m = mutex_new()
+  lock(m)
+  unlock(m)
+  output("mutex ok")
+
+  // 6. 块形式 lambda 线程体：sleep 后写入（时序由 join 保证）
+  let fn() -> void delayed = fn() -> void
+    sleep(10)
+    atomic_store(&counter, 7)
+  let t5 = spawn(delayed)
+  join(t5)
+  output(atomic_load(&counter))

@@ -1,0 +1,17 @@
+let i64 counter = 0
+
+fn void addmany()
+  for let i32 i = 0, i < 10000, i++
+    atomic_inc(&counter)
+
+fn main()
+  let t1 = spawn(addmany)
+  let t2 = spawn(addmany)
+  join(t1)
+  join(t2)
+  output(counter)
+  atomic_store(&counter, 5)
+  output(atomic_load(&counter))
+  let old = atomic_add(&counter, 10)
+  output(old)
+  output(counter)

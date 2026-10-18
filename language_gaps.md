@@ -1,6 +1,12 @@
 # zfy 语言功能差距分析（对照主流语言）
 
-> 2026-10-18 · 基线：v3.5.1（commit cdfde19）
+> **状态更新（2026-10-18，v3.8.0）**：P0 三项全部完成——
+> #1 容器 map/set（v3.6.0 容器轮）、#3 闭包/lambda（v3.7.0 函数式轮）、
+> #2 并发（v3.8.0 并发轮：spawn/join/atomic/mutex/chan<T>/sleep，见
+> grammar.md §21）。下文分析保留作历史依据，P0/P1 条目以各轮 changelog
+> 与 grammar.md 现行版为准。
+>
+> 2026-10-18 · 原始基线：v3.5.1（commit cdfde19）
 > 对照对象：C / C++ / Rust / Go / Java / Python / JavaScript / C#
 > 依据：grammar.md v3.4.0 全文 + examples/demos/bench 实测 + collab 历史轮记录
 > 定位：zfy 是"AOT 编译、值语义、无 GC、Windows 优先"的 LLVM 后端语言。

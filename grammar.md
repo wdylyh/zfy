@@ -1,6 +1,11 @@
-# zfy 语言规范（v3.7.0，2026-10-18）
+# zfy 语言规范（v3.8.0，2026-10-18）
 
 > 本版每一节都经过编译器实测校准（examples 全回归通过）。
+> 与 v3.7.0 的主要差异（v3.8.0 并发轮）：
+> **并发（§21）**——`spawn`/`join` 线程（收闭包/函数名）、原子内建
+> `atomic_load/store/add/inc`（32/64 位）、`mutex_new/lock/unlock`、
+> `chan<T>` 无界阻塞通道（send/recv/close/len，recv 产 `T!`）、`sleep`。
+>
 > 与 v3.6.0 的主要差异（v3.7.0 函数式轮）：
 > **闭包与 lambda（§20）**——lambda 表达式 `fn(x) => e` 与块形式
 > `fn(...) -> T`、默认值捕获 + `fn [&x]` 显式引用捕获、独立闭包类型
@@ -1118,3 +1123,62 @@ fn main()
 - lambda 参数必须显式类型；嵌套函数参数限标量；块形式必须显式 `-> T`。
 - 捕获类型限标量/string/bool/char/指针/闭包句柄。
 - 引用捕获逃逸、env 堆块回收见 20.3。
+
+## 21. 并发（v3.8.0）
+
+> 线程收闭包（v3.7 机制复用：env 堆块生命周期 = 进程，天然适配线程）；
+> 共享数据 v1 约定走全局变量 + 原子内建；容器（map/set/列表）非线程
+> 安全，跨线程共享须外部 mutex 保护。
+
+### 21.1 线程：spawn / join
+
+```zfy
+let t = spawn(fn() => output("hi"))   // 收 lambda
+let t2 = spawn(worker)                // 收裸函数名（自动包 wrapper）
+join(t)                               // 阻塞等待；句柄置空，重复 join 报错
+```
+
+- 线程体签名须 `fn() -> void`；spawn 返回线程句柄（`let t =` 推断）。
+- 闭包捕获照常：值捕获（声明点快照）安全；引用捕获逃逸为 UB（同 §20）。
+
+### 21.2 原子操作（32/64 位整数全局/局部变量）
+
+```zfy
+atomic_inc(&counter)                  // 自增（void，语句级）
+let old = atomic_add(&counter, 10)    // fetch_add：返回加前旧值
+atomic_store(&counter, 5)
+output(atomic_load(&counter))
+```
+
+- 实参 `&var` 取址；类型限 i32/u32/i64/u64（统一按位模式操作）。
+
+### 21.3 互斥锁
+
+```zfy
+let m = mutex_new()                   // 声明即构造（句柄捕获安全）
+lock(m)
+// ... 临界区 ...
+unlock(m)
+```
+
+### 21.4 channel：chan<T> 无界阻塞通道
+
+```zfy
+let chan<i32> ch                      // 声明即构造（见上）
+chan_send(ch, 42)                     // 无界队列，不阻塞；closed 后发送报错
+let v = chan_recv(ch) ?? -1           // 阻塞接收；产 T!（closed 且排空 =
+chan_close(ch)                        //   NOT_FOUND），须 ?? 解包
+output(chan_len(ch))                  // 当前排队数
+```
+
+- 元素类型限 ≤64 位标量/string（同 map 值）；string 深拷贝、所有权随
+  队列转移。
+- 句柄（thread/mutex/chan）可被闭包值捕获——声明即构造保证捕获副本
+  与原句柄指向同一对象（v3.8 设计要点）。
+- **仅支持 Windows**（非 Windows 平台调用即终止）。
+
+### 21.5 其他
+
+- `sleep(ms)`：休眠指定毫秒。
+- 已知限制 v1：join 后句柄置空；mutex/chan 不回收（生命周期 = 进程）；
+  output 多线程交错不保证；无逃逸分析（引用捕获跨线程逃逸 = UB）。
