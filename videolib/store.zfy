@@ -1,0 +1,81 @@
+// videolib/store.zfy —— 持久化：videolib.txt，每行一条
+// 格式（TAB 分隔）：title \t path \t tags \t rating \t plays \t added
+// title/path/tags 内不允许出现换行与 TAB（写入前不做转义，v1 约定）
+
+mod model;
+use model::{Video, lib_add}
+
+// 数据库文件名（顶层 const 仅支持整数，string 直接内联）
+// 从磁盘加载，文件不存在返回空列表（不算错误）
+pub fn Video[] load()
+    let Video[] lib
+    let bool ok = exists("videolib.txt")
+    if not ok
+        return lib
+    let string! data = read_file("videolib.txt")
+    let string text = data ?? ""
+    let i32 n = length(text)
+    let i32 pos = 0
+    while pos < n
+        // 找行尾
+        let i32 eol = pos
+        while eol < n
+            if text[eol] == '\n'
+                break
+            eol++
+        // 去 \r
+        let i32 last = eol
+        if last > pos
+            if text[last - 1] == '\r'
+                last--
+        if last > pos
+            let Video v = parse_line(text[pos, last - 1])
+            lib_add(ref lib, v)
+        pos = eol + 1
+    return lib
+
+// 解析一行（无校验，坏行给零值条目）
+fn Video parse_line(let string line)
+    let Video v = Video()
+    // 逐字段按 TAB 切
+    let i32 n = length(line)
+    let i32 f = 0
+    let i32 pos = 0
+    while f < 6
+        let i32 eol = pos
+        while eol < n
+            if line[eol] == '\t'
+                break
+            eol++
+        let string field = ""
+        if eol > pos
+            field = line[pos, eol - 1]
+        if f == 0
+            v.title = field
+        if f == 1
+            v.path = field
+        if f == 2
+            v.tags = field
+        if f == 3
+            v.rating = cast(field, i32) ?? 0
+        if f == 4
+            v.plays = cast(field, i64) ?? 0
+        if f == 5
+            v.added = cast(field, i64) ?? 0
+        pos = eol + 1
+        f++
+    return v
+
+// 全量写回。返回 true = 成功
+pub fn bool save(ref let Video[] lib)
+    let string out = ""
+    let i32 i = 0
+    let i32 n = length(lib)
+    while i < n
+        let Video v = lib[i]
+        out = out + v.title + "\t" + v.path + "\t" + v.tags + "\t" + cast(v.rating, string) + "\t" + cast(v.plays, string) + "\t" + cast(v.added, string) + "\n"
+        i++
+    let i64! w = write_file("videolib.txt", out)
+    if (w ?? -1) < 0
+        return false
+    return true

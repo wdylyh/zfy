@@ -1,0 +1,27 @@
+// digit_hist.zfy — 读入一行文本，统计 0-9 每个数字出现次数，打印直方图
+fn main()
+    let string line = ""
+    input(line)
+    let i32 n = cast(length(line), i32)
+    let i32[] cnt = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    let i32 i = 0
+    while i < n
+        let char c = line[i]
+        if c >= '0' and c <= '9'
+            let i32 d = ord(c) - ord('0')
+            cnt[d] = cnt[d] + 1
+        i++
+    // 输出统计与直方图
+    let i32 d = 0
+    while d < 10
+        output(d)
+        output(": ")
+        output(cnt[d])
+        output(" | ")
+        let i32 k = 0
+        while k < cnt[d]
+            output("#")
+            k++
+        output("\n")
+        d++
+    return 0

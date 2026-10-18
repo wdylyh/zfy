@@ -1,0 +1,17 @@
+fn void helper(let i32 v)
+    output("v=", v, end='\n')
+
+fn i32 getv()
+    return 42
+
+fn main()
+    let i32 z = zzz + 1
+    if z > 0
+        output("pos", end='\n')
+    z = z + 1
+    helper(z)
+    let i64 big = z * 100
+    let i32 arr[2]
+    arr[0] = z
+    output("still running", end='\n')
+    return 0

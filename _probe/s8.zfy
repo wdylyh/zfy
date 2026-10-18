@@ -1,0 +1,20 @@
+// 探针8：new.md bug 报告最小复现（自动 move 循环误判）
+// 修复前：内层循环第二轮 r 已是 null → 崩溃
+fn i32[] f(let i32[] a)
+    let i32[] out
+    out = push(out, cast(length(a), i32))
+    return out
+
+fn main()
+    let i32 i = 0
+    while i < 3
+        let i32[] r
+        r = push(r, i)
+        let i32 j = 0
+        while j < 2
+            let i32[] t = f(r)
+            if length(t) != 1
+                return 1
+            j++
+        i++
+    output("loop move ok\n")

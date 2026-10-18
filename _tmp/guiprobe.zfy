@@ -1,0 +1,32 @@
+// place_cursor 探针：验证像素定位产生的 cx 是否码点对齐
+mod gui;
+mod widgets;
+use gui::{gui_open, gui_close, gui_frame_sleep}
+use widgets::{TextArea}
+
+fn string hex_of(let string s)
+    let string out = ""
+    let string h = "0123456789abcdef"
+    let i32 i = 0
+    while i < length(s)
+        let i32 b = ord(s[i])
+        if b < 0
+            b = b + 256
+        out = out + h[b / 16] + h[b - (b / 16) * 16] + " "
+        i++
+    return out
+
+fn main()
+    let TextArea ta = TextArea(x=100, y=100, w=400, h=200)
+    ta.set_text("（未选中）")
+    if gui_open(800, 600, "probe") != 0
+        return 1
+    gui_frame_sleep(0)
+    // 点击文本中部（"中"字中间，约 target=53px）与行尾之后（target=500）
+    ta.place_cursor(159, 130)
+    let string r1 = "mid click(159): cx=" + cast(ta.cx, string) + " hex: " + hex_of(ta.lines[0]) + "\n"
+    ta.place_cursor(600, 130)
+    let string r2 = "end click(600): cx=" + cast(ta.cx, string) + " hex: " + hex_of(ta.lines[0]) + "\n"
+    let i64! _w = write_file("d:\\zfy\\_tmp\\ta_dbg.txt", r1 + r2)
+    gui_close()
+    return 0

@@ -1,0 +1,4 @@
+fn main()
+  let i32[] xs = 3, 1, 4
+  let i32[] ev = filter(xs, fn(i32 v) => v > 1)
+  output(ev, sep=" ")

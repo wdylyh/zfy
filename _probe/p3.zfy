@@ -1,0 +1,20 @@
+// 现状探针：四项需求的当前行为
+fn main()
+    let string s = "hello"
+    let char c = 'x'
+    // 1. length 返回类型现状
+    let i32 n1 = length(s)
+    // 2. char 用 < 比较
+    let char a = 'a'
+    let char b = 'b'
+    if a < b
+        output("a<b ok", end='\n')
+    // 3. string + char 拼接
+    let string s2 = s + c
+    output(s2, end='\n')
+    // 4. cast char->string
+    let string s3 = cast(c, string)
+    output(s3, end='\n')
+    // 5. length 用于 i64 上下文
+    let i64 n2 = length(s)
+    output("len=", n2, end='\n')

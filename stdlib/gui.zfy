@@ -75,6 +75,11 @@ extern "C"
     void zfy_gui_select(let i64 id)
     // 当前窗口图标（.ico 等文件路径；失败静默）
     void zfy_gui_set_icon(let string path)
+    // UI 打磨原语（v3.4.x）：字号/圆角/线条/渐变
+    void zfy_gui_font(let i32 px, let i32 bold)
+    void zfy_gui_round_rect(let i32 x, let i32 y, let i32 w, let i32 h, let i32 r, let u32 fill, let u32 border)
+    void zfy_gui_line(let i32 x0, let i32 y0, let i32 x1, let i32 y1, let u32 rgb)
+    void zfy_gui_fill_grad(let i32 x, let i32 y, let i32 w, let i32 h, let u32 c1, let u32 c2, let i32 vertical)
 
 // ===== 包装（zfy 侧友好形态） =====
 
@@ -100,6 +105,7 @@ pub fn i32 gui_dpi()
 // EV_KEY 的 k 值分区：0..0x10FFFF 为 WM_CHAR 码元；扩展键/Ctrl 组合键加前缀
 pub let i64 const KEY_EXT  = 0x10000000      // | VK：LEFT 0x25 RIGHT 0x27 UP 0x26 DOWN 0x28 DEL 0x2E HOME 0x24 END 0x23
 pub let i64 const KEY_CTRL = 0x20000000      // | 'C' 'V' 'A' 'X'
+pub let i64 const KEY_SHIFT = 0x40000000     // 与 KEY_EXT 叠加：Shift+导航键（扩选）
 
 // 读剪贴板为 UTF-8（内部按倍增造缓冲；失败返回 ""）
 pub fn string gui_clip_get()
@@ -154,6 +160,24 @@ pub fn void gui_draw_text(let i32 x, let i32 y, let string s, let u32 rgb)
 
 pub fn i32 gui_text_w(let string s)
     return zfy_gui_text_w(s)
+
+// ===== UI 打磨原语包装（v3.4.x） =====
+
+// 设置当前字体：px 逻辑像素（内部 ×DPI），bold 非 0 加粗；影响后续文字绘制
+pub fn void gui_font(let i32 px, let i32 bold)
+    zfy_gui_font(px, bold)
+
+// 圆角矩形：fill=0 只描边，border=0 只填充（r 为圆角半径，逻辑值须自行 ×SC）
+pub fn void gui_round_rect(let i32 x, let i32 y, let i32 w, let i32 h, let i32 r, let u32 fill, let u32 border)
+    zfy_gui_round_rect(x, y, w, h, r, fill, border)
+
+// 1px 线段
+pub fn void gui_line(let i32 x0, let i32 y0, let i32 x1, let i32 y1, let u32 rgb)
+    zfy_gui_line(x0, y0, x1, y1, rgb)
+
+// 渐变矩形：c1→c2 线性插值，vertical 非 0 纵向
+pub fn void gui_fill_grad(let i32 x, let i32 y, let i32 w, let i32 h, let u32 c1, let u32 c2, let i32 vertical)
+    zfy_gui_fill_grad(x, y, w, h, c1, c2, vertical)
 
 // 取一事件；true = e 已填充
 pub fn bool gui_poll(ref let Event e)

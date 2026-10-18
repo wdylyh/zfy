@@ -59,6 +59,12 @@ let expect_ident p what =
   | Ident s -> ignore (next p); s
   | _ -> err tp (Printf.sprintf "expected %s (identifier), got %s" what (pp_token tk))
 
+let expect_ident_pos p what =
+  let (tk, tp) = peek p in
+  match tk with
+  | Ident s -> ignore (next p); (s, tp)
+  | _ -> err tp (Printf.sprintf "expected %s (identifier), got %s" what (pp_token tk))
+
 let expect_kw p k what =
   let (tk, tp) = peek p in
   match tk with
@@ -236,6 +242,27 @@ let rec parse_ty ?(allow_fun = false) p =
        conv_ty 侧把 TNamed "frac" 解为 TFrac (TInt 32) *)
     ignore (next p);
     TNamed ("frac", tp)
+  | Keyword KFn ->
+    (* 闭包类型（v3.7 函数式轮）：fn(T1, T2) -> R——与函数指针类型
+       T(params)（无 fn 前缀，仅 type 别名处）并存；闭包值 = {code, env} *)
+    ignore (next p);
+    expect p LParen "(";
+    let ptys =
+      let rec go acc =
+        match peek p with
+        | (RParen, _) -> ignore (next p); List.rev acc
+        | _ ->
+          let t = parse_ty p in
+          (match peek p with
+           | (Comma, _) -> ignore (next p); go (t :: acc)
+           | (RParen, _) -> ignore (next p); List.rev (t :: acc)
+           | (_, tp') -> err tp' "expected ',' or ')' to end the closure parameter type list")
+      in
+      go []
+    in
+    expect p ThinArrow "->";
+    let ret = parse_ty p in
+    TClo (ptys, ret, tp)
   | Keyword (KArray | KList) ->
     err tp "'array'/'list' keywords removed: arrays are written T a[N], lists T a[]"
   | Star ->
@@ -664,6 +691,10 @@ and parse_primary p =
     let b = parse_expr p in
     expect p RParen ")";
     ERemove (a, b, tp)
+  | Keyword KFn ->
+    (* lambda（v3.7 函数式轮），解析体见 parse_lambda_after_fn *)
+    ignore (next p);
+    parse_lambda_after_fn p tp
   | Ident s ->
     ignore (next p);
     let s = qpath_extend p s in    (* 模块路径引用 m::f / m::Point(...) *)
@@ -747,6 +778,9 @@ and parse_modifiers p =
 and parse_let_head p =
   let ty_opt =
     match peek p with
+    | (Keyword KFn, _) when (match peek2 p with (LParen, _) -> true | _ -> false) ->
+      (* 闭包类型变量（v3.7）：let fn(T...) -> R 名 = ... *)
+      Some (parse_ty p)
     | (Ident s, _) when List.mem s p.tynames -> Some (parse_ty ~allow_fun:true p)
     (* 跨文件类型名（模块导入的 struct/type 别名）：Ident 后紧跟 Ident
        只能是"类型 名字"形状（无类型推断形式名字后必须是 = 或修饰符） *)
@@ -1030,6 +1064,18 @@ and parse_stmt p =
     ignore (next p);
     let b = parse_block p in
     SUnsafe (b, tp)
+  | Keyword KFn ->
+    (* 语句位置 fn（v3.7）：`fn 类型? 名(...)` = 嵌套函数定义；
+       `fn (` / `fn [` / `fn =>` = lambda 表达式（落表达式语句）。
+       先消费 KFn 再按后续形状分派 *)
+    ignore (next p);
+    (match peek p, peek2 p with
+     | (Ident _, _), (Ident _, _) -> parse_nested_fn p tp
+     | (Ident _, _), ((LParen | LBracket | ThinArrow), _) -> parse_nested_fn p tp
+     | _ ->
+       let e = parse_lambda_after_fn p tp in
+       end_of_stmt p;
+       SExpr e)
   | Keyword KReduce ->
     ignore (next p);
     expect p LParen "(";
@@ -1043,6 +1089,126 @@ and parse_stmt p =
     SReduce (a, b, c, tp)
   | Semicolon -> skip_trivia p; parse_stmt p
   | _ -> parse_expr_stmt p
+
+(* 嵌套函数定义（v3.7 函数式轮）：fn 返回类型 (frac)? (unred)? 名(参数) 块——
+   按命名 lambda 处理（隐式值捕获所在函数局部变量）；无泛型参数、无 main 特例 *)
+and parse_lambda_after_fn p tp =
+  (* KFn 已消费。lambda（v3.7 函数式轮）：
+     fn [caps] (params) => expr   简写（返回类型由表达式推断）
+     fn [caps] (params) -> T      换行 + 缩进块（块形式，体内 return）；
+     捕获列表可省 = 体内自由变量默认值捕获，[&x, y] 显式逐变量指定 *)
+  let caps =
+    match peek p with
+    | (LBracket, _) ->
+      ignore (next p);
+      let rec go acc =
+        let is_ref =
+          match peek p with
+          | (Amp, _) -> ignore (next p); true
+          | _ -> false
+        in
+        let n = expect_ident p "capture name" in
+        let acc = (is_ref, n, tp) :: acc in
+        match peek p with
+        | (Comma, _) -> ignore (next p); go acc
+        | (RBracket, _) -> ignore (next p); List.rev acc
+        | (_, ep) -> err ep "expected ',' or ']' to end the capture list"
+      in
+      go []
+    | _ -> []
+  in
+  expect p LParen "(";
+  let lparams =
+    let rec go acc =
+      match peek p with
+      | (RParen, _) -> ignore (next p); List.rev acc
+      | _ ->
+        (* 两种形状：名（推断类型）/ 类型 名（显式） *)
+        let (n0, np0) = expect_ident_pos p "lambda parameter" in
+        let lp =
+          match peek p with
+          | (Ident n1, _) ->
+            ignore (next p);
+            { lpname = n1; lpty = Some (TNamed (n0, np0)); lppos = np0 }
+          | _ -> { lpname = n0; lpty = None; lppos = np0 }
+        in
+        (match peek p with
+         | (Comma, _) -> ignore (next p); go (lp :: acc)
+         | (RParen, _) -> ignore (next p); List.rev (lp :: acc)
+         | (_, tp') -> err tp' "expected ',' or ')' to end the lambda parameter list")
+    in
+    go []
+  in
+  (match peek p with
+   | (FatArrow, _) ->
+     ignore (next p);
+     let e = parse_expr p in
+     ELambda ({ lparams; lcaps = caps; lbody = LExpr e }, tp)
+   | (ThinArrow, _) ->
+     ignore (next p);
+     let ret = parse_ty p in
+     (* 块形式：-> T 后换行 + 缩进块（与 ?? 块形式同机制） *)
+     (match peek p with
+      | (Newline, _) ->
+        ignore (next p);
+        let blk = parse_block p in
+        ELambda ({ lparams; lcaps = caps; lbody = LBlock (blk, Some ret) }, tp)
+      | (_, bp) ->
+        err bp "lambda block body requires a newline and an indented block (or use '=>' for a single expression)")
+   | (_, ap) ->
+     err ap "expected '=>' or '->' after lambda parameters")
+
+and parse_nested_fn p tp =
+  let ty_opt =
+    match peek p with
+    | (Ident s, _) when List.mem s p.tynames -> Some (parse_ty p)
+    | (Ident _, _) ->
+      (match peek2 p with
+       | (Ident _, _) -> Some (parse_ty p)
+       | (LBracket, _) | (Star, _) | (Bang, _) | (Lt, _) -> Some (parse_ty p)
+       | _ -> None)
+    | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty p)
+    | _ -> None
+  in
+  let is_frac =
+    match peek p with
+    | (Keyword KFrac, _) -> ignore (next p); true
+    | _ -> false
+  in
+  let is_unred =
+    match peek p with
+    | (Keyword KUnreduced, _) -> ignore (next p); true
+    | _ -> false
+  in
+  let name = expect_ident p "function name" in
+  expect p LParen "(";
+  let params =
+    let rec go acc =
+      match peek p with
+      | (RParen, _) -> ignore (next p); List.rev acc
+      | _ ->
+        (* 参数形状：let (类型)? 名——与顶层 fn 参数一致；
+           类型可省（须 frac）但嵌套 fn 限标量参数，此处要求显式类型 *)
+        (match peek p with
+         | (Keyword KLet, _) -> ignore (next p)
+         | _ -> ());
+        let (n0, np0) = expect_ident_pos p "parameter type" in
+        let (pn, pp) = expect_ident_pos p "parameter name" in
+        let lp = { lpname = pn; lpty = Some (TNamed (n0, np0)); lppos = pp } in
+        (match peek p with
+         | (Comma, _) -> ignore (next p); go (lp :: acc)
+         | (RParen, _) -> ignore (next p); List.rev (lp :: acc)
+         | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
+    in
+    go []
+  in
+  let body = parse_block p in
+  let ret =
+    match ty_opt with
+    | Some ty -> Some ty
+    | None -> err tp "nested function declaration requires a return type (or use void)"
+  in
+  SFn (name, params, ret, is_frac || is_unred, body, tp)
 
 (* 表达式语句 / 赋值 / 复合赋值 / 自增自减 *)
 and parse_expr_stmt p =

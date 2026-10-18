@@ -72,6 +72,13 @@ and texpr_kind =
     (* 函数指针调用 f(args)：被调指针表达式 + 实参（f.ety = TPtr TFunSig） *)
   | EFunPtrK of string
     (* 函数名作为值（取函数入口地址）：ety = TPtr (TFunSig ...) *)
+  | EClNewK of string * string * texpr list
+    (* 闭包构造（v3.7）：(closure\$sig mangle, clenv\$N, 堆块内容列表)——
+       首元素为 code 函数指针，其余为捕获值；llvmgen 生成堆块（h 指向
+       堆块，code 为堆块头部字段）；h 存入闭包句柄 struct *)
+  | EClCallK of texpr * texpr list
+    (* 闭包调用（v3.7）：cb(args) 即 call code(env=堆块地址, args)——
+       h 为 cb 的句柄字段，code 为堆块头部指针 *)
   | EFailK of texpr * texpr         (* fail(code, msg)：ety = TErr 元素类型（TVar 由上下文求解） *)
   | EPanicK of texpr option * texpr (* panic(code?, msg)：不可恢复终止（ety = TVoid） *)
   | EUnwrapK of texpr * texpr       (* a ?? b：a 为 TErr t，b 为 t，结果 t（短路） *)

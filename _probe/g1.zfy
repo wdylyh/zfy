@@ -1,0 +1,16 @@
+// _probe/g1.zfy —— 原语探针：三个 52x44 矩形，间距 6
+mod gui;
+use gui::{gui_open, gui_alive, gui_fill_rect, gui_draw_text, gui_present}
+
+fn main()
+    if gui_open(258, 300, "probe") != 0
+        return 1
+    gui_fill_rect(0, 0, 258, 300, 0x1E1E24)
+    while gui_alive()
+        gui_fill_rect(16, 88, 52, 44, 0xE05050)
+        gui_fill_rect(74, 88, 52, 44, 0x50E050)
+        gui_fill_rect(132, 88, 52, 44, 0x5060E0)
+        gui_draw_text(16, 150, "0123456789", 0xFFFFFF)
+        gui_present()
+        sleep_ms(16)
+    return 0

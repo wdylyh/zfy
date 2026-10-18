@@ -1,0 +1,33 @@
+fn main()
+    // 1) no-capture lambda + closure variable
+    let fn(i32) -> i32 dbl = fn(i32 x) => x * 2
+    output(dbl(21))  //                       // 42
+
+    // 2) value capture
+    let i32 base = 100
+    let fn(i32) -> i32 addb = fn(i32 x) => x + base
+    output(addb(5))  //                       // 105
+    let i32 base2 = base
+    output(base2)  //                         // 100
+
+    // 3) container builtins + lambda predicates
+    let i32[] xs = 3, 1, 4, 1, 5
+    let i32[] big = filter(xs, fn(i32 v) => v > 2)
+    output(big, sep=" ")  //                  // 3 4 5
+    output(any(xs, fn(i32 v) => v > 4))  // true
+    output(all(xs, fn(i32 v) => v > 0))  // true
+
+    // 4) sort_by + lambda comparator (descending)
+    let i32[] desc = sort_by(xs, fn(i32 a, i32 b) => b - a)
+    output(desc, sep=" ")  //                 // 5 4 3 1 1
+
+    // 5) fold (sum)
+    let i32 total = fold(xs, fn(i32 acc, i32 v) => acc + v, 0)
+    output(total)  //                         // 14
+
+    // 6) map (double)
+    let i32[] dd = map(xs, fn(i32 v) => v * 2)
+    output(dd, sep=" ")  //                   // 6 2 8 2 10
+
+fn bool is_even(let i32 v)
+    return v % 2 == 0

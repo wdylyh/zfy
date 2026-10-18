@@ -1,0 +1,107 @@
+// videolib/model.zfy —— 数据模型：Video 条目 + 库操作（纯逻辑，无 GUI）
+// 深拷贝值语义：Video 含 string 字段，按值传递会整体克隆，注意成本
+
+pub struct Video
+    string title
+    string path
+    string tags        // 逗号分隔
+    i32 rating         // 0..5
+    i64 plays
+    i64 added          // Unix 秒
+
+// 库容器：Video 列表 + 视图选中下标（视图下标由 ui 层维护）
+// 全部函数以 ref 接收列表，原地修改调用方数据
+
+pub fn i32 lib_count(ref let Video[] lib)
+    return length(lib)
+
+// 追加一条
+pub fn void lib_add(ref let Video[] lib, let Video v)
+    lib = push(lib, v)
+
+// 删除下标 i（越界忽略）
+pub fn void lib_remove_at(ref let Video[] lib, let i32 i)
+    let i32 n = length(lib)
+    if i >= 0 and i < n
+        let Video _gone = remove(lib, i)
+
+// 星级加减，钳制 0..5
+pub fn void lib_rate(ref let Video[] lib, let i32 i, let i32 d)
+    if i >= 0 and i < length(lib)
+        let i32 r = lib[i].rating + d
+        if r < 0
+            r = 0
+        if r > 5
+            r = 5
+        lib[i].rating = r
+
+// 播放计数 +1
+pub fn void lib_play(ref let Video[] lib, let i32 i)
+    if i >= 0 and i < length(lib)
+        lib[i].plays = lib[i].plays + 1
+
+// 排序（原地插入排序）：mode 0=添加时间新在前 1=播放多在前 2=评分高在前 3=标题升序
+pub fn void lib_sort(ref let Video[] lib, let i32 mode)
+    let i32 n = length(lib)
+    let i32 i = 1
+    while i < n
+        let Video key = lib[i]
+        let i32 j = i - 1
+        let bool cont = true
+        while j >= 0 and cont
+            // 返回 true 表示 lib[j] 应排在 key 之后（需后移）
+            let bool gt = false
+            if mode == 1
+                gt = lib[j].plays < key.plays
+            else
+                if mode == 2
+                    gt = lib[j].rating < key.rating
+                else
+                    if mode == 3
+                        gt = lib[j].title > key.title
+                    else
+                        gt = lib[j].added < key.added
+            if gt
+                lib[j + 1] = lib[j]
+                j--
+            else
+                cont = false
+        lib[j + 1] = key
+        i++
+
+// 子串匹配（大小写不敏感不做——保持简单；find 返回 i32!）
+pub fn bool lib_match(let Video v, let string q)
+    if q == ""
+        return true
+    let i32! p1 = find(v.title, q)
+    let i32! p2 = find(v.tags, q)
+    let i32! p3 = find(v.path, q)
+    if (p1 ?? -1) >= 0
+        return true
+    if (p2 ?? -1) >= 0
+        return true
+    if (p3 ?? -1) >= 0
+        return true
+    return false
+
+// 星星字符串：★★★☆☆
+fn string stars(let i32 r)
+    let string s = ""
+    let i32 i = 0
+    while i < 5
+        if i < r
+            s = s + "★"
+        else
+            s = s + "☆"
+        i++
+    return s
+
+// 列表行显示文本
+pub fn string video_row(let Video v)
+    return stars(v.rating) + " " + v.title + "  [" + v.tags + "]"
+
+// 详情文本
+pub fn string video_detail(let Video v)
+    let datetime t = localtime(v.added)
+    let string ds = cast(t.year, string) + "-" + cast(t.month, string) + "-" + cast(t.day, string)
+    return v.title + "\n" + v.path + "\n标签: " + v.tags + "\n" + stars(v.rating) + "  播放 " + cast(v.plays, string) + " 次  添加 " + ds

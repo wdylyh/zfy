@@ -1,0 +1,53 @@
+// 128 位幂探针：边界全覆盖
+fn main()
+    // 基础：2^3
+    let u128 b = 2
+    let u128 e3 = 3
+    let u128 r1 = b ** e3
+    output("2^3=", r1, end='\n')
+    // 锚点 3^39 = 4052555153018976267（u128 精确）
+    let u128 t = 3
+    let u128 e39 = 39
+    let u128 r2 = t ** e39
+    output("3^39=", r2, end='\n')
+    // 回绕：2^128 = 0（模 2^128）
+    let u128 e128 = 128
+    let u128 r3 = b ** e128
+    output("2^128=", r3, end='\n')
+    // 大指数：2^(2^64) mod 2^128 = 0（走指数 64 位对高位路径）
+    let u128 eb = 18446744073709551616
+    let u128 r4 = b ** eb
+    output("2^2^64=", r4, end='\n')
+    // 0^0 = 1（与 64 位语义一致）
+    let u128 z = 0
+    let u128 ez = 0
+    let u128 r5 = z ** ez
+    output("0^0=", r5, end='\n')
+    // 1 的大幂 = 1
+    let u128 one = 1
+    let u128 r6 = one ** eb
+    output("1^big=", r6, end='\n')
+    // 有符号：负底数
+    let i128 nb = -3
+    let i128 e2 = 2
+    let i128 s1 = nb ** e2
+    output("(-3)^2=", s1, end='\n')
+    let i128 e3s = 3
+    let i128 s2 = nb ** e3s
+    output("(-3)^3=", s2, end='\n')
+    // 负指数 → 0
+    let i128 ne = -1
+    let i128 s3 = nb ** ne
+    output("(-3)^-1=", s3, end='\n')
+    // 跨宽度提升：u64 底 ** i32 指
+    let u64 ub = 5
+    let i32 se = 3
+    let u128 r7 = ub ** se
+    output("5u64^3i32=", r7, end='\n')
+    // 嵌套幂（右结合）：2^(3^2) = 512
+    let u128 e2u = 2
+    let u128 r8 = b ** e3 ** e2u
+    output("2^3^2=", r8, end='\n')
+    // 混合字面量树：b ** (2 + 1) = 8
+    let u128 r9 = b ** (2 + 1)
+    output("2^(2+1)=", r9, end='\n')

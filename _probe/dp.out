@@ -1,0 +1,2 @@
+open rc=0 w=960 h=660 dpi=144
+loop end: alive=true frames=300

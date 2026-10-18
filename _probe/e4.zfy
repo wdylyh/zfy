@@ -1,0 +1,14 @@
+struct Msg
+    string message
+    i32 code
+
+fn i32 lengthx()
+    return 1
+
+fn main()
+    let Msg m
+    m.mesage = "hi"
+    let i32 n = lengthx() + 1
+    let i32 k = lenth(m.message)
+    let string s = m.message
+    output("n=", n, end='\n')

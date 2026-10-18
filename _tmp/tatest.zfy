@@ -1,0 +1,39 @@
+// 复现 TextArea 插入中文：cx=15 行尾 与 cx=12 行内 两种
+mod widgets;
+use widgets::{TextArea}
+
+fn string hex_of(let string s)
+    let string out = ""
+    let string h = "0123456789abcdef"
+    let i32 i = 0
+    while i < length(s)
+        let i32 b = ord(s[i])
+        if b < 0
+            b = b + 256
+        out = out + h[b / 16] + h[b - (b / 16) * 16] + " "
+        i++
+    return out
+
+fn main()
+    // 用例1：cx=15（行尾）
+    let TextArea ta = TextArea()
+    ta.set_text("（未选中）")
+    ta.cx = 15
+    ta.cy = 0
+    let bool _a = ta.handle_key(0xE4)
+    let bool _b = ta.handle_key(0xB8)
+    let bool _c = ta.handle_key(0xAD)
+    let bool _d = ta.handle_key(97)
+    output("tail  cx=" + cast(ta.cx, string) + " len=" + cast(length(ta.lines[0]), string) + " hex: " + hex_of(ta.lines[0]))
+
+    // 用例2：cx=12（"）"之前）
+    let TextArea tb = TextArea()
+    tb.set_text("（未选中）")
+    tb.cx = 12
+    tb.cy = 0
+    let bool _e = tb.handle_key(0xE4)
+    let bool _f = tb.handle_key(0xB8)
+    let bool _g = tb.handle_key(0xAD)
+    let bool _h = tb.handle_key(97)
+    output("mid   cx=" + cast(tb.cx, string) + " len=" + cast(length(tb.lines[0]), string) + " hex: " + hex_of(tb.lines[0]))
+    return 0

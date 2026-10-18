@@ -1,0 +1,3 @@
+fn main()
+  let add = fn(i32 a, i32 b) => a + b
+  output(add(1, 2))

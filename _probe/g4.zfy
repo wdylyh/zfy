@@ -1,0 +1,25 @@
+// _probe/g4.zfy —— 原语隔离：fill_rect vs gui_rect
+mod gui;
+use gui::{gui_open, gui_alive, gui_poll, gui_fill_rect, gui_rect, gui_draw_text, gui_present, gui_dpi, Event}
+
+fn main()
+    if gui_open(400, 200, "probe4") != 0
+        return 1
+    let Event e = Event()
+    while gui_alive()
+        while gui_poll(ref e)
+            nop()
+        gui_fill_rect(0, 0, 400, 200, 0x1E1E24)
+        // 1) 纯 fill_rect 实心块
+        gui_fill_rect(16, 60, 52, 44, 0xE05050)
+        // 2) gui_rect 描边框
+        gui_rect(100, 60, 52, 44, 0x50E050)
+        // 3) gui_rect 描边框（第二个，验证一致性）
+        gui_rect(184, 60, 52, 44, 0x5060E0)
+        gui_draw_text(16, 30, "dpi=" + cast(gui_dpi(), string), 0xFFFFFF)
+        gui_present()
+        sleep_ms(16)
+    return 0
+
+fn void nop()
+    return

@@ -1,0 +1,15 @@
+// 探针7：const 折叠 / f16 f128 inf / -0.0
+fn main()
+    let i32 const n = 2 ** 4
+    let i32 a[n]
+    a[0] = |n| - 16
+    output(n, "\n")           // 16
+    output(a[0], "\n")        // 0（|16|-16）
+    let f128 q = 1e400
+    output("q=", cast(q, f64), "\n")
+    let f16 hh = 1e5
+    output("hh=", cast(hh, f64), "\n")
+    let f64 nz = -0.0
+    output("nz=", nz, "\n")
+    let i32 const m = |3 - 7|
+    output(m, "\n")           // 4

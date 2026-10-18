@@ -1,0 +1,2 @@
+fn main()
+  output((fn(i32 x) => x + 1)(41))

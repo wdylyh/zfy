@@ -1,0 +1,7 @@
+mod p14;
+use p14::{Inner2, Bag2}
+fn main()
+    let Bag2 b = Bag2()
+    let Inner2 it = Inner2(v=42)
+    b.items = push(b.items, it)
+    output("v =", b.items[0].v)

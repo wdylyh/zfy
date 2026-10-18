@@ -1,0 +1,33 @@
+fn bool always(let string s)
+    return length(s) == 6
+
+fn i32 c1(let string s)
+    // while 条件只放一个调用
+    let i32 n = 0
+    while always(s)
+        n++
+        if n > 5
+            break
+    return n
+
+fn i32 c2(let string s)
+    // if 条件里连续两次调用
+    if always(s) and always(s)
+        return 1
+    return 0
+
+fn i32 c3(let string s)
+    // while 条件单调用 + and 字面量
+    let i32 n = 0
+    while always(s) and true
+        n++
+        if n > 5
+            break
+    return n
+
+fn main()
+    let string ln = "你好"
+    output("c1=", c1(ln))
+    output("c2=", c2(ln))
+    output("c3=", c3(ln))
+    return 0

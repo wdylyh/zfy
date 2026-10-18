@@ -1,0 +1,4 @@
+fn main()
+  let i32 counter = 0
+  let fn(i32) -> i32 bump = fn [&counter](i32 d) => counter + d
+  output(bump(3))

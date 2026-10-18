@@ -1,0 +1,24 @@
+// 字体探针 v3：全程只用一种字号，测试"无切换"时小字是否正常
+mod gui;
+mod widgets;
+use gui::{gui_open, gui_close, gui_fill_rect, gui_draw_text, gui_font, gui_frame_sleep, gui_poll, Event}
+
+fn main()
+    let Event ev = Event()
+    let i32 rc = gui_open(400, 160, "col")
+    if rc != 0
+        output("open failed rc=" + cast(rc, string))
+        return 1
+    let i32 f = 0
+    while f < 600
+        gui_fill_rect(0, 0, 400, 160, 0x202020)
+        gui_font(13, 0)
+        gui_draw_text(10, 10, "only 13px white", 0xFFFFFF)
+        gui_draw_text(10, 40, "13px again", 0xFFFFFF)
+        gui_draw_text(10, 70, "13px third", 0xFFFFFF)
+        let bool _p = gui_poll(ref ev)
+        let i64 t1 = tick_ms()
+        gui_frame_sleep(t1)
+        f++
+    gui_close()
+    return 0

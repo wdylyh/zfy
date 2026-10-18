@@ -1,0 +1,21 @@
+// _tmp/selprobe.zfy —— InputBox 拖选状态回显探针
+mod gui;
+mod widgets;
+use widgets::{App, InputBox, Label}
+use gui::gui_frame_sleep
+
+fn main()
+    let App app = App()
+    if app.open(600, 200, "selprobe") != 0
+        return 1
+    let InputBox ib = InputBox(x=20, y=20, w=400, text="", focus=true)
+    let i32 ii = app.add_input(ib)
+    let Label st = Label(x=20, y=100, text="", fs=14, bg_w=520)
+    let i32 si = app.add_label(st)
+    while app.alive()
+        let InputBox b = app.inputs[ii]
+        app.labels[si].text = "cx=" + cast(b.cx, string) + " sel=" + cast(b.sel_a, string) + " drag=" + cast(b.dragging, string) + " mx=" + cast(app.mx, string) + " my=" + cast(app.my, string) + " ldown=" + cast(app.ldown, string) + " t=" + b.text
+        app.labels[si].dirty = true
+        app.step()
+        gui_frame_sleep(app.t0)
+    app.close()

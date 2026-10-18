@@ -1,0 +1,41 @@
+// 空切片语义（2026-10-17）：a > b 或 a == len 产出空序列（闭区间 [a,b]，
+// 空区间合法）；清空容器惯用法 xs[0, -1]。
+// 修复背景：ListBox.clear 对空列表 items[0,0] 曾 panic（切片区间越界）。
+fn string join(let i32[] xs)
+    let string s = ""
+    let i32 i = 0
+    while i < length(xs)
+        if i > 0
+            s = s + ","
+        s = s + cast(xs[i], string)
+        i++
+    return s
+
+fn main()
+    let i32[] a = 1, 2, 3
+    // 空区间：a > b
+    let i32[] e1 = a[1, 0]
+    output(length(e1), end="\n")          // 0
+    // 空起点：a == len
+    let i32[] e2 = a[3, 3]
+    output(length(e2), end="\n")          // 0
+    // 原语义不变：闭区间
+    let i32[] s1 = a[0, 0]
+    output(length(s1), end="\n")          // 1
+    let i32[] s2 = a[1, 2]
+    output(join(s2), end="\n")        // 2,3
+    // 空列表上取空切片（此前 panic）
+    let i32[] z
+    let i32[] e3 = z[0, -1]
+    output(length(e3), end="\n")          // 0
+    // 清空惯用法
+    let i32[] c = a[0, -1]
+    output(length(c), end="\n")           // 0
+    // 字符串空切片
+    let string t = "abc"
+    output(t[1, 0] == "", end="\n")       // true
+    output(t[3, 3] == "", end="\n")       // true
+    output(t[0, 0], end="\n")             // a
+    output(t[0, -1] == "", end="\n")      // true
+    // 越界仍报错：非空区间 b >= len（注释掉防 panic，人工验证用）
+    // let i32[] bad = a[0, 3]

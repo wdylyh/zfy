@@ -1,0 +1,2 @@
+mid click(159): cx=6 hex: ef bc 88 e6 9c aa e9 80 89 e4 b8 ad ef bc 89 
+end click(600): cx=15 hex: ef bc 88 e6 9c aa e9 80 89 e4 b8 ad ef bc 89 

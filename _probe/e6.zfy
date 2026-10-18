@@ -1,0 +1,6 @@
+fn main()
+    let i32 v1 = undefined_var_1
+    let i32 v2 = undefined_var_2
+    let i32 v3 = undefined_var_3
+    let i32 v4 = undefined_var_4
+    let i32 v5 = undefined_var_5

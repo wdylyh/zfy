@@ -1,0 +1,4 @@
+// main 返回值探针：退出码应为 7
+fn main()
+    output("ret7", end='\n')
+    return 7

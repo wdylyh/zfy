@@ -1,0 +1,256 @@
+// videolib/main.zfy —— 本地视频管理工具（zfy 多文件项目）
+// 功能：视频库列表 / 搜索 / 标签 / 星级评分 / 播放计数 / 持久化(videolib.txt)
+// 结构：model.zfy(数据模型) + store.zfy(持久化) + ui.zfy(视图刷新) + main.zfy(组装与事件循环)
+
+mod model;
+mod store;
+mod ui;
+mod gui;
+mod widgets;
+use model::{Video, lib_add, lib_remove_at, lib_rate, lib_play, lib_sort}
+use store::{load, save}
+use ui::{refresh_list, show_detail, entry_valid, entry_take, btn_texts, sort_names}
+use widgets::{App, Label, Button, InputBox, ListBox, TextArea, SC, LH, C_BG, C_ACCENT}
+use gui::{gui_w, gui_h, gui_fill_rect, gui_fill_grad, gui_line, gui_frame_sleep}
+
+fn main()
+    let Video[] lib = load()
+    let i32[] view
+    let string query = ""       // 当前搜索词
+
+    let App app = App()
+    if app.open(720, 480, "zfy 视频管理器") != 0
+        output("无法创建窗口")
+        return 1
+
+    let Label title = Label(x=12, y=8, text="视频管理器")
+    title.fs = 18
+    title.bold = true
+    title.nobg = true
+    let i32 _i0 = app.add_label(title)
+
+    let InputBox search = InputBox(x=12, y=34, w=400, text="", focus=true)
+    let i32 _i1 = app.add_input(search)
+    // 搜索提示标签置空（WinUI 搜索框无外置标签，保持 labels 索引稳定）
+    let Label lblq = Label(x=424, y=34, text="")
+    lblq.nobg = true
+    lblq.fs = 13
+    let i32 _i2 = app.add_label(lblq)
+
+    let ListBox lb = ListBox(x=12, y=70, w=400, rows=14)
+    let i32 _i3 = app.add_list(lb)
+
+    let TextArea detail = TextArea(x=430, y=70, w=270, h=280)
+    let i32 _i4 = app.add_text(detail)
+
+    // 录入区：标题 / 路径 / 标签
+    let Label lt = Label(x=430, y=364, text="标题:")
+    let i32 _i5 = app.add_label(lt)
+    let InputBox in_t = InputBox(x=474, y=360, w=220, text="")
+    let i32 _i6 = app.add_input(in_t)
+    let Label lp = Label(x=430, y=392, text="路径:")
+    let i32 _i7 = app.add_label(lp)
+    let InputBox in_p = InputBox(x=474, y=388, w=220, text="")
+    let i32 _i8 = app.add_input(in_p)
+    let Label lg = Label(x=430, y=420, text="标签:")
+    let i32 _i9 = app.add_label(lg)
+    let InputBox in_g = InputBox(x=474, y=416, w=220, text="")
+    let i32 _i10 = app.add_input(in_g)
+
+    // 状态栏（labels[5]）：条目数/过滤数/当前排序
+    let Label status = Label(x=12, y=440, text="共 0 条", bg_w=430)
+    let i32 _i11 = app.add_label(status)
+
+    // 操作按钮 6 个（左下横排）：添加/删除/★+/★−/播放/排序
+    let string[] bts = btn_texts()
+    let i32 nb = length(bts)
+    let i32 b = 0
+    while b < nb
+        let Button bt = Button(x=0, y=0, w=72, h=30, text=bts[b])
+        let i32 _ib = app.add_button(bt)
+        b++
+
+    // 按钮点击计数快照
+    let i32[] prev_b = 0, 0, 0, 0, 0, 0
+    let i32 prev_sel = -2       // 列表选中快照（-2=首帧强制刷新）
+    let string prev_q = "@"     // 搜索词快照
+    let i32 prev_dbl = 0        // 列表双击计数快照
+    let bool armed = false      // 删除二次确认状态
+    let i32 sort_mode = 0       // 0=添加时间 1=播放 2=评分 3=标题
+    let string[] snames = sort_names()
+
+    // 首帧填充列表
+    refresh_list(ref app, ref lib, query, ref view, snames[sort_mode])
+
+    let i32 last_w = 0
+    let i32 last_h = 0
+
+    while app.alive()
+        app.t0 = tick_ms()
+
+        let i32 W = gui_w()
+        let i32 H = gui_h()
+        if W != last_w or H != last_h
+            last_w = W
+            last_h = H
+            let i32 u = SC()
+            let i32 m = 12 * u / 100
+            let i32 g = 8 * u / 100
+            let i32 lh = LH()
+            let i32 ih = lh + 8 * u / 100      // InputBox 高
+            gui_fill_rect(0, 0, W, H, C_BG)
+            // 顶栏：WinUI 扁平——大标题居左，搜索框右上，无渐变
+            let i32 hb = 46 * u / 100
+            let i32 ih2 = lh + 8 * u / 100
+            let i32 sw = 320 * u / 100
+            // 所有坐标一律按 DPI 换算（u/100），与组件内部 SC() 尺寸一致
+            let i32 sy = hb + 2 * u / 100      // 搜索框 y
+            app.labels[0].x = m
+            app.labels[0].y = (hb - LH()) / 2 + 2 * u / 100
+            app.inputs[0].x = W - sw - m
+            app.inputs[0].y = (hb - ih2) / 2
+            app.inputs[0].w = sw
+            app.labels[1].x = W - sw - m - 200 * u / 100
+            app.labels[1].y = (hb - LH()) / 2 + 2 * u / 100
+            // 响应式：列表区随窗口伸缩
+            let i32 ly = hb + 6 * u / 100 + ih + 6 * u / 100               // 列表 y
+            app.lists[0].x = m
+            app.lists[0].y = ly
+            app.lists[0].w = W / 2 - m - g
+            app.texts[0].x = W / 2
+            app.texts[0].y = ly
+            app.texts[0].w = W - W / 2 - m
+            // 录入区贴底右侧（三行，行距 = 框高 + 间隙）——先算 ry 再定详情高度
+            let i32 rgap = ih + 6 * u / 100
+            let i32 ry = H - 3 * rgap - 52 * u / 100
+            app.lists[0].rows = (ry - ly - 8 * u / 100) / (lh + 2 * u / 100)
+            app.texts[0].h = ry - ly - g
+            app.labels[2].x = W / 2
+            app.labels[2].y = ry + 5 * u / 100
+            app.inputs[1].x = W / 2 + 46 * u / 100
+            app.inputs[1].y = ry
+            app.labels[3].x = W / 2
+            app.labels[3].y = ry + rgap + 5 * u / 100
+            app.inputs[2].x = W / 2 + 46 * u / 100
+            app.inputs[2].y = ry + rgap
+            app.labels[4].x = W / 2
+            app.labels[4].y = ry + 2 * rgap + 5 * u / 100
+            app.inputs[3].x = W / 2 + 46 * u / 100
+            app.inputs[3].y = ry + 2 * rgap
+            app.inputs[1].w = W - W / 2 - 46 * u / 100 - m
+            app.inputs[2].w = W - W / 2 - 46 * u / 100 - m
+            app.inputs[3].w = W - W / 2 - 46 * u / 100 - m
+            // 按钮横排贴底
+            let i32 bw = 72 * u / 100
+            let i32 bh = 32 * u / 100
+            b = 0
+            while b < nb
+                app.buttons[b].x = m + b * (bw + g)
+                app.buttons[b].y = H - bh - m
+                app.buttons[b].w = bw
+                app.buttons[b].h = bh
+                b++
+            // 状态栏：按钮行上方
+            app.labels[5].x = m
+            app.labels[5].y = H - bh - m - LH() - 6 * u / 100
+            app.invalidate_all()
+
+        // 搜索词变化 -> 重新过滤
+        let string q = app.inputs[0].text
+        if q != prev_q
+            prev_q = q
+            query = q
+            refresh_list(ref app, ref lib, query, ref view, snames[sort_mode])
+            prev_sel = -2
+            if armed
+                armed = false
+                app.buttons[1].set_text(bts[1])
+
+        // 列表选中变化 -> 刷新详情
+        if app.lists[0].sel != prev_sel
+            prev_sel = app.lists[0].sel
+            show_detail(ref app, ref lib, ref view, prev_sel)
+            if armed
+                armed = false
+                app.buttons[1].set_text(bts[1])
+
+        // 双击列表 -> 播放
+        if app.lists[0].dbl != prev_dbl
+            prev_dbl = app.lists[0].dbl
+            let i32 drow = app.lists[0].dbl_row
+            if drow >= 0 and drow < length(view)
+                let i32 dli = view[drow]
+                lib_play(ref lib, dli)
+                let bool _sd = save(ref lib)
+                refresh_list(ref app, ref lib, query, ref view, snames[sort_mode])
+                show_detail(ref app, ref lib, ref view, drow)
+
+        // 按钮事件
+        b = 0
+        while b < nb
+            if app.buttons[b].clicks != prev_b[b]
+                prev_b[b] = app.buttons[b].clicks
+                let i32 vrow = app.lists[0].sel
+                let i32 li = -1
+                if vrow >= 0 and vrow < length(view)
+                    li = view[vrow]
+                // 非删除按钮点击时解除删除确认
+                if b != 1 and armed
+                    armed = false
+                    app.buttons[1].set_text(bts[1])
+                if b == 0
+                    // 添加
+                    if entry_valid(ref app)
+                        let Video v = entry_take(ref app)
+                        lib_add(ref lib, v)
+                        let bool _s = save(ref lib)
+                        refresh_list(ref app, ref lib, query, ref view, snames[sort_mode])
+                else
+                    if b == 1
+                        // 删除（二次确认；无选中项忽略）
+                        if li >= 0 and not armed
+                            armed = true
+                            app.buttons[1].set_text("确认?")
+                        else
+                            if li >= 0 and armed
+                                armed = false
+                                app.buttons[1].set_text(bts[1])
+                                lib_remove_at(ref lib, li)
+                                let bool _s = save(ref lib)
+                                refresh_list(ref app, ref lib, query, ref view, snames[sort_mode])
+                    else
+                        if b == 2
+                            // ★+
+                            if li >= 0
+                                lib_rate(ref lib, li, 1)
+                                let bool _s = save(ref lib)
+                                refresh_list(ref app, ref lib, query, ref view, snames[sort_mode])
+                        else
+                            if b == 3
+                                // ★−
+                                if li >= 0
+                                    lib_rate(ref lib, li, -1)
+                                    let bool _s = save(ref lib)
+                                    refresh_list(ref app, ref lib, query, ref view, snames[sort_mode])
+                            else
+                                if b == 4
+                                    // 播放
+                                    if li >= 0
+                                        lib_play(ref lib, li)
+                                        let bool _s = save(ref lib)
+                                        refresh_list(ref app, ref lib, query, ref view, snames[sort_mode])
+                                        show_detail(ref app, ref lib, ref view, vrow)
+                                else
+                                    // 排序：循环切换模式
+                                    sort_mode = (sort_mode + 1) % 4
+                                    lib_sort(ref lib, sort_mode)
+                                    let bool _s = save(ref lib)
+                                    refresh_list(ref app, ref lib, query, ref view, snames[sort_mode])
+            b++
+
+        app.step()
+        gui_frame_sleep(app.t0)
+
+    app.close()
+    let bool _s = save(ref lib)
+    return 0

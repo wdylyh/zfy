@@ -1,0 +1,5 @@
+fn main()
+  let y = 40
+  let f = fn(i32 x) => x + 1
+  output(f(1))
+  output(y)

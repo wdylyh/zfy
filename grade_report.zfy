@@ -1,0 +1,97 @@
+// grade_report.zfy — 班级成绩统计分析器
+// 输入：第一行学生人数 n，之后 n 行每行一个成绩(0-100)
+// 输出：平均分/最高/最低/及格率/五档分布直方图/逐人等级
+fn string grade_of(let i32 s)
+    if s >= 90
+        return "A(优秀)"
+    if s >= 80
+        return "B(良好)"
+    if s >= 70
+        return "C(中等)"
+    if s >= 60
+        return "D(及格)"
+    return "E(不及格)"
+
+fn i32 abs_i(let i32 x)
+    if x < 0
+        return -x
+    return x
+
+fn main()
+    let i32 n = 0
+    output("请输入学生人数: ")
+    input(n)
+    if n <= 0
+        output("人数必须为正整数")
+        return 0
+    let i32[] scores
+    let i32 i = 0
+    while i < n
+        let i32 s = 0
+        output("成绩[", i + 1, "]: ")
+        input(s)
+        // 非法输入钳制到 [0,100]
+        if s < 0
+            s = 0
+        if s > 100
+            s = 100
+        scores = push(scores, s)
+        i++
+    // 统计：总和/最高/最低/及格数
+    let i32 total = 0
+    let i32 mx = 0
+    let i32 mn = 100
+    let i32 pass = 0
+    i = 0
+    while i < n
+        let i32 s = scores[i]
+        total = total + s
+        if s > mx
+            mx = s
+        if s < mn
+            mn = s
+        if s >= 60
+            pass++
+        i++
+    // 平均分/及格率保留一位小数（四舍五入到 0.1）
+    let i32 avg10 = (total * 10 + n / 2) / n
+    let i32 rate10 = (pass * 1000 + n / 2) / n
+    output("")
+    output("===== 成绩统计报告 =====")
+    output("人数: ", n)
+    output("平均分: ", avg10 / 10, ".", abs_i(avg10 % 10))
+    output("最高分: ", mx)
+    output("最低分: ", mn)
+    output("及格人数: ", pass, "/", n)
+    output("及格率: ", rate10 / 10, ".", abs_i(rate10 % 10), "%")
+    // 五档分布：90-100/80-89/70-79/60-69/0-59
+    let string[] bands = "90-100", "80-89 ", "70-79 ", "60-69 ", "0-59  "
+    let i32[] bounds = 90, 80, 70, 60, 0
+    let i32 b = 0
+    while b < 5
+        let i32 cnt = 0
+        // 档位上界：首档 100，末档 59，其余 lo+9
+        let i32 hi = bounds[b] + 9
+        if b == 0
+            hi = 100
+        if b == 4
+            hi = 59
+        i = 0
+        while i < n
+            if scores[i] >= bounds[b] and scores[i] <= hi
+                cnt++
+            i++
+        let string bar = ""
+        let i32 k = 0
+        while k < cnt
+            bar = bar + "*"
+            k++
+        output(bands[b], " | ", bar, " ", cnt, " 人")
+        b++
+    output("")
+    output("----- 逐人等级 -----")
+    i = 0
+    while i < n
+        output("No.", i + 1, "  ", scores[i], "  ", grade_of(scores[i]))
+        i++
+    return 0

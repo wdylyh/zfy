@@ -1109,33 +1109,60 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
        emitf fc "  %s = call ptr @zfy_map_values(ptr %s, i32 %d, i32 %d)"
          d mp vstr w
      | _ -> lerr None "zfy_map_values: missing destination")
+  | "zfy_map_seq", [ xs; f ] ->
+    (* map(xs, f)（v3.7）：结果元素种类/宽度按返回 list 元素类型注入；
+       sck/rck = 源/结果元素的调用类别（0=int/ptr, 1=f32, 2=f64, 3=string），
+       runtime 据此按值传参/取返回（与 C 侧编码一致） *)
+    (match dst, ret_ty with
+     | Some d, TList bt ->
+       let (xp, _) = val_of fc xs in
+       let (cp, _) = ptr_of fc f in
+       let ck_of t =
+         match Typeck.resolve t with
+         | TFloat 32 -> 1 | TFloat 64 -> 2 | TString -> 3 | _ -> 0
+       in
+       let (bk, bw) =
+         match Typeck.resolve bt with
+         | TString -> (1, 8)
+         | TInt w | TUint w -> (0, w / 8)
+         | TFloat 32 -> (0, 4)
+         | TFloat 64 -> (0, 8)
+         | TBool | TChar -> (0, 1)
+         | t -> lerr None "zfy_map_seq: unsupported element %s" (Hir.pp_zty t)
+       in
+       let sck =
+         match Typeck.resolve xs.oty with
+         | TList e -> ck_of e
+         | _ -> 0
+       in
+       emitf fc "  %s = call ptr @zfy_map_seq(ptr %s, ptr %s, i32 %d, i32 %d, i32 %d, i32 %d)"
+         d xp cp bk bw sck (ck_of bt)
+     | _ -> lerr None "zfy_map_seq: missing destination")
   | (("zfy_filter" | "zfy_any" | "zfy_all" | "zfy_sort_by") as bn), [ seq; pred ] ->
-    (* 谓词/比较器 thunk（v3.6）：实参须为函数名（EFunPtrK 落 @名 寄存器） *)
+    (* 容器谓词/比较器（v3.7）：实参为闭包句柄 struct 槽（裸函数名已在
+       typeck 包装为 wrapper 闭包，lambda 为原生闭包）——runtime 回调
+       统一带 env 参数；末参 ck = 元素调用类别（按值分发） *)
     (match dst with
      | None -> ()
      | Some d ->
        let (sp, _) = val_of fc seq in
-       let (pv, _) = val_of fc pred in
-       if String.length pv = 0 || pv.[0] <> '@' then
-         lerr None "%s: predicate/comparator must be a function name" bn
-       else begin
-         let fname = String.sub pv 1 (String.length pv - 1) in
-         let (ptys, pret) =
-           match Typeck.resolve pred.oty with
-           | TPtr (TFunSig (ps, r)) -> (ps, r)
-           | _ -> lerr None "%s: predicate type error" bn
-         in
-         let tn = zfy_thunk fname ptys pret in
-         match bn with
-         | "zfy_filter" ->
-           emitf fc "  %s = call ptr @zfy_filter(ptr %s, ptr @\"%s\")" d sp tn
-         | "zfy_sort_by" ->
-           emitf fc "  %s = call ptr @zfy_sort_by(ptr %s, ptr @\"%s\")" d sp tn
-         | _ ->
-           let r = fresh_r fc in
-           emitf fc "  %s = call i32 @%s(ptr %s, ptr @\"%s\")" r bn sp tn;
-           emitf fc "  %s = icmp ne i32 %s, 0" d r
-       end)
+       let (cp, _) = ptr_of fc pred in
+       let ck =
+         match Typeck.resolve seq.oty with
+         | TList e ->
+           (match Typeck.resolve e with
+            | TFloat 32 -> 1 | TFloat 64 -> 2 | TString -> 3 | _ -> 0)
+         | _ -> 0
+       in
+       match bn with
+       | "zfy_filter" ->
+         emitf fc "  %s = call ptr @zfy_filter(ptr %s, ptr %s, i32 %d)" d sp cp ck
+       | "zfy_sort_by" ->
+         emitf fc "  %s = call ptr @zfy_sort_by(ptr %s, ptr %s, i32 %d)" d sp cp ck
+       | _ ->
+         let r = fresh_r fc in
+         emitf fc "  %s = call i32 @%s(ptr %s, ptr %s, i32 %d)" r bn sp cp ck;
+         emitf fc "  %s = icmp ne i32 %s, 0" d r)
   | "abs", [ a ] ->
     (* abs 重载（v3.2）：无符号=恒等；有符号=内联 sub+icmp+select（规避
        C abs 的 32 位截断，i128 同样适用）；浮点=@fabs。is_rt_name 已排除
@@ -2384,6 +2411,56 @@ let gen_instr fc (i : instr) : unit =
   | MFunAddr (d, name) ->
     (* 函数入口地址：寄存器表直接持有 LLVM 符号文本（@名） *)
     Hashtbl.replace fc.regs d ("@" ^ name)
+  | MClNew (d, mangle, clenv, items, _ret) ->
+    (* 闭包堆块（v3.7）：按 clenv$N 布局分配（zfy_env_new = 不回收的
+       malloc，env 生命周期 = 进程），逐字段写入（gen_field_store 完成
+       string/seq/struct 捕获的深拷贝）；dst = 句柄 struct 槽 { ptr h }，
+       堆块地址存入槽字段（后续传参/赋值按 struct 槽统一处理） *)
+    (match find_struct fc.g clenv with
+     | Some sd ->
+       let (sz, _) = Hir.struct_size_align fc.g.structs sd in
+       let addr = fresh_r fc in
+       emitf_entry fc "  %s = alloca %s" addr (ll_ty (TStruct mangle));
+       Hashtbl.replace fc.allocas d (addr, TStruct mangle);
+       emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty (TStruct mangle)) addr;
+       let blk = fresh_r fc in
+       emitf fc "  %s = call ptr @zfy_env_new(i64 %d)" blk sz;
+       List.iteri
+         (fun i v ->
+           let fp = gen_gep fc blk (ll_ty (TStruct clenv)) i in
+           gen_field_store ~free_old:false fc fp v)
+         items;
+       let hslot = gen_gep fc addr (ll_ty (TStruct mangle)) 0 in
+       emitf fc "  store ptr %s, ptr %s" blk hslot
+     | None -> lerr None "undefined closure env struct %s" clenv)
+  | MClCall (d, oc, args, ret) ->
+    (* 闭包调用（v3.7）：h = 闭包槽字段 0；code = 堆块头部指针；
+       call code(h, args...)——env 即堆块地址（lambda 首参 $env） *)
+    let (sp, _) = ptr_of fc oc in
+    let hp = gen_gep fc sp (ll_ty oc.oty) 0 in
+    let h = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" h hp;
+    let code = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" code h;
+    let targs =
+      ("ptr", h) ::
+      List.map
+        (fun (o : operand) ->
+          if is_agg o.oty then
+            let (p, _) = ptr_of fc o in
+            ("ptr", p)
+          else
+            let (v, t) = val_of fc o in
+            (t, v))
+        args
+    in
+    let args_str = String.concat ", " (List.map (fun (t, v) -> t ^ " " ^ v) targs) in
+    (match d with
+     | Some d' ->
+       let r = fresh_r fc in
+       emitf fc "  %s = call %s %s(%s)" r (ll_ty ret) code args_str;
+       Hashtbl.replace fc.regs d' r
+     | None -> emitf fc "  call void %s(%s)" code args_str)
   | MFreeStructTemp (name, ty) ->
     (* 语句末释放临时 struct 槽持有的资源（槽本身在栈上，无需释放） *)
     (match Hashtbl.find_opt fc.allocas name with
@@ -2861,6 +2938,8 @@ let gen_program (m : mir) : string =
     "declare ptr @zfy_file_read_lines(ptr)\n";
   Buffer.add_string g.mbuf
     "declare void @zfy_file_write_file_err(ptr sret(%err.i64), ptr, ptr)\n";
+  (* 闭包（v3.7）：env 堆块分配（不回收——生命周期 = 进程） *)
+  Buffer.add_string g.mbuf "declare ptr @zfy_env_new(i64)\n";
   (* 内建容器 map/set 与列表算法（v3.6） *)
   List.iter
     (fun s -> Buffer.add_string g.mbuf s)
@@ -2914,10 +2993,10 @@ let gen_program (m : mir) : string =
       "declare i32 @zfy_contains_f32(ptr, float)\n";
       "declare i32 @zfy_contains_f64(ptr, double)\n";
       "declare i32 @zfy_contains_str(ptr, ptr)\n";
-      "declare ptr @zfy_filter(ptr, ptr)\n";
-      "declare i32 @zfy_any(ptr, ptr)\n";
-      "declare i32 @zfy_all(ptr, ptr)\n";
-      "declare ptr @zfy_sort_by(ptr, ptr)\n";
+      "declare ptr @zfy_filter(ptr, ptr, i32)\n";
+      "declare i32 @zfy_any(ptr, ptr, i32)\n";
+      "declare i32 @zfy_all(ptr, ptr, i32)\n";
+      "declare ptr @zfy_sort_by(ptr, ptr, i32)\n";
       "declare i8 @zfy_fold_i8(ptr, ptr, i8)\n";
       "declare i16 @zfy_fold_i16(ptr, ptr, i16)\n";
       "declare i32 @zfy_fold_i32(ptr, ptr, i32)\n";
@@ -2928,7 +3007,9 @@ let gen_program (m : mir) : string =
       "declare i64 @zfy_fold_u64(ptr, ptr, i64)\n";
       "declare float @zfy_fold_f32(ptr, ptr, float)\n";
       "declare double @zfy_fold_f64(ptr, ptr, double)\n";
-      "declare ptr @zfy_fold_str(ptr, ptr, ptr)\n" ];
+      "declare ptr @zfy_fold_str(ptr, ptr, ptr)\n";
+      (* map(xs, f)（v3.7）：bkind/belosz 常量由 gen_call 注入 *)
+      "declare ptr @zfy_map_seq(ptr, ptr, i32, i32, i32, i32)\n" ];
   (* 函数 *)
   let fbuf = Buffer.create 4096 in
   Hashtbl.reset user_fns;

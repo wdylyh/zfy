@@ -1,0 +1,32 @@
+// _probe/g2.zfy —— 原语探针 v2：带诊断输出
+mod gui;
+use gui::{gui_open, gui_alive, gui_fill_rect, gui_draw_text, gui_present, gui_w, gui_h}
+
+fn main()
+    output("open 前")
+    let i32 r = gui_open(258, 300, "probe2")
+    output("open 返回", r)
+    if r != 0
+        return 1
+    output("gui_w=", gui_w(), " gui_h=", gui_h())
+    gui_fill_rect(0, 0, 258, 300, 0x1E1E24)
+    output("bg 填完")
+    gui_fill_rect(16, 88, 52, 44, 0xE05050)
+    gui_fill_rect(74, 88, 52, 44, 0x50E050)
+    gui_fill_rect(132, 88, 52, 44, 0x5060E0)
+    gui_draw_text(16, 150, "0123456789", 0xFFFFFF)
+    gui_present()
+    output("首帧 present 完，进循环")
+    let i32 frames = 0
+    while gui_alive()
+        gui_fill_rect(16, 88, 52, 44, 0xE05050)
+        gui_fill_rect(74, 88, 52, 44, 0x50E050)
+        gui_fill_rect(132, 88, 52, 44, 0x5060E0)
+        gui_draw_text(16, 150, "0123456789", 0xFFFFFF)
+        gui_present()
+        frames++
+        if frames % 60 == 0
+            output("帧 ", frames)
+        sleep_ms(16)
+    output("退出，共 ", frames, " 帧")
+    return 0

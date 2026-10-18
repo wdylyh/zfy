@@ -1,0 +1,5 @@
+fn main()
+    let u64 ub = 5
+    let i32 se = 3
+    let u64 m = ub * se
+    output("m=", m, end='\n')

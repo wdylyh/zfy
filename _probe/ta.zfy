@@ -1,0 +1,24 @@
+// _probe/ta.zfy —— TextArea UTF-8 探针
+mod gui;
+mod widgets;
+use widgets::{TextArea}
+use gui::{KEY_EXT}
+
+fn main()
+    let TextArea t = TextArea(x=0, y=0, w=200, h=100)
+    t.set_text("你好")
+    output("bytes=", length(t.lines[0]))
+    let bool rr = t.handle_key(KEY_EXT + 0x23)
+    output("end cx=", t.cx)
+    let bool rr = t.handle_key(KEY_EXT + 0x25)
+    output("left cx=", t.cx)
+    // 直接验证 is_cont/align_back
+    let string ln = t.lines[0]
+    let i32 i = 0
+    while i < length(ln)
+        let i32 b = ord(ln[i])
+        output("b[", i, "]=", b)
+        i++
+    let bool rr = t.handle_key(8)
+    output("after bs cx=", t.cx, " line=", t.lines[0])
+    return 0

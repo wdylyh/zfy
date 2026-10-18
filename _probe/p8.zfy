@@ -1,0 +1,4 @@
+fn main()
+    let char c = 'x'
+    let string s3 = cast(c, string)
+    output(s3, end='\n')

@@ -11,6 +11,9 @@ type ty =
   | TErr of ty * pos                  (* T!：可失败值（错误模型 ZEM） *)
   | TFun of ty * ty list * pos        (* 返回类型, 参数类型列表（仅 type 别名） *)
   | TApp of string * ty list * pos    (* 泛型实例化：Box<i32, T*>（名字 + 类型实参） *)
+  | TClo of ty list * ty * pos        (* fn(T...) -> R：闭包类型（v3.7 函数式轮）。
+                                         与函数指针 TFun（type 别名处 T(params) 无
+                                         fn 前缀）并存；闭包值 = {code, env} 二元组 *)
   | TSeq of ty * pos                  (* T[]：动态数组/列表（类型后缀形式，w-014 #1） *)
   | TSeqN of ty * expr * pos          (* T[N]：定长数组（类型后缀形式；N 须整数字面量，
                                          声明/参数处仍可用完整表达式长度） *)
@@ -61,6 +64,22 @@ and expr =
   | ERemove of expr * expr * pos
     (* remove(数组/列表, 下标)：表达式（v3 2026-10-11）——返回被删元素
        （深拷贝副本），数组槽位填零、列表删除并左移；裸语句报错 *)
+  | ELambda of lambda * pos
+    (* lambda（v3.7 函数式轮）：fn [caps] (params) => expr（简写，返回类型
+       由表达式推断）或 fn [caps] (params) -> T { block }（块形式，显式返回
+       类型）；捕获列表可省 = 体内自由变量默认值捕获，列表内 &x = 引用捕获 *)
+
+(* lambda 参数：类型可省（从期望闭包类型反推；无期望时报错要求显式） *)
+and lparam = { lpname : string; lpty : ty option; lppos : pos }
+
+and lambda =
+  { lparams : lparam list;
+    lcaps : (bool * string * pos) list;   (* (是否引用捕获, 变量名, pos) *)
+    lbody : lambda_body }
+
+and lambda_body =
+  | LExpr of expr                       (* => expr 简写 *)
+  | LBlock of block * ty option         (* -> T { block }；T 已由 parser 消费 *)
 
 and stmt =
   | SDecl of bool * bool * bool * string * ty option * expr option * pos
@@ -102,6 +121,11 @@ and stmt =
   | SContinue of pos
   | SUnsafe of block * pos
     (* unsafe 块：允许指针算术（p+n / p-n / p2-p1）；其余语义与普通块一致 *)
+  | SFn of string * lparam list * ty option * bool * block * pos
+    (* 嵌套函数定义（v3.7 函数式轮）：块内 fn 返回类型? 名(参数) { }——
+       按命名 lambda 处理：定义处创建闭包（隐式值捕获所在函数局部变量），
+       名字绑定为局部闭包值变量。仅语句位置（顶层 fn 走 IFn）；参数用
+       lparam 形状（param 定义在 stmt 之后，无法前向引用） *)
 
 (* for 头部初始化项：let 声明（let (类型)? (frac)? (const)? (unred)? 名 = 值，
    类型可省时由初值推断）或占位表达式（孤立变量名，如 for i, i<5, i++ 的 i，

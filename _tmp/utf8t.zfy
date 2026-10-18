@@ -1,0 +1,6 @@
+fn main()
+    output("中文输出测试：视频 ★☆")
+    let string s = ""
+    input(s)
+    output(s)
+

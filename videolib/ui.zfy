@@ -1,0 +1,65 @@
+// videolib/ui.zfy —— GUI 组装与视图刷新（依赖 widgets/model/store）
+
+mod widgets;
+mod model;
+use widgets::{App, Label, Button, InputBox, ListBox, TextArea}
+use model::{Video, lib_match, video_row, video_detail}
+
+// 按查询 q 过滤 lib，刷新列表框，view 记录 视图行 -> 库下标 映射
+// labels[5] 为状态栏（共 N 条 · 显示 M 条 · 排序：xx）
+pub fn void refresh_list(ref let App app, ref let Video[] lib, let string q, ref let i32[] view, let string sort_name)
+    app.lists[0].clear()
+    view = view[0, -1]
+    let i32 n = length(lib)
+    let i32 i = 0
+    while i < n
+        if lib_match(lib[i], q)
+            app.lists[0].add_item(video_row(lib[i]))
+            view = push(view, i)
+        i++
+    // 状态栏
+    app.labels[5].text = "共 " + cast(n, string) + " 条 · 显示 " + cast(length(view), string) + " 条 · 排序: " + sort_name
+    app.labels[5].dirty = true
+    // 复位详情
+    app.texts[0].set_text("（未选中）")
+
+// 选中视图行 vrow，显示详情
+pub fn void show_detail(ref let App app, ref let Video[] lib, ref let i32[] view, let i32 vrow)
+    let i32 n = length(view)
+    if vrow < 0 or vrow >= n
+        app.texts[0].set_text("（未选中）")
+        return
+    let i32 li = view[vrow]
+    app.texts[0].set_text(video_detail(lib[li]))
+
+// 三个录入框当前是否有效（标题非空）
+pub fn bool entry_valid(ref let App app)
+    return app.inputs[1].text != ""
+
+// 从录入框取一条新 Video（added 由调用方补）
+pub fn Video entry_take(ref let App app)
+    let Video v = Video()
+    v.title = app.inputs[1].text
+    v.path = app.inputs[2].text
+    v.tags = app.inputs[3].text
+    v.rating = 0
+    v.plays = 0
+    v.added = now()
+    // 清空录入框
+    app.inputs[1].text = ""
+    app.inputs[1].dirty = true
+    app.inputs[2].text = ""
+    app.inputs[2].dirty = true
+    app.inputs[3].text = ""
+    app.inputs[3].dirty = true
+    return v
+
+// 按钮文本（b[1] 会被删除确认改为"确认删除?"）
+pub fn string[] btn_texts()
+    let string[] b = "添加", "删除", "★+", "★−", "播放", "排序"
+    return b
+
+// 排序模式名（与 model.lib_sort mode 对应）
+pub fn string[] sort_names()
+    let string[] s = "添加时间", "播放次数", "评分", "标题"
+    return s

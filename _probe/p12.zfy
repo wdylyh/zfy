@@ -1,11 +1,10 @@
-// i128 除法/格式化、char 输出、f64 精度
-void main()
-    i128 a = 100000000000000000000
-    i128 b = 3
-    output(a / b)
-    char c = 'A'
-    output(c)
-    output(65)
-    f64 x = 0.1 + 0.2
-    output(x)
-    return
+mod gui;
+struct Inner
+    i32 v = 0
+struct Bag
+    Inner[] items
+    i32 n = 0
+    fn void bump_at(let i32 i)
+        self.items[i].v++
+pub fn i32 dummy()
+    return 0

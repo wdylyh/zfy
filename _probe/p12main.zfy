@@ -1,0 +1,8 @@
+mod p12;
+use p12::{Bag, Inner}
+fn main()
+    let Bag b = Bag()
+    let Inner it = Inner(v=7)
+    b.items = push(b.items, it)
+    b.bump_at(0)
+    output("called")

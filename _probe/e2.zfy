@@ -1,0 +1,19 @@
+struct P
+    i32 x
+    i32 yy
+
+fn void helper(let i32 v)
+    output("v=", v, end='\n')
+
+fn main()
+    let P p
+    p.xx = 5
+    p.yy = 6
+    output(p.xx, p.yy, end='\n')
+    let f64 w = "str"
+    w = w * 2
+    output(w, end='\n')
+    helper("not an int")
+    undefined_fn(3)
+    let i32 arr[3]
+    arr[10] = 1

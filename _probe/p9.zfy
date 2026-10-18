@@ -1,0 +1,44 @@
+fn main()
+    let string s = "hello world"
+    // find 返回 TErr i32：unwrap 后落 i32 槽
+    let i32 p1 = find(s, 'w') ?? -1
+    output("find=", p1, end='\n')
+    let i32 p2 = find(s, "orld") ?? -1
+    output("findstr=", p2, end='\n')
+    // find 结果直接作下标
+    output("at=", s[find(s, 'w') ?? -1], end='\n')
+    // char 六种比较
+    let char a = 'a'
+    let char b = 'b'
+    if a < b
+        output("1", end='
+')
+    if b > a
+        output("2", end='
+')
+    if a <= a
+        output("3", end='
+')
+    if b >= b
+        output("4", end='
+')
+    if a == a
+        output("5", end='
+')
+    if a != b
+        output("6", end='
+')
+    output("", end='\n')
+    // 反向拼接：char + string
+    let char c = 'H'
+    let string t = c + s
+    output(t, end='\n')
+    // utf8_len 返回 i32
+    let string zh = "héllo"
+    let i32 n = utf8_len(zh)
+    output("utf8=", n, end='\n')
+    // length 用于循环（i32 与 i64 混合比较宽化）
+    let i64 i = 0
+    while i < length(s)
+        i++
+    output("loop=", i, end='\n')

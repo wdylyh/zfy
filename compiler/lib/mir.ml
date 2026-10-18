@@ -117,6 +117,13 @@ type instr =
        分配 len=cap=元素个数的 seq 并逐元素写入 *)
   | MIndirectCall of string option * operand * operand list * zty
     (* 函数指针间接调用：dst, 被调指针值, 实参（标量语义借传）, 返回类型 *)
+  | MClNew of string * string * string * operand list * zty
+    (* 闭包构造（v3.7）：dst(h 句柄), closure$sig, clenv$N 布局类型,
+       堆块内容 [code; caps...], 签名返回类型——分配 [8+caps] 堆块并
+       逐字段写入（string/seq 捕获深拷贝），dst = 堆块地址 *)
+  | MClCall of string option * operand * operand list * zty
+    (* 闭包调用（v3.7）：dst, 闭包句柄 operand（槽）, 实参, 返回类型——
+       h = 槽字段 0；code = 堆块头部；call code(h, args) *)
   | MFunAddr of string * string
     (* 函数入口地址：dst 寄存器持有 LLVM 符号文本（@名），作函数指针值 *)
 
@@ -613,6 +620,9 @@ let rec lexpr l (e : texpr) : operand =
       match b.e with
       | EFieldK (b', i) -> flatten (i :: acc) b'
       | EVarK n -> Some (n, acc, b.ety)
+      (* deref(p).f（v3.7 闭包捕获）：p 槽持有指针，root 标 TPtr 由
+         llvmgen MFieldGet load 后 GEP（自动解引用字段访问） *)
+      | EDerefK ({ e = EVarK n; ety = TPtr t; _ }) -> Some (n, acc, TPtr t)
       | _ -> None
     in
     let (root, idxs, rootty) =
@@ -716,6 +726,36 @@ let rec lexpr l (e : texpr) : operand =
     let d = fresh l in
     emit l (MFunAddr (d, f));
     op (OLocal d) e.ety
+  | EClNewK (mangle, clenv, items) ->
+    (* 闭包构造（v3.7）：分配堆块写入 code+捕获，句柄值 = 堆块地址 *)
+    let oitems = List.map (lexpr l) items in
+    let d = fresh l in
+    emit l (MClNew (d, mangle, clenv, oitems, e.ety));
+    op (OLocal d) e.ety
+  | EClCallK (cb, args) ->
+    (* 闭包调用（v3.7）：call code(env=堆块, args)。
+       string/seq/struct 形参按 zfy 约定由被调方接管（末尾 free）——
+       调用点先深拷贝落临时槽再传（实参本身若是语句临时则 move 接管） *)
+    let oc = lexpr l cb in
+    let oargs =
+      List.map
+        (fun (a : texpr) ->
+          match a.ety with
+          | TString | TList _ | TArray _ | TStruct _ | TErr _ ->
+            let tmp = fresh l in
+            emit l (MAlloca (tmp, a.ety));
+            let va = lexpr l a in
+            if not (move_owned_temp l tmp va a.ety) then
+              emit l (MCopy (tmp, va, a.ety));
+            op (OLocal tmp) a.ety
+          | _ -> lexpr l a)
+        args
+    in
+    let d = if e.ety = TVoid then None else Some (fresh l) in
+    emit l (MClCall (d, oc, oargs, e.ety));
+    (match d with
+     | Some d' -> op (OLocal d') e.ety
+     | None -> op (OInt 0L) TVoid)
   | EEmptySeqK ->
     (* 数组/列表字段缺省分配：新分配 seq（定长/空列表），登记为语句临时 *)
     let d = fresh l in
@@ -1549,6 +1589,10 @@ let uses_of (i : instr) : string list =
   | MElemAddr (_, base, idx, _, _) -> operand_names base @ operand_names idx
   | MIndirectCall (_, f, args, _) ->
     operand_names f @ List.concat_map operand_names args
+  | MClNew (_, _, _, items, _) ->
+    List.concat_map operand_names items
+  | MClCall (_, cb, args, _) ->
+    operand_names cb @ List.concat_map operand_names args
   | MFunAddr _ -> []
 
 let pure_dst (i : instr) : string option =

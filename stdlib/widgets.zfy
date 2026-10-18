@@ -21,17 +21,21 @@
 //       app.close()
 
 
-use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_KEY, EV_WHEEL, KEY_EXT, KEY_CTRL, gui_clip_get}
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, gui_font, gui_round_rect, gui_line, Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_KEY, EV_WHEEL, KEY_EXT, KEY_CTRL, KEY_SHIFT, gui_clip_get, gui_clip_set}
 
-// ===== 主题配色 =====
-pub let u32 const C_BG      = 0x1E1E24   // 窗口背景
-pub let u32 const C_PANEL   = 0x2A2A34   // 面板
-pub let u32 const C_BORDER  = 0x55555F   // 边框
-pub let u32 const C_TEXT    = 0xF0F0F0   // 正文
-pub let u32 const C_ACCENT  = 0x2F7FD6   // 强调（焦点/进度）
-pub let u32 const C_HOT     = 0x3A8FE8   // 悬停
-pub let u32 const C_DOWN    = 0x1F5FA8   // 按下
-pub let u32 const C_OK      = 0x3FA060   // 绿
+// ===== 主题配色（WinUI3 深色风：扁平卡片 + subtle 边框 + 焦点下划线） =====
+pub let u32 const C_BG      = 0x202020   // 窗口背景（WinUI Layer）
+pub let u32 const C_PANEL   = 0x2C2C2C   // 卡片/控件面（Card）
+pub let u32 const C_PANELH  = 0x383838   // 卡片悬停/按下亮面
+pub let u32 const C_PANDOWN = 0x242424   // 按下暗面
+pub let u32 const C_BORDER  = 0x3A3A3A   // subtle 边框
+pub let u32 const C_TEXT    = 0xFFFFFF   // 主文本
+pub let u32 const C_SUB     = 0xA0A0A0   // 次级文本
+pub let u32 const C_ACCENT  = 0x4CC2FF   // 强调（WinUI 深色 accent light2）
+pub let u32 const C_ACCENTD = 0x0C3B5E   // 强调低亮度（选中行底）
+pub let u32 const C_HOT     = 0x383838   // 悬停
+pub let u32 const C_DOWN    = 0x242424   // 按下
+pub let u32 const C_OK      = 0x6CCB5F   // 绿（Fluent success）
 
 // 界面缩放：96dpi=100。组件内部尺寸一律 逻辑值 * SC() / 100
 pub fn i32 SC()
@@ -48,15 +52,24 @@ pub struct Label
     string text
     u32 color = C_TEXT
     i32 bg_w = 0         // 清屏宽度：0=按当前文本宽度；文本会变短时设大可防残影
+    i32 fs = 16          // 字号（逻辑 px）
+    bool bold = false
+    bool nobg = false    // true=不清背景（叠加在渐变带等自绘背景上）
     bool dirty = true
 
     fn void draw()
+        let i32 b = 0
+        if self.bold
+            b = 1
+        gui_font(self.fs, b)
         let i32 tw = gui_text_w(self.text)
         let i32 cw = self.bg_w
         if cw <= 0
             cw = tw + 4
-        gui_fill_rect(self.x - 2, self.y - 2, cw + 2, LH(), C_BG)
+        if not self.nobg
+            gui_fill_rect(self.x - 2, self.y - 2, cw + 2, self.fs * SC() / 100 + 6, C_BG)
         gui_draw_text(self.x, self.y, self.text, self.color)
+        gui_font(16, 0)
         self.dirty = false
 
 // ===== Button：点击计数按钮 =====
@@ -79,19 +92,23 @@ pub struct Button
         self.dirty = true
 
     fn void draw()
+        let i32 u = SC()
         let u32 fill = C_PANEL
         if self.pressed
-            fill = C_DOWN
+            fill = C_PANDOWN
         else
             if self.hot
-                fill = C_HOT
-        gui_fill_rect(self.x, self.y, self.w, self.h, fill)
-        gui_rect(self.x, self.y, self.w, self.h, C_BORDER)
+                fill = C_PANELH
+        // 扁平卡片：同色细边框（视觉上无边框），WinUI 标准圆角 6
+        gui_round_rect(self.x, self.y, self.w, self.h, 6 * u / 100, fill, fill)
+        gui_font(13, 0)
         let i32 tw = gui_text_w(self.text)
-        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - LH()) / 2 + 2 * SC() / 100, self.text, C_TEXT)
+        let i32 th = 13 * u / 100
+        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - th) / 2, self.text, C_TEXT)
+        gui_font(16, 0)
         self.dirty = false
 
-// ===== InputBox：单行文本框（点击聚焦，Backspace 退格，按键追加） =====
+// ===== InputBox：单行文本框（点击聚焦；鼠标拖选；Ctrl+A/C/X/V、方向键、Home/End） =====
 pub struct InputBox
     i32 x
     i32 y
@@ -99,6 +116,9 @@ pub struct InputBox
     string text
     bool focus = false
     bool dirty = true
+    i32 cx = 0            // 光标字节位置（码点对齐）
+    i32 sel_a = 0         // 选区锚点（字节）；cx==sel_a 即无选区
+    bool dragging = false
 
     fn bool hit(let i32 mx, let i32 my)
         return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + LH() + 8 * SC() / 100
@@ -106,40 +126,196 @@ pub struct InputBox
     fn void set_focus(let bool f)
         if self.focus != f
             self.focus = f
+            if not f
+                self.sel_a = self.cx
+                self.dragging = false
             self.dirty = true
+
+    // 像素 → 字节光标位置（最近码点起点；右侧空白落行尾）
+    fn i32 pos_from_mx(let i32 mx)
+        let i32 u = SC()
+        let i32 target = mx - self.x - 8 * u / 100
+        let i32 n = length(self.text)
+        if target <= 0
+            return 0
+        if gui_text_w(self.text) <= target
+            return n
+        let i32 i = 0
+        let i32 best = 0
+        while i < n
+            if gui_text_w(prefix(self.text, i)) > target
+                break
+            best = i
+            i = next_cp(self.text, i)
+        return best
+
+    // 选区规范化端点 [lo,hi)
+    fn i32 sel_lo()
+        if self.cx < self.sel_a
+            return self.cx
+        return self.sel_a
+
+    fn i32 sel_hi()
+        if self.cx < self.sel_a
+            return self.sel_a
+        return self.cx
+
+    // 有选区则删除并归位光标；返回是否有选区被删
+    fn bool del_selection()
+        let i32 lo = self.sel_lo()
+        let i32 hi = self.sel_hi()
+        if lo == hi
+            return false
+        self.text = prefix(self.text, lo) + suffix(self.text, hi)
+        self.cx = lo
+        self.sel_a = lo
+        self.dirty = true
+        return true
+
+    // 鼠标按下：定位光标 + 开始拖选
+    fn void on_press(let i32 mx)
+        let i32 p = self.pos_from_mx(mx)
+        self.cx = p
+        self.sel_a = p
+        self.dragging = true
+        self.dirty = true
+
+    fn void on_drag(let i32 mx)
+        if self.dragging
+            let i32 p = self.pos_from_mx(mx)
+            if p != self.cx
+                self.cx = p
+                self.dirty = true
+
+    fn void on_release()
+        self.dragging = false
+
+    // 单行化剪贴板文本：\r \n → 空格
+    fn string flatten(let string s)
+        let string out = ""
+        let i32 i = 0
+        while i < length(s)
+            let i32 b = ord(s[i])
+            if b == 10 or b == 13
+                out = out + " "
+            else
+                out = out + s[i]
+            i++
+        return out
 
     // 返回 true = 本帧有变化
     fn bool handle_key(let i64 k)
-        let i64 n = length(self.text)
-        if k == 8
-            // Backspace：删末字符
-            if n > 1
-                self.text = self.text[0, n - 2]
+        let i32 n = length(self.text)
+        let bool shift = k >= KEY_SHIFT   // SHIFT 位：0x40000000 为 k 值最高段
+        // Ctrl 组合键
+        if k == KEY_CTRL + 65        // Ctrl+A 全选
+            self.sel_a = 0
+            self.cx = n
+            self.dirty = true
+            return true
+        if k == KEY_CTRL + 67        // Ctrl+C 复制
+            let i32 lo = self.sel_lo()
+            let i32 hi = self.sel_hi()
+            if lo != hi
+                gui_clip_set(suffix(prefix(self.text, hi), lo))
+            return true
+        if k == KEY_CTRL + 88        // Ctrl+X 剪切
+            let i32 lo2 = self.sel_lo()
+            let i32 hi2 = self.sel_hi()
+            if lo2 != hi2
+                gui_clip_set(suffix(prefix(self.text, hi2), lo2))
+                let bool _dx = self.del_selection()
+                return true
+            return false
+        if k == KEY_CTRL + 86        // Ctrl+V 粘贴
+            let string clip = gui_clip_get()
+            if length(clip) > 0
+                let string ins = self.flatten(clip)
+                let bool _dv = self.del_selection()
+                self.text = prefix(self.text, self.cx) + ins + suffix(self.text, self.cx)
+                self.cx = self.cx + length(ins)
+                self.sel_a = self.cx
                 self.dirty = true
                 return true
-            if n == 1
-                self.text = ""
+            return false
+        // 导航键（Shift 按下时扩选：只移 cx，锚点 sel_a 不动；无 Shift 移动即取消选区）
+        if k == KEY_EXT + 37 or k == KEY_SHIFT + KEY_EXT + 37      // Left
+            if self.cx > 0
+                self.cx = align_back(self.text, self.cx - 1)
+            if not shift
+                self.sel_a = self.cx
+            self.dirty = true
+            return true
+        if k == KEY_EXT + 39 or k == KEY_SHIFT + KEY_EXT + 39      // Right
+            if self.cx < n
+                self.cx = next_cp(self.text, self.cx)
+            if not shift
+                self.sel_a = self.cx
+            self.dirty = true
+            return true
+        if k == KEY_EXT + 36 or k == KEY_SHIFT + KEY_EXT + 36      // Home
+            self.cx = 0
+            if not shift
+                self.sel_a = 0
+            self.dirty = true
+            return true
+        if k == KEY_EXT + 35 or k == KEY_SHIFT + KEY_EXT + 35      // End
+            self.cx = n
+            if not shift
+                self.sel_a = n
+            self.dirty = true
+            return true
+        if k == KEY_EXT + 46         // Delete：删选区或光标后一码点
+            if self.del_selection()
+                return true
+            if self.cx < n
+                let i32 p2 = next_cp(self.text, self.cx)
+                self.text = prefix(self.text, self.cx) + suffix(self.text, p2)
+                self.sel_a = self.cx
+                self.dirty = true
+                return true
+            return false
+        if k == 8
+            // Backspace：先删选区，否则删光标前一码点
+            if self.del_selection()
+                return true
+            if self.cx > 0
+                let i32 p = align_back(self.text, self.cx - 1)
+                self.text = prefix(self.text, p) + suffix(self.text, self.cx)
+                self.cx = p
+                self.sel_a = p
                 self.dirty = true
                 return true
             return false
         if k >= 32 and k < KEY_EXT
-            // 可打印（WM_CHAR 已做 Shift 映射）；中文/全角按 UTF-16 码元追加
-            self.text = self.text + cast(k, char)
+            // 可打印：覆盖选区后插入光标处（UTF-8 字节流逐字节拼出正确串）
+            let bool _dp = self.del_selection()
+            self.text = prefix(self.text, self.cx) + cast(k, char) + suffix(self.text, self.cx)
+            self.cx = self.cx + 1
+            self.sel_a = self.cx
             self.dirty = true
             return true
         return false
 
     fn void draw()
-        let i32 hh = LH() + 8 * SC() / 100
-        gui_fill_rect(self.x, self.y, self.w, hh, C_PANEL)
+        let i32 u = SC()
+        let i32 hh = LH() + 8 * u / 100
+        gui_round_rect(self.x, self.y, self.w, hh, 4 * u / 100, C_PANEL, C_BORDER)
         if self.focus
-            gui_rect(self.x, self.y, self.w, hh, C_ACCENT)
+            // 选区高亮（码点对齐的字节区间 → 像素区间）
+            let i32 lo = self.sel_lo()
+            let i32 hi = self.sel_hi()
+            if lo != hi
+                let i32 x1 = self.x + 8 * u / 100 + gui_text_w(prefix(self.text, lo))
+                let i32 x2 = self.x + 8 * u / 100 + gui_text_w(prefix(self.text, hi))
+                gui_fill_rect(x1, self.y + 4 * u / 100, x2 - x1, LH(), C_ACCENTD)
+            gui_draw_text(self.x + 8 * u / 100, self.y + 5 * u / 100, self.text, C_TEXT)
+            // 焦点下划线 + 光标（cx 可在文本中间）
+            gui_fill_rect(self.x + 1, self.y + hh - 2 * u / 100, self.w - 2, 2 * u / 100, C_ACCENT)
+            let i32 cw = gui_text_w(prefix(self.text, self.cx))
+            gui_fill_rect(self.x + 8 * u / 100 + cw, self.y + 5 * u / 100, 2 * u / 100, LH() - 4 * u / 100, C_TEXT)
         else
-            gui_rect(self.x, self.y, self.w, hh, C_BORDER)
-        gui_draw_text(self.x + 6 * SC() / 100, self.y + 5 * SC() / 100, self.text, C_TEXT)
-        if self.focus
-            let i32 tw = gui_text_w(self.text)
-            gui_fill_rect(self.x + 8 * SC() / 100 + tw, self.y + 5 * SC() / 100, 2 * SC() / 100, LH() - 4 * SC() / 100, C_TEXT)
+            gui_draw_text(self.x + 8 * u / 100, self.y + 5 * u / 100, self.text, C_TEXT)
         self.dirty = false
 
 // ===== Slider：拖动滑块，value 0..100 =====
@@ -215,10 +391,14 @@ pub struct ListBox
     string[] items
     i32 sel = -1         // 业务读这个（-1 未选）
     i32 top = 0          // 滚动偏移（首行下标）
+    i32 dbl = 0          // 双击计数（业务读差值；两次单击同一行 <400ms）
+    i32 dbl_row = -1     // 最后双击的行（items 下标）
+    i64 last_ms = 0      // 上次单击时刻（内部）
+    i32 last_row = -1    // 上次单击行（内部）
     bool dirty = true
 
     fn void clear()
-        self.items = self.items[0, 0]
+        self.items = self.items[0, -1]
         self.sel = -1
         self.top = 0
         self.dirty = true
@@ -242,9 +422,9 @@ pub struct ListBox
             self.dirty = true
 
     fn void draw()
-        let i32 hgt = self.rows * LH() + 8 * SC() / 100
-        gui_fill_rect(self.x, self.y, self.w, hgt, C_PANEL)
-        gui_rect(self.x, self.y, self.w, hgt, C_BORDER)
+        let i32 u = SC()
+        let i32 hgt = self.rows * LH() + 8 * u / 100
+        gui_round_rect(self.x, self.y, self.w, hgt, 6 * u / 100, C_PANEL, C_BORDER)
         let i32 n = length(self.items)
         let i32 last = self.top + self.rows
         if last > n
@@ -252,12 +432,16 @@ pub struct ListBox
         let i32 i = self.top
         while i < last
             let i32 row = i - self.top
-            let i32 ry = self.y + 4 * SC() / 100 + row * LH()
+            let i32 ry = self.y + 4 * u / 100 + row * LH()
             if i == self.sel
-                gui_fill_rect(self.x + 2 * SC() / 100, ry - 1, self.w - 4 * SC() / 100, LH(), C_ACCENT)
-                gui_draw_text(self.x + 8 * SC() / 100, ry, self.items[i], 0xFFFFFF)
+                // WinUI 选中行：accent 暗底 + 左侧强调条
+                gui_fill_rect(self.x + 2 * u / 100, ry - 1, self.w - 4 * u / 100, LH(), C_ACCENTD)
+                gui_draw_text(self.x + 8 * u / 100 + 4 * u / 100, ry, self.items[i], C_TEXT)
+                gui_fill_rect(self.x + 2 * u / 100, ry - 1, 3 * u / 100, LH(), C_ACCENT)
             else
-                gui_draw_text(self.x + 8 * SC() / 100, ry, self.items[i], C_TEXT)
+                gui_draw_text(self.x + 8 * u / 100 + 4 * u / 100, ry, self.items[i], C_TEXT)
+                if row > 0
+                    gui_line(self.x + 2 * u / 100, ry - 1, self.x + self.w - 2 * u / 100, ry - 1, 0x303030)
             i++
         self.dirty = false
 
@@ -436,6 +620,14 @@ pub struct App
             gui_present()
 
     fn void on_hover()
+        // 输入框拖选：聚焦且按住左键时移动即扩展选区
+        let i32 di = 0
+        while di < length(self.inputs)
+            if self.inputs[di].focus and self.inputs[di].dragging and self.ldown
+                self.inputs[di].on_drag(self.mx)
+                if self.inputs[di].dirty
+                    self.any_dirty = true
+            di++
         let i32 i = 0
         while i < length(self.buttons)
             let bool h = self.buttons[i].hit(self.mx, self.my) and not self.ldown
@@ -503,6 +695,10 @@ pub struct App
         while i < length(self.inputs)
             if press
                 self.inputs[i].set_focus(self.inputs[i].hit(self.mx, self.my))
+                if self.inputs[i].focus
+                    self.inputs[i].on_press(self.mx)
+            if not press
+                self.inputs[i].on_release()
             if self.inputs[i].dirty
                 self.any_dirty = true
             i++
@@ -568,6 +764,16 @@ pub struct App
                     if row >= 0 and idx < rows
                         self.lists[i].sel = idx
                         self.lists[i].dirty = true
+                        // 双击检测：同一行 <400ms 两次按下
+                        let i64 tms = tick_ms()
+                        if idx == self.lists[i].last_row and tms - self.lists[i].last_ms < 400
+                            self.lists[i].dbl++
+                            self.lists[i].dbl_row = idx
+                            self.lists[i].last_row = -1
+                            self.lists[i].last_ms = 0
+                        else
+                            self.lists[i].last_row = idx
+                            self.lists[i].last_ms = tms
             if self.lists[i].dirty
                 self.any_dirty = true
             i++
@@ -772,6 +978,16 @@ fn i32 align_fwd(let string s, let i32 i)
         q++
     return q
 
+// 从码点起点 i 前进到下一码点起点（i 为起点/任意位置均安全；i>=n 返回 n）
+fn i32 next_cp(let string s, let i32 i)
+    let i32 n = length(s)
+    if i >= n
+        return n
+    let i32 q = i + 1
+    while q < n and is_cont(s, q)
+        q++
+    return q
+
 // ===== Checkbox：复选框 =====
 // ===== Menu：菜单栏下拉菜单（App.add_menu 挂载；sel/clicks 业务读取） =====
 pub struct Menu
@@ -912,16 +1128,19 @@ pub struct TextArea
             self.cy = nl - 1
         let string ln = self.lines[self.cy]
         let i32 target = mx - self.x - pad
-        let i32 i = 0
-        let i32 best = 0
-        while i < length(ln)
-            if gui_text_w(prefix(ln, i)) > target
-                break
-            best = i
-            i = align_fwd(ln, i)
-            if i == best
-                i++
-        self.cx = best
+        let i32 n2 = length(ln)
+        if gui_text_w(ln) <= target
+            // 点击在行尾之后：光标落行尾（字节末尾，码点安全）
+            self.cx = n2
+        else
+            let i32 i = 0
+            let i32 best = 0
+            while i < n2
+                if gui_text_w(prefix(ln, i)) > target
+                    break
+                best = i
+                i = next_cp(ln, i)
+            self.cx = best
         self.clamp_scroll()
 
     // 替换第 cy 行并重建数组的通用入口都不需要——直接改 self.lines[cy]
@@ -1082,11 +1301,10 @@ pub struct TextArea
     fn void draw()
         let i32 u = SC()
         let i32 pad = 4 * u / 100
-        gui_fill_rect(self.x, self.y, self.w, self.h, C_PANEL)
+        let u32 border = C_BORDER
         if self.focus
-            gui_rect(self.x, self.y, self.w, self.h, C_ACCENT)
-        else
-            gui_rect(self.x, self.y, self.w, self.h, C_BORDER)
+            border = C_ACCENT
+        gui_round_rect(self.x, self.y, self.w, self.h, 6 * u / 100, C_PANEL, border)
         let i32 vr = self.vis_rows()
         let i32 nl = length(self.lines)
         let i32 last = self.top + vr

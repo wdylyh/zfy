@@ -8,8 +8,10 @@ exception CompileError of pos option * string
 
 type fixkind =
   | FixNone                     (* 普通错误 *)
-  | FixSem                      (* 语义级修复：coerce 已插 cast，编译继续 *)
-  | FixPatch of int * int * string  (* 改名类修复：源码补丁 (col, len, newtext) *)
+  | FixSem                      (* 语义级修复：coerce 已插 cast，编译继续
+                                   （仅当源码 token 无法定位时的兜底） *)
+  | FixPatch of int * int * string  (* 源码补丁 (col, len, newtext)：
+                                   改名类与 cast 插入类均适用 *)
 
 type zerr = { code : string; zpos : pos; zmsg : string; fix : fixkind }
 
@@ -419,14 +421,17 @@ let caret_width lines line col =
    <错误行及上下各 2 行，共 5 行>
         ^
    含自动修复项时，顶部先罗列将自动修复的错误序号 *)
+(* 报告序号的公共排序：按 (文件, 行, 列)——报告与交互式修复选择
+   都以此顺序编号 *)
+let sort_errs (errs : zerr list) : zerr list =
+  List.stable_sort
+    (fun a b ->
+       compare (a.zpos.file, a.zpos.line, a.zpos.col)
+         (b.zpos.file, b.zpos.line, b.zpos.col))
+    errs
+
 let report_err errs =
-  (* 按 (文件, 行, 列) 排序统一编号（序号即报告与 auto-fix 罗列的公共坐标） *)
-  let sorted =
-    List.stable_sort
-      (fun a b ->
-         compare (a.zpos.file, a.zpos.line, a.zpos.col)
-           (b.zpos.file, b.zpos.line, b.zpos.col))
-      errs in
+  let sorted = sort_errs errs in
   let fix_idx =
     sorted
     |> List.mapi (fun i (e : zerr) -> (i + 1, e))
@@ -772,18 +777,54 @@ let patch_src (src : string) (fixes : zerr list) : string =
     ordered;
   String.concat "\n" (Array.to_list lines)
 
+(* 定位源码 token：返回 (长度, 原文)。用于 cast 插入类补丁——把
+   `100` 包成 `cast(100, i8)`、把 `'A'`/char 变量包成 `cast(…, i32)`。
+   char 字面量从开引号扫到闭引号（容忍转义），其余按标识符/数字字符扫描 *)
+let token_at (src : string) (line : int) (col : int) : (int * string) option =
+  let lines = String.split_on_char '\n' src in
+  let nlines = List.length lines in
+  if line < 1 || line > nlines then None
+  else begin
+    let s = List.nth lines (line - 1) in
+    let n = String.length s in
+    let c = col - 1 in
+    if c < 0 || c >= n then None
+    else if s.[c] = '\'' then begin
+      let rec go i =
+        if i >= n then None
+        else if s.[i] = '\\' then (if i + 1 < n then go (i + 2) else None)
+        else if s.[i] = '\'' then
+          Some (i - c + 1, String.sub s c (i - c + 1))
+        else go (i + 1)
+      in
+      (try go (c + 1) with _ -> None)
+    end
+    else begin
+      let is_word ch =
+        match ch with
+        | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
+        | _ -> false
+      in
+      let j = ref c in
+      while !j < n && is_word s.[!j] do incr j done;
+      if !j = c then None else Some (!j - c, String.sub s c (!j - c))
+    end
+  end
+
 (* 补丁重跑轮数上限（防改名建议彼此互改死循环） *)
 let fix_round_cap = 4
 
 (* 收集式管线：词法 → 语法 → use 展开 → 类型 → MIR → LLVM。
    各阶段错误收集进 errs（多错误一次报告），阶段间提前终止：
    词法有错不进语法，语法/use 有错不进类型检查，类型有错不进降码。
-   自动修复：typeck 登记的唯一语义修复（undefined 改名/传统别名迁移）
-   从 errs 分流进 fixes；有 fixes 时对内存源码打补丁重跑（≤4 轮）——
-   全部错误可修 → Ok（产出 exe，fixes 随返回报告）；仍有残余错误 →
-   Error（fixes + 残余错误一起报告，不产出） *)
+   自动修复：typeck 登记的唯一语义修复（undefined 改名/传统别名迁移/
+   范围内字面量窄化插 cast/char→整数插 cast）从 errs 分流进 fixes。
+   ~auto（非交互默认 true）：fixes 对内存源码打补丁静默重跑（≤4 轮），
+   全部可修 → Ok（产出 exe）；~auto=false（交互模式）：fixes 原样随
+   Error 返回，由 compile 报告全部错误后询问用户选择、写回源文件重跑 *)
 let rec run_checked ?(src : string option) ?(acc : zerr list = [])
-    ?(round = 0) (path : string) : (string * zerr list, zerr list) result =
+    ?(round = 0) ?(auto = true) (path : string) :
+    (string * zerr list, zerr list) result =
   Hashtbl.reset Typeck.fix_pos;
   Typeck.autofixed := [];
   let errs = ref [] in
@@ -881,32 +922,44 @@ let rec run_checked ?(src : string option) ?(acc : zerr list = [])
     | Sys_error m ->
       driver_add `Driver None ("cannot read source file: " ^ m); None
   in
-  (* 语义级自动修复（coerce 插 cast）：文案登记 → fix 条目（无需改源码）；
-     同一位置可能因 coerce 多次调用重复登记，按 (行,列,文案) 去重 *)
+  (* cast 插入类自动修复（coerce）：登记条目 → fix 条目。补丁 = 把源码
+     token（字面量/char 变量）包成 `cast(token, 目标类型)`（交互模式写回
+     源文件；非交互对内存源码打补丁）；同一位置可能因 coerce 多次调用
+     重复登记，按 (行,列,文案) 去重。token 定位失败时兜底 FixSem（编译
+     继续但无法写回源码） *)
   let casts =
-    let seen = Hashtbl.create 8 in
-    List.filter_map
-      (fun (p, m) ->
-         let p = if p.file = "" then { p with file = path } else p in
-         let key = (p.line, p.col, m) in
-         if Hashtbl.mem seen key then None
-         else begin
-           Hashtbl.replace seen key ();
-           Some (mk `Type p m FixSem)
-         end)
-      !(Typeck.autofixed) in
+    if !Typeck.autofixed = [] then []
+    else
+      let seen = Hashtbl.create 8 in
+      let src0 = match src with Some s -> s | None -> read_file path in
+      List.filter_map
+        (fun (p, pp, m, ty) ->
+           let p = if p.file = "" then { p with file = path } else p in
+           let pp = if pp.file = "" then { pp with file = path } else pp in
+           let key = (p.line, p.col, m) in
+           if Hashtbl.mem seen key then None
+           else begin
+             Hashtbl.replace seen key ();
+             match token_at src0 pp.line pp.col with
+             | Some (len, tok) ->
+               Some (mk `Type p m
+                       (FixPatch (pp.col, len, "cast(" ^ tok ^ ", " ^ ty ^ ")")))
+             | None -> Some (mk `Type p m FixSem)
+           end)
+        !(Typeck.autofixed)
+  in
+  let fx = !fixes @ casts in
   match result with
-  | Some ll when !errs = [] -> Ok (ll, acc @ !fixes @ casts)
+  | Some ll when !errs = [] && (auto || fx = []) -> Ok (ll, acc @ fx)
   | _ ->
-    let fx = !fixes @ casts in
-    if !errs = [] && fx <> [] && round < fix_round_cap
+    if !errs = [] && fx <> [] && auto && round < fix_round_cap
        && List.for_all (fun (e : zerr) -> e.fix <> FixNone && e.zpos.file = path) fx
        && List.exists (fun (e : zerr) -> (match e.fix with FixPatch _ -> true | _ -> false)) fx
        then begin
-      (* 有可修复错误（且无残余硬错误）：打源码补丁重跑（内存副本） *)
+      (* 非交互：有可修复错误（且无残余硬错误）→ 打内存源码补丁重跑 *)
       let src0 = match src with Some s -> s | None -> read_file path in
       let patched = patch_src src0 fx in
-      run_checked ~src:patched ~acc:(acc @ fx) ~round:(round + 1) path
+      run_checked ~src:patched ~acc:(acc @ fx) ~round:(round + 1) ~auto path
     end
     else Error (acc @ fx @ !errs)
 
@@ -932,13 +985,116 @@ let find_runtime () =
     in
     go cands
 
-(* 编译到可执行文件，返回可执行文件路径 *)
+(* stdin 是否为交互终端（Unix.isatty；探测失败按非交互处理） *)
+let stdin_tty () : bool =
+  try Unix.isatty (Unix.descr_of_in_channel stdin) with _ -> false
+
+(* 修复模式：交互终端或 ZFY_FIX=ask → 询问用户选择；非交互默认 / 
+   ZFY_FIX=all → 自动修复全部（内存，源文件不动）。ZFY_FIX 供脚本/
+   测试强制指定 *)
+let fix_mode () =
+  match Option.map String.trim (Sys.getenv_opt "ZFY_FIX") with
+  | Some "ask" -> `Ask
+  | Some "all" -> `All
+  | _ -> if stdin_tty () then `Ask else `All
+
+(* 拆分用户输入：空格/逗号/Tab 均为分隔符（两种都支持，可混用） *)
+let split_selection (line : string) : string list =
+  let is_sep c = c = ' ' || c = ',' || c = '\t' || c = '\r' in
+  let n = String.length line in
+  let toks = ref [] in
+  let i = ref 0 in
+  while !i < n do
+    if is_sep line.[!i] then incr i
+    else begin
+      let j = ref !i in
+      while !j < n && not (is_sep line.[!j]) do incr j done;
+      toks := String.sub line !i (!j - !i) :: !toks;
+      i := !j
+    end
+  done;
+  List.rev !toks
+
+(* 交互询问：报告序号即选择序号（与 sort_errs 排序一致）。空输入=全部，
+   q/n/no=不修；非法/越界序号忽略并提示；选中不可修序号提示后跳过 *)
+let prompt_selection (errs : zerr list) (fixable : zerr list) : zerr list =
+  let arr = Array.of_list errs in
+  let total = Array.length arr in
+  Printf.eprintf
+    "zfy: enter error number(s) to auto-fix (space/comma separated; Enter = all, q = none): "
+  ;
+  flush stderr;
+  let line = (try input_line stdin with End_of_file -> "q") in
+  let line = String.trim line in
+  if line = "" then fixable
+  else if line = "q" || line = "n" || line = "no" then []
+  else begin
+    let toks = split_selection line in
+    let nums =
+      List.filter_map
+        (fun t ->
+           match int_of_string_opt t with
+           | Some k when k >= 1 && k <= total -> Some k
+           | _ ->
+             Printf.eprintf "zfy: ignoring invalid selection '%s'\n" t;
+             None)
+        toks
+    in
+    List.iter
+      (fun k ->
+         if arr.(k - 1).fix = FixNone then
+           Printf.eprintf "zfy: error [%d] is not auto-fixable, skipped\n" k)
+      nums;
+    List.filter
+      (fun (e : zerr) -> e.fix <> FixNone)
+      (List.map (fun k -> arr.(k - 1)) nums)
+  end
+
+(* 编译到可执行文件，返回可执行文件路径。
+   错误处理（含自动修复主循环）：
+   1. 报告全部错误（顶部罗列可自动修复的序号）；
+   2. 非交互 → 自动修复全部（内存补丁，源文件不动）；交互 → 询问用户
+      要修哪些（空格/逗号分隔序号），选中项直接写回源文件；
+   3. 重跑编译（≤4 轮），残余错误再次报告。
+   选了修复 → 产出 exe 时随报告打印修复明细；不修/不可全修失败 → exit 1 *)
 let compile path : string =
-  let ll, fixes =
-    match run_checked path with
+  let mode = fix_mode () in
+  let rec go round =
+    match run_checked ~auto:(mode = `All) ~round path with
     | Ok (ll, fixes) -> (ll, fixes)
-    | Error errs -> report_err errs; exit 1
+    | Error errs ->
+      if round >= fix_round_cap then (report_err errs; exit 1);
+      let errs = sort_errs errs in
+      let fixable =
+        List.filter (fun (e : zerr) -> e.fix <> FixNone) errs in
+      if fixable = [] then (report_err errs; exit 1);
+      (* 全部错误照常报告，顶部罗列可自动修复的序号 *)
+      report_err errs;
+      let sel =
+        match mode with
+        | `All -> fixable
+        | `Ask -> prompt_selection errs fixable
+      in
+      if sel = [] then exit 1;
+      (* 按文件分组，把补丁直接写回源文件后重跑 *)
+      let files =
+        List.sort_uniq compare
+          (List.map (fun (e : zerr) -> e.zpos.file) sel) in
+      List.iter
+        (fun f ->
+           let fs =
+             List.filter (fun (e : zerr) -> e.zpos.file = f) sel in
+           let patched = patch_src (read_file f) fs in
+           let oc = open_out f in
+           output_string oc patched;
+           close_out oc)
+        files;
+      Printf.eprintf "zfy: patched %d error(s) into source file(s), recompiling\n"
+        (List.length sel);
+      let ll, _ = go (round + 1) in
+      (ll, sel)
   in
+  let ll, fixes = go 0 in
   (* 全部错误被自动修复（仍产出 exe）：报告修复明细（全局序号与报告一致） *)
   if fixes <> [] then begin
     Printf.eprintf "zfy: note: auto-fixed %d error(s):\n" (List.length fixes);

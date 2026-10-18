@@ -1,0 +1,6 @@
+fn bool is_even(let i32 v)
+  return v % 2 == 0
+fn main()
+  let i32[] xs = 3, 4, 5
+  let i32[] ev = filter(xs, is_even)
+  output(ev, sep=" ")

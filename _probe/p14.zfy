@@ -1,6 +1,7 @@
-// struct 值自引用（应报错而非死循环）
-struct Bad
+mod gui;
+pub struct Inner2
     i32 v = 0
-    Bad next
-void main()
-    return
+pub struct Bag2
+    Inner2[] items
+pub fn i32 dummy()
+    return 0

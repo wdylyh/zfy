@@ -1,0 +1,19 @@
+// dpi probe: write gui metrics to stdout via window title area + file
+mod gui;
+use gui::{gui_open, gui_close, gui_w, gui_h, gui_dpi, gui_alive, gui_poll, gui_fill_rect, gui_draw_text, gui_present, gui_frame_sleep, Event}
+
+fn main()
+    let i32 rc = gui_open(640, 440, "zfy dpiprobe")
+    output("open rc=", rc, " w=", gui_w(), " h=", gui_h(), " dpi=", gui_dpi())
+    let i32 frames = 0
+    while gui_alive() and frames < 300
+        let Event e = Event()
+        while gui_poll(ref e)
+            output("ev ", e.typ)
+        gui_fill_rect(0, 0, gui_w(), gui_h(), 0x202028)
+        gui_draw_text(20, 20, "frame", 0xFFFFFF)
+        gui_present()
+        gui_frame_sleep(tick_ms())
+        frames++
+    output("loop end: alive=", gui_alive(), " frames=", frames)
+    gui_close()

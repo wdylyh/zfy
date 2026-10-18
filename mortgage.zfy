@@ -1,0 +1,98 @@
+// mortgage.zfy — 等额本息房贷月供计算器
+// 输入：贷款总额(元)、年利率(%)、贷款年限
+// 公式：月供 = P * r * (1+r)^n / ((1+r)^n - 1)，r 为月利率
+// 输出：月供、还款总额、总利息，以及逐年还款计划表
+
+// 金额分(厘)级四舍五入到两位小数打印：输入 x10^4 缩放后的整数
+fn i32 round100(let i64 x)
+    // x 为放大 10^4 倍的金额，返回放大 10^2 倍的整数
+    return cast((x + 50) / 100, i32)
+
+// 打印放大 10^4 倍的金额，补足两位小数（end="" 抑制换行）
+fn void print_amt(let i64 a4)
+    let i32 cents = round100(a4)
+    output(cents / 100, ".", end="")
+    if cents % 100 < 10
+        output("0", cents % 100, end="")
+    else
+        output(cents % 100, end="")
+
+fn main()
+    let f64 principal = 0
+    let f64 rate_pct = 0
+    let i32 years = 0
+    output("===== 等额本息房贷计算器 =====")
+    output("贷款总额(元): ")
+    input(principal)
+    output("年利率(%): ")
+    input(rate_pct)
+    output("贷款年限(年): ")
+    input(years)
+    if principal <= 0 or years <= 0 or rate_pct < 0
+        output("输入不合法: 金额/年限须为正，利率须非负")
+        return 0
+    let i32 months = years * 12
+    let f64 r = rate_pct / 100 / 12
+    let f64 base = (1 + r) ** cast(months, i64)
+    let f64 payment = 0
+    if r == 0
+        payment = principal / cast(months, f64)
+    else
+        payment = principal * r * base / (base - 1)
+    let f64 total_pay = payment * cast(months, f64)
+    let f64 total_int = total_pay - principal
+    // 金额显示：放大 10^4 取整，再由 round100 还原两位小数
+    let i64 pay4 = cast(payment * 10000 + 0.5, i64)
+    let i64 tot4 = cast(total_pay * 10000 + 0.5, i64)
+    let i64 int4 = cast(total_int * 10000 + 0.5, i64)
+    output("")
+    output("===== 计算结果 =====")
+    output("贷款总额: ", principal, " 元")
+    output("贷款期限: ", months, " 个月")
+    output("月利率: ", r * 100, "%")
+    output("每月月供: ", end="")
+    print_amt(pay4)
+    output(" 元")
+    output("还款总额: ", end="")
+    print_amt(tot4)
+    output(" 元")
+    output("支付利息: ", end="")
+    print_amt(int4)
+    output(" 元")
+    // 逐年计划：每年还款额、其中本金、其中利息、年末剩余本金
+    output("")
+    output("----- 逐年还款计划 -----")
+    output("年份    还款额(元)  其中本金(元)  其中利息(元)  年末剩余(元)")
+    let f64 remain = principal
+    let i32 y = 1
+    while y <= years
+        let f64 year_pay = 0
+        let f64 year_prin = 0
+        let f64 year_int = 0
+        let i32 m = 1
+        while m <= 12
+            let f64 interest = remain * r
+            let f64 prin = payment - interest
+            remain = remain - prin
+            year_pay = year_pay + payment
+            year_prin = year_prin + prin
+            year_int = year_int + interest
+            m++
+        // 负剩余钳零（浮点误差）
+        if remain < 0
+            remain = 0
+        let i64 yp4 = cast(year_pay * 10000 + 0.5, i64)
+        let i64 pr4 = cast(year_prin * 10000 + 0.5, i64)
+        let i64 pi4 = cast(year_int * 10000 + 0.5, i64)
+        let i64 rm4 = cast(remain * 10000 + 0.5, i64)
+        output(y, "       ", end="")
+        print_amt(yp4)
+        output("      ", end="")
+        print_amt(pr4)
+        output("       ", end="")
+        print_amt(pi4)
+        output("      ", end="")
+        print_amt(rm4)
+        output("")
+        y++
+    return 0

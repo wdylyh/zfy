@@ -35,35 +35,41 @@ zfy:error[序号][E码] in 行号 of 文件 because (文案)
 
 ## 〇′、自动修复
 
-编译器内置两级自动修复。报错含修复项时，错误块**顶部**先打一行预告：
+编译器内置自动修复（v3.5.1 起支持交互式选择）。报错含修复项时，错误块**顶部**先打一行预告：
 
 ```
 zfy: auto-fixable: error(s) [序号] [序号] ... will be repaired automatically
 ```
 
-### ① 语义级修复（编译继续，照常产出 exe）
+### ① 修复动作（两类，均可写回源文件）
 
-编译在类型检查内直接消化，不重跑：
+- **整数字面量窄化但值在目标范围内**：把字面量包成 `cast(字面量, 目标类型)`（对应 E3155 场景）。
+- **char → 整数槽**：按 ord 码点把 char 包成 `cast(c, 目标类型)`（对应 E3005 场景）。
+- **undefined variable / undefined function**：存在**唯一最近候选**（最小编辑距离且并列唯一；两个以上并列则只提示不修）时自动改名。
+- **undefined type 的传统别名迁移**：`int→i32`、`short→i16`、`long→i128`、`signed→i32`、`unsigned→u32`、`ulong→u128`、`float→f32`、`double→f64`、`byte→i8`。
 
-- **整数字面量窄化但值在目标范围内**：编译器插入 cast（对应 E3155 场景），报错标记 auto-fixed 后继续编译。
-- **char → 整数槽**：按 ord 码点插入 cast（对应 E3005 场景）。
+### ② 修复模式（按 stdin 是否为终端自动分流；`ZFY_FIX=ask`/`all` 可强制）
 
-修复后输出：
+- **非交互（脚本/管道，默认 `ZFY_FIX=all`）**：自动修复全部——内存补丁重跑 ≤4 轮，**源文件不动**，照常产出 exe 并附清单：
 
 ```
 zfy: note: auto-fixed N error(s):
 [序号][E码] in 行 of 文件 because (文案…auto-fixed…)
 ```
 
-### ② 改名级修复（对内存源码打补丁重跑，源文件不改，最多 4 轮）
+- **交互（终端，默认 `ZFY_FIX=ask`）**：照常报告全部错误（顶部罗列可修序号）**且不退出**，提示输入要修复的序号：
 
-- **undefined variable / undefined function**：存在**唯一最近候选**（最小编辑距离且并列唯一；两个以上并列则只提示不修）时自动改名后重跑编译。
-- **undefined type 的传统别名迁移**：`int→i32`、`short→i16`、`long→i128`、`signed→i32`、`unsigned→u32`、`ulong→u128`、`float→f32`、`double→f64`、`byte→i8`。
+```
+zfy: enter error number(s) to auto-fix (space/comma separated; Enter = all, q = none):
+```
+
+  序号**空格与逗号分隔均支持**（可混用，如 `1, 3` 或 `1 3`）；直接回车=全部，`q`/`n`/`no`=不修；非法序号忽略并提示；选中不可修序号提示后跳过。选中项**直接写回源文件**（改名与 cast 插入都改文件）后自动重编译。
 
 ### ③ 大决定（是否产出 exe）
 
-- **全部错误可自动修复** → 照常产出 exe，并附 `zfy: note: auto-fixed N error(s):` 清单。
-- **只有部分可修（存在不可修错误）** → 报告全部错误（含修复项序号），但**不产出 exe**。
+- **选中修复且全部错误可自动修复** → 照常产出 exe，并附 `zfy: note: auto-fixed N error(s):` 清单。
+- **选中部分修复** → 选中项写回源文件后重编译，不可修错误照常报告（重编译仍失败则不产出 exe）。
+- **选择不修（`q`）** → 报告全部错误，不产出 exe。
 
 各错误码条目的「自动修复」列即按上述范围标注。
 

@@ -516,6 +516,7 @@ let resolve (main : program) (main_dir : string)
       | TSeqN (t2, len, p) -> TSeqN (rw_ty m t2, len, p)
       | TFun (r, ps, p) -> TFun (rw_ty m r, List.map (rw_ty m) ps, p)
       | TApp (n, ts, p) -> TApp (resolve_name m n p, List.map (rw_ty m) ts, p)
+      | TClo (ps, r, p) -> TClo (List.map (rw_ty m) ps, rw_ty m r, p)
     in
     let rec rw_expr (m : modt) (e : expr) : expr =
       match e with
@@ -559,6 +560,14 @@ let resolve (main : program) (main_dir : string)
       | EUnwrap (a, b, p) -> EUnwrap (rw_expr m a, rw_expr m b, p)
       | EPropagate (x, p) -> EPropagate (rw_expr m x, p)
       | ERemove (b, i, p) -> ERemove (rw_expr m b, rw_expr m i, p)
+      | ELambda (lam, p) ->
+        ELambda ({ lam with
+                   lparams = lam.lparams;
+                   lcaps = lam.lcaps;
+                   lbody = (match lam.lbody with
+                            | LExpr x -> LExpr (rw_expr m x)
+                            | LBlock (bl, rt) -> LBlock (rw_block m bl, rt)) },
+                  p)
       | EInt _ | EFloat _ | EStr _ | EChar _ | EBool _ -> e
     and rw_block m bl = List.map (rw_stmt m) bl
     and rw_stmt m (s : stmt) : stmt =
@@ -615,6 +624,8 @@ let resolve (main : program) (main_dir : string)
       | SForIn (n, sx, b, p) ->
         SForIn (n, rw_expr m sx, rw_block m b, p)
       | SUnsafe (b, p) -> SUnsafe (rw_block m b, p)
+      | SFn (nm, params, ret, fr, body, p) ->
+        SFn (nm, params, Option.map (rw_ty m) ret, fr, rw_block m body, p)
       | SBreak _ | SContinue _ -> s
     in
     let rw_param m pr = { pr with pty = rw_ty m pr.pty } in

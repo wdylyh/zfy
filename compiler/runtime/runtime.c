@@ -2159,18 +2159,59 @@ DEF_CONTAINS(f32, x == v, float)
 DEF_CONTAINS(f64, x == v, double)
 DEF_CONTAINS(str, STRCMP(x, v) == 0, char *)
 
-/* 谓词/比较器 thunk：llvmgen 为每个 (函数, 元素类型) 生成 C ABI 适配器，
- * 这里只消费统一签名（元素按指针传入）：
- *   filter/any/all：i32 (*pred)(const void *elem)
- *   sort_by：       i32 (*cmp)(const void *a, const void *b)
- *   reduce：        T (*f)(T acc, T elem)（值传，按值种类宏生成） */
-zfy_seq *zfy_filter(zfy_seq *src, int (*pred)(const void *)) {
-    if (!src) zfy_die("filter: 源为空");
+/* ---------- 闭包与容器高阶算法（v3.7） ----------
+ * 闭包值 = 句柄 h（堆块地址）；堆块头部 code 指针，其后捕获字段。
+ * 调用约定：code(env, args...)——env = 堆块地址（lambda 首参 $env）。
+ * 容器内建收"闭包句柄 struct 槽地址"（{ ptr h }），解两层：
+ *   h = *(void**)clo; code = *(void**)h; code(h, ...)。
+ * 裸函数名在 typeck 包装为空捕获 wrapper 闭包（env 无关）。
+
+/* env 堆块分配：不回收（闭包/捕获生命周期 = 进程，v1 设计） */
+void *zfy_env_new(long long n) {
+    void *p = malloc(n > 0 ? (size_t)n : 1);
+    if (!p) zfy_die("out of memory (closure env)");
+    return p;
+}
+
+/* 从闭包槽解出调用入口 */
+static void *clo_code(void *clo) {
+    void *h = *(void **)clo;
+    if (!h) zfy_die("closure is null");
+    return *(void **)h;
+}
+
+/* 谓词/比较器统一约定（v3.7，元素按值传入）：
+ *   元素调用类别 ck：0=整型/bool/char/指针（槽内按宽度读、零扩展到 8 字节），
+ *   1=f32，2=f64，3=string（槽内指针直传）。与 llvmgen 注入的常量编码一致。
+ *   谓词返回 i1（LLVM 约定 AL 低 1 位有效）→ C 侧按 int 读后 &1。
+ *   filter/any/all：i32 (*pred)(void *env, <elem by value>)
+ *   sort_by：       i32 (*cmp)(void *env, <a>, <b>)
+ *   fold：          T (*f)(void *env, T acc, T elem)（按值种类宏生成） */
+static long long load_int_elem(void *e, int esz) {
+    switch (esz) {
+    case 1: return (long long)(unsigned char)*(unsigned char *)e;
+    case 2: return (long long)(unsigned short)*(unsigned short *)e;
+    case 4: return (long long)(unsigned int)*(unsigned int *)e;
+    default: return *(long long *)e;
+    }
+}
+static int pred_call(void *code, void *env, void *e, int esz, int ck) {
+    switch (ck) {
+    case 1: return ((int (*)(void *, float))code)(env, *(float *)e) & 1;
+    case 2: return ((int (*)(void *, double))code)(env, *(double *)e) & 1;
+    case 3: return ((int (*)(void *, void *))code)(env, *(void **)e) & 1;
+    default: return ((int (*)(void *, long long))code)(env, load_int_elem(e, esz)) & 1;
+    }
+}
+zfy_seq *zfy_filter(zfy_seq *src, void *pred_clo, int ck) {
+    if (!src) zfy_die("filter: source is null");
+    void *code = clo_code(pred_clo);
+    void *cenv = *(void **)pred_clo;
     zfy_seq *s = zfy_seq_new_k(0, src->len > 0 ? src->len : 1, src->elemsz,
                                src->kind, src->ops);
     for (long long i = 0; i < src->len; i++) {
         void *e = (char *)src->data + i * src->elemsz;
-        if (pred(e)) {
+        if (pred_call(code, cenv, e, src->elemsz, ck)) {
             void *slot = (char *)s->data + s->len * s->elemsz;
             elem_init(slot, e, s->kind, s->ops, s->elemsz);
             s->len++;
@@ -2179,35 +2220,122 @@ zfy_seq *zfy_filter(zfy_seq *src, int (*pred)(const void *)) {
     return s;
 }
 
-int zfy_any(zfy_seq *s, int (*pred)(const void *)) {
+int zfy_any(zfy_seq *s, void *pred_clo, int ck) {
     if (!s) return 0;
+    void *code = clo_code(pred_clo);
+    void *cenv = *(void **)pred_clo;
     for (long long i = 0; i < s->len; i++)
-        if (pred((char *)s->data + i * s->elemsz)) return 1;
+        if (pred_call(code, cenv, (char *)s->data + i * s->elemsz,
+                      s->elemsz, ck)) return 1;
     return 0;
 }
 
-int zfy_all(zfy_seq *s, int (*pred)(const void *)) {
+int zfy_all(zfy_seq *s, void *pred_clo, int ck) {
     if (!s) return 0;
+    void *code = clo_code(pred_clo);
+    void *cenv = *(void **)pred_clo;
     for (long long i = 0; i < s->len; i++)
-        if (!pred((char *)s->data + i * s->elemsz)) return 0;
+        if (!pred_call(code, cenv, (char *)s->data + i * s->elemsz,
+                       s->elemsz, ck)) return 0;
     return 1;
 }
 
-/* sort_by：clone 后按用户比较器（C thunk）排序，返回新表（值语义） */
-zfy_seq *zfy_sort_by(zfy_seq *src, int (*cmp)(const void *, const void *)) {
+/* sort_by：qsort 的比较器签名 (a, b) 不带上下文——经线程局部 env 中转
+ * （zfy v1 无并发，安全）；元素按 ck 分发为值传给比较闭包；
+ * 返回 clone 排序后的新表（值语义） */
+static void *zfy_sb_env;
+static void *zfy_sb_code;
+static int zfy_sb_ck;
+static int zfy_sb_esz;
+static int zfy_sb_trampoline(const void *a, const void *b) {
+    switch (zfy_sb_ck) {
+    case 1: return ((int (*)(void *, float, float))zfy_sb_code)(
+        zfy_sb_env, *(float *)a, *(float *)b);
+    case 2: return ((int (*)(void *, double, double))zfy_sb_code)(
+        zfy_sb_env, *(double *)a, *(double *)b);
+    case 3: return ((int (*)(void *, void *, void *))zfy_sb_code)(
+        zfy_sb_env, *(void **)a, *(void **)b);
+    default: return ((int (*)(void *, long long, long long))zfy_sb_code)(
+        zfy_sb_env, load_int_elem((void *)a, zfy_sb_esz),
+        load_int_elem((void *)b, zfy_sb_esz));
+    }
+}
+zfy_seq *zfy_sort_by(zfy_seq *src, void *cmp_clo, int ck) {
     if (!src) return zfy_seq_new_k(0, 1, 8, 0, NULL);
     zfy_seq *s = zfy_seq_clone(src);
-    if (s->len > 1)
-        qsort(s->data, (size_t)s->len, (size_t)s->elemsz, cmp);
+    if (s->len > 1) {
+        zfy_sb_code = clo_code(cmp_clo);
+        zfy_sb_env = *(void **)cmp_clo;
+        zfy_sb_ck = ck;
+        zfy_sb_esz = s->elemsz;
+        qsort(s->data, (size_t)s->len, (size_t)s->elemsz, zfy_sb_trampoline);
+    }
+    return s;
+}
+
+/* map(xs, f) -> list<B>（v3.7）：逐元素应用闭包，结果按 B 的种类写入新表。
+ * sck/rck：源/结果元素的调用类别（按值传参、按返回类别取值——i/f32/f64/
+ * string 分别经 rax/xmm0/返回指针寄存器约定拆位）；
+ * string 返回堆串（所有权移交新表）。 */
+zfy_seq *zfy_map_seq(zfy_seq *src, void *f_clo, int bkind, int belosz,
+                     int sck, int rck) {
+    if (!src) zfy_die("map: source is null");
+    void *code = clo_code(f_clo);
+    void *cenv = *(void **)f_clo;
+    zfy_seq *s = zfy_seq_new_k(0, src->len > 0 ? src->len : 1, belosz,
+                               bkind, NULL);
+    for (long long i = 0; i < src->len; i++) {
+        void *e = (char *)src->data + i * src->elemsz;
+        long long r = 0;
+        switch (sck) {
+        case 1: {   /* f32 arg */
+            if (rck == 2) { double d = ((double (*)(void *, float))code)(cenv, *(float *)e); memcpy(&r, &d, 8); }
+            else if (rck == 1) { float f = ((float (*)(void *, float))code)(cenv, *(float *)e); memcpy(&r, &f, 4); }
+            else if (rck == 3) { r = (long long)(intptr_t)((void *(*)(void *, float))code)(cenv, *(float *)e); }
+            else r = ((long long (*)(void *, float))code)(cenv, *(float *)e);
+            break; }
+        case 2: {   /* f64 arg */
+            if (rck == 2) { double d = ((double (*)(void *, double))code)(cenv, *(double *)e); memcpy(&r, &d, 8); }
+            else if (rck == 1) { float f = ((float (*)(void *, double))code)(cenv, *(double *)e); memcpy(&r, &f, 4); }
+            else if (rck == 3) { r = (long long)(intptr_t)((void *(*)(void *, double))code)(cenv, *(double *)e); }
+            else r = ((long long (*)(void *, double))code)(cenv, *(double *)e);
+            break; }
+        case 3: {   /* string arg (heap ptr, f takes ownership) */
+            if (rck == 2) { double d = ((double (*)(void *, void *))code)(cenv, *(void **)e); memcpy(&r, &d, 8); }
+            else if (rck == 1) { float f = ((float (*)(void *, void *))code)(cenv, *(void **)e); memcpy(&r, &f, 4); }
+            else if (rck == 3) { r = (long long)(intptr_t)((void *(*)(void *, void *))code)(cenv, *(void **)e); }
+            else r = ((long long (*)(void *, void *))code)(cenv, *(void **)e);
+            break; }
+        default: {  /* int/bool/char/ptr arg (load by width, zero-extend) */
+            long long v = load_int_elem(e, src->elemsz);
+            if (rck == 2) { double d = ((double (*)(void *, long long))code)(cenv, v); memcpy(&r, &d, 8); }
+            else if (rck == 1) { float f = ((float (*)(void *, long long))code)(cenv, v); memcpy(&r, &f, 4); }
+            else if (rck == 3) { r = (long long)(intptr_t)((void *(*)(void *, long long))code)(cenv, v); }
+            else r = ((long long (*)(void *, long long))code)(cenv, v);
+            break; }
+        }
+        void *slot = (char *)s->data + s->len * s->elemsz;
+        if (bkind == 1) {
+            char *str = (char *)(uintptr_t)r;
+            *(char **)slot = zfy_strdup(str);
+            free(str);
+        } else {
+            memcpy(slot, &r, belosz);
+        }
+        s->len++;
+    }
     return s;
 }
 
 #define DEF_REDUCE(TAG, ELEM_T)                                            \
-ELEM_T zfy_fold_##TAG(zfy_seq *s, ELEM_T (*f)(ELEM_T, ELEM_T), ELEM_T init) { \
+ELEM_T zfy_fold_##TAG(zfy_seq *s, void *f_clo, ELEM_T init) {               \
     if (!s) return init;                                                   \
+    ELEM_T (*f)(void *, ELEM_T, ELEM_T) =                                   \
+        (ELEM_T (*)(void *, ELEM_T, ELEM_T))clo_code(f_clo);               \
+    void *cenv = *(void **)f_clo;                                          \
     ELEM_T acc = init;                                                     \
     for (long long i = 0; i < s->len; i++)                                 \
-        acc = f(acc, *(ELEM_T *)((char *)s->data + i * s->elemsz));        \
+        acc = f(cenv, acc, *(ELEM_T *)((char *)s->data + i * s->elemsz));  \
     return acc;                                                            \
 }
 
@@ -2222,12 +2350,15 @@ DEF_REDUCE(u64, unsigned long long)
 DEF_REDUCE(f32, float)
 DEF_REDUCE(f64, double)
 /* string 归并：f 接管两个参数所有权（zfy 传参约定），结果串归调用方 */
-char *zfy_fold_str(zfy_seq *s, char *(*f)(char *, char *), char *init) {
+char *zfy_fold_str(zfy_seq *s, void *f_clo, char *init) {
     if (!s) return init;
+    char *(*f)(void *, char *, char *) =
+        (char *(*)(void *, char *, char *))clo_code(f_clo);
+    void *cenv = *(void **)f_clo;
     char *acc = init;
     for (long long i = 0; i < s->len; i++) {
         char *x = *(char **)((char *)s->data + i * s->elemsz);
-        acc = f(acc, zfy_strdup(x));
+        acc = f(cenv, acc, zfy_strdup(x));
     }
     return acc;
 }

@@ -1,0 +1,54 @@
+// menu probe: click state drawn on screen
+mod gui;
+mod widgets;
+use widgets::{App, Menu, Label}
+use gui::{gui_present, gui_alive, gui_w, gui_h, gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    if app.open(420, 240, "zfy menuprobe") != 0
+        output("open fail")
+        return 1
+    let Menu mFile = Menu()
+    mFile.title = "文件"
+    mFile.items = "新建", "退出"
+    let Menu mEdit = Menu()
+    mEdit.title = "编辑"
+    mEdit.items = "复制", "粘贴"
+    let i32 _idx1 = app.add_menu(mFile)
+    let i32 _idx2 = app.add_menu(mEdit)
+    app.layout_menus()
+
+    let Label st = Label()
+    st.text = ""
+    let i32 _idx3 = app.add_label(st)
+    let Label act = Label()
+    act.text = ""
+    let i32 _idx4 = app.add_label(act)
+
+    while app.alive()
+        // 状态行
+        app.labels[0].text = "mx=" + cast(app.mx, string) + " my=" + cast(app.my, string) + " bar_h=" + cast(app.menu_bar_h(), string) + " m0.x=" + cast(app.menus[0].x, string) + " tw=" + cast(app.menus[0].tw, string) + " open0=" + cast(app.menus[0].open, string) + " m1.x=" + cast(app.menus[1].x, string)
+        app.labels[0].y = gui_h() - 26
+        app.labels[0].bg_w = gui_w() - 16
+        app.labels[0].dirty = true
+        if app.menus[0].clicks > 0
+            app.labels[1].text = "FILE sel=" + cast(app.menus[0].sel, string) + " clicks=" + cast(app.menus[0].clicks, string)
+            app.menus[0].clicks = 0
+            app.labels[1].dirty = true
+        if app.menus[1].clicks > 0
+            app.labels[1].text = "EDIT sel=" + cast(app.menus[1].sel, string) + " clicks=" + cast(app.menus[1].clicks, string)
+            app.menus[1].clicks = 0
+            app.labels[1].dirty = true
+        if gui_w() != app.labels[0].x
+            app.labels[0].x = 8
+            app.labels[1].x = 8
+            app.labels[1].y = gui_h() - 52
+        app.step()
+        app.labels[0].draw()
+        app.labels[1].draw()
+        gui_present()
+        gui_frame_sleep(app.t0)
+
+    app.close()
+    return 0

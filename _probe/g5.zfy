@@ -1,0 +1,11 @@
+mod gui;
+use gui::{gui_open, gui_alive, gui_fill_rect, gui_rect, gui_present}
+
+fn main()
+    if gui_open(100, 100, "ir") != 0
+        return 1
+    gui_rect(100, 60, 52, 44, 0x50E050)
+    gui_present()
+    while gui_alive()
+        sleep_ms(16)
+    return 0

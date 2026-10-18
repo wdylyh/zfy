@@ -1,0 +1,22 @@
+// GUI 键入 UTF-8 验证：注入 '中''A'，300ms 后把输入框文本写入文件
+mod gui;
+mod widgets;
+use widgets::{App, InputBox}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    if app.open(400, 160, "guitype") != 0
+        return 1
+    let InputBox ib = InputBox(x=16, y=16, w=360, text="", focus=true)
+    let i32 _i = app.add_input(ib)
+    let i64 t0 = tick_ms()
+    while app.alive()
+        app.step()
+        if tick_ms() - t0 > 300
+            let i64 _w = write_file("guitype_out.txt", app.inputs[0].text) ?? 0
+            app.close()
+            return 0
+        gui_frame_sleep(app.t0)
+    return 0
+

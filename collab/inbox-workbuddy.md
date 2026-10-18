@@ -3,6 +3,153 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-046
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-18 04:35
+---
+**t-045 D 项落地：GUI_KEY_SHIFT 事件标志 + InputBox Shift+方向键扩选**，回归 0 失败（69 例）。
+
+- **runtime.c**：新增 `GUI_KEY_SHIFT 0x40000000`；WM_KEYDOWN 导航键拦截处按 `GetKeyState(VK_SHIFT)<0` 给 k 值叠加 SHIFT 位（EXT|SHIFT|VK）。
+- **gui.zfy**：导出 `KEY_SHIFT = 0x40000000`（与 KEY_EXT 叠加使用）。
+- **widgets.zfy InputBox**：handle_key 开头取 `shift = k >= KEY_SHIFT`（0x40000000 为 k 值最高段，WM_CHAR 码元与 EXT/CTRL 值均低于此）；Left/Right/Home/End 分支改为同时匹配 SHIFT 变体，Shift 按下时只移 cx、锚点 sel_a 不动（扩选），无 Shift 保持原"移动即取消选区"语义。
+- **TextArea**：handle_key 为精确匹配，SHIFT 键值不命中任何分支、行为安全（多行选区扩选属独立功能，未做）。
+- **注入验证**（videolib 新构建 + 真键）：键入 hello → Shift+Home → 截图确认 "hello" 全选蓝底高亮（锚点=尾部、光标=行首）。注意验证前提：**被测 exe 必须用新 runtime/widgets 重新构建**（旧 main.exe 曾导致连续假阴性），且 keybd_event 真键注入须真前台（Alt 空按 + SetForegroundWindow 重试，失败兜底 SwitchToThisWindow）。
+- 附注：PostMessage 注入 WM_KEYDOWN VK_SHIFT **不能**让后续 Home 的 GetKeyState(VK_SHIFT) 读到按下（GetKeyState 是同步键盘状态，不消费队列消息）——验证 Shift 组合只能真键。
+
+<!-- t-046 无需操作则置 done；TextArea 多行选区扩选如需要另行立条 -->
+
+---
+id: t-045
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-18 03:40
+---
+**gui_font 修复落地 + InputBox 鼠标拖选/快捷键全套实现并注入验证通过**，回归 0 失败（69 例）。本条同时闭环 t-044 的 C 项。
+
+**A. gui_font 小字号 bug 已修（t-044 C 项闭环）**：
+- 修法即 t-044 建议的多槽缓存：`zfy_gui_font` 重写为 16 槽 (px,bold)→HFONT 常驻缓存（命中直 SelectObject，未命中 CreateFontW 后循环槽覆盖；**不再 DeleteObject 任何仍可能被 DC 持有的字体**）。
+- 另重要修正 t-044 的结论：当时"13px 第二行缺失/变黑"部分是**采样坐标误判**——GetWindowRect 含边框+标题栏偏移，导出 PNG 后确认三行 13px 全部正常。DeleteObject 隐患是真实的，修复仍有价值；13px 已回归使用（Button.draw 恢复 gui_font(13,0)，截图验证正常）。
+
+**B. InputBox 文本选择与快捷键（用户明确要求）**，widgets.zfy InputBox 重写：
+- 新字段：`cx`（光标字节位置，码点对齐）、`sel_a`（选区锚点）、`dragging`；选区 [min(cx,sel_a), max)。
+- 鼠标：`pos_from_mx` 像素→字节（next_cp 码点推进，右侧空白落行尾）；App.on_click 接 on_press（定位+开始拖选）/on_release，App.on_hover 中 focus+dragging+ldown 时 on_drag 实时扩展选区。
+- 键盘：Ctrl+A 全选 / Ctrl+C 复制 / Ctrl+X 剪切 / Ctrl+V 粘贴（gui_clip_get/set，粘贴文本 \r\n→空格单行化）；Left/Right/Home/End（移动即取消选区）、Delete/Backspace（先删选区）；可打印字符覆盖选区后在 cx 插入（UTF-8 字节流逐字节拼串，中文安全）。
+- 绘制：选区 C_ACCENTD 高亮像素区间 + 光标竖线画在 gui_text_w(prefix(text,cx)) 处。
+
+**C. 注入验证（关键教训两条）**：
+- **教训 1（DPI 虚拟化）**：DPI-unaware 进程（Python）PostMessage 鼠标消息坐标会被系统 **×1.5 虚拟化转换**到 per-monitor-aware 目标窗口——注入脚本须先 ÷1.5 发"逻辑坐标"。此前"拖选无高亮"排查半天的根因即此：注入点全落在文本右侧空白，pos_from_mx 恒返回行尾。**widgets 代码本身无 bug**（真实鼠标物理坐标直达，不受影响）。
+- **教训 2（前台限制）**：keybd_event 真键注入 Ctrl 组合（GetKeyState 读目标线程状态，PostMessage 无效）需先 SetForegroundWindow；后台进程直接调用会被拒，须先空按一次 Alt 解除限制。
+- 实测通过（videolib 真实窗口截图+像素扫描）：拖选高亮（探针 cx=2 sel=5 "llo" 反白）、Ctrl+A 全选、Ctrl+C（剪贴板读回 "abc"）、Ctrl+X 清空、Ctrl+V 粘贴回填；键盘 Home/Right/中间插入上轮已验（"hXello"）。
+- 探针留存：_tmp/selprobe.zfy（状态回显 cx/sel/drag/mx/my/ldown）、sprobe/iprobe/cprobe/aprobe/vprobe.py、shotp.py（任意标题截图）、find_hl.py（PNG 内扫描指定色行）。
+
+**D. 遗留建议**：runtime 事件无 Shift 修饰标志——Shift+方向键扩选做不了（GUI_KEY 只有 EXT/CTRL 位）；如需加 SHIFT 标志（0x40000000|VK），runtime WM_KEYDOWN 拦截处与 gui.zfy 常量两侧同步。另 gui_clip_get 的 buf[0, n-1] 语义依赖 zfy 切片 [lo,hi)，注意 future 改动。
+
+<!-- t-045 请复核 B 项 UI 行为是否符合预期（选区高亮配色可调）；t-044 C 项已闭环可置 done -->
+<!-- gui_font 多槽缓存：runtime.c GUI_FONT_SLOTS=16，重启后生效需重编译 GUI 程序 -->
+
+---
+id: t-044
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-17 23:55
+---
+**WinUI3 化主题改造 + 两个 runtime/工具 bug 定位（一个待修）**，回归 0 失败。
+
+**A. widgets.zfy 主题 WinUI3 深色化（用户要求"现代美观优雅"）**：
+- 配色全面换血：C_BG #202020 / C_PANEL #2C2C2C / hover #383838 / pressed #242424 / C_BORDER #3A3A3A / C_ACCENT #4CC2FF（WinUI 深色 accent light2）/ 新增 C_ACCENTD #0C3B5E（选中行暗底）、C_SUB #A0A0A0。
+- Button：扁平无边框（fill==border 同色）、hover 亮/pressed 暗、圆角 6。
+- InputBox：焦点时底部 2px accent 下划线（WinUI 特征）替代整框变色。
+- ListBox：选中行 = C_ACCENTD 暗底 + 左侧 3px accent 竖条 + 白字；行分隔线 #303030。
+- videolib 布局扁平化：删渐变顶栏与品牌强调线，改"大标题(fs18 bold)居左 + 搜索框右上"的 WinUI 头部；搜索提示标签移除（置空保索引）。验收截图：卡片化、accent 选中行、焦点下划线全部到位。
+
+**B. 已修：截图工具 shot.py R/B 反序**（重要教训）：
+- `GetDIBits` 输出 BGRA，旧 shot.py 直接当 RGBA 写 PNG → **历史所有截图的 R/B 都是反的**（accent 蓝显示成橙）。已修（byte0/byte2 交换后写 PNG）。
+- 定位方法：DIB 像素直采（GetDIBits 按通道读数）证明屏显 (76,194,255)=0x4CC2FF 正确 → 排除 runtime 颜色 bug → 反推截图工具反序。**runtime 的 fill_rect（DIB 直写 0x00RRGGBB）、draw_text（COLORREF 交换）、gui_rgb（GDI 笔刷交换）三条颜色路径全部正确，勿再怀疑**。
+
+**C. 待修：gui_font 小字号（<16px）多字号切换异常**（本轮发现未修）：
+- 探针（d:\zfy\_tmp\colprobe.zfy 可复用）实测：16px 白字正常；13px 在"16→13 切换后"出现部分行文字渲染**缺失**（v3：三行同字号中第二行峰值=背景色，文字整体没画出来）或**变黑**（v1 平均 (0,0,0)，比背景 32 还暗）。
+- 规避已落地：widgets 与 videolib 全部回到 16px（观感影响小）。
+- 嫌疑范围：zfy_gui_font 的 static (px,bold) 缓存 + DeleteObject(cf) 在字体仍选入 mem DC 时调用的组合（GDI 语义：选入 DC 的对象 DeleteObject 失败，但后续行为未验证）；也不排除 CLEARTYPE_QUALITY 与 DIB memDC 的交互。建议修法：缓存改"每种 (px,bold) 独立 HFONT 常驻"（GUI 程序字号种类少，不做单槽淘汰），或 SelectObject 换出后再 Delete。
+- 附带发现：gui_frame_sleep(t0) 参数是**帧起点时间戳**而非 sleep 毫秒（探针误传 16 导致全速空转）——语义易踩，建议改名或加注释。
+
+**D. 顺带**：place_cursor 相关确认——InputBox 恒末尾光标无点击定位（符合设计）；ListBox 双击、删除确认等 t-042 功能在新主题下复验正常。
+
+---
+id: t-043
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-17 23:20
+---
+**GUI 编辑器乱码 bug 修复（TextArea 点击定位劈开 UTF-8 多字节字符）**，回归 0 失败。用户报告"光标可以在文字中间显示，删除和添加字符导致别的字符乱码"。
+
+**根因**（widgets.zfy 纯 zfy 逻辑 bug，非编译器/runtime）：
+- `align_fwd(s, i)` 语义是"从 i 起**跳过 continuation 字节**"——传入码点起点时原地返回 i。
+- `place_cursor` 循环把它当"前进到下一码点"用，靠 `i = align_fwd(ln, i); if i == best: i++` 兜底。当 i 恰好是某 3 字节汉字起点（非 continuation），align_fwd 原地返回 → 兜底只 +1 字节 → **i 落进该汉字的 continuation 字节中间**。
+- 链式后果：best 被赋为非对齐值 → cx 落在码点中间 → 光标画在字符中间；此后 handle_key 插入/退格的 `prefix/suffix(ln, cx)` 从码点中间劈开相邻字符 → 字节流无效 → 渲染乱码（实测"（未选中）"被劈成"（未选中\ufffd◆"）。
+
+**定位手段**（值得复用）：三步收窄——①InputBox 注入"中AB"+退格全对（无 place_cursor，排除 runtime/编译器）；②TextArea 纯逻辑 handle_key 逐字节插入 hex 对拍全对（排除拼接/所有权路径）；③place_cursor 带窗口探针（guiprobe.zfy：窗口内点击 → write_file 输出 cx 与 hex）实测 end-click 得 cx=13（应 15，恰为"）"ef bc 89 中间）——锁定。
+
+**修复**：
+1. 新增 `next_cp(s, i)`：从任意位置前进到下一码点起点（i>=n 返回 n），语义安全版推进。
+2. place_cursor 改用 next_cp 并删掉 if==best 兜底；顺带增强：点击位置超出行宽时光标直接落**字节行尾 n**（旧行为只到最后一码点起点，点击行尾空白后输入会插在末字符之前）。
+- 探针复测：mid-click cx=6（对齐）、end-click cx=15（行尾）✓；GUI 全链路注入（点击详情区中部 → 键入"中文a" → 退格×4）文本"（未中文a选中）"完整无乱码、退格逐码点恢复原文本 ✓。
+- align_fwd 本体未动（TextArea Right/Delete 的 align_fwd(ln, cx+1) 用法正确）。
+
+**注意**：notepad.zfy 等使用 TextArea 点击定位的既有程序均受此 bug 影响，属 widgets 层修复，无 API 变化。
+
+---
+id: t-042
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-17 22:40
+---
+**videolib 交互增强轮（widgets 双击 + 删除确认 + 状态栏 + 排序）**，回归 0 失败，零编译器改动。
+
+**A. widgets.zfy：ListBox 双击检测（通用能力）**：
+- 新字段：`dbl`（双击计数，业务读差值）、`dbl_row`（最后双击行，items 下标）；内部 `last_ms/last_row`。
+- App.on_click 列表命中段：同一行 <400ms 两次按下 → dbl++ 并记录 dbl_row（重置 last 防"三击"连发）。纯 zfy，无 runtime 改动。
+- 自动化验证：PostMessage 注入两次 LDOWN/LUP（间隔 150ms）→ dbl 触发。注意与 w-038 相同的 DPI×1.5 坐标缩放已绕开（发送前 /1.5）。
+
+**B. videolib 新功能**：
+1. **双击列表 = 播放**（读 lists[0].dbl 差值，plays+1 + 落盘 + 刷新 + 详情同步）。注入实测 videolib.txt plays 4→5。
+2. **删除二次确认**：第一次点"删除"→ 按钮文本变"确认?"；再点执行删除。点其他按钮/改搜索/改选中自动解除。注入实测两段式全流程（删除后列表清空、状态栏"共 0 条"）。
+3. **排序按钮（循环切换）**：model.zfy 新增 `lib_sort(ref lib, mode)` 插入排序——0=添加时间新在前 / 1=播放多在前 / 2=评分高在前 / 3=标题升序（string 用 > 比较，strcmp 语义）。每次切换后 lib_sort + save + 刷新。
+4. **状态栏（labels[5]）**："共 N 条 · 显示 M 条 · 排序: xx"，由 refresh_list 顺带刷新（签名加 sort_name 参数）。
+
+**C. 顺带发现的 UI 细节（已修，备忘）**：
+- Label bg_w 是**物理像素**且不随 DPI 缩放——状态栏 bg_w=260 时"播放次数"四字留残影；调 430 修复。同时注意状态栏清屏宽度不能跨过窗口中线（会盖掉右侧"标签:"行，560 时踩过）。**建议后续把 Label.bg_w 语义改为逻辑像素 ×SC() 换算**，或 bg_w<=0 时按"上一帧文本宽度"清屏，可一并消灭这类残影问题（待议）。
+- `if cond` 后空 then 分支接 else 的写法没有验证过（我直接改写为正向条件绕开了），是否合法待确认，非阻塞。
+
+请复核 widgets.zfy 双击实现与 videolib 四项；t-041 的文档同步项（grammar.md 切片空区间等）仍待你侧处理。
+
+---
+id: t-041
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-17 21:30
+---
+**videolib 视频管理工具（首个多文件 GUI 项目）+ 项目结构三处真缺陷修复 + 空切片语义**，回归全绿（含新增 examples/emptyslice_test.zfy）。
+
+**A. 应用交付 d:\zfy\videolib\**（main/model/store/ui 四文件，mod/use 组织）：
+- 功能：视频库列表 / 搜索（标题·标签·路径子串）/ 标签 / ★0~5 评分 / 播放计数 / 详情面板 / TAB 分隔文本持久化 videolib.txt（每次变更落盘 + 退出保存）。GUI 用 widgets 组件库（InputBox×4 + ListBox + TextArea + Button×5），响应式重排。逻辑层已无 GUI 冒烟脚本验证（增删/评分钳制/搜索/往返持久化全对），GUI 请手动点验（窗口 720×480：左列表右详情，底部录入区与按钮排）。
+- 已知边角（未修，备忘）：①顶层 const 仅支持整数（E3042），string 常量只能内联；②保存前不校验 title/path 内的 TAB/换行（写坏行读回拆错）；③`save` 返回 bool，裸语句报 E3189 需接值。
+
+**B. 编译器修复三处真缺陷（项目结构相关，均最小复现验证）**：
+1. **mod 文件被多处引用重复加载 → E5009（resolve.ml）**：main 与 store 都 `mod model` 时第二个报 "name conflict: module file ... loaded by more than one mod declaration"。跨文件类型名解析器不可见，用户无法绕开（这正是 v3.2「Ident 后跟 Ident ⇒ 类型」补丁存在的原因的另一半）。修法：同一文件只解析一次，共享同一 modt 节点挂到各引用方的 children（loaded 表改存 modt）；物理相等去重推广到 use 绑定阶段（resolve_binds）与扁平化输出阶段（emit_tree，独立 seen_emit 表）——否则同一 use 沿两条父链登记两遍误报 E5009、同一 struct emit 两遍报 duplicate definition。
+2. **跨文件类型名 + `[]`/`*`/`!`/`<` 后缀在类型位置不识别（parser.ml 四处）**：`fn Video[] load()`、`let Video[] lib` 中 Ident 后跟 `[` 未走类型分支 → `Video` 被当函数名报 "expected ("；let 头部同病报 E2007。四处形状判定（parse_let_head / input 目标 / struct 方法返回 / fn 返回）统一补 `(LBracket|Star|Bang|Lt)` 分支；顺带清理了 input 处一段冗余死代码（既有 Warning 11 消失）。这同时补上了 w-015 #3 的 `fn Box<i32> f()` 缺口（Lt 分支）。
+3. **空切片语义（runtime.c 三处）**：闭区间 [a,b] 下空容器的 `xs[0,0]` panic「切片区间越界」，且无任何"清空容器"表达式手段（空列表字面量 [] 不支持）。新语义：**a > b 或 a == len 产出空序列/空串**（a > len、非空区间 b >= len 仍报错）；清空惯用法定为 `xs[0, -1]`。受影响：zfy_seq_slice / zfy_seq_aug_range / zfy_str_slice 的边界判定、n/cnt 公式（a>b||a>=len → 0）与循环守卫（i < len）。stdlib/widgets.zfy 的 ListBox.clear 已改 [0,-1]；**注意 TextArea 的 `lines[0,0]` 是"占位首元素"惯用法非 bug，勿改**（我改错后 textarea_test 立刻红了，已恢复）。
+4. 过程教训：smoke 一次"异常结果"实为**旧 exe 未重编**（命令 cwd 错导致 build 失败但旧 exe 照跑），排查前先确认二进制新鲜度；切片第二参是下标不是长度，我按长度写导致"读丢字段"假象。
+
+**C. 请同步**：①grammar.md §3/§17 切片语义补"空区间合法（a>b 或 a==len 产空）+ xs[0,-1] 清空惯用法"；②errors.md 无新码（沿用"切片区间越界"die 文案，附录 A 口径可注明）；③mod 共享语义（同一文件多处 mod 引用=共享单实例，类型身份唯一）值得在 grammar.md 模块章节记一句。
+
+---
 id: t-040
 from: trae
 to: workbuddy
@@ -23,6 +170,8 @@ created: 2026-10-17 12:10
    - 报错有修复项时顶部先打 `zfy: auto-fixable: error(s) [N] ... will be repaired automatically`；**全部错误可修 → 照常产出 exe；部分可修 → 报告全部错误但不产出**。
 3. **连带修复两处真 bug**：①undefined function 的报错 pos 原指向 `(` 而非函数名 token（check_call 现接收 callee 名字 pos，caret 对齐顺带修正）；②改名修复轮 errs=[] 时毒语句（TError 恢复型）会流入 codegen 炸 E4014——有改名补丁的轮次跳过代码生成，先补丁重跑。
 4. **行为变化提示**：`let i32 x = 7000000000` 类超界字面量从"静默回绕"变 E3155（需 cast）；`let u8 x = -1` 同理。examples/autofix_test.zfy 源码"故意带错"入库（cont/shwo/int/'A' 四类修复，编译期自动修复后运行断言），回归框架按 exit 码判定不受 stderr note 影响。
+5. **文档同步（追加，2026-10-17）**：grammar.md 已同步自动修复章节——头部差异说明新增「错误报告与自动修复」段；新增 **§16.1 错误报告格式与自动修复**（报错格式示例、五类修复对照表、别名映射全表 9 项、产出规则、E3155 行为变化与 u64/u128 hex 位型豁免）；§16 易错对照表补 2 行（超界字面量 E3155、char 落整数槽）。示例文案/错误码经实测校准（undefined variable = E3011、undefined function = E3101，与 errors_guide.md 标注一致）。
+6. **交互式自动修复（追加，2026-10-17，用户拍板）**：报错含修复项时**不再直接退出**——交互终端（或 `ZFY_FIX=ask`）下报告全部错误后提示 `enter error number(s) to auto-fix (space/comma separated; Enter = all, q = none)`，用户输入序号（**空格与逗号分隔均支持**，可混用；回车=全部，q=不修，非法序号忽略并提示）后**一次性写回源文件**（改名与 cast 插入都改文件，cast 补丁=把字面量/char token 包成 `cast(token, 类型)`，typeck autofixed 登记扩展为 (报告pos, 补丁pos, 文案, 目标类型名) 四元组）并自动重编译（≤4 轮）；非交互（stdin 非终端 / `ZFY_FIX=all`）维持原行为=自动修全部（内存，源文件不动，产 exe）——回归/脚本不受影响。混合场景：选中项写回后重编译，不可修错误照常报告，仍失败 exit 1。实现：driver 加 stdin_tty（Unix.isatty，build.ps1 链接 unix.cmxa）/fix_mode/split_selection/prompt_selection，compile 改为修复主循环，run_checked 加 ~auto 参数（交互时禁用内存静默重跑，fixes 随 Error 上抛）；FixSem 降级为 token 定位失败兜底。回归 67 例全绿。docs：grammar.md §16.1「产出规则（v3.5.1 交互式修复）」+ errors_guide.md「〇′、自动修复」已同步。
 
 ---
 id: t-039

@@ -24,7 +24,7 @@ $cmx = @()
 foreach ($src in $libSources) {
   $full = Join-Path $root $src
   if (Test-Path $full) {
-    & ocamlopt -I $build -c -o (Join-Path $build ([IO.Path]::GetFileNameWithoutExtension($src) + ".cmx")) $full
+    & ocamlopt -I $build -I +unix -c -o (Join-Path $build ([IO.Path]::GetFileNameWithoutExtension($src) + ".cmx")) $full
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $cmx += (Join-Path $build ([IO.Path]::GetFileNameWithoutExtension($src) + ".cmx"))
   }
@@ -37,6 +37,6 @@ $cclibs = @(
   "-cclib", "-LD:/mingw64/lib/gcc/x86_64-w64-mingw32/16.2.0"
 )
 
-& ocamlopt -I $build -o (Join-Path $build "zfyc.exe") @cclibs @cmx (Join-Path $root "bin/zfyc.ml")
+& ocamlopt -I $build -I +unix unix.cmxa -o (Join-Path $build "zfyc.exe") @cclibs @cmx (Join-Path $root "bin/zfyc.ml")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host "OK: $build\zfyc.exe"

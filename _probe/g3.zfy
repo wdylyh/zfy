@@ -1,0 +1,34 @@
+// _probe/g3.zfy —— 字段值探针：把 Button 字段值画到窗口上
+mod gui;
+mod widgets;
+use widgets::{App, Button}
+use gui::{gui_open, gui_alive, gui_poll, gui_fill_rect, gui_draw_text, gui_present, Event}
+
+fn main()
+    let App app = App()
+    if app.open(400, 200, "probe3") != 0
+        return 1
+    let Button b = Button(x=16, y=88, w=52, h=44, text="7")
+    let i32 _idx1 = app.add_button(b)
+
+    let Event e = Event()
+    while gui_alive()
+        while gui_poll(ref e)
+            nop()
+        // 背景
+        gui_fill_rect(0, 0, 400, 200, 0x1E1E24)
+        // 用组件画
+        app.buttons[0].draw()
+        // 把字段值直接画出来
+        gui_draw_text(16, 20, "x=" + cast(app.buttons[0].x, string), 0xFFFFFF)
+        gui_draw_text(80, 20, "y=" + cast(app.buttons[0].y, string), 0xFFFFFF)
+        gui_draw_text(150, 20, "w=" + cast(app.buttons[0].w, string), 0xFFFFFF)
+        gui_draw_text(230, 20, "h=" + cast(app.buttons[0].h, string), 0xFFFFFF)
+        gui_draw_text(16, 45, "text=[" + app.buttons[0].text + "]", 0x50E050)
+        gui_present()
+        sleep_ms(16)
+    app.close()
+    return 0
+
+fn void nop()
+    return

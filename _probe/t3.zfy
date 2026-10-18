@@ -1,0 +1,5 @@
+fn main()
+  let xs = [1, 2, 3]
+  let ev = filter(xs, fn(i32 v) => v % 2 == 0)
+  for v in ev
+    output(v)
