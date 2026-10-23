@@ -1,5 +1,23 @@
 # zfy 语言功能差距分析（对照主流语言）
 
+> **状态更新（2026-10-23，v3.13.0）**：**P1 主体清空**——
+> #6 for-in 遍历（v3.6 + v3.10 带下标）、#7 容器算法（v3.6 + v3.10
+> min/max/sum/count/index_of）、#10 接口/多态（v3.13：interface 隐式实现 +
+> vtable 分派 + 接口值列表，§27）、#12 标准库最小版（v3.12：os_args/
+> os_env/assert_eq，§26）全部完成；#4/#5 match/enum 追强（v3.11 穷尽性
+> 检查 + match 初始化表达式）。match v2 部分余项：return/嵌套表达式位置、
+> 守卫。并发 v2（线程池/有界 channel）仍为候选。
+>
+> **P1 剩余两项均为架构级工程，需专项轮决策**：
+> - **#9 泛型约束**：当前泛型体只检查一次（T=TVar），内建调用（sum 等）
+>   在泛型体内不可用。根治 = 泛型函数按实例化重新 typeck（per-monomorphization
+>   body check），牵动 gstructs/gfns 实例化缓存与槽命名，建议专项设计。
+> - **#11 独立编译/增量构建**：driver 文本内联合并 + 单 LLVM module 是
+>   根基约束；增量需 per-file module + 链接编排 + 跨文件 typeck 边界
+>   （导入文件类型/函数一致性检查）。建议路径：先做 per-module 缓存
+>   （.zfy hash → 跳过 parse/typeck 的模块级缓存），再做真独立编译。
+>   二者工作量均为 1-2 个专项轮，需与 P2 清单（错误恢复/数值安全）竞争排期。
+>
 > **状态更新（2026-10-23，v3.10.0）**：P1 继续收窄——
 > #6 for-in 遍历（v3.6 落地 + v3.10 带下标 `for x in xs, i`）、
 > #7 容器算法（v3.6 sort/reverse/join/filter/any/all/sort_by/fold/contains +

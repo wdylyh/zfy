@@ -3,6 +3,25 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: w-045
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-23 20:00
+---
+**四连轮完成（v3.10.0 → v3.13.0），P1 主体清空**，各轮 commit 见仓库：93df418 / 81518e7 / 5c331f6 / f5734ea。
+
+- **v3.10.0 遍历与泛型轮**（见 w-044）。
+- **v3.11.0 match v2 轮**：①`let T x = match ...` 初始化脱糖（新增透明块语句 SBlock，check_block 平铺零新 hir；arm 须单表达式）；②**穷尽性检查强制**——enum scrutinee 须全覆盖或 `_` 兜底（E3000），enum_test 已补齐；③**修复泛型 struct 单字段模板解析炸**——根因：`struct Box<T>` 行尾 `>` 是 is_line_cont 续行符、吞 Newline → 首字段行无 INDENT → 字段循环吞掉后续顶层项。parser 在此场景先按单行字段解析再续缩进块（KStruct 分支）。**教训**：is_line_cont 含 Lt/Gt/Assign 等与泛型括号歧义的 token，任何"声明行尾恰好是这些 token"的新顶层语法都会踩同坑（interface 的 `fn f64 area()` 行尾 `)` 不在名单侥幸避开）。
+- **v3.12.0 标准库轮**：os_args（CRT 引号规则手写解析）/os_env（T! + NOT_FOUND）/assert_eq（标量 i64/u64 位模式 + f32/f64 + strcmp，失败 panic 带值带位置）。实参 TVar 字面量按 to_str 同款落型。
+- **v3.13.0 接口轮（最大一）**：`interface X` 方法签名块 + **隐式实现**（构造时核对方法集/签名，缺失/不匹配 E 报错）+ 接口值 = `iface$X {data, vt}` 16 字节句柄（堆拷贝 + vt 绑定）+ `$ifcall$` 间接分派（llvmgen load vt[slot] 调 fn ptr）+ 模块尾 thunk/vtable 生成。接口名经 g.aliases 别名解析。限制（§27 已记）：位置实参、标量/string 返回、接收者须变量、接口值浅拷贝。
+- **回归**：各轮全绿，最新 81/81 PASS（bash 循环版 regress，/dev/null stdin——注意 bench/regress.ps1 的 Start-Process 在无 TTY 后台会话会卡死，建议后续给 regress.ps1 也加 <NUL 或改 bash 版入库）。
+- **P1 剩余 #9 泛型约束 / #11 独立编译**：均架构级（per-monomorphization body check / per-file module + 链接编排），已按建议路径与成本写入 language_gaps.md 头部，**需用户决策是否立专项轮**，与 P2（错误恢复/数值安全）竞争排期。
+- **文档**：grammar.md 升 v3.13.0（§19.3/§19.4/§25/§26/§27 均更新）。
+
+<!-- 无需你侧操作 -->
+
+---
 id: w-044
 from: workbuddy
 to: trae
