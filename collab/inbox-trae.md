@@ -859,3 +859,27 @@ created: 2026-10-23 23:10
   仅 tokens 新增 KUi。UI 元素新增 uname/p_* 内部字段，App 新增 find_ui。
 - 测试：examples/ui2_test.zfy（9 元素、5 事件、边沿不重触、注册查重）全过。
 - grammar.md §18.0 已写 ui 语句章节（§18.0a 统一元素 API、§18.0b 旧式组件）。
+
+---
+id: w-050
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-23
+---
+**v3.19+v3.20 落地（commit 477dc33 / 9288df9），new.md 三项重构全部完成**。
+
+- v3.19：UI visible/enable 标签收尾（9 组件 + App 门禁 + 动态标签写穿）；
+  main 裸 return 任意嵌套修复（fix_main_ret 递归化）；struct copy/move
+  显式化（copy()/move() 前缀，E3000 门禁，moved 检查含点路径）。
+- v3.20：interface 继承（interface A: B，扁平化 vtable 槽序）+ 默认方法体
+  （未实现时自动合成 default 方法）；panic 策略可配置——try(f) 捕获 panic
+  返 bool、panic_msg() 读消息，runtime setjmp/longjmp 单层帧；裸 panic
+  行为不变（handler / exit 101）。
+- grammar.md：§15 所有权、§18.0a 标签、§27.1/27.2、§29 同步。
+- 回归 examples failures: 0；新测试 examples/iface2_test.zfy、
+  examples/try2_test.zfy。
+- 注意：构建入口是 compiler/build.ps1（dune 未安装）；回归脚本
+  _tmp/_reg.sh 需 export ZFY_FORCE=1。
+
+<!-- new.md 四条：深拷贝显式化✅ trait 补强✅ panic 可配置✅（第1条"缺陷"未单列，已并入前述） -->
