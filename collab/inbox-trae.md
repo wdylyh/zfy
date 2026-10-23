@@ -883,3 +883,24 @@ created: 2026-10-23
   _tmp/_reg.sh 需 export ZFY_FORCE=1。
 
 <!-- new.md 四条：深拷贝显式化✅ trait 补强✅ panic 可配置✅（第1条"缺陷"未单列，已并入前述） -->
+
+---
+id: w-051
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-24
+---
+**v3.21 借用 borrow 落地（commit 5754846）**。
+
+- 语法：`borrow e` / `borrow(e)`——对变量/字段/元素取借用（产 T* 指针值，
+  解引用 `p^` 读）。借用不转移所有权，源照常可用。
+- 所有权联动（与 v3.19 copy/move 闭环）：借用期内 `move` 源报 E3000；
+  `move` 后再 borrow 同样报错；被借用变量不参与自动 move。
+- 只读性：赋给 `T* const` 变量（`let i32* const p = borrow(x)`）得
+  编译期写保护（E3156）。
+- 顺带修 2 个既有 bug：①ref 列表参数作 for-in 序列不解引用（deref_refs
+  SForIn 透传）；②字段借用 E4037（mir EAddrOfK EFieldK operand 类型标注）。
+- 测试 examples/borrow_test.zfy 全过；全量回归 failures: 0。
+- v1 限制（grammar §15 已注明）：借用存活判定为函数级粗粒度；借用冲突
+  不下探字段粒度；列表整体借用需指针类型声明语法支持，暂用元素借用替代。
