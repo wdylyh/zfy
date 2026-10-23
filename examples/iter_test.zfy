@@ -1,0 +1,35 @@
+// v3.10.0：for-in 带下标 + 容器算法内建 min/max/sum/count/index_of
+fn i32[] mk()
+    let i32 a[] = 3, 1, 4, 1, 5
+    return a
+fn main()
+    let i32[] xs = mk()
+    // for-in 带下标（列表）：i 绑定 i64 索引
+    let i64 acc = 0
+    for x in xs, i
+        acc = acc + x * i
+    output(acc)
+    // min/max/sum
+    output(min(xs))
+    output(max(xs))
+    output(sum(xs))
+    // count / index_of
+    output(count(xs, 1))
+    output(index_of(xs, 4))
+    output(index_of(xs, 9))
+    // string 列表算法
+    let string[] ws = split("b,a,b", ",")
+    output(count(ws, "b"))
+    output(index_of(ws, "a"))
+    output(max(ws))
+    // string 遍历带下标：c 为 char
+    let string s = "abc"
+    for c in s, i
+        output(c)
+        output(i)
+    // for-in 无下标形式不回归
+    let i32 t = 0
+    for x in xs
+        t = t + x
+    output(t)
+    return

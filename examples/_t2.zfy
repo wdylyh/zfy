@@ -1,3 +1,0 @@
-fn main()
-    let i32 q = 5
-    output(q)

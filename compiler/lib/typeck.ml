@@ -385,6 +385,8 @@ let rec tag_of_zty (z : zty) : string =
   | TBool -> "bool" | TChar -> "char" | TString -> "string" | TVoid -> "void"
   | TStruct s -> s
   | TPtr t -> "p" ^ tag_of_zty t
+  | TList e -> "list$" ^ tag_of_zty e
+  | TArray (e, n) -> "arr$" ^ tag_of_zty e ^ "$" ^ string_of_int n
   | TFrac e -> "frac" ^ tag_of_zty e
   | TArray (t, n) -> "a" ^ string_of_int n ^ "$" ^ tag_of_zty t
   | TList t -> "l$" ^ tag_of_zty t
@@ -487,7 +489,12 @@ let rec ast_of_zty (p : pos) (z : zty) : ty =
   | TStruct s -> TNamed (s, p)
   | TPtr t -> TPtr (ast_of_zty p t, p)
   | TErr t -> TErr (ast_of_zty p t, p)
-  | TFrac _ | TArray _ | TList _ | TFunSig _ | TVar _ | TError ->
+  | TList e ->
+    (* v3.10 泛型放宽：列表/定长数组/指针可作类型实参（单 ptr/值形态，
+       单态化零成本）。AST 形态 = TSeq/TSeqN（conv_ty 兜底路径同款） *)
+    TSeq (ast_of_zty p e, p)
+  | TArray (e, n) -> TSeqN (ast_of_zty p e, EInt (Int64.of_int n, p), p)
+  | TFrac _ | TFunSig _ | TVar _ | TError ->
     terr p "this type cannot be used as a generic type argument"
 
 (* AST 类型层替换：TNamed（类型参数名）-> 实参类型的 AST 形态 *)
@@ -1268,6 +1275,40 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
       (match resolve c.ety with
        | TStruct s when is_chan_struct s -> mkf "zfy_chan_len" [ TStruct s ] (TInt 64)
        | _ -> terr p "chan_len expects a chan handle")
+    (* ---------- 容器算法内建（v3.10）：min/max/sum/count/index_of ---------- *)
+    | "sum", [ xs ] ->
+      (* 数值列表求和，同型返回（空列表 = 0） *)
+      let e = seq_elem xs in
+      let tag =
+        match resolve e with
+        | TInt w -> "i" ^ string_of_int w
+        | TUint w -> "u" ^ string_of_int w
+        | TFloat 32 -> "f32" | TFloat 64 -> "f64"
+        | t -> terr p "sum does not support element type %s" (pp_zty t)
+      in
+      mkf ("zfy_sum_" ^ tag) [ TList e ] e
+    | ("min" | "max") as kn, [ xs ] ->
+      (* 最值：同型返回；空列表运行期 die *)
+      let e = seq_elem xs in
+      let tag =
+        match resolve e with
+        | TInt w -> "i" ^ string_of_int w
+        | TUint w -> "u" ^ string_of_int w
+        | TFloat 32 -> "f32" | TFloat 64 -> "f64" | TString -> "str"
+        | t -> terr p "%s does not support element type %s" kn (pp_zty t)
+      in
+      mkf ("zfy_" ^ kn ^ "_" ^ tag) [ TList e ] e
+    | ("count" | "index_of") as kn, [ xs; v ] ->
+      (* 计数 / 首个相等下标（未找到 -1，i64） *)
+      let e = seq_elem xs in
+      let tag =
+        match resolve e with
+        | TInt w -> "i" ^ string_of_int w
+        | TUint w -> "u" ^ string_of_int w
+        | TFloat 32 -> "f32" | TFloat 64 -> "f64" | TString -> "str"
+        | t -> terr p "%s does not support element type %s" kn (pp_zty t)
+      in
+      mkf ("zfy_" ^ kn ^ "_" ^ tag) [ TList e; e ] (TInt 64)
     | "sort", [ xs ] ->
       let e = seq_elem xs in
       let tag =
@@ -2916,7 +2957,7 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
     List.fold_left uses_of_expr acc inits
   | SDeclList ss -> List.fold_left uses_of_stmt acc ss
   | SAssign (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
-  | SForIn (_, sx, b, _) ->
+  | SForIn (_, _, sx, b, _) ->
     List.fold_left uses_of_stmt (uses_of_expr acc sx) b
   | SAssignList (a, bs, _) ->
     List.fold_left uses_of_expr (uses_of_expr acc a) bs
@@ -4846,10 +4887,12 @@ and check_stmt env (st : stmt) : tstmt =
     let tb = check_block env body in
     env.ldepth <- env.ldepth - 1;
     mk (SForK (init_stmts, tc, up_stmts, tb))
-  | SForIn (name, seqx, body, p) ->
+  | SForIn (name, idx, seqx, body, p) ->
     (* for x in xs { }（v3.6）：xs 支持 列表/数组(变量)/string/map(产键)。
        降码：序列入临时槽（表达式只求值一次）+ 索引循环；循环变量每轮
-       由元素读深拷贝（循环体内不自动 move），与手写三段式等价 *)
+       由元素读深拷贝（循环体内不自动 move），与手写三段式等价。
+       v3.10 带下标：for x in xs, i { }——索引变量用用户名绑定（i64），
+       与手写 `for let i64 i = 0 ...` 中的 i 同样可见可用 *)
     let mkx k ety = { e = k; ety; epos = p } in
     let fresh nm lty : local =
       declare env nm { lconst = false; lty; lslot = ""; lunred = false;
@@ -4891,7 +4934,7 @@ and check_stmt env (st : stmt) : tstmt =
       | t ->
         terr p "for-in requires a list/array/string/map, got %s" (pp_zty t)
     in
-    let iv = fresh (name ^ "$i") (TInt 64) in
+    let iv = fresh (match idx with Some i -> i | None -> name ^ "$i") (TInt 64) in
     let ivx = mkx (EVarK iv.lslot) (TInt 64) in
     let ev = fresh name elem in
     (* 索引变量声明（槽分配 + 初始化 0）必须落在 inits *)
@@ -5171,7 +5214,7 @@ and pos_of_stmt = function
   | SAug (_, _, _, p)
   | SInc (_, p) | SDec (_, p)
   | SReturn (_, p) | SIf (_, _, _, p)
-  | SWhile (_, _, p) | SFor (_, _, _, _, p) | SForIn (_, _, _, p) | SReduce (_, _, _, p)
+  | SWhile (_, _, p) | SFor (_, _, _, _, p) | SForIn (_, _, _, _, p) | SReduce (_, _, _, p)
   | SOutput (_, _, _, p) | SInput (_, _, p)
   | SSeqDecl (_, _, _, _, _, _, _, _, p)
   | SUnsafe (_, p)

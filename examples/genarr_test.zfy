@@ -1,0 +1,25 @@
+// v3.9.0：泛型类型实参放宽——列表/定长数组/指针作 TApp 实参
+struct Box<T>
+    T v = 0
+    T* pv = null
+struct Pair<A, B>
+    A a = 0
+    B b = 0
+fn main()
+    let i32[] xs = 1, 2, 3
+    let Box<i32[]> b = Box(xs)
+    b.v = push(b.v, 4)
+    output(b.v)
+    let i32[] ys = 4, 5
+    let Pair<i32[], string> p = Pair(ys, "hi")
+    output(p.a)
+    output(p.b)
+    // 实例字段再包一层：Box<Box<i32>>
+    let Box<i32> inner = Box(7)
+    let Box<Box<i32>> outer = Box(inner)
+    output(outer.v.v)
+    // 定长数组实参
+    let i32[3] arr = 9, 8, 7
+    let Box<i32[3]> ba = Box(arr)
+    output(ba.v)
+    return

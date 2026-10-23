@@ -2159,6 +2159,108 @@ DEF_CONTAINS(f32, x == v, float)
 DEF_CONTAINS(f64, x == v, double)
 DEF_CONTAINS(str, STRCMP(x, v) == 0, char *)
 
+/* ---------- 容器算法内建（v3.10）：min/max/sum/count/index_of ----------
+ * min/max：空列表 die（运行期错误）；返回元素值（str 返回指针，
+ *   调用方按 TList 元素所有权约定深拷贝/接管）。
+ * sum：仅数值列表，同型返回（回绕与既有算术语义一致）。
+ * count：相等元素计数（str 用 strcmp）；index_of：首个相等下标（未找到 -1）。 */
+
+#define DEF_MINMAX(TAG, DECL, ELEM_T)                                      \
+static ELEM_T zfy_mm_##TAG(zfy_seq *s, int want_max) {                     \
+    if (!s || s->len == 0)                                                 \
+        zfy_die("min/max of empty list");                                  \
+    ELEM_T best = *(ELEM_T *)(char *)s->data;                              \
+    for (long long i = 1; i < s->len; i++) {                               \
+        ELEM_T x = *(ELEM_T *)((char *)s->data + i * s->elemsz);           \
+        if (want_max ? (x > best) : (x < best)) best = x;                  \
+    }                                                                      \
+    return best;                                                           \
+}                                                                          \
+ELEM_T zfy_min_##TAG(zfy_seq *s) { return zfy_mm_##TAG(s, 0); }            \
+ELEM_T zfy_max_##TAG(zfy_seq *s) { return zfy_mm_##TAG(s, 1); }
+
+DEF_MINMAX(i8, signed char, signed char)
+DEF_MINMAX(i16, short, short)
+DEF_MINMAX(i32, int, int)
+DEF_MINMAX(i64, long long, long long)
+DEF_MINMAX(u8, unsigned char, unsigned char)
+DEF_MINMAX(u16, unsigned short, unsigned short)
+DEF_MINMAX(u32, unsigned int, unsigned int)
+DEF_MINMAX(u64, unsigned long long, unsigned long long)
+DEF_MINMAX(f32, float, float)
+DEF_MINMAX(f64, double, double)
+
+char *zfy_min_str(zfy_seq *s) {
+    if (!s || s->len == 0) zfy_die("min of empty list");
+    char *best = *(char **)(char *)s->data;
+    for (long long i = 1; i < s->len; i++) {
+        char *x = *(char **)((char *)s->data + i * s->elemsz);
+        if (strcmp(x, best) < 0) best = x;
+    }
+    /* 所有权约定：返回独立堆串（元素指针不得移交，槽 free 会双重释放） */
+    return zfy_strdup(best);
+}
+char *zfy_max_str(zfy_seq *s) {
+    if (!s || s->len == 0) zfy_die("max of empty list");
+    char *best = *(char **)(char *)s->data;
+    for (long long i = 1; i < s->len; i++) {
+        char *x = *(char **)((char *)s->data + i * s->elemsz);
+        if (strcmp(x, best) > 0) best = x;
+    }
+    return zfy_strdup(best);
+}
+
+#define DEF_SUM(TAG, ELEM_T)                                               \
+ELEM_T zfy_sum_##TAG(zfy_seq *s) {                                         \
+    if (!s) return (ELEM_T)0;                                              \
+    ELEM_T acc = (ELEM_T)0;                                                \
+    for (long long i = 0; i < s->len; i++)                                 \
+        acc = (ELEM_T)(acc + *(ELEM_T *)((char *)s->data + i * s->elemsz));\
+    return acc;                                                            \
+}
+
+DEF_SUM(i8, signed char)
+DEF_SUM(i16, short)
+DEF_SUM(i32, int)
+DEF_SUM(i64, long long)
+DEF_SUM(u8, unsigned char)
+DEF_SUM(u16, unsigned short)
+DEF_SUM(u32, unsigned int)
+DEF_SUM(u64, unsigned long long)
+DEF_SUM(f32, float)
+DEF_SUM(f64, double)
+
+#define DEF_COUNT(TAG, EQ_EXPR, ELEM_T)                                    \
+long long zfy_count_##TAG(zfy_seq *s, ELEM_T v) {                          \
+    if (!s) return 0;                                                      \
+    long long n = 0;                                                       \
+    for (long long i = 0; i < s->len; i++) {                               \
+        ELEM_T x = *(ELEM_T *)((char *)s->data + i * s->elemsz);           \
+        if (EQ_EXPR) n++;                                                  \
+    }                                                                      \
+    return n;                                                              \
+}                                                                          \
+long long zfy_index_of_##TAG(zfy_seq *s, ELEM_T v) {                       \
+    if (!s) return -1;                                                     \
+    for (long long i = 0; i < s->len; i++) {                               \
+        ELEM_T x = *(ELEM_T *)((char *)s->data + i * s->elemsz);           \
+        if (EQ_EXPR) return i;                                             \
+    }                                                                      \
+    return -1;                                                             \
+}
+
+DEF_COUNT(i8, x == v, signed char)
+DEF_COUNT(i16, x == v, short)
+DEF_COUNT(i32, x == v, int)
+DEF_COUNT(i64, x == v, long long)
+DEF_COUNT(u8, x == v, unsigned char)
+DEF_COUNT(u16, x == v, unsigned short)
+DEF_COUNT(u32, x == v, unsigned int)
+DEF_COUNT(u64, x == v, unsigned long long)
+DEF_COUNT(f32, x == v, float)
+DEF_COUNT(f64, x == v, double)
+DEF_COUNT(str, STRCMP(x, v) == 0, char *)
+
 /* ---------- 闭包与容器高阶算法（v3.7） ----------
  * 闭包值 = 句柄 h（堆块地址）；堆块头部 code 指针，其后捕获字段。
  * 调用约定：code(env, args...)——env = 堆块地址（lambda 首参 $env）。

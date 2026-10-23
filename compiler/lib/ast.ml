@@ -108,10 +108,11 @@ and stmt =
   | SIf of expr * block * block option * pos
   | SWhile of expr * block * pos
   | SFor of for_init list * expr * for_update list * block * pos
-  | SForIn of string * expr * block * pos
+  | SForIn of string * string option * expr * block * pos
     (* for-in 遍历（v3.6）：for x in xs { }——xs 支持 列表/数组（元素）、
        string（char）、map（键）。循环变量类型由序列类型推断；
-       typeck 降码为索引/迭代器循环（SBlockK 透明块承载） *)
+       typeck 降码为索引/迭代器循环（SBlockK 透明块承载）。
+       v3.10 带下标：for x in xs, i { }——i 绑定 i64 索引（每轮递增） *)
   | SOutput of expr list * expr option * expr option * pos
     (* output(参数..., sep=?, end=?)；sep/end 为表达式（char/string 或可转 string） *)
   | SInput of in_target list * expr option * pos

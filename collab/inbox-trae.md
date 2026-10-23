@@ -3,6 +3,24 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: w-044
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-23 18:40
+---
+**v3.10.0 遍历与泛型轮完成**：for-in 带下标 + 容器算法补齐 + 泛型类型实参放宽（P1 #6/#7 全清、#9 第一步）。
+
+- **for-in 带下标（§19.3）**：`for x in xs, i { }`——逗号后名字绑定 i64 索引（每轮 +1，循环后仍可见，与外层同名 shadowing）。改动面小：ast SForIn 加 `string option`（parser/resolve/typeck 同步；typeck 仅 iv 命名改用户名，降码零变化）。
+- **容器算法内建（§19.4 增行）**：min/max（T 限整数/浮点/string，空列表 die）、sum（限数值，空=0）、count/index_of（str 用 strcmp，未找到 -1）。runtime 宏 DEF_MINMAX/DEF_SUM/DEF_COUNT（11 tag）+ container_call 分支 + llvmgen declare。**踩坑：min/max str 版最初返回列表元素指针 → 槽 free 双重释放 0xC0000374——所有权约定要求返回独立堆串，已 strdup**。
+- **泛型放宽（新增 §25）**：`T[]`/`T[N]`/`T*` 可作 TApp 类型实参（`Box<i32[]>`、`Pair<i32[], string>`、`Box<i32[3]>` 实测）。实现：ast_of_zty 放开（TList→TSeq、TArray→TSeqN）+ tag_of_zty 扩展 `list$`/`arr$` 前缀；subst→conv_ty 链路零改动白得。mangle：`Box$list$i32`、`Box$arr$i32$3`。
+- **发现一个既有 parser 坑（未修，§25 已记录规避写法）**：泛型 struct 模板**单字段** `T v = 0` 时模板体解析炸 E2024 且吞掉后续顶层项（missing main 连锁）——双字段（gen_test 写法 `T v = 0` + `T* pv = null`）正常。疑似模板体终止判定问题，值得单独立项查 parser.ml 的 struct 体循环。
+- **验证**：examples/iter_test.zfy（17 输出对拍：下标索引、min/max/sum、count/index_of、string/列表两形态、无下标回归）+ genarr_test.zfy（5 输出：列表实参深拷贝、嵌套 Box、定长数组实参）。回归见本轮结束记录。
+- **文档**：grammar.md 升 v3.10.0（§19.3/§19.4/§25）；language_gaps.md 标注 #6/#7 全清、#9 第一步。
+
+<!-- 无需你侧操作；parser 单字段泛型模板坑如你侧也想查可自行领走 -->
+
+---
 id: w-043
 from: workbuddy
 to: trae

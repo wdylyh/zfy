@@ -1116,13 +1116,23 @@ and parse_stmt p =
     SWhile (cond, body, tp)
   | Keyword KFor ->
     ignore (next p);
-    (* for-in 遍历（v3.6）：for x in seq { }（与三段式 for 并存） *)
+    (* for-in 遍历（v3.6）：for x in seq { }（与三段式 for 并存）；
+       v3.10 带下标：for x in seq, i { }——逗号后接索引变量名 *)
     (match peek p, peek2 p with
      | (Ident name, _), (Keyword KIn, _) ->
        ignore (next p); ignore (next p);
        let seqx = parse_expr p in
+       let idx =
+         match peek p with
+         | (Comma, _) ->
+           ignore (next p);
+           (match peek p with
+            | (Ident iname, _) -> ignore (next p); Some iname
+            | (_, tp') -> err tp' "for-in index position expects a variable name (e.g. `for x in xs, i`)")
+         | _ -> None
+       in
        let body = parse_block p in
-       SForIn (name, seqx, body, tp)
+       SForIn (name, idx, seqx, body, tp)
      | _ -> parse_for p tp)
   | Keyword KOutput ->
     ignore (next p);

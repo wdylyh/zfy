@@ -1,5 +1,12 @@
 # zfy 语言功能差距分析（对照主流语言）
 
+> **状态更新（2026-10-23，v3.10.0）**：P1 继续收窄——
+> #6 for-in 遍历（v3.6 落地 + v3.10 带下标 `for x in xs, i`）、
+> #7 容器算法（v3.6 sort/reverse/join/filter/any/all/sort_by/fold/contains +
+> v3.10 min/max/sum/count/index_of）全部完成；#9 泛型放宽第一步
+> （v3.10：T[]/T[N]/T* 可作类型实参，§25）。P1 剩余：#9 泛型约束系统、
+> #10 接口/多态、#11 独立编译、#12 标准库。下文分析保留作历史依据。
+>
 > **状态更新（2026-10-18，v3.8.0）**：P0 三项全部完成——
 > #1 容器 map/set（v3.6.0 容器轮）、#3 闭包/lambda（v3.7.0 函数式轮）、
 > #2 并发（v3.8.0 并发轮：spawn/join/atomic/mutex/chan<T>/sleep，见

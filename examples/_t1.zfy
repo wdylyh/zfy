@@ -1,3 +1,0 @@
-fn main()
-    let fn(i32) -> i32 dbl = fn(i32 x) => x * 2
-
