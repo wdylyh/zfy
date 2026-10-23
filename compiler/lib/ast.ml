@@ -130,7 +130,11 @@ and stmt =
   | SMatch of expr * marm list * pos
     (* match 分发（v3.9）：match scrut 缩进块，每 arm `模式 => 语句或块`。
        模式：_ 通配 / 字面量（== 比较）/ 枚举变体（变体路径 + (绑定名...)）；
-       降码为 tag/相等比较 if 链（typeck 内展开，hir/mir 无新构造） *)
+       降码为 tag/相等比较 if 链（typeck 内展开，hir/mir 无新构造）。
+       v3.11：穷尽性检查——enum 类型的 scrutinee 须覆盖全部变体或含 `_` *)
+  | SBlock of stmt list * pos
+    (* 透明块（v3.11）：仅作 parser 脱糖容器（let x = match ... 的合成语句
+       序列），typecheck 平铺进当前块，不引入新作用域 *)
 
 (* match 模式（v3.9） *)
 and mpat =

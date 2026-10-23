@@ -925,18 +925,25 @@ and parse_declarator p tp ty_opt is_const is_frac is_unred =
     SSeqDecl (is_const, is_frac, is_unred, name, ety, Some len, false, inits, tp)
   | (ety, None, false, []) ->
     (* 标量：类型与初值二选一或都写（都无时 frac 修饰可顶替类型，
-       由 typeck 校验）；初值可省略（省略时填零值）；const 必须带初值 *)
-    let init =
-      (match p.toks with
-       | (Assign, _) :: _ ->
-         let (_t, _tp) = next p in
-         Some (parse_expr p)
-       | _ -> None)
-    in
-    (match is_const, init with
-     | true, None -> err tp "const requires an initializer"
-     | _ -> ());
-    SDecl (is_const, is_frac, is_unred, name, ty_opt, init, tp)
+       由 typeck 校验）；初值可省略（省略时填零值）；const 必须带初值。
+       v3.11：`let T x = match ...` 直接脱糖返回合成透明块 *)
+    (match p.toks with
+     | (Assign, _) :: _ ->
+       let (_t, _tp) = next p in
+       (match peek p with
+        | (Keyword KMatch, mp) ->
+          parse_match_decl p mp name ty_opt is_const is_frac is_unred
+        | _ ->
+          let e = parse_expr p in
+          (match is_const, Some e with
+           | true, None -> err tp "const requires an initializer"
+           | _ -> ());
+          SDecl (is_const, is_frac, is_unred, name, ty_opt, Some e, tp))
+     | _ ->
+       (match is_const with
+        | true -> err tp "const requires an initializer"
+        | false -> ());
+       SDecl (is_const, is_frac, is_unred, name, ty_opt, None, tp))
 
 (* 语句位置 let 声明：一行多声明器——let i32 a, b = 1, c[3], d[]，逗号分隔，
    共享类型与前缀修饰符，初值各自独立 *)
@@ -1054,6 +1061,63 @@ and parse_mpat p =
     PLit (parse_expr p)
   | _ -> err tp "expected pattern: literal, enum variant, or '_'"
 
+and parse_match_arms p tp =
+  (* match 头（v3.9）：`match <scrutinee>` 换行缩进 arm 块。
+     v3.11 抽取复用：语句位置（SMatch）与 let 初始化脱糖共用 *)
+  ignore (next p);
+  let scrut = parse_expr p in
+  let rec skip_nl () =
+    match peek p with
+    | (Newline, _) -> ignore (next p); skip_nl ()
+    | _ -> ()
+  in
+  skip_nl ();
+  (match peek p with
+   | (Indent, _) ->
+     ignore (next p);
+     let rec arms acc =
+       match peek p with
+       | (Dedent, _) -> ignore (next p); List.rev acc
+       | (Eof, _) -> List.rev acc
+       | (Newline, _) -> ignore (next p); arms acc
+       | _ ->
+         let pat = parse_mpat p in
+         expect p FatArrow "=>";
+         (match peek p with
+          | (Newline, _) ->
+            ignore (next p);
+            let blk = parse_block p in
+            arms ({ mpat = pat; mbody = blk; mpos = tp } :: acc)
+          | _ ->
+            let st = parse_stmt p in
+            arms ({ mpat = pat; mbody = [ st ]; mpos = tp } :: acc))
+     in
+     (scrut, arms [])
+   | (_, ep) ->
+     err ep "match requires a newline and an indented arm block (one 'pattern => body' per arm)")
+
+(* let x = match ...（v3.11）：match 初始化表达式，脱糖为透明块——
+   目标变量零值声明 + 每个 arm 体转为对目标的赋值。
+   目标类型由 let 头给出；限标量/struct/string 形状（零初始化）；
+   arm 体须为单表达式语句（绑定变量在 arm 内仍可用） *)
+and parse_match_decl p tp name ty_opt is_const is_frac is_unred =
+  if is_const then
+    err tp "const does not support a match initializer";
+  let (scrut, arms) = parse_match_arms p tp in
+  let arms2 =
+    List.map
+      (fun (a : marm) ->
+        match a.mbody with
+        | [ SExpr e ] ->
+          { a with mbody = [ SAssign (EVar (name, tp), e, a.mpos) ] }
+        | _ ->
+          err a.mpos "match initializer arms must be a single expression statement")
+      arms
+  in
+  SBlock ([ SDecl (false, is_frac, is_unred, name, ty_opt, None, tp);
+            SMatch (scrut, arms2, tp) ],
+          tp)
+
 and parse_stmt p =
   let (tk, tp) = peek p in
   match tk with
@@ -1078,37 +1142,8 @@ and parse_stmt p =
   | Keyword KMatch ->
     (* match 分发（v3.9）：match scrut 换行缩进块；
        arm：`模式 => 语句` 或 `模式 =>` 换行缩进块 *)
-    ignore (next p);
-    let scrut = parse_expr p in
-    let rec skip_nl () =
-      match peek p with
-      | (Newline, _) -> ignore (next p); skip_nl ()
-      | _ -> ()
-    in
-    skip_nl ();
-    (match peek p with
-     | (Indent, _) ->
-       ignore (next p);
-       let rec arms acc =
-         match peek p with
-         | (Dedent, _) -> ignore (next p); List.rev acc
-         | (Eof, _) -> List.rev acc
-         | (Newline, _) -> ignore (next p); arms acc
-         | _ ->
-           let pat = parse_mpat p in
-           expect p FatArrow "=>";
-           (match peek p with
-            | (Newline, _) ->
-              ignore (next p);
-              let blk = parse_block p in
-              arms ({ mpat = pat; mbody = blk; mpos = tp } :: acc)
-            | _ ->
-              let st = parse_stmt p in
-              arms ({ mpat = pat; mbody = [ st ]; mpos = tp } :: acc))
-       in
-       SMatch (scrut, arms [], tp)
-     | (_, ep) ->
-       err ep "match requires a newline and an indented arm block (one 'pattern => body' per arm)")
+    let (scrut, arms) = parse_match_arms p tp in
+    SMatch (scrut, arms, tp)
   | Keyword KWhile ->
     ignore (next p);
     let cond = parse_expr p in
@@ -1642,7 +1677,7 @@ let rec parse_struct_fields p facc macc =
       | Some len, false -> PArray len
       | _ -> PScalar
     in
-    (* rest ≠ []（嵌套元素类型，如 i32 m[3][4]）经 conv_ty 展开（w-014 #4） *)
+    (* rest ≠ []（嵌套元素类型，如 i32 m[3][4]）经 conv_ty 展开（w-14 #4） *)
     let fdefault =
       match peek p with
       | (Assign, _) -> ignore (next p); Some (parse_expr p)
@@ -1906,7 +1941,41 @@ and parse_item p =
       | (Lt, _) -> parse_tparams p
       | _ -> []
     in
-    let (fields, methods) = parse_struct_fields p [] [] in
+    let (fields, methods) =
+      match peek p with
+      | (Ident _, _) ->
+        (* v3.11 修复：泛型 struct 声明行尾 '>' 是续行符（is_line_cont），
+           吞掉了声明行的 Newline——首字段行与头相连、无 INDENT 前缀，
+           曾致字段循环误吞后续顶层项（单字段模板 E2024 + missing main）。
+           先按单行字段解析；第二字段起仍带 INDENT，续缩进块循环 *)
+        let ftp = snd (peek p) in
+        let fty0 = parse_ty ~allow_fun:true p in
+        let (base_ty, tgroups) = collect_ty_groups fty0 in
+        let fname = expect_ident p "field name" in
+        let (fty, _flen, _isl, _rest) =
+          decl_shape base_ty (tgroups @ parse_name_groups p) in
+        let fseq =
+          match _flen, _isl with
+          | None, true -> PList
+          | Some len, false -> PArray len
+          | _ -> PScalar
+        in
+        let fdefault =
+          match peek p with
+          | (Assign, _) -> ignore (next p); Some (parse_expr p)
+          | _ -> None
+        in
+        (match fdefault with
+         | None -> ()
+         | _ when fseq = PScalar -> ()
+         | _ -> err ftp "array/list struct fields cannot have default values");
+        end_of_stmt p;
+        let f0 = { fname; fty; fseq; fdefault; fpos = ftp } in
+        (match peek p with
+         | (Indent, _) -> parse_struct_fields p [ f0 ] []
+         | _ -> ([ f0 ], []))
+      | _ -> parse_struct_fields p [] []
+    in
     p.tynames <- name :: p.tynames;
     IStruct { name; packed; fields; pos = tp; tparams; methods }
   | Keyword KExtern ->

@@ -1,0 +1,40 @@
+// v3.11.0：match 表达式（let 初始化位置脱糖）+ 穷尽性检查
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    Named(string)
+    Empty
+
+fn f64 area(let Shape s)
+    let f64 a = match s
+        Shape.Circle(r) => 3.14159 * r * r
+        Shape.Rect(w, h) => w * h
+        Shape.Named(n) => 0.0
+        Shape.Empty => 0.0
+    return a
+
+fn string show(let Shape s)
+    let string t = "shape"
+    return t
+
+fn main()
+    // match 初始化：enum 全变体穷尽
+    output(area(Shape.Circle(2.0)))
+    output(area(Shape.Rect(3.0, 4.0)))
+    // 字面量 match 初始化（非 enum，无穷尽要求）
+    let i32 k = match 7
+        1 => 10
+        7 => 70
+        _ => 99
+    output(k)
+    // arm 内绑定变量可用
+    let f64 w = match Shape.Rect(2.0, 5.0)
+        Shape.Rect(a, b) => a + b
+        _ => 0.0
+    output(w)
+    // string 载荷 arm（string 比较 == 语义）
+    let string msg = match Shape.Named("hi")
+        Shape.Named(n) => n
+        _ => "none"
+    output(msg)
+    return

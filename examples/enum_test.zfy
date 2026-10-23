@@ -27,6 +27,7 @@ fn main()
     Shape.Circle(r) => a1 = 3.14159 * r * r
     Shape.Rect(w, h) => a1 = w * h
     Shape.Empty => a1 = 0.0
+    Shape.Named(n) => a1 = 0.0
   output(a1)   // 12.56636
 
   // 3. 双载荷 + _ 通配

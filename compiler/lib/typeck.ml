@@ -2964,6 +2964,7 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
   | SAug (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | SInc (a, _) | SDec (a, _) -> uses_of_expr acc a
   | SExpr e -> uses_of_expr acc e
+  | SBlock (bs, _) -> List.fold_left uses_of_stmt acc bs
   | SReturn (e, _) -> (match e with Some e -> uses_of_expr acc e | None -> acc)
   | SIf (c, a, b, _) ->
     let acc = uses_of_expr acc c in
@@ -3225,6 +3226,7 @@ and deref_refs (refs : string list) (body : block) : block =
     | SUnsafe (blk, p) -> SUnsafe (List.map rs blk, p)
     | SBreak _ | SContinue _ -> s
     | SForIn _ | SFn _ -> s
+    | SBlock (blk, p) -> SBlock (List.map rs blk, p)
     | SMatch (sx, arms, p) ->
       SMatch
         (re sx,
@@ -4327,6 +4329,7 @@ and check_block env (stmts : stmt list) : tblock =
   let rec expand (st : stmt) : stmt list =
     match st with
     | SDeclList ss -> List.concat_map expand ss
+    | SBlock (bs, _) -> List.concat_map expand bs
     | s -> [ s ]
   in
   let recover s =
@@ -4984,6 +4987,34 @@ and check_stmt env (st : stmt) : tstmt =
       | _ -> ("", [], "")
     in
     let is_enum = ename <> "" in
+    (* 穷尽性检查（v3.11）：enum 类型的 scrutinee 须覆盖全部变体或含 `_`。
+       字面量模式对 enum 无意义（== 比较不作用于 struct），不计入覆盖 *)
+    if is_enum then begin
+      let covered =
+        List.filter_map
+          (fun (a : marm) ->
+            match a.mpat with
+            | PWild -> Some "_"
+            | PVar (vname, _, _) ->
+              Some
+                (if String.contains vname '.' then begin
+                   let i = String.index vname '.' in
+                   String.sub vname (i + 1) (String.length vname - i - 1)
+                 end
+                 else vname)
+            | PLit _ -> None)
+          arms
+      in
+      if not (List.mem "_" covered) then begin
+        let missing =
+          List.filter (fun (v, _, _) -> not (List.mem v covered)) variants in
+        match missing with
+        | [] -> ()
+        | _ ->
+          terr p "match is not exhaustive: missing variant(s) %s of enum %s (add them or a `_` arm)"
+            (String.concat ", " (List.map (fun (v, _, _) -> v) missing)) ename
+      end
+    end;
     let fresh nm lty : local =
       declare env nm { lconst = false; lty; lslot = ""; lunred = false;
                        lconstp = false };
@@ -5220,6 +5251,7 @@ and pos_of_stmt = function
   | SUnsafe (_, p)
   | SFn (_, _, _, _, _, p)
   | SMatch (_, _, p)
+  | SBlock (_, p)
   | SBreak p
   | SContinue p -> p
   | SDeclList ss -> (match ss with s :: _ -> pos_of_stmt s | [] -> { file = ""; line = 0; col = 0 })

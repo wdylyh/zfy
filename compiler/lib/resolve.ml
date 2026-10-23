@@ -625,6 +625,7 @@ let resolve (main : program) (main_dir : string)
         SReduce (rw_expr m a, rw_expr m b, rw_expr m c, p)
       | SForIn (n, idx, sx, b, p) ->
         SForIn (n, idx, rw_expr m sx, rw_block m b, p)
+      | SBlock (bs, p) -> SBlock (rw_block m bs, p)
       | SUnsafe (b, p) -> SUnsafe (rw_block m b, p)
       | SFn (nm, params, ret, fr, body, p) ->
         SFn (nm, params, Option.map (rw_ty m) ret, fr, rw_block m body, p)
