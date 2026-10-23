@@ -47,6 +47,16 @@ let extern_fns : (string, unit) Hashtbl.t = Hashtbl.create 8
    check_program 开头清空（单文件单进程，防御性重置） *)
 let method_tbl : (string * string, string) Hashtbl.t = Hashtbl.create 16
 
+(* interface 方法表（v3.13）：接口名 -> (方法名, 参数 zty, 返回 zty) 列表；
+   iface_impls：已实现 (接口名, struct 名) 集合（llvmgen 生成 thunk/vtable 用）。
+   check_program 开头重置（与 method_tbl 同策略） *)
+let iface_tbl : (string, (string * zty list * zty) list) Hashtbl.t = Hashtbl.create 8
+let iface_impls : (string * string, unit) Hashtbl.t = Hashtbl.create 8
+let is_iface_name s =
+  String.length s > 6 && String.sub s 0 6 = "iface$"
+let iface_of_struct s =
+  if is_iface_name s then String.sub s 6 (String.length s - 6) else ""
+
 (* ---------- TVar 求解 ---------- *)
 
 let subs : (int, zty) Hashtbl.t = Hashtbl.create 16
@@ -2192,6 +2202,9 @@ and check_expr env (e : expr) : texpr =
           mk (EUnK (UBitNot, t1)) t1.ety))
   | ECall (callee, args, p') ->
     (match callee with
+     | EVar (name, np) when Hashtbl.mem iface_tbl name ->
+       (* 接口构造（v3.13）：Drawable(p) *)
+       check_iface_ctor env p' name args
      | EVar (name, np) ->
        (match name with
         | "length" | "find" | "trim" | "split" | "replace" | "prec"
@@ -2478,6 +2491,12 @@ and check_expr env (e : expr) : texpr =
           元素地址，指针接收者直接传指针值）；否则维持 unsupported callee *)
        let tb = check_expr env b in
        (match resolve tb.ety with
+        | TStruct s when is_iface_name s ->
+          (* 接口方法分派（v3.13）：接收者须为变量（槽引用） *)
+          (match tb.e with
+           | EVarK _ -> check_iface_call env pp (iface_of_struct s) seg tb args
+           | _ ->
+             terr pp "interface method call on a non-variable expression is not supported yet (assign to a variable first)")
         | TStruct s ->
           (match Hashtbl.find_opt method_tbl (s, seg) with
            | Some gname ->
@@ -2749,6 +2768,10 @@ and try_method env name p' args =
     (match lookup_var env front with
      | Some l ->
        (match resolve l.lty with
+        | TStruct s when is_iface_name s ->
+          (* 接口方法分派（v3.13）：接收者为接口值槽引用 *)
+          Some (check_iface_call env p' (iface_of_struct s) mname
+                  { e = EVarK l.lslot; ety = l.lty; epos = p' } args)
         | TStruct s | TPtr (TStruct s) ->
           (match Hashtbl.find_opt method_tbl (s, mname) with
            | Some gname ->
@@ -2766,6 +2789,69 @@ and try_method env name p' args =
         | _ -> None)
      | None -> None)
   | _ -> None
+
+(* 接口构造（v3.13）：IfaceName(structValue)——核对 struct 方法集与签名
+   （同名同签名：全局方法签名 = self ptr :: 接口参数），登记 (iface, struct)
+   供 llvmgen 生成 thunk/vtable；降码 = $ifnew$<iface>$<struct>(值) *)
+and check_iface_ctor env p iname args =
+  let imethods = Hashtbl.find iface_tbl iname in
+  let pos_arg = function CPos e | CCopy e -> Some e | _ -> None in
+  if List.length args <> 1 then
+    terr p "interface constructor %s expects exactly 1 struct argument" iname;
+  let tv =
+    match args with
+    | [ a ] ->
+      (match pos_arg a with
+       | Some e -> check_expr env e
+       | None -> terr p "interface constructor %s takes a plain struct value" iname)
+    | _ -> assert false
+  in
+  let sname =
+    match resolve tv.ety with
+    | TStruct s when not (is_iface_name s) -> s
+    | t -> terr p "interface constructor %s expects a struct value, got %s" iname (pp_zty t)
+  in
+  let selfp = TPtr (TStruct sname) in
+  List.iter
+    (fun (mn, ptys, ret) ->
+      match Hashtbl.find_opt method_tbl (sname, mn) with
+      | None ->
+        terr p "struct %s does not implement interface %s (missing method %s)" sname iname mn
+      | Some gname ->
+        (match Hashtbl.find_opt env.g.fns gname with
+         | Some fsig ->
+           if fsig.params <> (selfp :: ptys) || fsig.ret <> ret then
+             terr p "struct %s does not implement interface %s (method %s signature mismatch)"
+               sname iname mn
+         | None -> terr p "internal: method %s not registered" gname))
+    imethods;
+  Hashtbl.replace iface_impls (iname, sname) ();
+  { e = ECallK ("$ifnew$" ^ iname ^ "$" ^ sname, [ tv ], []);
+    ety = TStruct ("iface$" ^ iname); epos = p }
+
+(* 接口方法调用（v3.13）：ifaceVar.m(args)——$ifcall$<iface>$<m>(槽, args...)。
+   实参按接口方法签名 coerce（仅位置实参）；recv 为接口值槽引用 texpr *)
+and check_iface_call env p iname mname recv args =
+  let imethods = Hashtbl.find iface_tbl iname in
+  let (_, ptys, ret) =
+    match List.find_opt (fun (mn, _, _) -> mn = mname) imethods with
+    | Some m -> m
+    | None -> terr p "interface %s has no method %s" iname mname
+  in
+  if List.length args <> List.length ptys then
+    terr p "method %s.%s expects %d argument(s), got %d"
+      iname mname (List.length ptys) (List.length args);
+  let rec go i acc = function
+    | [] -> List.rev acc
+    | (CPos e | CMove e) :: rest ->
+      let tx = check_expr env e in
+      go (i + 1) (coerce p tx (List.nth ptys i) :: acc) rest
+    | _ :: _ ->
+      terr p "interface method calls support positional arguments only"
+  in
+  let targs = go 0 [] args in
+  { e = ECallK ("$ifcall$" ^ iname ^ "$" ^ mname, recv :: targs, []);
+    ety = ret; epos = p }
 
 and check_call env p np name0 targs origs modes =
   let name = ref name0 in
@@ -5355,6 +5441,9 @@ let check_program (prog : program) : hir =
       gtargs = Hashtbl.create 8; gstructpos = Hashtbl.create 8;
       enums = Hashtbl.create 8;
       closigs = Hashtbl.create 16 } in
+  (* 接口表重置（v3.13，与 method_tbl 同策略：单文件单进程防御性重置） *)
+  Hashtbl.reset iface_tbl;
+  Hashtbl.reset iface_impls;
   (* 内建 Err struct（解包块内 err 变量的类型）：code + msg。
      ErrCode 为虚拟常量命名空间（编译期查表），无对应 struct *)
   Hashtbl.replace g.structs "Err"
@@ -5587,6 +5676,26 @@ let check_program (prog : program) : hir =
             (* 9d：登记 extern 名单——llvmgen 对 i128 参数/返回值做 ABI 适配 *)
             Hashtbl.replace extern_fns f.ename ())
           funcs
+      | IIf { name; methods; pos } ->
+        (* interface（v3.13）：注册方法表 + 接口值 struct iface$<名>
+           { ptr data; ptr vt }。struct 隐式实现（构造时核对签名） *)
+        if Hashtbl.mem iface_tbl name then
+          terr pos "duplicate interface definition: %s" name;
+        if Hashtbl.mem g.structs name || Hashtbl.mem fn_names name
+           || List.mem name builtin_names then
+          terr pos "%s conflicts with an existing struct/function/builtin name" name;
+        Hashtbl.replace g.structs ("iface$" ^ name)
+          { spacked = false;
+            sfields = [ ("data", TPtr (TUint 8), None);
+                        ("vt", TPtr (TUint 8), None) ] };
+        (* 接口名 → 句柄 struct 别名（let Drawable d 可解析） *)
+        Hashtbl.replace g.aliases name (TStruct ("iface$" ^ name));
+        Hashtbl.replace iface_tbl name
+          (List.map
+             (fun (ret, mn, params, mp) ->
+               (mn, List.map (fun (pd : param) -> conv_ty g mp pd.pty) params,
+                (match ret with Some t -> conv_ty g mp t | None -> TVoid)))
+             methods)
       | IEnum { name; variants; pos } ->
         (* enum（v3.9）：注册 enum$<名> struct = tag + 类型槽字段；
            载荷按类型分槽（Rect(f64,f64) 占两个 f64 槽，Named(string)

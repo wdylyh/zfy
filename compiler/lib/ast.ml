@@ -231,6 +231,11 @@ type item =
     (* type 别名：type 名 = 类型（可含函数类型） *)
   | IDecl of stmt * pos
     (* 顶层声明：仅允许 const 标量（编译期常量，使用处内联，不生成运行时槽） *)
+  | IIf of { name : string; methods : (ty option * string * param list * pos) list;
+             pos : pos }
+    (* interface 接口（v3.13）：缩进块内每行一个方法签名 fn ret? 名(参数)——
+       无方法体；struct 方法同名同签名（除 self）即隐式实现。
+       接口类型 = struct iface$<名> { ptr data; ptr vt }（vtable 分派） *)
   | IEnum of { name : string; variants : (string * ty list) list; pos : pos }
     (* enum 枚举与和类型（v3.9）：enum 名 { 变体, 变体(载荷类型...), ... }——
        简单枚举 = 全部变体零载荷；统一编译为 struct enum$<名>

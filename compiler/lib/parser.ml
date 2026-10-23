@@ -1889,6 +1889,53 @@ and parse_item p =
              end_of_stmt p;
              IUseP { binds = [ (first, [ first ], tp) ]; pos = tp })))
 
+  | Keyword KInterface ->
+    (* interface 接口（v3.13）：interface 名 缩进块——每行一个方法签名
+       `fn (返回类型)? 名(参数)`，无方法体。struct 方法同名同签名即隐式实现；
+       接口类型 = struct iface$<名> { ptr data; ptr vt }，vtable 分派 *)
+    ignore (next p);
+    let iname = expect_ident p "interface name" in
+    let rec skip_nl () =
+      match peek p with
+      | (Newline, _) -> ignore (next p); skip_nl ()
+      | _ -> ()
+    in
+    let rec methods acc =
+      skip_nl ();
+      match peek p with
+      | (Dedent, _) -> ignore (next p); List.rev acc
+      | (Eof, _) -> List.rev acc
+      | (Keyword KFn, mp) ->
+        ignore (next p);
+        let ret =
+          match peek p with
+          | (Ident _, _) -> Some (parse_ty p)
+          | _ -> None
+        in
+        let mname = expect_ident p "interface method name" in
+        expect p LParen "(";
+        let rec pparams acc =
+          match peek p with
+          | (RParen, _) -> ignore (next p); List.rev acc
+          | _ ->
+            let pd = parse_param p in
+            (match peek p with
+             | (Comma, _) -> ignore (next p); pparams (pd :: acc)
+             | (RParen, _) -> ignore (next p); List.rev (pd :: acc)
+             | (_, tp') -> err tp' "expected ',' or ')' to end the parameter list")
+        in
+        let params = pparams [] in
+        end_of_stmt p;
+        methods ((ret, mname, params, mp) :: acc)
+      | (_, tp') ->
+        err tp' "interface body expects one method signature per line (fn ret? name(params))"
+    in
+    (skip_nl ();
+     (match peek p with
+      | (Indent, _) -> ignore (next p)
+      | (_, tp') -> err tp' "interface requires a newline and an indented method-signature block"));
+    IIf { name = iname; methods = methods []; pos = tp }
+
   | Keyword KEnum ->
     (* enum 枚举与和类型（v3.9）：enum 名 缩进块——每行一个变体：
        `变体名`（零载荷）或 `变体名(类型, ...)`（带载荷）；

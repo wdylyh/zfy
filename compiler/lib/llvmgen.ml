@@ -1163,6 +1163,80 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
          let r = fresh_r fc in
          emitf fc "  %s = call i32 @%s(ptr %s, ptr %s, i32 %d)" r bn sp cp ck;
          emitf fc "  %s = icmp ne i32 %s, 0" d r)
+  | name, [ src ] when String.length name > 7 && String.sub name 0 7 = "$ifnew$" ->
+    (* 接口值构造（v3.13）：堆拷贝 struct 值 + vtable 指针 → { data, vt }。
+       dst = 接口值槽（16 字节聚合，sret 约定）；生命周期 = 进程（不回收，
+       与闭包 env 同策略） *)
+    (match dst with
+     | None -> lerr None "$ifnew must be captured"
+     | Some d ->
+       let sfx = String.sub name 7 (String.length name - 7) in
+       let i = String.index sfx '$' in
+       let (iname, sname) =
+         (String.sub sfx 0 i, String.sub sfx (i + 1) (String.length sfx - i - 1)) in
+       (match find_struct fc.g sname with
+        | Some sd ->
+          let (sz, _) = Hir.struct_size_align fc.g.structs sd in
+          let (srcp, _) = ptr_of fc src in
+          let blk = fresh_r fc in
+          emitf_entry fc "  %s = call ptr @zfy_env_new(i64 %d)" blk sz;
+          emitf fc "  call void @llvm.memcpy.p0.p0.i64(ptr %s, ptr %s, i64 %d, i1 false)"
+            blk srcp sz;
+          let (addr, _) = Hashtbl.find fc.allocas d in
+          let ifty = ll_ty (TStruct ("iface$" ^ iname)) in
+          let d0 = gen_gep fc addr ifty 0 in
+          emitf fc "  store ptr %s, ptr %s" blk d0;
+          let d1 = gen_gep fc addr ifty 1 in
+          emitf fc "  store ptr @vt$%s$%s, ptr %s" iname sname d1
+        | None -> lerr None "undefined struct %s" sname))
+  | name, ifc :: rargs when String.length name > 8 && String.sub name 0 8 = "$ifcall$" ->
+    (* 接口方法分派（v3.13）：data/vt 从接口值槽读出，vt[slot] 间接调用。
+       实参：iface 值按槽指针；其余按值（聚合再按指针——v1 限标量/string） *)
+    let sfx = String.sub name 8 (String.length name - 8) in
+    let i = String.index sfx '$' in
+    let (iname, mname) =
+      (String.sub sfx 0 i, String.sub sfx (i + 1) (String.length sfx - i - 1)) in
+    let imethods =
+      (match Hashtbl.find_opt Typeck.iface_tbl iname with
+       | Some m -> m | None -> lerr None "undefined interface %s" iname)
+    in
+    let slot =
+      let rec go k = function
+        | (mn, _, _) :: rest -> if mn = mname then k else go (k + 1) rest
+        | [] -> lerr None "interface %s has no method %s" iname mname
+      in go 0 imethods
+    in
+    let (_, _ptys, ret) = List.nth imethods slot in
+    let (ifp, _) = ptr_of fc ifc in
+    let data = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" data ifp;
+    let ifty = ll_ty (TStruct ("iface$" ^ iname)) in
+    let vtp = gen_gep fc ifp ifty 1 in
+    let vt = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" vt vtp;
+    let fp = fresh_r fc in
+    emitf fc "  %s = getelementptr [ %d x ptr ], ptr %s, i64 0, i32 %d"
+      fp (List.length imethods) vt slot;
+    let fn = fresh_r fc in
+    emitf fc "  %s = load ptr, ptr %s" fn fp;
+    let targs2 =
+      List.map
+        (fun (o : operand) ->
+          if is_agg o.oty then
+            let (p, _) = ptr_of fc o in ("ptr", p)
+          else
+            let (v, t) = val_of fc o in (t, v))
+        rargs
+    in
+    let args_str =
+      String.concat ", "
+        (Printf.sprintf "ptr %s" data
+         :: List.map (fun (t, v) -> Printf.sprintf "%s %s" t v) targs2)
+    in
+    (match ret, dst with
+     | TVoid, _ -> emitf fc "  call void %s(%s)" fn args_str
+     | _, Some d -> emitf fc "  %s = call %s %s(%s)" d (ll_ty ret) fn args_str
+     | _ -> lerr None "interface method return value must be used")
   | "abs", [ a ] ->
     (* abs 重载（v3.2）：无符号=恒等；有符号=内联 sub+icmp+select（规避
        C abs 的 32 位截断，i128 同样适用）；浮点=@fabs。is_rt_name 已排除
@@ -2741,6 +2815,54 @@ let gen_program (m : mir) : string =
       Buffer.add_string g.mbuf (gen_struct_free_fn sd);
       Buffer.add_string g.mbuf (gen_struct_assign_fn sd))
     m.mstructs;
+  (* 接口 thunk 与 vtable（v3.13）：对每个已实现 (iface, struct)——
+     thunk 转发到脱糖全局方法（self ptr 首参）；@vt$I$S = thunk 数组常量。
+     依赖 typeck 侧 iface_impls（构造处登记）与 method_tbl（全局函数名） *)
+  Hashtbl.iter
+    (fun (iname, sname) () ->
+      match Hashtbl.find_opt Typeck.iface_tbl iname with
+      | None -> ()
+      | Some imethods ->
+        let thunks =
+          List.map
+            (fun (mn, ptys, ret) ->
+              match Hashtbl.find_opt Typeck.method_tbl (sname, mn) with
+              | None -> lerr None "internal: method %s.%s not registered" sname mn
+              | Some gname ->
+                let thunk = Printf.sprintf "thunk$%s$%s$%s" iname mn sname in
+                let pnames =
+                  List.mapi (fun i _ -> Printf.sprintf "%%a%d" i) ptys in
+                let params_str =
+                  String.concat ", "
+                    (Printf.sprintf "ptr %%data"
+                     :: List.mapi
+                          (fun i (pty, pn) -> Printf.sprintf "%s %s" (ll_ty pty) pn)
+                          (List.combine ptys pnames)) in
+                Buffer.add_string g.mbuf
+                  (Printf.sprintf "define %s @%s(%s) {\n"
+                     (if ret = TVoid then "void" else ll_ty ret) thunk params_str);
+                let call_args =
+                  String.concat ", "
+                    (Printf.sprintf "ptr %%data"
+                     :: List.map
+                          (fun (pty, pn) -> Printf.sprintf "%s %s" (ll_ty pty) pn)
+                          (List.combine ptys pnames)) in
+                (match ret with
+                 | TVoid ->
+                   Buffer.add_string g.mbuf
+                     (Printf.sprintf "  call void @%s(%s)\n  ret void\n}\n" gname call_args)
+                 | _ ->
+                   Buffer.add_string g.mbuf
+                     (Printf.sprintf "  %%r = call %s @%s(%s)\n  ret %s %%r\n}\n"
+                        (ll_ty ret) gname call_args (ll_ty ret)));
+                Printf.sprintf "ptr %s" ("@" ^ thunk))
+            imethods
+        in
+        Buffer.add_string g.mbuf
+          (Printf.sprintf "@vt$%s$%s = constant [ %d x ptr ] [ %s ]\n"
+             iname sname (List.length thunks)
+             (String.concat ", " thunks)))
+    Typeck.iface_impls;
   (* 每个 struct 的元素操作对（w-014 #2）：struct 作 seq 元素时
      zfy_seq_set_agg/get_agg/free 按头部 ops 深拷贝/释放 *)
   List.iter
@@ -3117,6 +3239,7 @@ let gen_program (m : mir) : string =
      的 callee，按实参/返回类型生成 declare（去重，同名首见签名生效） *)
   let is_rt_name (n : string) =
     Hashtbl.mem user_fns n || n = "main" || n = "strlen"
+    || (String.length n > 0 && n.[0] = '$')   (* $ifnew$/$ifcall$ 内部调用，不 declare *)
     || String.length n >= 4 && String.sub n 0 4 = "zfy_"
     || String.length n >= 4 && String.sub n 0 4 = "zfy."
     || n = "str_len" || n = "zfy.prec" || n = "abs"

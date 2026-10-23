@@ -1,0 +1,43 @@
+// v3.13.0：interface 接口与多态（vtable 分派）
+interface Drawable
+    fn f64 area()
+    fn string name()
+
+struct Circle
+    f64 r = 0.0
+
+    fn f64 area()
+        return 3.14159 * self.r * self.r
+
+    fn string name()
+        return "circle"
+
+struct Square
+    f64 side = 0.0
+
+    fn f64 area()
+        return self.side * self.side
+
+    fn string name()
+        return "square"
+
+fn main()
+    let Circle c = Circle(1.0)
+    let Square s = Square(2.0)
+    // 接口值构造：方法集/签名核对，vtable 绑定
+    let Drawable d1 = Drawable(c)
+    let Drawable d2 = Drawable(s)
+    // 多态分派：同名方法按动态类型执行
+    output(d1.area())
+    output(d2.area())
+    output(d1.name())
+    output(d2.name())
+    // 接口值列表
+    let Drawable[] shapes
+    shapes = push(shapes, Drawable(Circle(3.0)))
+    shapes = push(shapes, Drawable(Square(4.0)))
+    let f64 total = 0.0
+    for sh in shapes
+        total = total + sh.area()
+    output(total)
+    return

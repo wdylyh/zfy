@@ -90,6 +90,7 @@ let pos_of_item (it : item) : pos =
   | IFn f -> f.pos
   | IStruct s -> s.pos
   | IEnum e -> e.pos
+  | IIf i -> i.pos
   | IMod (_, _, p) | IModFile (_, p) | IPub (_, p) -> p
   | IExtern e -> e.pos
   | ITypeAlias a -> a.pos
@@ -269,6 +270,7 @@ let resolve (main : program) (main_dir : string)
     | IFn f -> add_local modt f.name pub "fn" f.pos; modt.raw <- modt.raw @ [ it ]
     | IStruct s -> add_local modt s.name pub "struct" s.pos; modt.raw <- modt.raw @ [ it ]
     | IEnum e -> add_local modt e.name pub "enum" e.pos; modt.raw <- modt.raw @ [ it ]
+    | IIf i -> add_local modt i.name pub "interface" i.pos; modt.raw <- modt.raw @ [ it ]
     | ITypeAlias a -> add_local modt a.name pub "alias" a.pos; modt.raw <- modt.raw @ [ it ]
     | IExtern e ->
       List.iter (fun fn -> add_local modt fn.ename pub "extern" fn.epos) e.funcs;
@@ -684,6 +686,13 @@ let resolve (main : program) (main_dir : string)
                          List.map (fun (vn, pys) -> (vn, List.map (rw_ty m) pys))
                            e.variants;
                        pos = e.pos } :: !out
+      | IIf i ->
+        out := IIf { name = flat_prefix m.mpath ^ i.name;
+                     methods =
+                       List.map (fun (r, mn, ps, p) ->
+                           (Option.map (rw_ty m) r, mn, List.map (rw_param m) ps, p))
+                           i.methods;
+                     pos = i.pos } :: !out
       | ITypeAlias a ->
         out := ITypeAlias { name = flat_prefix m.mpath ^ a.name;
                             ty = rw_ty m a.ty; pos = a.pos } :: !out

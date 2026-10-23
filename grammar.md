@@ -1,6 +1,9 @@
-# zfy 语言规范（v3.12.0，2026-10-23）
+# zfy 语言规范（v3.13.0，2026-10-23）
 
 > 本版每一节都经过编译器实测校准（examples 全回归通过）。
+> 与 v3.12.0 的主要差异（v3.13.0 接口轮）：
+> **interface 接口与多态（§27）**——隐式实现、vtable 分派、接口值列表。
+>
 > 与 v3.11.0 的主要差异（v3.12.0 标准库轮）：
 > **os_args / os_env / assert_eq（§26）**——命令行参数、环境变量（T!）、
 > 测试断言内建。
@@ -1326,3 +1329,36 @@ v3.10 放宽：
   位模式）；f32/f64 数值比较；string 按 strcmp。两侧须同类别。
 - 典型用法：`let string home = os_env("HOME") ?? "fallback"`；
   测试断言 `assert_eq(actual, expected)`（失败即 panic，带 file:line）。
+
+## 27. interface 接口与多态（v3.13.0）
+
+```zfy
+interface Drawable
+    fn f64 area()
+    fn string name()
+
+struct Circle
+    f64 r = 0.0
+    fn f64 area()
+        return 3.14159 * self.r * self.r
+    fn string name()
+        return "circle"
+
+fn main()
+    let Drawable d = Drawable(Circle(2.0))
+    output(d.area())          // 多态分派：按构造时的动态类型
+    let Drawable[] shapes
+    shapes = push(shapes, d)  // 接口值可入列表（16 字节值语义）
+    return
+```
+
+- **隐式实现**：struct 拥有与接口方法同名、同签名（除 self）的方法即满足，
+  无显式 impl 声明；构造 `IfaceName(structValue)` 时逐一核对方法集与签名，
+  缺失/不匹配编译期报错。
+- **表示**：接口类型 = 句柄 struct `iface$<名>` { ptr data; ptr vt }（16 字节）。
+  构造 = struct 值堆拷贝（生命周期 = 进程，不回收，与闭包 env 同策略）
+  + vtable 指针绑定；方法调用 = `vt[slot](data, args...)` 间接分派。
+- **限制（v1）**：接口方法实参限位置实参；方法参数/返回限标量/string/指针
+  （聚合返回不支持）；接口方法调用接收者须为变量；接口值浅拷贝（共享
+  data 堆拷贝）；接口名经别名解析（`let Drawable d`），不可再嵌泛型实参。
+- self 约定与 struct 方法一致（隐式首参 = 接收者引用，方法体内 `self.x`）。
