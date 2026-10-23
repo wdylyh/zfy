@@ -1295,6 +1295,42 @@ fn main()
   按值语义深拷贝转移）。
 - self 约定与 struct 方法一致（隐式首参 = 接收者引用，方法体内 `self.x`）。
 
+### 27.1 接口继承
+
+```zfy
+interface Animal
+    fn string name()
+
+interface Pet: Animal
+    fn string owner()
+```
+
+- `interface A: B` 声明继承：A 的方法集 = B 的全部方法 + 自身方法
+  （父方法在前，vtable 槽序与声明序一致）。
+- struct 实现 A 时必须同时实现 B 的全部方法；子接口重定义父方法（同名
+  同签名出现两次）编译期报错。
+- 多层继承扁平化展开；`Pet(implValue)` 构造出的接口值可当 `Animal` 用
+  （赋给 Animal 变量/实参，前缀槽方法分派不变）。
+
+### 27.2 接口默认方法体
+
+```zfy
+interface Greeter
+    fn string greet()
+    fn void hello()
+        output(self.greet())   // 默认实现：未实现时 struct 直接继承
+
+struct Robot
+    fn string greet()
+        return "beep"
+```
+
+- 接口方法签名行后跟缩进块即为**默认方法体**；struct 未实现该方法时
+  自动按默认体合成（`struct.m$=default` 隐藏方法），实现了则用自身的。
+- 默认体内可调用同接口其他方法（含只有默认体的方法、被 struct 覆盖的
+  方法——动态分派按 struct 实际实现）。
+- 合成方法签名与接口声明一致；self 类型为实现 struct。
+
 ## 28. 泛型约束与泛型 struct 方法
 
 ### 28.1 约束语法
@@ -1352,3 +1388,31 @@ p.twice()   // 10——方法随实例化实例化，self 类型 = Pct<i32>
 - `ZFY_FORCE=1` 强制全量重建；任一依赖（源文件/runtime/编译器本体）变化
   即自动全量重编。注意这是**构建级缓存**（非 per-module 独立编译）——
   模块级增量仍在 #11 路线图上（per-module 缓存 → 真独立编译）。
+
+## 29. panic 策略可配置：try / panic_msg
+
+```zfy
+fn void risky()
+    let i32[] a
+    a = push(a, 1)
+    output(a[5])          // 越界 → panic（默认 die 路径）
+
+fn main()
+    let bool ok = try(risky)      // 正常完成 = true，panic 被捕获 = false
+    if !ok
+        let string msg = panic_msg()   // 被捕获的 panic 消息
+        output("caught: ", msg)
+    return
+```
+
+- `try(f)`：f 为**零参 lambda** 或**零参具名函数名**（函数名自动包装为
+  wrapper 闭包，与 spawn/容器谓词同机制）。返回 bool：f 正常完成 = true；
+  f 内部发生 panic（含数组越界、除零、cast 失败等全部运行期 die 路径）=
+  捕获并返回 false。带参闭包编译期报错。
+- `panic_msg()`：返回最近一次被 try 捕获的 panic 消息；无捕获上下文时为
+  空串。消息在下次 try 调用时重置。
+- 捕获实现 = runtime setjmp/longjmp（单层恢复帧）；被捕获的 panic 不走
+  panic_handler、不 exit 101，控制流回到 try 调用点。
+- 未被 try 包裹的 panic 行为完全不变（panic_handler 或打印位置 + exit 101）。
+- 注意：try 捕获后 f 中已分配的堆资源（string 列表等 RAII）随栈回退由
+  进程级策略处理；v1 不保证捕获点局部资源的即时释放（与进程退出同语义）。

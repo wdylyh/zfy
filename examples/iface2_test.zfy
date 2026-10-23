@@ -1,0 +1,45 @@
+// interface 补强（v3.20）：继承 + 方法默认实现
+interface Animal
+    fn string name()
+    fn i32 legs()
+    fn string describe()      // 默认实现：self describe() 调 name/legs
+        return self.name() + "/" + cast(self.legs(), string) + " legs"
+
+interface Pet: Animal        // 继承：Pet 拥有 name/legs/describe
+    fn string owner()
+
+struct Dog
+    fn string name()
+        return "dog"
+    fn i32 legs()
+        return 4
+    // describe 未实现 → 用 Animal 默认体
+
+struct Spider
+    fn string name()
+        return "spider"
+    fn i32 legs()
+        return 8
+    fn string describe()      // 覆盖默认（自己实现了就不用默认体）
+        return "spider!"
+
+struct Cat
+    fn string name()
+        return "cat"
+    fn i32 legs()
+        return 4
+    fn string describe()
+        return self.name() + "-feline"
+    fn string owner()
+        return "ann"
+
+fn main()
+    let Animal a1 = Animal(Dog())
+    output(a1.describe(), "\n")        // dog/4 legs（默认体合成）
+    let Animal a2 = Animal(Spider())
+    output(a2.describe(), "\n")        // spider!（自实现）
+    let Pet p = Pet(Cat())
+    output(p.describe(), "\n")         // cat-feline
+    output(p.owner(), "\n")            // ann（父接口方法分派）
+    let Animal a3 = Animal(Cat())
+    output(a3.describe(), "\n")        // cat-feline（同一 struct 多接口）

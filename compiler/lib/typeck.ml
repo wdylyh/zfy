@@ -51,6 +51,10 @@ let method_tbl : (string * string, string) Hashtbl.t = Hashtbl.create 16
    iface_impls：已实现 (接口名, struct 名) 集合（llvmgen 生成 thunk/vtable 用）。
    check_program 开头重置（与 method_tbl 同策略） *)
 let iface_tbl : (string, (string * zty list * zty) list) Hashtbl.t = Hashtbl.create 8
+(* 接口默认方法体（v3.20）：iface 名 -> (方法名, ast 参数, 返回, 块, pos) *)
+let iface_defaults :
+  (string, (string * param list * ty option * block * pos) list) Hashtbl.t =
+  Hashtbl.create 8
 let iface_impls : (string * string, unit) Hashtbl.t = Hashtbl.create 8
 let is_iface_name s =
   String.length s > 6 && String.sub s 0 6 = "iface$"
@@ -184,6 +188,10 @@ type genv = { fns : (string, fn_sig) Hashtbl.t;
    兄弟 self.m2 调用可命中）。check_program 里赋值（需 check_one_fn 闭包） *)
 let method_inst_hook :
   (genv -> string -> (string * zty) list -> string -> pos -> unit) ref =
+  ref (fun _ _ _ _ _ -> ())
+(* 接口默认实现合成钩子（v3.20）：登记 method_tbl/g.fns 并查体（见 check_program 赋值处） *)
+let default_synth_hook :
+  (genv -> string -> string -> string -> pos -> unit) ref =
   ref (fun _ _ _ _ _ -> ())
                 (* 闭包类型签名（v3.7）：closure$... mangled 名 -> (参数, 返回) *)
 
@@ -3013,7 +3021,18 @@ and check_iface_ctor env p iname args =
     (fun (mn, ptys, ret) ->
       match Hashtbl.find_opt method_tbl (sname, mn) with
       | None ->
-        terr p "struct %s does not implement interface %s (missing method %s)" sname iname mn
+        (* 默认实现合成（v3.20）：接口带默认体且 struct 未实现 → 按实现者
+           生成 S__m$I$default（self 指向 S，体内 self.m2 静态分派） *)
+        let has_default =
+          match Hashtbl.find_opt iface_defaults iname with
+          | Some ds -> List.exists (fun (dn, _, _, _, _) -> dn = mn) ds
+          | None -> false
+        in
+        if not has_default then
+          terr p "struct %s does not implement interface %s (missing method %s)"
+            sname iname mn
+        else
+          !default_synth_hook env.g sname iname mn p
       | Some gname ->
         (match Hashtbl.find_opt env.g.fns gname with
          | Some fsig ->
@@ -3056,7 +3075,40 @@ and check_call env p np name0 targs origs modes =
     match container_call env p name0 targs with
     | Some (n2, s2) -> name := n2; s2
     | None ->
-    if name0 = "abs" then begin
+    if name0 = "try" then begin
+      (* try(f)（v3.20，new.md panic 策略可配置）：f 为零参闭包/lambda——
+         正常完成返回 true；内部 panic（含数组越界等运行期 die）被捕获，
+         返回 false，消息经 panic_msg() 读取 *)
+      name := "zfy_try";
+      match targs with
+      | [ a ] ->
+        (* targs 已是检查后的 texpr；实际降码（拆闭包→zfy_try）在 mir
+           ECallK 特判 "zfy_try"，这里只核对类型并返回签名。
+           裸函数名（TPtr TFunSig）经 wrap_fn_as_clo 包成零参 wrapper 闭包
+           （与 spawn/容器谓词同机制） *)
+        let a =
+          match a.e, resolve a.ety with
+          | EFunPtrK f, TPtr (TFunSig (ps, r)) -> wrap_fn_as_clo env p f ps r
+          | _ -> a
+        in
+        (match resolve a.ety with
+         | TStruct cs when is_clo_struct cs ->
+           let (ptys, _) = clo_sig env.g cs p in
+           if ptys <> [] then
+             terr p "try expects a zero-argument closure, got %d parameter(s)"
+               (List.length ptys);
+           { params = [ a.ety ]; prefs = [ false ]; ret = TBool; runred = false }
+         | t -> terr p "try expects a closure argument, got %s" (pp_zty t))
+      | _ -> terr p "try expects exactly 1 closure argument"
+    end
+    else if name0 = "panic_msg" then begin
+      (* panic_msg()：最近一次被 try 捕获的 panic 消息（无捕获为空串） *)
+      name := "zfy_panic_msg";
+      match targs with
+      | [] -> { params = []; prefs = []; ret = TString; runred = false }
+      | _ -> terr p "panic_msg takes no arguments"
+    end
+    else if name0 = "abs" then begin
       (* abs 重载（v3.2）：整数→同宽整数（llvmgen 内联 sub+select），
          浮点→同宽浮点（llvmgen 走 @fabs/@fabsf）；其余类型报错。
          纯字面量实参树（ety=TVar）延迟定型（v3.3.2，与 BPow 字面量树
@@ -5718,7 +5770,7 @@ let rec subst_ty (t : zty) : zty =
 (* ---------- 程序级检查 ---------- *)
 
 (* 函数式内建名（用户自定义函数不得与之冲突） *)
-let builtin_names = [ "length"; "find"; "trim"; "split"; "replace"; "prec";
+let builtin_names = [ "try"; "panic_msg"; "length"; "find"; "trim"; "split"; "replace"; "prec";
                       "sort";
                       "open"; "read_all"; "read_line"; "write"; "writeln";
                       "close"; "exists"; "read_file"; "write_file"; "read_lines";
@@ -5763,6 +5815,7 @@ let check_program (prog : program) : hir =
       gused = Hashtbl.create 16 } in
   (* 接口表重置（v3.13，与 method_tbl 同策略：单文件单进程防御性重置） *)
   Hashtbl.reset iface_tbl;
+  Hashtbl.reset iface_defaults;
   Hashtbl.reset iface_impls;
   (* 内建 Err struct（解包块内 err 变量的类型）：code + msg。
      ErrCode 为虚拟常量命名空间（编译期查表），无对应 struct *)
@@ -5995,7 +6048,7 @@ let check_program (prog : program) : hir =
             (* 9d：登记 extern 名单——llvmgen 对 i128 参数/返回值做 ABI 适配 *)
             Hashtbl.replace extern_fns f.ename ())
           funcs
-      | IIf { name; methods; pos } ->
+      | IIf { name; methods; parent; defaults; pos } ->
         (* interface（v3.13）：注册方法表 + 接口值 struct iface$<名>
            { ptr data; ptr vt }。struct 隐式实现（构造时核对签名） *)
         if Hashtbl.mem iface_tbl name then
@@ -6009,12 +6062,29 @@ let check_program (prog : program) : hir =
                         ("vt", TPtr (TUint 8), None) ] };
         (* 接口名 → 句柄 struct 别名（let Drawable d 可解析） *)
         Hashtbl.replace g.aliases name (TStruct ("iface$" ^ name));
-        Hashtbl.replace iface_tbl name
-          (List.map
-             (fun (ret, mn, params, mp) ->
-               (mn, List.map (fun (pd : param) -> conv_ty g mp pd.pty) params,
-                (match ret with Some t -> conv_ty g mp t | None -> TVoid)))
-             methods)
+        (* 继承（v3.20）：父接口方法在前（vtable 槽序一致）；子重名方法报错 *)
+        let parent_ms =
+          match parent with
+          | Some pn ->
+            (match Hashtbl.find_opt iface_tbl pn with
+             | Some ms -> ms
+             | None -> terr pos "unknown parent interface %s (define it first)" pn)
+          | None -> []
+        in
+        let own_ms =
+          List.map
+            (fun (ret, mn, params, mp) ->
+              (mn, List.map (fun (pd : param) -> conv_ty g mp pd.pty) params,
+               (match ret with Some t -> conv_ty g mp t | None -> TVoid)))
+            methods
+        in
+        List.iter
+          (fun (mn, _, _) ->
+            if List.exists (fun (n, _, _) -> n = mn) parent_ms then
+              terr pos "interface %s redefines inherited method %s (override not supported)" name mn)
+          own_ms;
+        Hashtbl.replace iface_tbl name (parent_ms @ own_ms);
+        Hashtbl.replace iface_defaults name defaults
       | IEnum { name; variants; pos } ->
         (* enum（v3.9）：注册 enum$<名> struct = tag + 类型槽字段；
            载荷按类型分槽（Rect(f64,f64) 占两个 f64 槽，Named(string)
@@ -6405,6 +6475,54 @@ let check_program (prog : program) : hir =
           | Some tf -> generic_fns_acc := !generic_fns_acc @ [ tf ]
           | None -> ())
         gs.gmethods);
+  (* 接口默认实现合成（v3.20）：为未实现方法的 struct 生成
+     S__m$I$default——签名同接口方法（self ptr 首参），体 = 接口默认体。
+     两段式（同泛型方法 hook）：先登记全部缺失方法签名（体里 self.m2
+     静态分派要能命中），再逐个 check_one_fn 查体（tf 下传 codegen） *)
+  default_synth_hook :=
+    (fun g sname iname mn p ->
+      let ds = Hashtbl.find iface_defaults iname in
+      let missing =
+        List.filter
+          (fun (dn, _, _, _, _) ->
+            dn = mn || (match Hashtbl.find_opt method_tbl (sname, dn) with
+                        | Some _ -> false | None -> true))
+          ds
+      in
+      let mk_self mp =
+        { pname = "self"; pty = TNamed (sname, mp); pfrac = false;
+          pseq = PScalar; pconst = false; punred = false; pref = true;
+          ppos = mp }
+      in
+      let fn_name dn = sname ^ "__" ^ dn ^ "$" ^ iname ^ "$default" in
+      (* 第一段：登记签名 *)
+      List.iter
+        (fun (dn, params, ret, _, mp) ->
+          let selfp = mk_self mp in
+          let prev = ref [] in
+          let ptys =
+            List.map
+              (fun (pd : param) ->
+                let t = conv_param g mp !prev pd in
+                prev := pd.pname :: !prev;
+                if pd.pref then TPtr t else t)
+              params
+          in
+          let rty = match ret with None -> TVoid | Some t -> conv_ty g mp t in
+          Hashtbl.replace method_tbl (sname, dn) (fn_name dn);
+          Hashtbl.replace g.fns (fn_name dn)
+            { params = TPtr (TStruct sname) :: ptys;
+              prefs = true :: List.map (fun _ -> false) ptys;
+              ret = rty; runred = false })
+        missing;
+      (* 第二段：逐个查体 *)
+      List.iter
+        (fun (dn, params, ret, body, mp) ->
+          let selfp = mk_self mp in
+          match check_one_fn (fn_name dn) (selfp :: params) body mp with
+          | Some tf -> generic_fns_acc := !generic_fns_acc @ [ tf ]
+          | None -> ())
+        missing);
   (* dry check（v3.15）：从未实例化、且类型参数全带 num/cmp 约束的泛型函数，
      用代表类型实例化检查一次——坏体（未定义变量等语义错误）早暴露，
      不再静默逃逸。误报抑制：逐代表类型尝试（num→[i64;f64]、cmp→[i64;string]），
@@ -6575,6 +6693,7 @@ let check_program (prog : program) : hir =
       | EPropagateK a -> (EPropagateK (fix_texpr a), ety)
       | EErrOkK a -> (EErrOkK (fix_texpr a), ety)
       | EFindK (s, c, k) -> (EFindK (fix_texpr s, fix_texpr c, fix_texpr k), ety)
+      | ETryK cb -> (ETryK (fix_texpr cb), ety)
       | ESortSeqK (a, el, d) -> (ESortSeqK (fix_texpr a, subst_ty el, d), ety)
       | ESortMixK (args, el, d) ->
         (ESortMixK (List.map fix_texpr args, subst_ty el, d), ety)

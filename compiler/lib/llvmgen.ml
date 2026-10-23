@@ -2994,6 +2994,8 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "@zfy_cur_line = external global i32\n";
   Buffer.add_string g.mbuf "@zfy_cur_file = external global ptr\n";
   Buffer.add_string g.mbuf "declare void @zfy_set_panic_handler(ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_try(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_panic_msg()\n";
   Buffer.add_string g.mbuf "declare void @zfy_stoi_err(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_stod_err(ptr, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_stoi_wide_err(ptr, ptr)\n";

@@ -86,8 +86,38 @@ char *zfy_strdup(const char *s); /* 前向声明（zfy_strdup 定义在后） */
 /* panic：不可恢复。有 handler 先调用（用户可自定义输出），随后退出进程。
    handler 是 zfy 函数，string 参数按所有权约定接管——调用方须克隆（同
    普通函数传参的值语义）；panic 随后 exit，克隆无人释放（最小泄漏，无碍） */
+/* ---- panic 恢复（v3.20，new.md：panic 策略可配置）----
+ * try(f) 内建：活动恢复帧存在时 panic 不再退出，保存消息后 longjmp
+ * 回 zfy_try（返回 0=发生 panic / 1=正常完成）；无帧时走原策略
+ * （handler 或打印 + exit(101)）。v1 单层帧（嵌套 try 内层覆盖）。 */
+#include <setjmp.h>
+static jmp_buf zfy_try_jmp;
+static volatile int zfy_try_active = 0;
+static char zfy_panic_msg_buf[512];
+
+int zfy_try(void (*fn)(void *), void *env) {
+    if (setjmp(zfy_try_jmp) == 0) {
+        zfy_try_active = 1;
+        fn(env);
+        zfy_try_active = 0;
+        return 1;
+    }
+    zfy_try_active = 0;
+    return 0;
+}
+
+const char *zfy_panic_msg(void) {
+    return zfy_panic_msg_buf;
+}
+
 void zfy_panic(int32_t code, char *msg) {
     fflush(stdout);
+    if (zfy_try_active) {
+        snprintf(zfy_panic_msg_buf, sizeof(zfy_panic_msg_buf), "%s",
+                 msg ? msg : "");
+        zfy_try_active = 0;
+        longjmp(zfy_try_jmp, 1);
+    }
     if (zfy_panic_handler) {
         zfy_panic_handler(code, zfy_strdup(msg ? msg : ""));
     } else if (code == 0) {

@@ -2097,6 +2097,13 @@ and parse_item p =
        接口类型 = struct iface$<名> { ptr data; ptr vt }，vtable 分派 *)
     ignore (next p);
     let iname = expect_ident p "interface name" in
+    (* 继承（v3.20）：interface A: B——B 的方法并入 A（父在前） *)
+    let iparent =
+      match peek p with
+      | (Colon, _) -> ignore (next p); Some (expect_ident p "parent interface name")
+      | _ -> None
+    in
+    let defaults = ref [] in
     let rec skip_nl () =
       match peek p with
       | (Newline, _) -> ignore (next p); skip_nl ()
@@ -2128,6 +2135,12 @@ and parse_item p =
         in
         let params = pparams [] in
         end_of_stmt p;
+        (* 默认实现（v3.20）：签名后跟缩进块——struct 未实现时按实现者合成 *)
+        (match peek p with
+         | (Indent, _) ->
+           let body = parse_block p in
+           defaults := (mname, params, ret, body, mp) :: !defaults
+         | _ -> ());
         methods ((ret, mname, params, mp) :: acc)
       | (_, tp') ->
         err tp' "interface body expects one method signature per line (fn ret? name(params))"
@@ -2136,7 +2149,10 @@ and parse_item p =
      (match peek p with
       | (Indent, _) -> ignore (next p)
       | (_, tp') -> err tp' "interface requires a newline and an indented method-signature block"));
-    IIf { name = iname; methods = methods []; pos = tp }
+    let ms = methods [] in
+    let defs = List.rev !defaults in
+    IIf { name = iname; methods = ms; parent = iparent;
+          defaults = defs; pos = tp }
 
   | Keyword KEnum ->
     (* enum 枚举与和类型（v3.9）：enum 名 缩进块——每行一个变体：

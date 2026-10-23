@@ -1,0 +1,29 @@
+// try/panic 捕获测试：panic 策略可配置（new.md #4）
+struct P
+    i32 x
+
+fn void boom()
+    let P p = P(x=1)
+    output(p.x)
+    panic("boom happened")
+
+fn void fine()
+    output("fine runs")
+    return
+
+fn main()
+    // 1) 无 panic 的闭包：try 返回 true
+    let bool ok = try(fine)
+    output(ok)
+
+    // 2) panic 被捕获：try 返回 false，panic_msg 取到消息
+    let bool caught = try(boom)
+    output(caught)
+    let string msg = panic_msg()
+    output(msg)
+
+    // 3) 无捕获上下文时 panic_msg 为空串
+    let string none = panic_msg()
+    output(none == "")
+
+    output("done")

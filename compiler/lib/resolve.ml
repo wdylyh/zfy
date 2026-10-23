@@ -700,6 +700,12 @@ let resolve (main : program) (main_dir : string)
                        List.map (fun (r, mn, ps, p) ->
                            (Option.map (rw_ty m) r, mn, List.map (rw_param m) ps, p))
                            i.methods;
+                     parent = Option.map (fun pn -> resolve_name m pn i.pos) i.parent;
+                     defaults =
+                       List.map (fun (mn, ps, r, b, p) ->
+                           (mn, List.map (rw_param m) ps, Option.map (rw_ty m) r,
+                            rw_block m b, p))
+                           i.defaults;
                      pos = i.pos } :: !out
       | ITypeAlias a ->
         out := ITypeAlias { name = flat_prefix m.mpath ^ a.name;

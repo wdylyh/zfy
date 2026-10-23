@@ -237,9 +237,14 @@ type item =
   | IDecl of stmt * pos
     (* 顶层声明：仅允许 const 标量（编译期常量，使用处内联，不生成运行时槽） *)
   | IIf of { name : string; methods : (ty option * string * param list * pos) list;
+             parent : string option;
+             defaults : (string * param list * ty option * block * pos) list;
              pos : pos }
     (* interface 接口（v3.13）：缩进块内每行一个方法签名 fn ret? 名(参数)——
-       无方法体；struct 方法同名同签名（除 self）即隐式实现。
+       struct 方法同名同签名（除 self）即隐式实现。
+       继承（v3.20）：interface A: B——A 的方法表 = B 的方法 @ A 自己。
+       默认实现（v3.20）：签名后跟缩进块体——struct 未实现该方法时按
+       实现者合成（self 指向实现 struct，self.m2 静态分派）。
        接口类型 = struct iface$<名> { ptr data; ptr vt }（vtable 分派） *)
   | IEnum of { name : string; variants : (string * ty list) list; pos : pos }
     (* enum 枚举与和类型（v3.9）：enum 名 { 变体, 变体(载荷类型...), ... }——

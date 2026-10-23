@@ -85,6 +85,8 @@ and texpr_kind =
   | EPropagateK of texpr            (* a?：a 为 TErr t；失败则从函数传播返回（ety = t） *)
   | EErrOkK of texpr                (* 成功包装：T 值包成 TErr T（赋值/传参/返回自动包装） *)
   | EFindK of texpr * texpr * texpr (* find(s, c, k)：ety = TErr (TInt 64)；找不到 = NOT_FOUND *)
+  | ETryK of texpr                  (* try(f)（v3.20）：运行零参闭包，panic 时 longjmp
+                                       恢复；ety = TBool（true=正常完成） *)
   | ESortSeqK of texpr * zty * bool
     (* sort(seq, max|min)（new.md 第3条）：单容器实参。seq 已由 typeck 统一为
        列表形态（数组实参展开为序列字面量拷贝）；elem = 元素类型（限整数/

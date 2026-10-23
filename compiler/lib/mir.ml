@@ -31,6 +31,7 @@ type instr =
   | MUnop of string * unop * operand
   | MCast of string * operand * zty
   | MCall of string option * string * operand list * zty
+  | MTry of operand               (* try(f)：zfy_try(code, env) -> i1 前置 i32 *)
   | MCallOwn of string option * string * (operand * bool) list * zty * (string * zty) list
     (* 用户函数调用（所有权传参）：每个 string/数组/列表实参带 move 标志——
        true 直接移交（免克隆），false 由调用方克隆（保持值语义）；
@@ -478,6 +479,37 @@ let rec lexpr l (e : texpr) : operand =
     let oa = lexpr l a in
     let d = fresh l in
     emit l (MCast (d, oa, t));
+    op (OLocal d) e.ety
+  | ECallK ("zfy_try", [ cb ], _) ->
+    (* try(f)：特判降码。f 是零参闭包，lexpr 产出闭包句柄 struct 槽
+       { ptr h }——字段 0 = 堆块地址 h；h 处首 8 字节 = 代码指针 code。
+       调 zfy_try(code, h) 返回 i32（0=正常完成，非 0=panic 捕获），
+       与 0 比较转 bool *)
+    let oh = lexpr l cb in
+    (match oh.oty with
+     | TStruct cs ->
+       let hp = fresh l in
+       emit l (MFieldAddr (hp, oh, TStruct cs, [ 0 ], TPtr (TUint 8)));
+       let h = fresh l in
+       emit l (MLoadK (h, op (OLocal hp) (TPtr (TPtr (TUint 8))), TPtr (TUint 8)));
+       let code = fresh l in
+       emit l (MLoadK (code, op (OLocal h) (TPtr (TPtr (TUint 8))), TPtr (TUint 8)));
+       let d = fresh l in
+       emit l
+         (MCall
+            ( Some d,
+              "zfy_try",
+              [ op (OLocal code) (TPtr (TUint 8));
+                op (OLocal h) (TPtr (TUint 8)) ],
+              TInt 32 ));
+       let b = fresh l in
+       emit l (MBinop (b, BNe, op (OLocal d) (TInt 32), op (OInt 0L) (TInt 32)));
+       op (OLocal b) e.ety
+     | t -> merr e.epos "zfy_try: expected closure handle, got %s" (Hir.pp_zty t))
+  | ECallK ("zfy_panic_msg", _, _) ->
+    (* panic_msg()：直接调运行时取最近一次 panic 消息（无捕获时空串） *)
+    let d = fresh l in
+    emit l (MCall (Some d, "zfy_panic_msg", [], TString));
     op (OLocal d) e.ety
   | ECallK (f, args, moves) ->
     (* 用户函数：所有权传参。先求值全部实参，再逐个判定可移动性
