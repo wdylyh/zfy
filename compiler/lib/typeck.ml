@@ -217,7 +217,8 @@ let time_rt_name = function
 let str_builtin_names =
   [ "length"; "find"; "trim"; "split"; "replace"; "prec";
     "utf8_len"; "utf8_char_at"; "utf8_sub";
-    "startswith"; "endswith"; "substr"; "to_str"; "format" ]
+    "startswith"; "endswith"; "substr"; "to_str"; "format";
+    "os_args"; "os_env"; "assert_eq" ]
 
 (* 期望类型提示（new2.md 第2条）：声明/字段上下文把已知的期望类型传给
    泛型推断，字面量实参按期望落型（如 Box<i32> a = Box(7) 中 7 → i32
@@ -2195,7 +2196,8 @@ and check_expr env (e : expr) : texpr =
        (match name with
         | "length" | "find" | "trim" | "split" | "replace" | "prec"
         | "utf8_len" | "utf8_char_at" | "utf8_sub"
-        | "startswith" | "endswith" | "substr" | "to_str" | "format" ->
+        | "startswith" | "endswith" | "substr" | "to_str" | "format"
+        | "os_args" | "os_env" | "assert_eq" ->
           (* 函数式内建：支持命名参数 count=，位置参数在前 *)
           check_builtin env p' name args
         | "panic_handler" ->
@@ -3755,6 +3757,40 @@ and check_builtin env p name (args : call_arg list) =
     (match resolve tx.ety with
      | TBool | TChar | TInt _ | TUint _ | TFloat _ | TFrac _ -> to_string_of tx
      | t -> terr p "to_str expects a scalar/bool/char/frac, got %s" (pp_zty t))
+  | "os_args", [], [] ->
+    (* v3.12：命令行参数 -> string 列表（argv[0] = 程序路径） *)
+    { e = ECallK ("zfy_os_args", [], []); ety = TList TString; epos = p }
+  | "os_env", [ k ], [] ->
+    (* v3.12：环境变量读取；未设置 = NOT_FOUND（T! 须 ?? 解包） *)
+    let tk = str_of k "argument 1" in
+    { e = ECallK ("zfy_os_env_err", [ tk ], []); ety = TErr TString; epos = p }
+  | "assert_eq", [ a; b ], [] ->
+    (* v3.12 测试内建：断言相等，不等 panic（打印两侧值）。
+       整数/bool/char 统一 i64 位模式；u64 单独（无符号位模式）；
+       f32/f64/string 各自分发。语句级使用（void 返回） *)
+    let ta = check_expr env a in
+    let tb = check_expr env b in
+    (* 未定整型/浮点字面量（TVar）默认落型（同 to_str） *)
+    let drop_var (t : texpr) =
+      match resolve t.ety with
+      | TVar _ -> { t with ety = if floaty_texpr t then TFloat 64 else TInt 64 }
+      | _ -> t
+    in
+    let ta = drop_var ta and tb = drop_var tb in
+    let fn, args =
+      match resolve ta.ety, resolve tb.ety with
+      | TString, TString -> ("zfy_assert_eq_str", [ ta; tb ])
+      | TFloat 32, TFloat 32 -> ("zfy_assert_eq_f32", [ ta; tb ])
+      | TFloat 64, TFloat 64 -> ("zfy_assert_eq_f64", [ ta; tb ])
+      | (TUint 64 | TUint 128), _ | _, (TUint 64 | TUint 128) ->
+        ("zfy_assert_eq_u64", [ to_i64 ta; to_i64 tb ])
+      | (TInt _ | TUint _ | TBool | TChar), (TInt _ | TUint _ | TBool | TChar) ->
+        ("zfy_assert_eq_i64", [ to_i64 ta; to_i64 tb ])
+      | t1, t2 ->
+        terr p "assert_eq expects two values of the same scalar/string type, got %s vs %s"
+          (pp_zty (resolve t1)) (pp_zty t2)
+    in
+    { e = ECallK (fn, args, []); ety = TVoid; epos = p }
   | "format", [ fmt; args ], [] ->
     (* format(fmt, args)：args 为 string 列表，逐个替换 "{}" 占位 *)
     let tf = str_of fmt "argument 1" in
@@ -5283,6 +5319,7 @@ let builtin_names = [ "length"; "find"; "trim"; "split"; "replace"; "prec";
                       "close"; "exists"; "read_file"; "write_file"; "read_lines";
                       (* 时间内建（v3.3.6）+ 内建 datetime struct 名 *)
                       "now"; "tick_ms"; "sleep_ms"; "localtime"; "mktime";
+                      "os_args"; "os_env"; "assert_eq";
                       "datetime" ]
 
 (* 参数 -> zty：

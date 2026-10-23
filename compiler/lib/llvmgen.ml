@@ -2916,6 +2916,14 @@ let gen_program (m : mir) : string =
       Buffer.add_string g.mbuf
         (Printf.sprintf "declare ptr @zfy_frac_str_%s(ptr)\n" suf))
     sufs;
+  (* 标准库最小版（v3.12）：os_args / os_env / assert_eq *)
+  Buffer.add_string g.mbuf "declare ptr @zfy_os_args()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_os_env_err(ptr sret(%err.str), ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_assert_eq_i64(i64, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_assert_eq_u64(i64, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_assert_eq_f32(float, float)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_assert_eq_f64(double, double)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_assert_eq_str(ptr, ptr)\n";
   (* remove 运行时函数：数组槽位填零 / 列表删除并左移（元素资源按头部释放） *)
   Buffer.add_string g.mbuf "declare void @zfy_seq_zero(ptr, i64, ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_seq_remove(ptr, i64, ptr)\n";

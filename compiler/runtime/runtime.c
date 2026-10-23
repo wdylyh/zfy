@@ -2261,6 +2261,105 @@ DEF_COUNT(f32, x == v, float)
 DEF_COUNT(f64, x == v, double)
 DEF_COUNT(str, STRCMP(x, v) == 0, char *)
 
+/* ---------- 标准库最小版（v3.12）：os_args / os_env / assert_eq ---------- */
+
+/* os_args() -> list<string>：Windows CRT argv 规则解析 GetCommandLineA
+ * （空格分隔，"..." 段内空格保留，"..." 内 "" 转义引号，反斜杠按 CRT 规则） */
+zfy_seq *zfy_os_args(void) {
+    char *cmd = GetCommandLineA();
+    if (!cmd) cmd = "";
+    /* 先数 argv 数量：CommandLineToArgvW 语义的轻量实现 */
+    long long n = 0;
+    for (const char *p = cmd; *p; ) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        n++;
+        int in_q = 0, bs = 0;
+        for (; *p; p++) {
+            if (*p == '\\') { bs++; continue; }
+            if (*p == '"') {
+                if (bs % 2 == 0) in_q = !in_q;
+                bs = 0;
+                continue;
+            }
+            bs = 0;
+            if (!in_q && (*p == ' ' || *p == '\t')) break;
+        }
+    }
+    zfy_seq *s = zfy_seq_new_k(n, n > 0 ? n : 1, 8, 1, NULL);
+    long long i = 0;
+    for (const char *p = cmd; *p && i < n; ) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        /* 逐字符写出（处理转义）到动态缓冲 */
+        size_t cap = 32, len = 0;
+        char *buf = (char *)malloc(cap);
+        if (!buf) zfy_die("os_args: out of memory");
+        int in_q = 0, bs = 0;
+        for (; *p; p++) {
+            if (*p == '\\') { bs++; buf[len++] = *p; if (len + 2 > cap) { cap *= 2; buf = (char *)realloc(buf, cap); if (!buf) zfy_die("os_args: out of memory"); } continue; }
+            if (*p == '"') {
+                if (bs % 2 == 0) { in_q = !in_q; }
+                /* 成对反斜杠后跟引号：CRT 规则减半反斜杠并可能吃引号 */
+                long long drop = bs / 2;
+                len -= drop;
+                if (bs % 2 == 1) { buf[len++] = '"'; }
+                else if (in_q) { buf[len++] = '"'; }
+                bs = 0;
+                if (len + 2 > cap) { cap *= 2; buf = (char *)realloc(buf, cap); if (!buf) zfy_die("os_args: out of memory"); }
+                continue;
+            }
+            bs = 0;
+            if (!in_q && (*p == ' ' || *p == '\t')) break;
+            buf[len++] = *p;
+            if (len + 2 > cap) { cap *= 2; buf = (char *)realloc(buf, cap); if (!buf) zfy_die("os_args: out of memory"); }
+        }
+        buf[len] = '\0';
+        char *cp = buf;
+        memcpy((char *)s->data + i * 8, &cp, 8);
+        i++;
+    }
+    return s;
+}
+
+/* os_env(name) -> T! string：环境变量读取，未设置 = NOT_FOUND 错误值。
+ * sret 写 zfy_err（同 input_err_str 布局） */
+void zfy_os_env_err(zfy_err *out, const char *name) {
+    char tmp[1024];
+    DWORD n = GetEnvironmentVariableA(name, tmp, (DWORD)sizeof(tmp));
+    if (n == 0 || n >= sizeof(tmp)) {
+        err_set(out, ZFY_ENOT_FOUND, "os_env: 环境变量未设置");
+        return;
+    }
+    out->code = ZFY_EOK;
+    out->msg = NULL;
+    out->value.p = zfy_strdup(tmp);
+}
+
+/* assert_eq(a, b)（v3.12 测试内建）：不等 panic（打印两侧值）。 */
+#define DEF_ASSERT(TAG, FMT, ELEM_T, FREAD)                                \
+void zfy_assert_eq_##TAG(ELEM_T a, ELEM_T b) {                             \
+    if (!(a == b)) {                                                       \
+        char buf[128];                                                     \
+        snprintf(buf, sizeof(buf), "assert_eq failed: " FMT " != " FMT,    \
+                 (FREAD)a, (FREAD)b);                                      \
+        zfy_die(buf);                                                      \
+    }                                                                      \
+}
+DEF_ASSERT(i64, "%lld", long long, long long)
+DEF_ASSERT(u64, "%llu", unsigned long long, unsigned long long)
+DEF_ASSERT(f32, "%g", float, double)
+DEF_ASSERT(f64, "%g", double, double)
+
+void zfy_assert_eq_str(const char *a, const char *b) {
+    if (!a || !b || strcmp(a, b) != 0) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "assert_eq failed: \"%s\" != \"%s\"",
+                 a ? a : "(null)", b ? b : "(null)");
+        zfy_die(buf);
+    }
+}
+
 /* ---------- 闭包与容器高阶算法（v3.7） ----------
  * 闭包值 = 句柄 h（堆块地址）；堆块头部 code 指针，其后捕获字段。
  * 调用约定：code(env, args...)——env = 堆块地址（lambda 首参 $env）。

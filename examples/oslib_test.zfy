@@ -1,0 +1,19 @@
+// v3.12.0：标准库最小版 os_args / os_env / assert_eq
+fn main()
+    // assert_eq：通过（不打印）；失败 panic
+    assert_eq(1 + 1, 2)
+    assert_eq("abc", "abc")
+    let f64 x = 1.5
+    assert_eq(x, 1.5)
+    // os_args：argv[0] = 程序路径（非空判定）
+    let string[] argv = os_args()
+    output(length(argv) > 0)
+    // os_env：ZFY_TEST 若设置走 ?? 解包，否则错误分支
+    let string ev = os_env("ZFY_TEST") ?? "unset"
+    match ev
+        "unset" => output("no-env")
+        _ => output("has-env")
+    // os_env T! 值 setdefault 式用法
+    let string home = os_env("ZFY_MISSING_XYZ") ?? "fallback"
+    output(home)
+    return

@@ -1,6 +1,10 @@
-# zfy 语言规范（v3.11.0，2026-10-23）
+# zfy 语言规范（v3.12.0，2026-10-23）
 
 > 本版每一节都经过编译器实测校准（examples 全回归通过）。
+> 与 v3.11.0 的主要差异（v3.12.0 标准库轮）：
+> **os_args / os_env / assert_eq（§26）**——命令行参数、环境变量（T!）、
+> 测试断言内建。
+>
 > 与 v3.10.0 的主要差异（v3.11.0 match v2 轮）：
 > **match 表达式（§23.3）**——`let x = match ...` 初始化脱糖；
 > **穷尽性检查（§23.3）**——enum scrutinee 强制全覆盖或 `_` 兜底；
@@ -1309,3 +1313,16 @@ v3.10 放宽：
   在此场景先按单行字段解析再续缩进块。）
 - 泛型函数对 `T`（绑定为列表）只能做值语义操作（传参/返回/赋值），
   无约束系统（P1 遗留）：`sum(xs)`/`length(xs)` 等内建在泛型体内不可用。
+
+## 26. 标准库最小版：os_args / os_env / assert_eq（v3.12.0）
+
+| 内建 | 签名 | 说明 |
+|---|---|---|
+| os_args | () -> list<string> | 命令行参数（argv[0] = 程序路径）；Windows CRT 引号/转义规则 |
+| os_env | (string) -> string! | 环境变量读取；未设置 = NOT_FOUND（T!，`??` 解包或 match） |
+| assert_eq | (标量, 标量) / (string, string) -> void | 断言相等；不等 panic 打印两侧值（`assert_eq failed: a != b`），exit 101 |
+
+- assert_eq 的整数/bool/char 统一按 i64 位模式比较（u64/u128 走无符号
+  位模式）；f32/f64 数值比较；string 按 strcmp。两侧须同类别。
+- 典型用法：`let string home = os_env("HOME") ?? "fallback"`；
+  测试断言 `assert_eq(actual, expected)`（失败即 panic，带 file:line）。
