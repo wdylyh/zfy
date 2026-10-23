@@ -1,0 +1,15 @@
+mod widgets;
+use widgets::{App, UI}
+fn main()
+    let App app = App()
+    let UI s = UI("slider")
+    s.pos(20, 150)
+    s.size(280, 0)
+    s.value(30)
+    output("tag v=", s.value, "\n")
+    let i32 k = app.add(s)
+    output("added k=", k, " sliders[0].value=", app.sliders[0].value, " uis.value=", app.uis[k].value, "\n")
+    app.sliders[0].value = 77
+    output("after poke: uis.value=", app.uis[k].value, "\n")
+    app.sync_outputs()
+    output("after sync: uis.value=", app.uis[k].value, "\n")

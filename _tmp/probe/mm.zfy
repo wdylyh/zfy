@@ -1,0 +1,9 @@
+struct W
+    string text = ""
+    fn void text(let string s)
+        self.text = s
+
+fn main()
+    let W w = W()
+    w.text("hi")
+    output(w.text, "\n")

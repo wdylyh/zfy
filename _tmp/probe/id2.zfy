@@ -1,0 +1,7 @@
+interface Greet
+    fn string twice()
+        return zzz_bogus_fn()
+
+fn main()
+    let Greet g = Greet(W())
+    output(g.twice(), "\n")

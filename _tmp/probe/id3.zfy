@@ -1,0 +1,12 @@
+interface Greet
+    fn string hi()
+    fn string twice()
+        return self.hi() + self.hi()
+
+struct W
+    fn string hi()
+        return "yo"
+
+fn main()
+    let Greet g = Greet(W())
+    output(g.twice(), "\n")

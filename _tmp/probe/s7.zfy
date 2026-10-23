@@ -1,0 +1,3 @@
+fn main()
+    let i32[] one = 7
+    output(sort(one, min), "\n")        // 非 const 单元素：运行期报错

@@ -1,0 +1,5 @@
+// 1d: T! 复合赋值 + 整体 output
+fn main()
+    let i32! xs[] = 1, fail(3, "m")
+    xs[0] += 1
+    output(xs[0] ?? -1, "\n")

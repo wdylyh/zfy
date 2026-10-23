@@ -1,0 +1,2 @@
+fn main()
+    output(sort(5, min), "\n")          // 单标量：编译报错

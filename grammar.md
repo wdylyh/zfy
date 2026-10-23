@@ -55,7 +55,7 @@ fn main()
 ```
 if else while for return true false pub mod use break continue
 const frac unred reduce and or not output input cast remove import as
-fail panic err sep end delim struct packed move copy ref null unsafe
+fail panic err sep end delim struct packed move copy borrow ref null unsafe
 extern type let fn array list xor
 ```
 
@@ -539,10 +539,21 @@ fn main()
   源变量此后使用报 E3013，重新赋值解除）；构造调用 `P(...)`、函数返回值、
   枚举变体等产新值形式不需标记。数组/列表/string 聚合赋值/传参默认
   深拷贝，`move`/自动 move（源变量此后不再出现时）免拷贝。
+- **借用 `borrow e`**（`borrow(x)` 同形）：对可定位表达式（变量/字段/
+  元素）取借用，产指针值 `T*`，解引用 `p^` 读。借用不转移所有权——
+  源变量照常可用（`f(ref src)` 传参、读值均合法）。所有权联动：
+  借用期内 `move` 源报 E3000（借用存活判定 v1 为函数级粗粒度，登记后
+  到函数尾解除）；`move` 后再 `borrow` 同样报错。只读性：把借用赋给
+  `T* const` 变量（`let i32* const p = borrow(x)`）获得编译期写保护
+  （解引用写报 E3156）；v1 不阻止赋给普通 `T*` 变量。
+  已知限制（v1）：列表借用需 `T[]*` 形态的指针类型声明语法，暂以元素/
+  字段借用替代；借用冲突不下探字段粒度（`borrow b.x` 期间 `move b`
+  检不出冲突）。
   **自动 move 循环限制**：循环体内（while/for 任意嵌套深度）的
   实参/赋值一律不自动 move、走克隆——源码位置判不出"下一轮迭代还会用"
   （`while` 里 `f(r)` 反复传同一列表是安全且常见的，误 move 会致
   第二轮空指针崩溃）；循环外顶层"最后使用"仍自动 move 免拷贝。
+  被借用变量同样不参与自动 move。
 - string 槽独占堆串（MCopy strdup 保证）；`s[i] = c` 原地写（越界 panic）。
 - 程序入口前执行 `zfy.globals`（顶层变量初始化）。
 

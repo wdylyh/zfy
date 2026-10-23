@@ -1,0 +1,4 @@
+stdlib/widgets.zfy:1233
+stdlib/widgets.zfy:883
+zfy:error[1][E3000] in 883 of .\stdlib\widgets.zfy because (struct initialization requires explicit copy(...) or move ... (no implicit deep copy))
+zfy:error[4][E3000] in 1233 of .\stdlib\widgets.zfy because (struct initialization requires explicit copy(...) or move ... (no implicit deep copy))

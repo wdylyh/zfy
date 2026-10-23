@@ -1,0 +1,11 @@
+mod widgets;
+use widgets::{App, UI}
+fn main()
+    let App app = App()
+    if app.open(200, 120, "t") != 0
+        return 0
+    app.close()
+    ui button b
+        x 1, y 2
+    output(b.x, "\n")
+    output(app.uis[0].x, "\n")

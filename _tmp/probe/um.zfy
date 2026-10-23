@@ -1,0 +1,6 @@
+mod widgets;
+use widgets::{UI}
+fn main()
+    let UI b = UI("button")
+    b.pos(1, 2)
+    output(b.x, "\n")

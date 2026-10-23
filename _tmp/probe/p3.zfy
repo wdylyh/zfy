@@ -1,0 +1,8 @@
+// 1c: T! 作泛型实参
+struct Box<T>
+    T v = fail(3, "none")
+
+fn main()
+    let Box<i32!> b = Box()
+    let i32 x = b.v ?? -1
+    output(x, "\n")

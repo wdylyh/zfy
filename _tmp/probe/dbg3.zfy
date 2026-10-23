@@ -1,0 +1,26 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+fn main()
+    let App app = App()
+    if app.open(300, 250, "d3") != 0
+        return 0
+    app.t0 = tick_ms()
+    let i32 f = 0
+    while f < 4 and app.alive()
+        app.step()
+        ui slider sld
+            x 20, y 150, w 280
+            value 30
+        if f == 0
+            output("k=", app.find_ui("sld"), " which=", app.uis[app.find_ui("sld")].which,
+                   " idx=", app.uis[app.find_ui("sld")].idx,
+                   " sliders[0].value=", app.sliders[0].value,
+                   " uis.value=", app.uis[app.find_ui("sld")].value, "\n")
+        if f == 1
+            app.sync_outputs()
+            output("f1 resync: sliders[0].value=", app.sliders[0].value,
+                   " uis.value=", app.uis[app.find_ui("sld")].value, "\n")
+        f++
+        gui_frame_sleep(app.t0)
+    app.close()

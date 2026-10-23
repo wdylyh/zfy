@@ -530,6 +530,11 @@ and parse_unary p =
     (* move x：显式所有权转移标记（源变量此后不可用） *)
     ignore (next p);
     EMoveOf (parse_postfix p, tp)
+  | (Keyword KBorrow, tp) ->
+    (* borrow e：只读借用（T* const），借用期内源不可被 move；
+       borrow(x) 与 borrow x 均合法（parse_postfix 吃掉括号） *)
+    ignore (next p);
+    EBorrow (parse_postfix p, tp)
   | _ -> parse_postfix p
 
 and parse_postfix p =

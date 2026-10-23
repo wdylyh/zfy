@@ -749,7 +749,10 @@ let rec lexpr l (e : texpr) : operand =
          | EDerefK p -> lexpr l p
          | _ -> merr x.epos "unsupported address-of target"
        in
-       addr_of a
+       (* EFieldK 内部按字段类型标注（MElemAddr/MLoadK 语义需要），但
+          EAddrOfK 的结果是指针值——重新标为外层 TPtr *)
+       let o = addr_of a in
+       { o with oty = e.ety }
      | ESeqGetK (b, i) ->
        (* 元素地址：基为变量槽/字段链/解引用等任意"seq 指针值"形态
           （w-014 #8 泛化；显式取地址，无越界检查） *)

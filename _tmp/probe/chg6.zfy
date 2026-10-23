@@ -1,0 +1,18 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+fn main()
+    let App app = App()
+    if app.open(300, 200, "c6") != 0
+        return 0
+    app.t0 = tick_ms()
+    let i32 f = 0
+    while f < 3 and app.alive()
+        app.step()
+        ui input box
+            x 20, y 100, w 280
+            on_change ->
+                output("CHG-ONLY fires\n")
+        f++
+        gui_frame_sleep(app.t0)
+    app.close()

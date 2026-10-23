@@ -1,0 +1,24 @@
+// T! 泛型函数实参 + T! output + T! 字段成功值
+struct Box<T>
+    T v = 0
+
+fn <T> T id(let T v)
+    return v
+
+fn main()
+    let Box<i32!> b = Box()
+    b.v = 42
+    output(b.v, "\n")
+    let i32 x = id(b.v) ?? -1
+    output(x, "\n")
+    let i32! e = fail(3, "boom")
+    output(e, "\n")
+    let i32! n = 7
+    n += 1
+    output(n, "\n")
+    e += 5
+    output(e, "\n")
+    let i32! xs[] = 1, fail(2, "m")
+    xs[0] += 10
+    output(xs[0] ?? -1, "|")
+    output(xs[1], "\n")

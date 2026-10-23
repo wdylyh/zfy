@@ -1,0 +1,13 @@
+// 1b: 泛型 struct 方法参与 interface 实现
+interface Show
+    fn string name()
+
+struct Wrap<T: num>
+    T v = 0
+    fn string name()
+        return "wrap"
+
+fn main()
+    let Wrap<i32> w = Wrap(1)
+    let Show s = Show(w)
+    output(s.name(), "\n")

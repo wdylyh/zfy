@@ -1,0 +1,2 @@
+fn main()
+    output(sort(1, 6, 3, max), "\n")

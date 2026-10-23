@@ -1,0 +1,13 @@
+// 1e: 接口方法返回聚合
+interface Buf
+    fn i32[] data()
+
+struct B
+    fn i32[] data()
+        let i32[] xs = 1, 2
+        return xs
+
+fn main()
+    let Buf b = Buf(B())
+    let i32[] xs = b.data()
+    output(length(xs), "\n")

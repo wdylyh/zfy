@@ -1,0 +1,25 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+fn main()
+    let App app = App()
+    if app.open(300, 200, "c4") != 0
+        return 0
+    app.t0 = tick_ms()
+    let UI box = UI("input")
+    box.pos(20, 100)
+    box.size(280, 0)
+    let i32 k = app.add(box)
+    let i32 f = 0
+    while f < 4 and app.alive()
+        app.step()
+        if f == 1
+            app.inputs[0].set_focus(true)
+            app.on_key(65)
+        if app.uis[k].changed
+            output("CHG edge yes\n")
+        if app.uis[k].changed == true
+            output("CHG eq true\n")
+        f++
+        gui_frame_sleep(app.t0)
+    app.close()

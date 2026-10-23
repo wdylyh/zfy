@@ -1,0 +1,8 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    let i32 fails = 0
+    output("ok", fails, "\n")

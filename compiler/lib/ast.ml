@@ -63,6 +63,8 @@ and expr =
   | EPropagate of expr * pos               (* a?：错误传播（函数返回类型须 T!） *)
   | ECopyOf of expr * pos                  (* copy x：显式深拷贝标记（struct 赋值必须） *)
   | EMoveOf of expr * pos                  (* move x：显式所有权转移标记（源变量此后不可用） *)
+  | EBorrow of expr * pos                  (* borrow e：只读借用——取 e 的地址（T* const），
+                                              借用期内源不可被 move *)
   | ERemove of expr * expr * pos
     (* remove(数组/列表, 下标)：表达式（v3 2026-10-11）——返回被删元素
        （深拷贝副本），数组槽位填零、列表删除并左移；裸语句报错 *)

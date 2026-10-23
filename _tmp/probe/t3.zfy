@@ -1,0 +1,9 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    app.t0 = tick_ms()
+    output("ok\n")
+    app.close()

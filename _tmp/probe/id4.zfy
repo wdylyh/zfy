@@ -1,0 +1,11 @@
+interface Greet
+    fn string hi()
+        return "def"
+
+struct W
+    fn void noop()
+        return
+
+fn main()
+    let Greet g = Greet(W())
+    output(g.hi(), "\n")

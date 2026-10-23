@@ -1,0 +1,5 @@
+struct P
+    i32 x = 0
+fn main()
+    let P a = P(1, 2)
+    let P d = a

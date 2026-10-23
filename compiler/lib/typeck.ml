@@ -213,6 +213,9 @@ type env = {
   mutable in_unsafe : bool;                  (* 是否在 unsafe 块内（指针算术门禁） *)
   mutable in_unwrap : bool;                  (* 是否在 ?? 解包块内（块末兜底值表达式合法） *)
   mutable moved : (string, unit) Hashtbl.t;  (* 已被显式 move 的变量槽（使用报错；写回解除） *)
+  mutable borrowed : (string, unit) Hashtbl.t;
+    (* 被只读借用的变量槽（borrow x，v3.21）：借用期内 move 源报错；
+       v1 粗粒度——登记后到函数尾（或 lambda 保存/恢复）才解除 *)
   mutable uses : (string * pos) list;        (* 当前函数体内全部 EVar 出现位置
                                                 （自动 move 后向判定用，new2.md #1） *)
   mutable ldepth : int;                      (* 循环嵌套深度（while/for 体检查时 +1）：
@@ -591,6 +594,7 @@ let rec subst_expr map (e : expr) : expr =
   | ERemove (a, b, p) -> ERemove (subst_expr map a, subst_expr map b, p)
   | ECopyOf (a, p) -> ECopyOf (subst_expr map a, p)
   | EMoveOf (a, p) -> EMoveOf (subst_expr map a, p)
+  | EBorrow (a, p) -> EBorrow (subst_expr map a, p)
   | ELambda (l, p) ->
     let lparams =
       List.map
@@ -947,7 +951,7 @@ let pos_of_expr = function
   | EStructNew (_, _, p) | EField (_, _, p)
   | EAddrOf (_, p) | EDeref (_, p) | ENull p
   | EFail (_, _, p) | EPanic (_, _, p) | EUnwrap (_, _, p) | EPropagate (_, p)
-  | ECopyOf (_, p) | EMoveOf (_, p)
+  | ECopyOf (_, p) | EMoveOf (_, p) | EBorrow (_, p)
   | ERemove (_, _, p)
   | ELambda (_, p)
   | EBlock (_, p) -> p
@@ -1671,6 +1675,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
   let saved_uses = env.uses in
   let saved_fnvars = env.fnvars in
   let saved_moved = env.moved in
+  let saved_borrowed = env.borrowed in
   let saved_ret = env.fncur_ret in
   let saved_cap = env.capctx in
   let saved_ldepth = env.ldepth in
@@ -1679,6 +1684,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
     try
       env.fnvars <- Hashtbl.create 8;
       env.moved <- Hashtbl.create 8;
+      env.borrowed <- Hashtbl.create 8;
       env.uses <- [];
       env.ldepth <- 0;
       env.capctx <- Some cc;
@@ -1785,6 +1791,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
       env.uses <- saved_uses;
       env.fnvars <- saved_fnvars;
       env.moved <- saved_moved;
+      env.borrowed <- saved_borrowed;
       env.ldepth <- saved_ldepth;
       env.slotn <- saved_slotn;
       while List.length env.scopes > cc.base do pop_scope env done;
@@ -1822,6 +1829,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
       env.uses <- saved_uses;
       env.fnvars <- saved_fnvars;
       env.moved <- saved_moved;
+      env.borrowed <- saved_borrowed;
       env.ldepth <- saved_ldepth;
       env.slotn <- saved_slotn;
       while List.length env.scopes > cc.base do pop_scope env done;
@@ -1973,6 +1981,47 @@ and check_expr env (e : expr) : texpr =
     (* move x（new.md #1）：显式所有权转移——struct 现实现为
        深拷贝 + 源变量标记 moved（此后使用报错）；无悬垂无双释放 *)
     check_move_arg env a
+  | EBorrow (a, p') ->
+    (* borrow e（v3.21）：只读借用——取可定位 e 的地址，产 T* const；
+       已 moved 的源不可借用；登记 borrowed，此后 move 源报错 *)
+    (match a with
+     | EDeref (inner, _) ->
+       (* 借用解引用 p^ == p 本身（p 已是借用/指针），直接化简 *)
+       check_expr env inner
+     | _ ->
+       let rec locatable (e : expr) =
+         match e with
+         | EVar _ -> true
+         | EField (b, _, _) -> locatable b
+         | EIndex (b, _, _) -> locatable b
+         | EDeref (b, _) -> locatable b
+         | _ -> false
+       in
+       if not (locatable a) then
+         terr p' "borrow can only borrow a variable/field/element";
+       (* 借用前核对源未被 move；登记根变量槽（字段/元素借用也按根记） *)
+       let rec root_var (e : expr) =
+         match e with
+         | EVar (n, _) -> Some n
+         | EField (b, _, _) | EIndex (b, _, _) | EDeref (b, _) -> root_var b
+         | _ -> None
+       in
+       (match root_var a with
+        | Some n ->
+          (match lookup_var env n with
+           | Some l ->
+             if Hashtbl.mem env.moved l.lslot then
+               terr p' "cannot borrow %s: it has been moved" n;
+             if l.lslot.[0] = '@' then
+               terr p' "cannot borrow global variable %s" n;
+             Hashtbl.replace env.borrowed l.lslot ()
+           | None -> ())
+        | None -> ());
+       let t1 = check_expr env a in
+       if resolve t1.ety = TVoid then terr p' "cannot borrow a void value";
+       (* v1：产普通指针 T*；只读性靠约定（赋给 T* const 变量得 E3156 保护），
+          借用核心价值 = 所有权联动（借用期内源不可 move） *)
+       mk (EAddrOfK t1) (TPtr t1.ety))
   | EVar (name, p') ->
     let direct =
       match env.capctx with
@@ -3222,6 +3271,8 @@ and check_move_arg env (e : expr) : texpr =
          terr p "cannot move global variable %s" name;
        if Hashtbl.mem env.moved l.lslot then
          terr p "variable %s has already been moved" name;
+       if Hashtbl.mem env.borrowed l.lslot then
+         terr p "variable %s is borrowed (borrow %s) and cannot be moved while the borrow is alive" name name;
        (match resolve l.lty with
         | TString | TArray _ | TList _ | TFile | TStruct _ ->
           (* 先按普通读检查实参（此时尚未标记 moved），再标记已 move *)
@@ -3248,6 +3299,7 @@ and uses_of_expr (acc : (string * pos) list) (e : expr) : (string * pos) list =
   | EInt _ | EBigInt _ | EFloat _ | EStr _ | EChar _ | EBool _ | ENull _ -> acc
   | EBin (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | EUn (_, a, _) -> uses_of_expr acc a
+  | EBorrow (a, _) -> uses_of_expr acc a
   | ECall (callee, args, _) ->
     let acc = uses_of_expr acc callee in
     List.fold_left
@@ -3386,6 +3438,7 @@ and auto_moveable env n (p : pos) =
         && (match resolve l.lty with
             | TString | TArray _ | TList _ -> true | _ -> false)
         && not (Hashtbl.mem env.moved l.lslot)
+        && not (Hashtbl.mem env.borrowed l.lslot)
         && last_use env n p
       | None -> false)
 
@@ -3502,6 +3555,7 @@ and deref_refs (refs : string list) (body : block) : block =
     | EPropagate (a, p) -> EPropagate (re a, p)
     | ECopyOf (a, p) -> ECopyOf (re a, p)
     | EMoveOf (a, p) -> EMoveOf (re a, p)
+    | EBorrow (a, p) -> EBorrow (re a, p)
     | ERemove (b, i, p) -> ERemove (re b, re i, p)
     (* 不会出现在普通 fn 参数体中，保守原样透传 *)
     | EBigInt _ -> e
@@ -3565,7 +3619,12 @@ and deref_refs (refs : string list) (body : block) : block =
     | SReduce (a, b, c, p) -> SReduce (re a, re b, re c, p)
     | SUnsafe (blk, p) -> SUnsafe (List.map rs blk, p)
     | SBreak _ | SContinue _ -> s
-    | SForIn _ | SFn _ -> s
+    | SForIn (x, i, seqx, b, p) ->
+      (* v3.21 修复：ref 参数作 for-in 序列须解引用改写（此前透传导致
+         "for-in requires ... got T list*"）；x/i 是新绑定，body 走 rs
+         （其自身作用域由 check 侧处理，与变量读路径一致） *)
+      SForIn (x, i, re seqx, List.map rs b, p)
+    | SFn _ -> s
     | SBlock (blk, p) -> SBlock (List.map rs blk, p)
     | SMatch (sx, arms, p) ->
       SMatch
@@ -6140,7 +6199,8 @@ let check_program (prog : program) : hir =
   let env =
     { g; scopes = []; fncur_ret = TVoid; slotn = 0;
       fnvars = Hashtbl.create 8; const_vals = Hashtbl.create 16;
-      in_unsafe = false; in_unwrap = false; moved = Hashtbl.create 8; uses = [];
+      in_unsafe = false; in_unwrap = false; moved = Hashtbl.create 8;
+      borrowed = Hashtbl.create 8; uses = [];
       ldepth = 0; capctx = None }
   in
   (* 全局作用域：顶层声明（const 内联；非 const 为全局可变变量） *)
@@ -6232,6 +6292,7 @@ let check_program (prog : program) : hir =
     let saved_uses = env.uses in
     let saved_fnvars = env.fnvars in
     let saved_moved = env.moved in
+    let saved_borrowed = env.borrowed in
     let saved_ret = env.fncur_ret in
           let r =
             try
@@ -6239,6 +6300,7 @@ let check_program (prog : program) : hir =
               env.fncur_ret <- sig_.ret;
               env.fnvars <- Hashtbl.create 8;   (* 槽名按函数隔离 *)
               env.moved <- Hashtbl.create 8;    (* move 跟踪按函数隔离 *)
+              env.borrowed <- Hashtbl.create 8; (* 借用跟踪按函数隔离 *)
               push_scope env;
               let tparams =
                 List.map2
@@ -6322,6 +6384,7 @@ let check_program (prog : program) : hir =
     env.uses <- saved_uses;
     env.fnvars <- saved_fnvars;
     env.moved <- saved_moved;
+    env.borrowed <- saved_borrowed;
     env.fncur_ret <- saved_ret;
     while List.length env.scopes > depth do pop_scope env done;
     r

@@ -1,0 +1,8 @@
+struct P
+    i32 x = 0
+fn void dummy(let P p)
+    output(p.x, "\n")
+fn main()
+    let P a = P(1)
+    dummy(move a)
+    output(a.x, "\n")

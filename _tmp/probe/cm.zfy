@@ -1,0 +1,15 @@
+struct P
+    i32 x = 0
+    i32 y = 0
+
+fn main()
+    let P a = P(1, 2)
+    let P b = copy(a)          // 显式拷贝
+    b.x = 99
+    output(a.x, b.x, "\n")     // 1 99（值语义）
+    let P c = copy(a)
+    c.x = 7
+    output(a.x, c.x, "\n")     // 1 7
+    // let P d = a             // ← 编译报错：需 copy/move
+    // let P e = move a        // 试 move：a 之后不可用
+    // output(a.x, "\n")       // ← 报错：moved

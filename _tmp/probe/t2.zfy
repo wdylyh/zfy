@@ -1,0 +1,12 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    if app.open(400, 320, "t") != 0
+        return
+    app.t0 = tick_ms()
+    let i32 fails = 0
+    output("ok", fails, "\n")
+    app.close()

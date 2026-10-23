@@ -1,0 +1,23 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+fn main()
+    let App app = App()
+    if app.open(300, 200, "c5") != 0
+        return 0
+    app.t0 = tick_ms()
+    let i32 f = 0
+    while f < 4 and app.alive()
+        app.step()
+        ui input box
+            x 20, y 100, w 280
+            on_input ->
+                output("IN: changed=", app.uis[app.find_ui("box")].changed, "\n")
+            on_change ->
+                output("CHG fires\n")
+        if f == 1
+            app.inputs[0].set_focus(true)
+            app.on_key(65)
+        f++
+        gui_frame_sleep(app.t0)
+    app.close()

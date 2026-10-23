@@ -1,0 +1,8 @@
+// 1a: 泛型函数体内 let T 局部变量
+fn <T> T dup(let T v)
+    let T w = v
+    return w
+
+fn main()
+    output(dup(42), "\n")
+    output(dup("hi"), "\n")

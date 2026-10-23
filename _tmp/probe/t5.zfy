@@ -1,0 +1,10 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    if app.open(400, 320, "t") != 0
+        return
+    output("ok\n")
+    app.close()

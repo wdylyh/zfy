@@ -1,0 +1,7 @@
+// 1f: 无约束泛型体内 length/sum
+fn <T> i64 cnt(let T xs)
+    return length(xs)
+
+fn main()
+    let i32[] xs = 1, 2, 3
+    output(cnt(xs), "\n")

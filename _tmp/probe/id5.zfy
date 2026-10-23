@@ -1,0 +1,11 @@
+interface Greet
+    fn string hi()
+        return zzz_bogus()
+
+struct W
+    fn void noop()
+        return
+
+fn main()
+    let Greet g = Greet(W())
+    output(g.hi(), "\n")

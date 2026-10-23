@@ -1,0 +1,5 @@
+fn main()
+    let i32[] a = 5, 2, 9, 1
+    let i32[] asc = sort(a, min)
+    output(asc, "\n")
+    output(a, "\n")

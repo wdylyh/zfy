@@ -1,0 +1,3 @@
+fn main()
+    let i32 const one[1] = 7
+    output(sort(one, min), "\n")

@@ -1,0 +1,30 @@
+mod gui;
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+fn main()
+    let App app = App()
+    if app.open(480, 420, "dbg") != 0
+        return 0
+    app.t0 = tick_ms()
+    let i32 f = 0
+    while f < 8 and app.alive()
+        app.step()
+        ui slider sld
+            x 20, y 150, w 280
+            value 30
+            on_value ->
+                output("on_value fired v=", app.uis[app.find_ui("sld")].value, "\n")
+        if f == 3
+            app.mx = 148
+            app.my = 158
+            app.ldown = true
+            app.sliders[0].dragging = true
+            output("set drag: dragging=", app.sliders[0].dragging, " mx=", app.mx, "\n")
+        if f == 4
+            app.ldown = false
+            app.sliders[0].dragging = false
+        f++
+        gui_frame_sleep(app.t0)
+    output("final v=", app.uis[app.find_ui("sld")].value, " sliders.len=", length(app.sliders), "\n")
+    app.close()

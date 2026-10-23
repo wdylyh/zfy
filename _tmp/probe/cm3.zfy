@@ -1,0 +1,6 @@
+struct P
+    i32 x = 0
+fn main()
+    let P a = P(1)
+    let P e = move a
+    output(a.x, "\n")

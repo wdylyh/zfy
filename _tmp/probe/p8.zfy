@@ -1,0 +1,10 @@
+// let T 在泛型 struct 方法体内
+struct Holder<T: num>
+    T v = 0
+    fn T twice()
+        let T w = self.v
+        return w + w
+
+fn main()
+    let Holder<i32> h = Holder(21)
+    output(h.twice(), "\n")

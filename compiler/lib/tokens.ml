@@ -8,7 +8,7 @@ type keyword =
   | KCast | KArray | KList
   | KRemove | KImport | KAs | KSep | KEnd | KDelim
   | KFail | KPanic | KErr
-  | KStruct | KPacked | KMove | KCopy | KRef | KNull | KUnsafe | KExtern | KType
+  | KStruct | KPacked | KMove | KCopy | KBorrow | KRef | KNull | KUnsafe | KExtern | KType
   | KEnum | KMatch | KInterface | KUi
   | KLet | KFn | KIn
 
@@ -27,6 +27,7 @@ let keyword_table =
     "fail", KFail; "panic", KPanic; "err", KErr;
     "sep", KSep; "end", KEnd; "delim", KDelim;
     "struct", KStruct; "packed", KPacked; "move", KMove; "copy", KCopy;
+    "borrow", KBorrow;
     "ref", KRef; "null", KNull;
     "unsafe", KUnsafe; "extern", KExtern; "type", KType;
     "let", KLet; "fn", KFn; "in", KIn;
@@ -78,7 +79,7 @@ let pp_keyword = function
   | KRemove -> "remove" | KImport -> "import" | KAs -> "as"
   | KFail -> "fail" | KPanic -> "panic" | KErr -> "err"
   | KStruct -> "struct" | KPacked -> "packed" | KMove -> "move"
-  | KCopy -> "copy" | KRef -> "ref"
+  | KCopy -> "copy" | KBorrow -> "borrow" | KRef -> "ref"
   | KNull -> "null" | KUnsafe -> "unsafe" | KExtern -> "extern" | KType -> "type"
   | KSep -> "sep" | KEnd -> "end" | KDelim -> "delim"
   | KAnd -> "and" | KOr -> "or" | KNot -> "not" | KXor -> "xor"

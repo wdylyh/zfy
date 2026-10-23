@@ -1,0 +1,7 @@
+fn main()
+    let f64[] xs = 2.5, 1.5, 9.0
+    let f64[] a = sort(xs, max)
+    output(a, "\n")
+    output(xs, "\n")
+    output(sort(2.5, 1.5, 9.0, max), "\n")
+    output(sort(2.5, 1.5, 9.0, min), "\n")

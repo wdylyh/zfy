@@ -1,0 +1,4 @@
+fn main()
+    let i32! e = fail(3, "m")
+    output(e, "\n")
+    output(42, "\n")
