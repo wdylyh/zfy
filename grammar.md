@@ -624,41 +624,100 @@ let u8 y = -1            // E3155：负值不在 u8 范围
 
 > 分层：**L0** runtime.c C 渲染核心（DIB 帧缓冲 + 事件环形队列 + GDI
 > 雅黑中文文本 + BitBlt 单次提交）→ **L1** `stdlib/gui.zfy`（纯 extern
-> 薄绑定）→ **L2** `stdlib/widgets.zfy`（9 组件 + App 容器，damage
-> 脏区跟踪，只重绘变化的组件）→ **L3** 应用（examples/demos）。
+> 薄绑定）→ **L2** `stdlib/widgets.zfy`（统一元素 UI + 9 组件 + App 容器，
+> damage 脏区跟踪，只重绘变化的组件）→ **L3** 应用（examples/demos）。
 > 仅 Windows（Win32 + GDI）；非 Windows 平台 GUI 桩全部返回失败/空。
 
-### 18.0 30 秒上手（App 容器，推荐路径）
+### 18.0 统一元素 UI（推荐路径）
+
+**一个元素类型 + 标签袋**：先定义元素（`UI(kind)`），给它打标签
+（坐标/颜色/形状/大小/内容），再注册；输入=改标签，输出=读标签。
 
 ```
 mod gui;
 mod widgets;
-use widgets::{App, Label, Button, SC, C_BG}
-use gui::{gui_w, gui_h, gui_frame_sleep}
+use widgets::{App, UI, C_ACCENT}
+use gui::{gui_frame_sleep}
 
 fn main()
     let App app = App()
-    if app.open(280, 340, "zfy 计算器") != 0      // 0=成功（逻辑尺寸）
+    if app.open(300, 200, "demo") != 0
         return 1
-    let Button b = Button(x=0, y=0, w=10, h=10, text="点我")
-    app.add_button(b)
+    // 定义元素 → 打标签 → 注册（返回元素下标 k）
+    let UI btn = UI("button")
+    btn.pos(20, 20)            // 坐标
+    btn.size(120, 44)          // 大小
+    btn.text("点我 +1")        // 内容
+    btn.color(C_ACCENT)        // 面色
+    btn.radius(8)              // 形状（圆角）
+    let i32 kb = app.add(btn)
+    let UI num = UI("label")
+    num.pos(20, 80)
+    num.text("计数 0")
+    let i32 kn = app.add(num)
     let i32 prev = 0
-    let i32 last_w = 0
     while app.alive()
-        // 响应式布局：窗口可拖拽缩放，每帧比对尺寸重排
-        if gui_w() != last_w
-            ...重算组件位置...
-        app.step()                                // 泵事件+更新+按需重绘
-        if b.clicks != prev                       // 按钮被点（读计数器差值）
-            prev = b.clicks
-            ...业务...
-        gui_frame_sleep(tick_ms())                // 限帧（App 已修 CPU 空转）
+        app.step()                       // 输出标签每帧自动刷新
+        if app.uis[kb].clicks != prev    // 输出：读标签（差值）
+            prev = app.uis[kb].clicks
+            app.set_text(kn, "计数 " + str(prev))   // 输入：改标签即改界面
+        gui_frame_sleep(app.t0)
     app.close()
 ```
 
-要点：**组件交互结果全部通过字段回读**（Button.clicks / Slider.value /
-ListBox.sel / Menu.sel+clicks / Checkbox.checked），不用回调——业务每帧
-对比差值。响应式布局参考 `demos/calculator.zfy`。
+**kind**：`"label" "button" "input" "slider" "progress" "list" "check"
+"menu" "textarea"`。
+
+**属性标签（加入前，元素方法）**：`pos(x,y)` `size(w,h)` `text(s)`
+`color(rgb)`（面色/填充，0=主题默认）`text_color(rgb)` `radius(r)`
+（button 圆角）`value(v)`（slider/progress 初值 0..100）`rows(n)`
+（list 可见行数）`checked(b)`（check 初值）`add_item(s)`（list/menu 条目）。
+
+**属性标签（加入后，按元素下标）**：`app.set_text(k, s)` `set_pos(k, x, y)`
+`set_size(k, w, h)` `set_color(k, c)` `set_text_color(k, c)`
+`set_value(k, v)` `set_checked(k, b)` `app.add_item(k, s)`。
+
+**输出标签（`app.uis[k]` 只读，`app.step()` 后刷新）**：
+
+| 输出 | kind | 含义 |
+|---|---|---|
+| `clicks` | button/check/menu | 点击计数（差值=新点击）；list=双击计数 |
+| `checked` | check | 勾选态 |
+| `sel` | list/menu | 选中下标（-1 未选） |
+| `value` | slider/progress | 当前值 0..100 |
+| `text_out` | input/textarea | 当前文本；list=选中项文本 |
+| `changed` | input/textarea/slider/progress/list | 本帧值/文本/选中是否变化 |
+
+要点：仍然**无回调**（差值模型）、damage 脏区跟踪不变；UI 内部按 kind
+转发到各组件实现。响应式布局参考 `demos/ui_demo.zfy`。
+
+### 18.0b 组件 API（旧式，直接构造组件）
+
+需要细粒度控制（如 bg_w 防残影、TextArea 光标操作）时可直接构造组件：
+
+```
+let App app = App()
+if app.open(280, 340, "zfy 计算器") != 0      // 0=成功（逻辑尺寸）
+    return 1
+let Button b = Button(x=0, y=0, w=10, h=10, text="点我")
+app.add_button(b)                             // 返回组件下标
+let i32 prev = 0
+let i32 last_w = 0
+while app.alive()
+    // 响应式布局：窗口可拖拽缩放，每帧比对尺寸重排
+    if gui_w() != last_w
+        ...重算组件位置...
+    app.step()                                // 泵事件+更新+按需重绘
+    if app.buttons[0].clicks != prev          // 按钮被点（读计数器差值）
+        prev = app.buttons[0].clicks
+        ...业务...
+    gui_frame_sleep(tick_ms())                // 限帧（App 已修 CPU 空转）
+app.close()
+```
+
+要点：add 进去的是**副本**（值语义），此后业务读写一律走
+`app.buttons[idx].字段`。Button 支持自定义 `color`（面色，0=主题）/`tcolor`
+（文本色）/`radius`（圆角，默认 6）。响应式布局参考 `demos/calculator.zfy`。
 
 ### 18.1 L1：gui.zfy 窗口与绘制 API
 

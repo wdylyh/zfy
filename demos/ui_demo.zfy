@@ -1,0 +1,49 @@
+// demos/ui_demo.zfy —— 统一元素（UI 标签）写法演示：30 行内完整交互界面
+// 对比 demos/calculator.zfy 的旧式组件 API：一个元素类型 + 标签袋，
+// 输入 = 打标签（app.set_text/set_value），输出 = 读标签（app.uis[k]）
+mod gui;
+mod widgets;
+use widgets::{App, UI, C_ACCENT}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    if app.open(300, 200, "zfy UI 标签演示") != 0
+        return 1
+
+    // 定义元素 → 打标签 → 注册（输出标签自动随 step 刷新）
+    let UI btn = UI("button")
+    btn.pos(20, 20)
+    btn.size(120, 44)
+    btn.text("点我 +1")
+    btn.color(C_ACCENT)
+    btn.radius(8)
+    let i32 kb = app.add(btn)
+
+    let UI num = UI("label")
+    num.pos(20, 80)
+    num.text("计数 0")
+    let i32 kn = app.add(num)
+
+    let UI sld = UI("slider")
+    sld.pos(20, 110)
+    sld.size(260, 0)
+    let i32 ks = app.add(sld)
+
+    let UI bar = UI("progress")
+    bar.pos(20, 140)
+    bar.size(260, 0)
+    let i32 kp = app.add(bar)
+
+    let i32 prev = 0
+    while app.alive()
+        app.step()
+        // 输出标签：按钮点击（读差值）
+        if app.uis[kb].clicks != prev
+            prev = app.uis[kb].clicks
+            // 输入标签：改文本即改界面
+            app.set_text(kn, "计数 " + cast(prev, string))
+        // 输出标签：滑杆值 → 进度条（输入标签联动）
+        app.set_value(kp, app.uis[ks].value)
+        gui_frame_sleep(app.t0)
+    app.close()

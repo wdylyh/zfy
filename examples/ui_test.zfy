@@ -1,0 +1,214 @@
+// examples/ui_test.zfy —— 统一元素 UI 标签模型测试（v3.17，new2.md）
+// 验证：kind 分派 / 前置标签 / 输出标签同步（clicks/value/sel/text_out/changed）/
+//       后置输入标签（set_text/set_pos/set_value/set_checked/add_item）
+mod gui;
+mod widgets;
+use widgets::{App, UI, kind_of}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let i32 fails = 0
+
+    // ---- kind 分派 ----
+    if kind_of("button") != 1 or kind_of("list") != 5 or kind_of("textarea") != 8
+        output("FAIL kind_of")
+        fails++
+
+    // ---- 前置标签 ----
+    let UI v = UI("slider")
+    v.value(150)
+    if v.value != 100
+        output("FAIL value clamp")
+        fails++
+    v.value(-5)
+    if v.value != 0
+        output("FAIL value clamp low")
+        fails++
+    v.pos(10, 20)
+    v.size(200, 0)
+    v.text("s")
+    v.color(0x112233)
+    v.radius(10)
+    v.rows(3)
+    if v.x != 10 or v.w != 200 or v.radius != 10 or v.rows != 3
+        output("FAIL tag setters")
+        fails++
+
+    // ---- 窗口 + 元素注册 ----
+    let App app = App()
+    if app.open(480, 420, "ui_test") != 0
+        output("SKIP open failed")
+        return 0
+    let UI lb = UI("label")
+    lb.pos(20, 16)
+    lb.text("统一元素测试")
+    let i32 kl = app.add(lb)
+
+    let UI btn = UI("button")
+    btn.pos(20, 50)
+    btn.size(130, 36)
+    btn.text("按钮 0 次")
+    btn.color(0x17405A)
+    let i32 kb = app.add(btn)
+
+    let UI inp = UI("input")
+    inp.pos(20, 100)
+    inp.size(280, 0)
+    let i32 ki = app.add(inp)
+
+    let UI sld = UI("slider")
+    sld.pos(20, 150)
+    sld.size(280, 0)
+    sld.value(30)
+    let i32 ks = app.add(sld)
+
+    let UI bar = UI("progress")
+    bar.pos(20, 190)
+    bar.size(280, 0)
+    let i32 kp = app.add(bar)
+
+    let UI lst = UI("list")
+    lst.pos(20, 224)
+    lst.size(200, 0)
+    lst.rows(4)
+    lst.add_item("alpha")
+    lst.add_item("beta")
+    lst.add_item("gamma")
+    let i32 kx = app.add(lst)
+
+    let UI chk = UI("check")
+    chk.pos(240, 230)
+    chk.text("启用")
+    let i32 kc = app.add(chk)
+
+    let UI ta = UI("textarea")
+    ta.pos(20, 300)
+    ta.size(280, 90)
+    ta.text("第一行")
+    let i32 kt = app.add(ta)
+
+    // 元素下标与内部注册对应
+    if app.uis[kb].which != 1 or app.uis[kx].which != 5 or app.uis[kt].which != 8
+        output("FAIL which")
+        fails++
+    if length(app.lists) != 1 or app.lists[0].rows != 4 or length(app.lists[0].items) != 3
+        output("FAIL list add")
+        fails++
+    if app.buttons[0].color != 0x17405A or app.buttons[0].radius <= 0
+        output("FAIL button tags")
+        fails++
+    if app.sliders[0].value != 30
+        output("FAIL slider init value")
+        fails++
+    if length(app.texts[0].lines) < 1 or app.texts[0].lines[0] != "第一行"
+        output("FAIL textarea init")
+        fails++
+
+    // ---- 首帧：全部绘制 ----
+    app.t0 = tick_ms()
+    app.step()
+    if app.buttons[0].dirty or app.labels[0].dirty
+        output("FAIL first flush")
+        fails++
+
+    // ---- 输出标签：按钮点击 ----
+    app.mx = 60
+    app.my = 68
+    app.ldown = true
+    app.on_click()
+    app.ldown = false
+    app.on_click()
+    app.step()
+    if app.uis[kb].clicks != 1
+        output("FAIL uis clicks")
+        fails++
+
+    let UI mnu = UI("menu")
+    mnu.text("文件")
+    mnu.add_item("新建")
+    mnu.add_item("退出")
+    let i32 km = app.add(mnu)
+
+    if app.menus[0].tw <= 0 or length(app.menus[0].items) != 2
+        output("FAIL menu add/layout")
+        fails++
+    // ---- 输出标签：输入框 text_out + changed ----
+    app.inputs[0].set_focus(true)
+    app.on_key(65)
+    app.step()
+    if app.uis[ki].text_out != "A" or not app.uis[ki].changed
+        output("FAIL input text_out/changed")
+        fails++
+    app.step()
+    if app.uis[ki].changed
+        output("FAIL input changed should clear")
+        fails++
+
+    // ---- 输出标签：滑块拖动 ----
+    app.mx = 148
+    app.my = 158
+    app.ldown = true
+    app.sliders[0].dragging = true
+    app.step()
+    app.ldown = false
+    app.sliders[0].dragging = false
+    if app.uis[ks].value < 40 or app.uis[ks].value > 50 or not app.uis[ks].changed
+        output("FAIL slider uis value")
+        fails++
+
+    // ---- 后置输入标签：set_text / set_pos / set_value / set_checked ----
+    app.set_text(kl, "计数 1")
+    if app.labels[0].text != "计数 1" or app.uis[kl].text != "计数 1"
+        output("FAIL set_text")
+        fails++
+    app.set_text(kb, "按钮 1 次")
+    if app.buttons[0].text != "按钮 1 次"
+        output("FAIL set_text button")
+        fails++
+    app.set_pos(kb, 30, 60)
+    if app.buttons[0].x != 30 or app.uis[kb].x != 30
+        output("FAIL set_pos")
+        fails++
+    app.set_value(kp, 55)
+    app.step()
+    if app.uis[kp].value != 55 or app.uis[kp].changed == false
+        output("FAIL set_value/sync")
+        fails++
+    app.set_checked(kc, true)
+    if app.checks[0].checked != true or app.uis[kc].checked != true
+        output("FAIL set_checked")
+        fails++
+
+    // ---- 输出标签：list 选中 ----
+    app.lists[0].sel = 1
+    app.step()
+    if app.uis[kx].sel != 1 or app.uis[kx].text_out != "beta" or not app.uis[kx].changed
+        output("FAIL list sel sync")
+        fails++
+
+    // ---- 后置输入标签：add_item ----
+    app.add_item(kx, "delta")
+    if length(app.lists[0].items) != 4
+        output("FAIL app.add_item")
+        fails++
+
+    // ---- 渲染数帧（真实事件泵） ----
+    let i32 f = 0
+    while f < 30 and app.alive()
+        app.step()
+        gui_frame_sleep(app.t0)
+        f++
+    if f < 1
+        output("FAIL frames")
+        fails++
+    if app.uis[kb].clicks != 1
+        output("FAIL clicks changed during frames")
+        fails++
+
+    app.close()
+
+    if fails == 0
+        output("ui_test: all PASS")
+        return 0
+    output(fails, " failures")
+    return 1

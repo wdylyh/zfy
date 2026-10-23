@@ -83,6 +83,9 @@ pub struct Button
     bool pressed = false
     i32 clicks = 0        // 业务读这个
     bool dirty = true
+    u32 color = 0         // 自定义面色（0=主题 C_PANEL；按下仍 C_PANDOWN）
+    u32 tcolor = 0        // 自定义文本色（0=主题 C_TEXT）
+    i32 radius = 6        // 圆角（逻辑 px，UI 标签可覆盖）
 
     fn bool hit(let i32 mx, let i32 my)
         return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + self.h
@@ -94,17 +97,26 @@ pub struct Button
     fn void draw()
         let i32 u = SC()
         let u32 fill = C_PANEL
-        if self.pressed
-            fill = C_PANDOWN
+        if self.color != 0
+            // 自定义面色：保留按下反馈，悬停不覆盖自定义色
+            fill = self.color
+            if self.pressed
+                fill = C_PANDOWN
         else
-            if self.hot
-                fill = C_PANELH
+            if self.pressed
+                fill = C_PANDOWN
+            else
+                if self.hot
+                    fill = C_PANELH
         // 扁平卡片：同色细边框（视觉上无边框），WinUI 标准圆角 6
-        gui_round_rect(self.x, self.y, self.w, self.h, 6 * u / 100, fill, fill)
+        gui_round_rect(self.x, self.y, self.w, self.h, self.radius * u / 100, fill, fill)
         gui_font(13, 0)
+        let u32 tc = C_TEXT
+        if self.tcolor != 0
+            tc = self.tcolor
         let i32 tw = gui_text_w(self.text)
         let i32 th = 13 * u / 100
-        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - th) / 2, self.text, C_TEXT)
+        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - th) / 2, self.text, tc)
         gui_font(16, 0)
         self.dirty = false
 
@@ -456,6 +468,7 @@ pub struct App
     TextArea[] texts
     Checkbox[] checks
     Menu[] menus
+    UI[] uis
     bool menu_dirty = false
     i32 mx = -1
     i32 my = -1
@@ -518,6 +531,261 @@ pub struct App
         self.menus = push(self.menus, m)
         self.menu_dirty = true
         return length(self.menus) - 1
+
+    // ===== 统一元素入口（new2.md 元素+标签模型） =====
+    // add(UI) 返回元素下标 k；此后输出读 app.uis[k]，输入用 app.set_xxx(k, ...)
+    fn i32 add(let UI u)
+        let UI e = u
+        e.which = kind_of(e.kind)
+        if e.which == 0
+            let Label w = Label(x=e.x, y=e.y, text=e.text)
+            if e.tcolor != 0
+                w.color = e.tcolor
+            e.idx = self.add_label(w)
+        if e.which == 1
+            let i32 rr = e.radius
+            if rr <= 0
+                rr = 6
+            let Button w = Button(x=e.x, y=e.y, w=e.w, h=e.h, text=e.text)
+            w.color = e.color
+            w.tcolor = e.tcolor
+            w.radius = rr
+            e.idx = self.add_button(w)
+        if e.which == 2
+            let InputBox w = InputBox(x=e.x, y=e.y, w=e.w)
+            w.text = e.text
+            w.cx = length(e.text)
+            e.idx = self.add_input(w)
+        if e.which == 3
+            let Slider w = Slider(x=e.x, y=e.y, w=e.w)
+            w.value = e.value
+            e.idx = self.add_slider(w)
+        if e.which == 4
+            let ProgressBar w = ProgressBar(x=e.x, y=e.y, w=e.w)
+            w.value = e.value
+            if e.color != 0
+                w.color = e.color
+            e.idx = self.add_bar(w)
+        if e.which == 5
+            let i32 nr = e.rows
+            if nr <= 0
+                nr = 4
+            let ListBox w = ListBox(x=e.x, y=e.y, w=e.w, rows=nr)
+            w.items = e.items
+            e.idx = self.add_list(w)
+        if e.which == 6
+            let Checkbox w = Checkbox(x=e.x, y=e.y, text=e.text)
+            w.checked = e.checked
+            e.idx = self.add_checkbox(w)
+        if e.which == 7
+            let Menu w = Menu(title=e.text)
+            w.items = e.items
+            e.idx = self.add_menu(w)
+            self.layout_menus()
+        if e.which == 8
+            let i32 th = e.h
+            if th <= 0
+                th = 120
+            let TextArea w = TextArea(x=e.x, y=e.y, w=e.w, h=th)
+            if e.text != ""
+                w.set_text(e.text)
+            e.idx = self.add_text(w)
+        self.uis = push(self.uis, e)
+        return length(self.uis) - 1
+
+    // 输出标签刷新（step 末尾自动调用）：把内部组件状态同步进 uis[k]
+    fn void sync_outputs()
+        let i32 k = 0
+        while k < length(self.uis)
+            let UI e = self.uis[k]
+            let i32 ix = e.idx
+            if e.which == 1
+                e.clicks = self.buttons[ix].clicks
+            if e.which == 2
+                e.text_out = self.inputs[ix].text
+                e.changed = e.text_out != e.cache_s
+                e.cache_s = e.text_out
+            if e.which == 3
+                e.value = self.sliders[ix].value
+                e.changed = e.value != e.cache_i
+                e.cache_i = e.value
+            if e.which == 4
+                e.value = self.bars[ix].value
+                e.changed = e.value != e.cache_i
+                e.cache_i = e.value
+            if e.which == 5
+                e.sel = self.lists[ix].sel
+                e.clicks = self.lists[ix].dbl
+                e.changed = e.sel != e.cache_i
+                e.cache_i = e.sel
+                if e.sel >= 0
+                    if e.sel < length(self.lists[ix].items)
+                        e.text_out = self.lists[ix].items[e.sel]
+            if e.which == 6
+                e.checked = self.checks[ix].checked
+                e.clicks = self.checks[ix].clicks
+            if e.which == 7
+                e.sel = self.menus[ix].sel
+                e.clicks = self.menus[ix].clicks
+            if e.which == 8
+                e.text_out = self.texts[ix].text()
+                e.changed = e.text_out != e.cache_s
+                e.cache_s = e.text_out
+            self.uis[k] = e
+            k++
+
+    // ---- 加元素后的输入标签（按元素下标 k 修改） ----
+    fn void set_text(let i32 k, let string s)
+        let UI e = self.uis[k]
+        let i32 ix = e.idx
+        e.text = s
+        if e.which == 0
+            self.labels[ix].text = s
+            self.labels[ix].dirty = true
+        if e.which == 1
+            self.buttons[ix].set_text(s)
+        if e.which == 2
+            self.inputs[ix].text = s
+            self.inputs[ix].cx = length(s)
+            self.inputs[ix].sel_a = length(s)
+            self.inputs[ix].dirty = true
+        if e.which == 7
+            self.menus[ix].title = s
+            self.layout_menus()
+        if e.which == 8
+            self.texts[ix].set_text(s)
+        self.uis[k] = e
+
+    fn void set_pos(let i32 k, let i32 px, let i32 py)
+        let UI e = self.uis[k]
+        let i32 ix = e.idx
+        e.x = px
+        e.y = py
+        if e.which == 0
+            self.labels[ix].x = px
+            self.labels[ix].y = py
+            self.labels[ix].dirty = true
+        if e.which == 1
+            self.buttons[ix].x = px
+            self.buttons[ix].y = py
+            self.buttons[ix].dirty = true
+        if e.which == 2
+            self.inputs[ix].x = px
+            self.inputs[ix].y = py
+            self.inputs[ix].dirty = true
+        if e.which == 3
+            self.sliders[ix].x = px
+            self.sliders[ix].y = py
+            self.sliders[ix].dirty = true
+        if e.which == 4
+            self.bars[ix].x = px
+            self.bars[ix].y = py
+            self.bars[ix].dirty = true
+        if e.which == 5
+            self.lists[ix].x = px
+            self.lists[ix].y = py
+            self.lists[ix].dirty = true
+        if e.which == 6
+            self.checks[ix].x = px
+            self.checks[ix].y = py
+            self.checks[ix].dirty = true
+        if e.which == 8
+            self.texts[ix].x = px
+            self.texts[ix].y = py
+            self.texts[ix].dirty = true
+        self.uis[k] = e
+
+    fn void set_size(let i32 k, let i32 pw, let i32 ph)
+        let UI e = self.uis[k]
+        let i32 ix = e.idx
+        e.w = pw
+        e.h = ph
+        if e.which == 1
+            self.buttons[ix].w = pw
+            self.buttons[ix].h = ph
+            self.buttons[ix].dirty = true
+        if e.which == 2
+            self.inputs[ix].w = pw
+            self.inputs[ix].dirty = true
+        if e.which == 3
+            self.sliders[ix].w = pw
+            self.sliders[ix].dirty = true
+        if e.which == 4
+            self.bars[ix].w = pw
+            self.bars[ix].dirty = true
+        if e.which == 5
+            self.lists[ix].w = pw
+            if ph > 0
+                let i32 nr = (ph - 8 * SC() / 100) / LH()
+                if nr < 1
+                    nr = 1
+                self.lists[ix].rows = nr
+            self.lists[ix].dirty = true
+        if e.which == 8
+            self.texts[ix].w = pw
+            self.texts[ix].h = ph
+            self.texts[ix].dirty = true
+        self.uis[k] = e
+
+    fn void set_color(let i32 k, let u32 c)
+        let UI e = self.uis[k]
+        let i32 ix = e.idx
+        e.color = c
+        if e.which == 0
+            self.labels[ix].color = c
+            self.labels[ix].dirty = true
+        if e.which == 1
+            self.buttons[ix].color = c
+            self.buttons[ix].dirty = true
+        if e.which == 4
+            self.bars[ix].color = c
+            self.bars[ix].dirty = true
+        self.uis[k] = e
+
+    fn void set_text_color(let i32 k, let u32 c)
+        let UI e = self.uis[k]
+        let i32 ix = e.idx
+        e.tcolor = c
+        if e.which == 0
+            self.labels[ix].color = c
+            self.labels[ix].dirty = true
+        if e.which == 1
+            self.buttons[ix].tcolor = c
+            self.buttons[ix].dirty = true
+        self.uis[k] = e
+
+    fn void set_value(let i32 k, let i32 v)
+        let UI e = self.uis[k]
+        let i32 ix = e.idx
+        e.value = v
+        if e.which == 3
+            self.sliders[ix].set_value(v)
+        if e.which == 4
+            self.bars[ix].set_value(v)
+        self.uis[k] = e
+
+    fn void set_checked(let i32 k, let bool b)
+        let UI e = self.uis[k]
+        let i32 ix = e.idx
+        e.checked = b
+        if e.which == 6
+            self.checks[ix].checked = b
+            self.checks[ix].dirty = true
+        self.uis[k] = e
+
+    fn void add_item(let i32 k, let string s)
+        let UI e = self.uis[k]
+        let i32 ix = e.idx
+        if e.which == 5
+            self.lists[ix].add_item(s)
+        if e.which == 7
+            let Menu mm = self.menus[ix]
+            mm.items = push(mm.items, s)
+            mm.dirty = true
+            self.menus[ix] = mm
+            self.menu_dirty = true
+        e.items = push(e.items, s)
+        self.uis[k] = e
 
     // 关闭全部下拉（点击空白/打开新菜单/选中项后调用）
     fn void close_menus()
@@ -614,6 +882,8 @@ pub struct App
                 self.any_dirty = true
             si++
         self.ldown_prev = self.ldown
+        // 输出标签刷新（uis[k].clicks/value/sel/text_out/changed）
+        self.sync_outputs()
         // 重绘脏组件
         self.flush_dirty()
         if self.any_dirty
@@ -1329,3 +1599,94 @@ pub struct TextArea
                 let i32 cxx = gui_text_w(prefix(ln2, self.cx))
                 gui_fill_rect(self.x + pad + cxx, self.y + pad + (self.cy - self.top) * LH(), 2 * u / 100, LH(), C_TEXT)
         self.dirty = false
+
+// ===== UI：统一元素（new2.md「元素+标签」模型，v3.17） =====
+// 一个元素类型 + 标签袋：kind 决定功能，标签声明坐标/颜色/形状/大小/内容。
+//   输入 = 打标签：加入前用元素方法（pos/size/text/color/...），
+//          加入后用 app.set_xxx(k, ...)；
+//   输出 = 读标签：每帧 app.step() 后读 app.uis[k] 的
+//          clicks / value / sel / checked / text_out / changed。
+// kind："label" "button" "input" "slider" "progress" "list" "check" "menu" "textarea"
+pub fn i32 kind_of(let string k)
+    if k == "button"
+        return 1
+    if k == "input"
+        return 2
+    if k == "slider"
+        return 3
+    if k == "progress"
+        return 4
+    if k == "list"
+        return 5
+    if k == "check"
+        return 6
+    if k == "menu"
+        return 7
+    if k == "textarea"
+        return 8
+    return 0
+
+pub struct UI
+    string kind = "label"
+    // ---- 属性标签 ----
+    i32 x = 0
+    i32 y = 0
+    i32 w = 0
+    i32 h = 0
+    string text = ""
+    u32 color = 0        // 面色/填充（0=各 kind 主题默认）
+    u32 tcolor = 0       // 文本色（0=主题 C_TEXT）
+    i32 radius = 0       // 圆角（0=各 kind 默认；button 生效）
+    i32 value = 0        // slider/progress 初值（0..100）
+    i32 rows = 0         // list 可见行数（0=默认 4）
+    string[] items       // list 条目 / menu 条目
+    bool checked = false // check 初值
+    // ---- 输出标签（app.step() 后自动刷新） ----
+    i32 clicks = 0       // button/check/menu：点击计数；list：双击计数
+    i32 sel = -1         // list/menu 选中下标
+    bool changed = false // 本帧 value/sel/text 是否变化
+    // （value/checked 兼作输出：step 后同步为当前值）
+    string text_out = "" // input/textarea 当前文本；list 选中项文本
+    // ---- 内部 ----
+    i32 which = 0
+    i32 idx = -1         // 在 App 对应组件数组中的下标
+    string cache_s = ""
+    i32 cache_i = 0
+
+    // ---- 加入前的标签方法 ----
+    fn void pos(let i32 px, let i32 py)
+        self.x = px
+        self.y = py
+
+    fn void size(let i32 pw, let i32 ph)
+        self.w = pw
+        self.h = ph
+
+    fn void text(let string s)
+        self.text = s
+
+    fn void color(let u32 c)
+        self.color = c
+
+    fn void text_color(let u32 c)
+        self.tcolor = c
+
+    fn void radius(let i32 r)
+        self.radius = r
+
+    fn void value(let i32 v)
+        let i32 vv = v
+        if vv < 0
+            vv = 0
+        if vv > 100
+            vv = 100
+        self.value = vv
+
+    fn void rows(let i32 n)
+        self.rows = n
+
+    fn void checked(let bool b)
+        self.checked = b
+
+    fn void add_item(let string s)
+        self.items = push(self.items, s)
