@@ -55,6 +55,8 @@ pub struct Label
     i32 fs = 16          // 字号（逻辑 px）
     bool bold = false
     bool nobg = false    // true=不清背景（叠加在渐变带等自绘背景上）
+    bool visible = true
+    bool enable = true
     bool dirty = true
 
     fn void draw()
@@ -82,6 +84,8 @@ pub struct Button
     bool hot = false
     bool pressed = false
     i32 clicks = 0        // 业务读这个
+    bool visible = true
+    bool enable = true
     bool dirty = true
     u32 color = 0         // 自定义面色（0=主题 C_PANEL；按下仍 C_PANDOWN）
     u32 tcolor = 0        // 自定义文本色（0=主题 C_TEXT）
@@ -127,6 +131,8 @@ pub struct InputBox
     i32 w
     string text
     bool focus = false
+    bool visible = true
+    bool enable = true
     bool dirty = true
     i32 cx = 0            // 光标字节位置（码点对齐）
     i32 sel_a = 0         // 选区锚点（字节）；cx==sel_a 即无选区
@@ -337,6 +343,8 @@ pub struct Slider
     i32 w
     i32 value = 0        // 业务读这个（0..100）
     bool dragging = false
+    bool visible = true
+    bool enable = true
     bool dirty = true
 
     fn void set_value(let i32 v)
@@ -373,6 +381,8 @@ pub struct ProgressBar
     i32 w
     i32 value = 0
     u32 color = C_OK
+    bool visible = true
+    bool enable = true
     bool dirty = true
 
     fn void set_value(let i32 v)
@@ -407,6 +417,8 @@ pub struct ListBox
     i32 dbl_row = -1     // 最后双击的行（items 下标）
     i64 last_ms = 0      // 上次单击时刻（内部）
     i32 last_row = -1    // 上次单击行（内部）
+    bool visible = true
+    bool enable = true
     bool dirty = true
 
     fn void clear()
@@ -544,12 +556,14 @@ pub struct App
     // ===== 统一元素入口（new2.md 元素+标签模型） =====
     // add(UI) 返回元素下标 k；此后输出读 app.uis[k]，输入用 app.set_xxx(k, ...)
     fn i32 add(let UI u)
-        let UI e = u
+        let UI e = copy(u)
         e.which = kind_of(e.kind)
         if e.which == 0
             let Label w = Label(x=e.x, y=e.y, text=e.text)
             if e.tcolor != 0
                 w.color = e.tcolor
+            w.visible = e.visible
+            w.enable = e.enable
             e.idx = self.add_label(w)
         if e.which == 1
             let i32 rr = e.radius
@@ -559,21 +573,29 @@ pub struct App
             w.color = e.color
             w.tcolor = e.tcolor
             w.radius = rr
+            w.visible = e.visible
+            w.enable = e.enable
             e.idx = self.add_button(w)
         if e.which == 2
             let InputBox w = InputBox(x=e.x, y=e.y, w=e.w)
             w.text = e.text
             w.cx = length(e.text)
+            w.visible = e.visible
+            w.enable = e.enable
             e.idx = self.add_input(w)
         if e.which == 3
             let Slider w = Slider(x=e.x, y=e.y, w=e.w)
             w.value = e.value
+            w.visible = e.visible
+            w.enable = e.enable
             e.idx = self.add_slider(w)
         if e.which == 4
             let ProgressBar w = ProgressBar(x=e.x, y=e.y, w=e.w)
             w.value = e.value
             if e.color != 0
                 w.color = e.color
+            w.visible = e.visible
+            w.enable = e.enable
             e.idx = self.add_bar(w)
         if e.which == 5
             let i32 nr = e.rows
@@ -581,14 +603,20 @@ pub struct App
                 nr = 4
             let ListBox w = ListBox(x=e.x, y=e.y, w=e.w, rows=nr)
             w.items = e.items
+            w.visible = e.visible
+            w.enable = e.enable
             e.idx = self.add_list(w)
         if e.which == 6
             let Checkbox w = Checkbox(x=e.x, y=e.y, text=e.text)
             w.checked = e.checked
+            w.visible = e.visible
+            w.enable = e.enable
             e.idx = self.add_checkbox(w)
         if e.which == 7
             let Menu w = Menu(title=e.text)
             w.items = e.items
+            w.visible = e.visible
+            w.enable = e.enable
             e.idx = self.add_menu(w)
             self.layout_menus()
         if e.which == 8
@@ -598,6 +626,8 @@ pub struct App
             let TextArea w = TextArea(x=e.x, y=e.y, w=e.w, h=th)
             if e.text != ""
                 w.set_text(e.text)
+            w.visible = e.visible
+            w.enable = e.enable
             e.idx = self.add_text(w)
         self.uis = push(self.uis, e)
         return length(self.uis) - 1
@@ -606,7 +636,7 @@ pub struct App
     fn void sync_outputs()
         let i32 k = 0
         while k < length(self.uis)
-            let UI e = self.uis[k]
+            let UI e = copy(self.uis[k])
             let i32 ix = e.idx
             if e.which == 1
                 e.clicks = self.buttons[ix].clicks
@@ -645,7 +675,7 @@ pub struct App
 
     // ---- 加元素后的输入标签（按元素下标 k 修改） ----
     fn void set_text(let i32 k, let string s)
-        let UI e = self.uis[k]
+        let UI e = copy(self.uis[k])
         let i32 ix = e.idx
         e.text = s
         if e.which == 0
@@ -666,7 +696,7 @@ pub struct App
         self.uis[k] = e
 
     fn void set_pos(let i32 k, let i32 px, let i32 py)
-        let UI e = self.uis[k]
+        let UI e = copy(self.uis[k])
         let i32 ix = e.idx
         e.x = px
         e.y = py
@@ -705,7 +735,7 @@ pub struct App
         self.uis[k] = e
 
     fn void set_size(let i32 k, let i32 pw, let i32 ph)
-        let UI e = self.uis[k]
+        let UI e = copy(self.uis[k])
         let i32 ix = e.idx
         e.w = pw
         e.h = ph
@@ -737,7 +767,7 @@ pub struct App
         self.uis[k] = e
 
     fn void set_color(let i32 k, let u32 c)
-        let UI e = self.uis[k]
+        let UI e = copy(self.uis[k])
         let i32 ix = e.idx
         e.color = c
         if e.which == 0
@@ -752,7 +782,7 @@ pub struct App
         self.uis[k] = e
 
     fn void set_text_color(let i32 k, let u32 c)
-        let UI e = self.uis[k]
+        let UI e = copy(self.uis[k])
         let i32 ix = e.idx
         e.tcolor = c
         if e.which == 0
@@ -764,7 +794,7 @@ pub struct App
         self.uis[k] = e
 
     fn void set_value(let i32 k, let i32 v)
-        let UI e = self.uis[k]
+        let UI e = copy(self.uis[k])
         let i32 ix = e.idx
         e.value = v
         if e.which == 3
@@ -774,7 +804,7 @@ pub struct App
         self.uis[k] = e
 
     fn void set_checked(let i32 k, let bool b)
-        let UI e = self.uis[k]
+        let UI e = copy(self.uis[k])
         let i32 ix = e.idx
         e.checked = b
         if e.which == 6
@@ -782,13 +812,75 @@ pub struct App
             self.checks[ix].dirty = true
         self.uis[k] = e
 
+    fn void set_visible(let i32 k, let bool b)
+        let UI e = copy(self.uis[k])
+        let i32 ix = e.idx
+        e.visible = b
+        if e.which == 0
+            self.labels[ix].visible = b
+            self.labels[ix].dirty = true
+        if e.which == 1
+            self.buttons[ix].visible = b
+            self.buttons[ix].dirty = true
+        if e.which == 2
+            self.inputs[ix].visible = b
+            self.inputs[ix].dirty = true
+        if e.which == 3
+            self.sliders[ix].visible = b
+            self.sliders[ix].dirty = true
+        if e.which == 4
+            self.bars[ix].visible = b
+            self.bars[ix].dirty = true
+        if e.which == 5
+            self.lists[ix].visible = b
+            self.lists[ix].dirty = true
+        if e.which == 6
+            self.checks[ix].visible = b
+            self.checks[ix].dirty = true
+        if e.which == 7
+            self.menus[ix].visible = b
+            self.menu_dirty = true
+        if e.which == 8
+            self.texts[ix].visible = b
+            self.texts[ix].dirty = true
+        self.uis[k] = e
+
+    fn void set_enable(let i32 k, let bool b)
+        let UI e = copy(self.uis[k])
+        let i32 ix = e.idx
+        e.enable = b
+        if e.which == 0
+            self.labels[ix].enable = b
+        if e.which == 1
+            self.buttons[ix].enable = b
+            self.buttons[ix].dirty = true
+        if e.which == 2
+            self.inputs[ix].enable = b
+            self.inputs[ix].dirty = true
+        if e.which == 3
+            self.sliders[ix].enable = b
+            self.sliders[ix].dirty = true
+        if e.which == 4
+            self.bars[ix].enable = b
+        if e.which == 5
+            self.lists[ix].enable = b
+            self.lists[ix].dirty = true
+        if e.which == 6
+            self.checks[ix].enable = b
+            self.checks[ix].dirty = true
+        if e.which == 7
+            self.menus[ix].enable = b
+        if e.which == 8
+            self.texts[ix].enable = b
+        self.uis[k] = e
+
     fn void add_item(let i32 k, let string s)
-        let UI e = self.uis[k]
+        let UI e = copy(self.uis[k])
         let i32 ix = e.idx
         if e.which == 5
             self.lists[ix].add_item(s)
         if e.which == 7
-            let Menu mm = self.menus[ix]
+            let Menu mm = copy(self.menus[ix])
             mm.items = push(mm.items, s)
             mm.dirty = true
             self.menus[ix] = mm
@@ -885,7 +977,7 @@ pub struct App
         // 拖动持续更新（按住不放也跟随）
         let i32 si = 0
         while si < length(self.sliders)
-            if self.sliders[si].dragging and self.ldown
+            if self.sliders[si].dragging and self.sliders[si].enable and self.ldown
                 self.sliders[si].set_value((self.mx - self.sliders[si].x) * 100 / (self.sliders[si].w - 2))
             if self.sliders[si].dirty
                 self.any_dirty = true
@@ -902,7 +994,7 @@ pub struct App
         // 输入框拖选：聚焦且按住左键时移动即扩展选区
         let i32 di = 0
         while di < length(self.inputs)
-            if self.inputs[di].focus and self.inputs[di].dragging and self.ldown
+            if self.inputs[di].focus and self.inputs[di].enable and self.inputs[di].dragging and self.ldown
                 self.inputs[di].on_drag(self.mx)
                 if self.inputs[di].dirty
                     self.any_dirty = true
@@ -934,7 +1026,7 @@ pub struct App
             // 下拉打开时：条目命中 > 其他标题 > 空白关闭
             mi = 0
             while mi < length(self.menus)
-                if self.menus[mi].open
+                if self.menus[mi].open and self.menus[mi].enable
                     let i32 it = self.menu_item_at(mi, self.mx, self.my)
                     if it >= 0
                         self.menus[mi].sel = it
@@ -947,7 +1039,7 @@ pub struct App
             if not handled and in_bar
                 mi = 0
                 while mi < length(self.menus)
-                    if self.mx >= self.menus[mi].x and self.mx < self.menus[mi].x + self.menus[mi].tw
+                    if self.menus[mi].enable and self.mx >= self.menus[mi].x and self.mx < self.menus[mi].x + self.menus[mi].tw
                         let bool was = self.menus[mi].open
                         self.close_menus()
                         self.menus[mi].open = not was
@@ -973,7 +1065,7 @@ pub struct App
         i = 0
         while i < length(self.inputs)
             if press
-                self.inputs[i].set_focus(self.inputs[i].hit(self.mx, self.my))
+                self.inputs[i].set_focus(self.inputs[i].enable and self.inputs[i].hit(self.mx, self.my))
                 if self.inputs[i].focus
                     self.inputs[i].on_press(self.mx)
             if not press
@@ -984,7 +1076,7 @@ pub struct App
         i = 0
         while i < length(self.texts)
             if press
-                self.texts[i].set_focus(self.texts[i].hit(self.mx, self.my))
+                self.texts[i].set_focus(self.texts[i].enable and self.texts[i].hit(self.mx, self.my))
                 if self.texts[i].focus
                     self.texts[i].place_cursor(self.mx, self.my)
             if self.texts[i].dirty
@@ -994,10 +1086,10 @@ pub struct App
         i = 0
         while i < length(self.checks)
             let bool inside = self.checks[i].hit(self.mx, self.my)
-            if press and inside
+            if press and inside and self.checks[i].enable
                 self.checks[i].pressed = true
                 self.checks[i].dirty = true
-            if release and self.checks[i].pressed
+            if release and self.checks[i].enable and self.checks[i].pressed
                 self.checks[i].pressed = false
                 self.checks[i].checked = not self.checks[i].checked
                 self.checks[i].clicks++
@@ -1009,10 +1101,10 @@ pub struct App
         i = 0
         while i < length(self.buttons)
             let bool inside = self.buttons[i].hit(self.mx, self.my)
-            if press and inside
+            if press and inside and self.buttons[i].enable
                 self.buttons[i].pressed = true
                 self.buttons[i].dirty = true
-            if release and self.buttons[i].pressed
+            if release and self.buttons[i].enable and self.buttons[i].pressed
                 self.buttons[i].pressed = false
                 self.buttons[i].dirty = true
                 if inside
@@ -1023,7 +1115,7 @@ pub struct App
         // 滑块：左键按下进入拖动，抬起结束
         i = 0
         while i < length(self.sliders)
-            if press and self.sliders[i].hit_wide(self.mx, self.my)
+            if press and self.sliders[i].enable and self.sliders[i].hit_wide(self.mx, self.my)
                 self.sliders[i].dragging = true
                 self.sliders[i].set_value((self.mx - self.sliders[i].x) * 100 / (self.sliders[i].w - 2))
             if release
@@ -1034,7 +1126,7 @@ pub struct App
         // 列表选中
         i = 0
         while i < length(self.lists)
-            if press and self.mx >= self.lists[i].x and self.mx < self.lists[i].x + self.lists[i].w
+            if press and self.lists[i].enable and self.mx >= self.lists[i].x and self.mx < self.lists[i].x + self.lists[i].w
                 let i32 rows = length(self.lists[i].items)
                 let i32 hgt = self.lists[i].rows * LH() + 8 * SC() / 100
                 if self.my >= self.lists[i].y and self.my < self.lists[i].y + hgt
@@ -1063,13 +1155,13 @@ pub struct App
     fn void on_key(let i64 k)
         let i32 i = 0
         while i < length(self.inputs)
-            if self.inputs[i].focus
+            if self.inputs[i].focus and self.inputs[i].enable
                 if self.inputs[i].handle_key(k)
                     self.any_dirty = true
             i++
         i = 0
         while i < length(self.texts)
-            if self.texts[i].focus
+            if self.texts[i].focus and self.texts[i].enable
                 if self.texts[i].handle_key(k)
                     self.any_dirty = true
             i++
@@ -1138,7 +1230,7 @@ pub struct App
             gui_fill_rect(0, mbh - 1, gui_w(), 1, C_BORDER)
             i = 0
             while i < length(self.menus)
-                let Menu m = self.menus[i]
+                let Menu m = copy(self.menus[i])
                 let bool hot = self.my < mbh and self.mx >= m.x and self.mx < m.x + m.tw
                 if m.open
                     gui_fill_rect(m.x, 0, m.tw, mbh, C_HOT)
@@ -1172,49 +1264,49 @@ pub struct App
         self.draw_menu_bar()
         let i32 i = 0
         while i < length(self.labels)
-            if self.labels[i].dirty
+            if self.labels[i].dirty and self.labels[i].visible
                 self.labels[i].draw()
                 self.any_dirty = true
             i++
         i = 0
         while i < length(self.buttons)
-            if self.buttons[i].dirty
+            if self.buttons[i].dirty and self.buttons[i].visible
                 self.buttons[i].draw()
                 self.any_dirty = true
             i++
         i = 0
         while i < length(self.inputs)
-            if self.inputs[i].dirty
+            if self.inputs[i].dirty and self.inputs[i].visible
                 self.inputs[i].draw()
                 self.any_dirty = true
             i++
         i = 0
         while i < length(self.sliders)
-            if self.sliders[i].dirty
+            if self.sliders[i].dirty and self.sliders[i].visible
                 self.sliders[i].draw()
                 self.any_dirty = true
             i++
         i = 0
         while i < length(self.bars)
-            if self.bars[i].dirty
+            if self.bars[i].dirty and self.bars[i].visible
                 self.bars[i].draw()
                 self.any_dirty = true
             i++
         i = 0
         while i < length(self.lists)
-            if self.lists[i].dirty
+            if self.lists[i].dirty and self.lists[i].visible
                 self.lists[i].draw()
                 self.any_dirty = true
             i++
         i = 0
         while i < length(self.texts)
-            if self.texts[i].dirty
+            if self.texts[i].dirty and self.texts[i].visible
                 self.texts[i].draw()
                 self.any_dirty = true
             i++
         i = 0
         while i < length(self.checks)
-            if self.checks[i].dirty
+            if self.checks[i].dirty and self.checks[i].visible
                 self.checks[i].draw()
                 self.any_dirty = true
             i++
@@ -1277,6 +1369,8 @@ pub struct Menu
     i32 sel = -1         // 最后选中的条目索引
     i32 clicks = 0       // 选中任一条目时 ++（业务对比差值）
     bool open = false
+    bool visible = true
+    bool enable = true
     bool dirty = true
 
 pub struct Checkbox
@@ -1287,6 +1381,8 @@ pub struct Checkbox
     bool hot = false
     bool pressed = false
     i32 clicks = 0
+    bool visible = true
+    bool enable = true
     bool dirty = true
 
     fn i32 box_size()
@@ -1331,6 +1427,8 @@ pub struct TextArea
     i32 cy = 0            // 光标行
     i32 top = 0           // 首可见行
     bool focus = false
+    bool visible = true
+    bool enable = true
     bool dirty = true
 
     fn i32 vis_rows()
@@ -1646,6 +1744,8 @@ pub struct UI
     u32 color = 0        // 面色/填充（0=各 kind 主题默认）
     u32 tcolor = 0       // 文本色（0=主题 C_TEXT）
     i32 radius = 0       // 圆角（0=各 kind 默认；button 生效）
+    bool visible = true  // 可见性（flush 跳过绘制）
+    bool enable = true   // 可用性（事件忽略）
     i32 value = 0        // slider/progress 初值（0..100）
     i32 rows = 0         // list 可见行数（0=默认 4）
     string[] items       // list 条目 / menu 条目
@@ -1704,6 +1804,12 @@ pub struct UI
 
     fn void checked(let bool b)
         self.checked = b
+
+    fn void visible(let bool b)
+        self.visible = b
+
+    fn void enable(let bool b)
+        self.enable = b
 
     fn void add_item(let string s)
         self.items = push(self.items, s)

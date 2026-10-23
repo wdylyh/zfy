@@ -1,371 +1,251 @@
-// notepad.zfy —— 单文件记事本（zfy v3.4.0）
-// 菜单完全自绘，不用任何局部 string[] 数组（避开可能的局部数组 bug）
-// 编译：zfyc build notepad.zfy
+// main.zfy —— zfy v3.15.0 文本统计与报告工具（完整修正版）
+// 用法：main.exe <文件> [topN] [--chars] [--md]
+//   不给文件则从 stdin 逐行读取（EOF 安全退出）。
 
-mod gui;
-mod widgets;
+// ---------------- §28.1 泛型约束 ----------------
+fn <T: num> T gsum2(let T a, let T b)
+    return a + b
 
-use gui::{gui_w, gui_h, gui_dpi, gui_frame_sleep, gui_clip_set, gui_clip_get, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present}
-use widgets::{App, TextArea, Label, C_TEXT, C_PANEL, C_BORDER, C_HOT, C_ACCENT}
+// ---------------- §22 枚举 ----------------
+enum OutFmt
+    Plain
+    Markdown
 
-fn string base_name(let string path)
-    let i32 n = length(path)
-    let i32 i = n - 1
-    while i >= 0
-        let char c = path[i]
-        if c == '/' or c == '\\'
-            return path[i + 1, n - 1]
-        i--
-    return path
+enum Kind
+    Num
+    Word
 
-fn i32 count_lines(let string s)
+// ---------------- 工具函数（返回类型前置） ----------------
+fn bool is_space(let char c)
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n'
+
+fn string[] tokenize(let string s)
+    let string[] out
     let i32 n = length(s)
-    let i32 lines = 1
     let i32 i = 0
+    let i32 start = 0
+    let bool in_tok = false
     while i < n
-        if s[i] == '\n'
-            lines++
-        i++
-    return lines
-
-fn string i32_to_str(let i32 v)
-    if v == 0
-        return "0"
-    let bool neg = false
-    let i64 x = cast(v, i64)
-    if x < 0
-        neg = true
-        x = 0 - x
-    let char buf[] = '\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0'
-    let i32 k = 20
-    while x > 0
-        k--
-        buf[k] = chr(cast(ord('0') + cast(x % 10, i32), i32))
-        x = x / 10
-    let string out = ""
-    if neg
-        out += '-'
-    let i32 j = k
-    while j < 20
-        out += buf[j]
-        j++
+        let char c = s[i]
+        if is_space(c)
+            if in_tok
+                out = push(out, s[start, i - 1])
+                in_tok = false
+            i++
+        else
+            if not in_tok
+                start = i
+                in_tok = true
+            i++
+    if in_tok
+        out = push(out, s[start, n - 1])
     return out
 
-fn string pad2(let i32 v)
-    if v < 10
-        return "0" + i32_to_str(v)
-    return i32_to_str(v)
+fn string lower(let string s)
+    let string r = ""
+    let i32 n = length(s)
+    let i32 i = 0
+    while i < n
+        let char c = s[i]
+        if c >= 'A' and c <= 'Z'
+            r += chr(ord(c) + 32)
+        else
+            r += c
+        i++
+    return r
 
-fn string pad4(let i32 v)
-    if v < 10
-        return "000" + i32_to_str(v)
-    if v < 100
-        return "00" + i32_to_str(v)
-    if v < 1000
-        return "0" + i32_to_str(v)
-    return i32_to_str(v)
+// 词频条目
+struct WordCount
+    string w = ""
+    i32 n = 0
 
-fn string fmt_time(let i64 ts)
-    let datetime d = localtime(ts)
-    return (pad4(d.year) + "-" + pad2(d.month) + "-" + pad2(d.day) + " "
-          + pad2(d.hour) + ":" + pad2(d.minute) + ":" + pad2(d.second))
+// 手写选择排序：按次数降序，同次数按词字典序升序
+// （struct 元素不支持 sort_by，见规范 §19.4）
+fn WordCount[] top_words(let map<string, i32> freq, let i32 topn)
+    let string[] ks = keys(freq)
+    let WordCount[] ws
+    for k in ks
+        let i32 c = freq[k] ?? 0
+        ws = push(ws, WordCount(w=k, n=c))
+    let i32 m = length(ws)
+    let i32 i = 0
+    while i < m
+        let i32 bi = i
+        let i32 j = i + 1
+        while j < m
+            let bool better = false
+            if ws[j].n > ws[bi].n
+                better = true
+            else if ws[j].n == ws[bi].n
+                if ws[j].w < ws[bi].w
+                    better = true
+            if better
+                bi = j
+            j++
+        if bi != i
+            let WordCount tmp = copy(ws[i])
+            ws[i] = ws[bi]
+            ws[bi] = tmp
+        i++
+    let WordCount[] out
+    let i32 k2 = 0
+    while k2 < m and k2 < topn
+        out = push(out, ws[k2])
+        k2++
+    return out
 
-fn string status_text(let string nm, let i32 lines, let i32 chars)
-    return nm + "   |   " + i32_to_str(lines) + " 行   |   " + i32_to_str(chars) + " 字符"
+fn string[] top_chars(let map<string, i32> cf, let i32 topn)
+    let string[] pool = keys(cf)
+    let string[] out
+    let i32 used = 0
+    while used < topn and length(pool) > 0
+        let i32 bi = 0
+        let i32 bv = -1
+        let i32 i = 0
+        while i < length(pool)
+            let i32 v = cf[pool[i]] ?? 0
+            if v > bv
+                bv = v
+                bi = i
+            i++
+        out = push(out, pool[bi] + ":" + to_str(bv))
+        let string dropped = remove(pool, bi)
+        used++
+    return out
 
+fn Kind classify(let i32 n)
+    let Kind k = match n % 2
+        0 => Kind.Num
+        _ => Kind.Word
+    return k
+
+fn string describe(let Kind k)
+    let string s = match k
+        Kind.Num =>
+            "even/number"
+        Kind.Word =>
+            "odd/word"
+    return s
+
+// ---------------- 主流程 ----------------
 fn main()
-    let App app = App()
-    if app.open(820, 620, "zfy 记事本") != 0
-        return 1
-
-    let i32 dpi = gui_dpi()
-    let i32 sc = dpi / 96
-    if sc < 1
-        sc = 1
-    let i32 menu_h = 30 * sc
-    let i32 status_h = 24 * sc
-
-    // ---- 编辑区 ----
-    let TextArea ta = TextArea(x=0, y=0, w=100, h=100)
-    ta.set_text("")
-    let i32 _idx1 = app.add_text(ta)
-
-    // ---- 状态栏 ----
-    let Label status = Label(x=0, y=0, text="未命名   |   1 行   |   0 字符", color=C_TEXT, bg_w=100)
-    let i32 _idx2 = app.add_label(status)
-
-    // ---- 菜单：硬编码标题和条目（不用数组）----
-    let string t0 = "文件"
-    let string t1 = "编辑"
-    let string f0 = "新建"
-    let string f1 = "打开"
-    let string f2 = "保存"
-    let string f3 = "另存为"
-    let string f4 = "退出"
-    let string e0 = "复制"
-    let string e1 = "粘贴"
-    let string e2 = "剪切"
-    let string e3 = "插入时间"
-    let i32 nf = 5          // 文件菜单条目数
-    let i32 ne = 4          // 编辑菜单条目数
-
-    let i32 m_open = -1
-    let i32 m_hover_item = -1
-    let i32 click_lock = 0
-
-    // ---- 布局 ----
-    app.texts[0].x = 0
-    app.texts[0].y = menu_h
-    app.texts[0].w = gui_w()
-    app.texts[0].h = gui_h() - menu_h - status_h
-    app.texts[0].focus = true
-    app.texts[0].dirty = true
-    app.labels[0].x = 6 * sc
-    app.labels[0].y = gui_h() - status_h + 3 * sc
-    app.labels[0].bg_w = gui_w()
-    app.labels[0].dirty = true
-    app.invalidate_all()
-
-    // ---- 文档状态 ----
-    let string cur_path = ""
-    let string cur_name = "未命名"
-    let bool doc_dirty = false
-    let string last_snap = app.texts[0].text()
-    let i32 last_w = gui_w()
-    let i32 last_h = gui_h()
-    let i32 last_dpi = dpi
-    let bool my_prev_down = false
-
-    // ---- 主循环 ----
-    while app.alive()
-        if gui_w() != last_w or gui_h() != last_h or gui_dpi() != last_dpi
-            last_w = gui_w()
-            last_h = gui_h()
-            last_dpi = gui_dpi()
-            sc = last_dpi / 96
-            if sc < 1
-                sc = 1
-            menu_h = 30 * sc
-            status_h = 24 * sc
-            app.texts[0].x = 0
-            app.texts[0].y = menu_h
-            app.texts[0].w = last_w
-            app.texts[0].h = last_h - menu_h - status_h
-            app.texts[0].dirty = true
-            app.labels[0].x = 6 * sc
-            app.labels[0].y = last_h - status_h + 3 * sc
-            app.labels[0].bg_w = last_w
-            app.labels[0].dirty = true
-            app.invalidate_all()
-
-        app.step()
-
-        let i32 mx = app.mx
-        let i32 my = app.my
-        let bool down = app.ldown
-        let bool clicked = down and not my_prev_down
-        if click_lock > 0
-            click_lock--
-
-        // 菜单栏几何
-        let i32 tx0 = 8 * sc
-        let i32 tw0 = gui_text_w(t0) + 20 * sc
-        let i32 tx1 = tx0 + tw0
-        let i32 tw1 = gui_text_w(t1) + 20 * sc
-        let i32 item_h = 22 * sc
-        let i32 panel_y = menu_h
-        let i32 fpanel_w = 100 * sc
-        let i32 epanel_w = 100 * sc
-
-        // 悬停条目
-        m_hover_item = -1
-        if m_open == 0
-            if mx >= tx0 and mx < tx0 + fpanel_w and my >= panel_y
-                let i32 r = (my - panel_y) / item_h
-                if r >= 0 and r < nf
-                    m_hover_item = r
-        if m_open == 1
-            if mx >= tx1 and mx < tx1 + epanel_w and my >= panel_y
-                let i32 r = (my - panel_y) / item_h
-                if r >= 0 and r < ne
-                    m_hover_item = r
-
-        // 点击
-        if clicked and click_lock == 0
-            if my < menu_h
-                if mx >= tx0 and mx < tx0 + tw0
-                    if m_open == 0
-                        m_open = -1
-                    else
-                        m_open = 0
-                    click_lock = 1
-                else if mx >= tx1 and mx < tx1 + tw1
-                    if m_open == 1
-                        m_open = -1
-                    else
-                        m_open = 1
-                    click_lock = 1
-                else
-                    m_open = -1
-                    click_lock = 1
-            else if m_open == 0 and m_hover_item >= 0
-                let i32 it = m_hover_item
-                m_open = -1
-                click_lock = 1
-                if it == 0
-                    app.texts[0].set_text("")
-                    app.texts[0].dirty = true
-                    cur_path = ""
-                    cur_name = "未命名"
-                    doc_dirty = false
-                    last_snap = ""
-                else if it == 1
-                    output("输入要打开的路径: ")
-                    let string p = ""
-                    input(p)
-                    if length(p) > 0 and exists(p)
-                        let string! rf = read_file(p)
-                        let string body = rf ?? ""
-                        app.texts[0].set_text(body)
-                        app.texts[0].dirty = true
-                        cur_path = p
-                        cur_name = base_name(p)
-                        doc_dirty = false
-                        last_snap = body
-                else if it == 2
-                    if length(cur_path) == 0
-                        output("输入保存路径: ")
-                        let string p2 = ""
-                        input(p2)
-                        if length(p2) > 0
-                            cur_path = p2
-                            cur_name = base_name(p2)
-                    if length(cur_path) > 0
-                        let i64! wn = write_file(cur_path, app.texts[0].text())
-                        let i64 written = wn ?? -1
-                        if written >= 0
-                            doc_dirty = false
-                            last_snap = app.texts[0].text()
-                else if it == 3
-                    output("输入另存为路径: ")
-                    let string p3 = ""
-                    input(p3)
-                    if length(p3) > 0
-                        let i64! wn2 = write_file(p3, app.texts[0].text())
-                        let i64 written2 = wn2 ?? -1
-                        if written2 >= 0
-                            cur_path = p3
-                            cur_name = base_name(p3)
-                            doc_dirty = false
-                            last_snap = app.texts[0].text()
-                else if it == 4
-                    app.close()
-                    continue
-            else if m_open == 1 and m_hover_item >= 0
-                let i32 it = m_hover_item
-                m_open = -1
-                click_lock = 1
-                if it == 0
-                    gui_clip_set(app.texts[0].text())
-                else if it == 1
-                    let string cb = gui_clip_get()
-                    if cb != ""
-                        app.texts[0].insert_at_cursor(cb)
-                        app.texts[0].dirty = true
-                        doc_dirty = true
-                else if it == 2
-                    gui_clip_set(app.texts[0].text())
-                    app.texts[0].set_text("")
-                    app.texts[0].dirty = true
-                    doc_dirty = true
-                else if it == 3
-                    app.texts[0].insert_at_cursor(fmt_time(now()))
-                    app.texts[0].dirty = true
-                    doc_dirty = true
+    let string[] argv = os_args()
+    let string fname = ""
+    let i32 topn = 10
+    let bool want_chars = false
+    let OutFmt fmt = OutFmt.Plain
+    let i32 ai = 1
+    while ai < length(argv)
+        let string a = argv[ai]
+        if a == "--chars"
+            want_chars = true
+        else if a == "--md"
+            fmt = OutFmt.Markdown
+        else if startswith(a, "--")
+            output("unknown option: ", a, "\n")
+            return 2
+        else if length(fname) == 0
+            fname = a
+        else
+            let i32! pn = cast(a, i32)
+            if (pn ?? 0) > 0
+                topn = pn ?? 10
             else
-                if m_open >= 0
-                    m_open = -1
-                    click_lock = 1
+                output("bad topN: ", a, "\n")
+                return 2
+        ai++
 
-        // ---- 自绘菜单栏 ----
-        gui_fill_rect(0, 0, gui_w(), menu_h, C_PANEL)
-        gui_fill_rect(0, menu_h - 1, gui_w(), 1, C_BORDER)
-        if m_open == 0
-            gui_fill_rect(tx0, 0, tw0, menu_h, C_ACCENT)
-        else
-            if my >= 0 and my < menu_h and mx >= tx0 and mx < tx0 + tw0
-                gui_fill_rect(tx0, 0, tw0, menu_h, C_HOT)
-        gui_draw_text(tx0 + 10 * sc, (menu_h - 20 * sc) / 2, t0, C_TEXT)
-        if m_open == 1
-            gui_fill_rect(tx1, 0, tw1, menu_h, C_ACCENT)
-        else
-            if my >= 0 and my < menu_h and mx >= tx1 and mx < tx1 + tw1
-                gui_fill_rect(tx1, 0, tw1, menu_h, C_HOT)
-        gui_draw_text(tx1 + 10 * sc, (menu_h - 20 * sc) / 2, t1, C_TEXT)
+    // 读取输入
+    let string text = ""
+    if length(fname) > 0
+        let string! rf = read_file(fname)
+        let string got = rf ??
+            output("cannot read: ", fname, "\n")
+            return 1
+            ""
+        text = got
+    else
+        // stdin：逐行读到 EOF（用 ?? 值形式判失败，不用 ? 传播）
+        let bool eof = false
+        while not eof
+            let string! seg
+            input(seg, delim='\n')
+            let string line = seg ??
+                eof = true
+                ""
+            if not eof
+                text += line + "\n"
 
-        // ---- 下拉面板（硬编码每条）----
-        if m_open == 0
-            let i32 ph = nf * item_h + 4 * sc
-            gui_fill_rect(tx0, panel_y, fpanel_w, ph, C_PANEL)
-            gui_rect(tx0, panel_y, fpanel_w, ph, C_BORDER)
-            let i32 iy0 = panel_y + 2 * sc
-            if m_hover_item == 0
-                gui_fill_rect(tx0 + 1, iy0, fpanel_w - 2, item_h, C_HOT)
-            gui_draw_text(tx0 + 10 * sc, iy0 + 2 * sc, f0, C_TEXT)
-            let i32 iy1 = iy0 + item_h
-            if m_hover_item == 1
-                gui_fill_rect(tx0 + 1, iy1, fpanel_w - 2, item_h, C_HOT)
-            gui_draw_text(tx0 + 10 * sc, iy1 + 2 * sc, f1, C_TEXT)
-            let i32 iy2 = iy1 + item_h
-            if m_hover_item == 2
-                gui_fill_rect(tx0 + 1, iy2, fpanel_w - 2, item_h, C_HOT)
-            gui_draw_text(tx0 + 10 * sc, iy2 + 2 * sc, f2, C_TEXT)
-            let i32 iy3 = iy2 + item_h
-            if m_hover_item == 3
-                gui_fill_rect(tx0 + 1, iy3, fpanel_w - 2, item_h, C_HOT)
-            gui_draw_text(tx0 + 10 * sc, iy3 + 2 * sc, f3, C_TEXT)
-            let i32 iy4 = iy3 + item_h
-            if m_hover_item == 4
-                gui_fill_rect(tx0 + 1, iy4, fpanel_w - 2, item_h, C_HOT)
-            gui_draw_text(tx0 + 10 * sc, iy4 + 2 * sc, f4, C_TEXT)
-        if m_open == 1
-            let i32 ph = ne * item_h + 4 * sc
-            gui_fill_rect(tx1, panel_y, epanel_w, ph, C_PANEL)
-            gui_rect(tx1, panel_y, epanel_w, ph, C_BORDER)
-            let i32 jy0 = panel_y + 2 * sc
-            if m_hover_item == 0
-                gui_fill_rect(tx1 + 1, jy0, epanel_w - 2, item_h, C_HOT)
-            gui_draw_text(tx1 + 10 * sc, jy0 + 2 * sc, e0, C_TEXT)
-            let i32 jy1 = jy0 + item_h
-            if m_hover_item == 1
-                gui_fill_rect(tx1 + 1, jy1, epanel_w - 2, item_h, C_HOT)
-            gui_draw_text(tx1 + 10 * sc, jy1 + 2 * sc, e1, C_TEXT)
-            let i32 jy2 = jy1 + item_h
-            if m_hover_item == 2
-                gui_fill_rect(tx1 + 1, jy2, epanel_w - 2, item_h, C_HOT)
-            gui_draw_text(tx1 + 10 * sc, jy2 + 2 * sc, e2, C_TEXT)
-            let i32 jy3 = jy2 + item_h
-            if m_hover_item == 3
-                gui_fill_rect(tx1 + 1, jy3, epanel_w - 2, item_h, C_HOT)
-            gui_draw_text(tx1 + 10 * sc, jy3 + 2 * sc, e3, C_TEXT)
-        gui_present()
+    // 统计
+    let i32 bytes = length(text)
+    let string[] lines = split(text, '\n')
+    let i32 nlines = length(lines)
+    if nlines > 0 and length(lines[nlines - 1]) == 0
+        nlines--
+    let string[] words = tokenize(text)
+    let i32 nwords = length(words)
 
-        // ---- 状态栏 ----
-        let string snap = app.texts[0].text()
-        if snap != last_snap
-            last_snap = snap
-            doc_dirty = true
-            app.texts[0].dirty = true
-        let string mark = ""
-        if doc_dirty
-            mark = " *"
-        let string want = status_text(cur_name + mark, count_lines(snap), length(snap))
-        if app.labels[0].text != want
-            app.labels[0].text = want
-            app.labels[0].dirty = true
+    // 词频（小写归一）
+    let map<string, i32> freq
+    for w in words
+        let string lw = lower(w)
+        let i32 old = freq[lw] ?? 0
+        freq[lw] = old + 1
 
-        my_prev_down = down
-        gui_frame_sleep(tick_ms())
+    // 字符频率（char→string 用 cast）
+    let map<string, i32> cf
+    if want_chars
+        let i32 i = 0
+        while i < bytes
+            let char c = text[i]
+            if not is_space(c)
+                let string k = cast(c, string)
+                cf[k] = (cf[k] ?? 0) + 1
+            i++
 
-    app.close()
+    // 最长行
+    let i32 longest = 0
+    let i32 longest_ln = 0
+    let i32 li = 0
+    for ln in lines
+        let i32 L = length(ln)
+        if L > longest
+            longest = L
+            longest_ln = li + 1
+        li++
+
+    // 输出（enum 用 match 分派，不能用 ==）
+    let string header = match fmt
+        OutFmt.Plain =>
+            "== report: " + fname + " ==\n"
+        OutFmt.Markdown =>
+            "# report: `" + fname + "`\n\n"
+    output(header)
+
+    output("lines: ", nlines, "\n")
+    output("words: ", nwords, "\n")
+    output("bytes: ", bytes, "\n")
+    output("longest line: ", longest_ln, " (", longest, " bytes)\n")
+    output("unique words: ", map_len(freq), "\n\n")
+
+    output("top ", topn, " words:\n")
+    let WordCount[] tw = top_words(freq, topn)
+    for wc in tw
+        output("  ", prec(wc.w, 16), " ", wc.n, "\n")
+
+    if want_chars
+        output("\ntop ", topn, " chars (non-space):\n")
+        let string[] tc = top_chars(cf, topn)
+        for s in tc
+            output("  ", s, "\n")
+
+    // §26 断言自检
+    assert_eq(gsum2(2, 3), 5)
+
+    // 分类演示（前 3 个词）
+    for i in words, idx
+        if idx < 3
+            let Kind k = classify(length(i))
+            output("word[", idx, "] kind=", describe(k), "\n")
+
     return 0

@@ -569,6 +569,8 @@ let resolve (main : program) (main_dir : string)
       | EPanic (c, msg, p) -> EPanic (Option.map (rw_expr m) c, rw_expr m msg, p)
       | EUnwrap (a, b, p) -> EUnwrap (rw_expr m a, rw_expr m b, p)
       | EPropagate (x, p) -> EPropagate (rw_expr m x, p)
+      | ECopyOf (x, p) -> ECopyOf (rw_expr m x, p)
+      | EMoveOf (x, p) -> EMoveOf (rw_expr m x, p)
       | ERemove (b, i, p) -> ERemove (rw_expr m b, rw_expr m i, p)
       | ELambda (lam, p) ->
         ELambda ({ lam with

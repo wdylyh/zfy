@@ -58,7 +58,7 @@ fn main()
     output(pl.name, t)
 
     // 整体赋值深拷贝：改副本不影响原件
-    let Player cp = pl
+    let Player cp = copy(pl)
     cp.hp = 1
     cp.pos.x = 99.0
     output(pl.hp, cp.hp, pl.pos.x, cp.pos.x)

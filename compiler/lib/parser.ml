@@ -521,6 +521,15 @@ and parse_unary p =
     ECall (EVar ("abs", tp), [ CPos e ], tp)
   | (Amp, tp) -> ignore (next p); EAddrOf (parse_unary p, tp)
   | (Tilde, tp) -> ignore (next p); EUn (BitNot, parse_unary p, tp)
+  | (Keyword KCopy, tp) ->
+    (* copy x：显式深拷贝标记（struct 赋值必须，new.md #1）。
+       操作数取 postfix 层：copy x + y == (copy x) + y *)
+    ignore (next p);
+    ECopyOf (parse_postfix p, tp)
+  | (Keyword KMove, tp) ->
+    (* move x：显式所有权转移标记（源变量此后不可用） *)
+    ignore (next p);
+    EMoveOf (parse_postfix p, tp)
   | _ -> parse_postfix p
 
 and parse_postfix p =
@@ -1182,6 +1191,7 @@ and parse_ui_stmt p tp =
   let props = ref [] in       (* 标签方法调用，逆序 *)
   let texpr = ref None in     (* text 标签表达式（on_input 初值对齐） *)
   let vexpr = ref None in     (* value 标签表达式（on_value 初值对齐） *)
+  let dynv = ref [] in        (* (visible/enable, expr)：运行期动态标签，逆序 *)
   let evs = ref [] in         (* (事件名, 块, pos)，逆序 *)
   let tag_call m args =
     (* 方法调用在 AST 中为点路径 EVar "obj.method"（typeck try_method 分派） *)
@@ -1215,12 +1225,14 @@ and parse_ui_stmt p tp =
             let b = parse_expr p in
             end_of_stmt p;
             props := tag_call tname [ a; b ] :: !props
-          | "text" | "color" | "text_color" | "radius" | "value" | "rows" | "checked" ->
+          | "text" | "color" | "text_color" | "radius" | "value" | "rows" | "checked"
+          | "visible" | "enable" ->
             let e = parse_expr p in
             end_of_stmt p;
             (match tname with
              | "text" -> texpr := Some e
              | "value" -> vexpr := Some e
+             | "visible" | "enable" -> dynv := (tname, e) :: !dynv
              | _ -> ());
             props := tag_call tname [ e ] :: !props
           | "items" ->
@@ -1292,6 +1304,13 @@ and parse_ui_stmt p tp =
                         app_call "find_ui" [ EStr (name, tp) ], tp);
                SIf (EBin (Eq, EVar (vk, tp), EInt (-1L, tp), tp),
                     register_stmts, None, tp) ]
+           (* visible/enable 动态标签：注册后每帧写穿（k=-1 未注册时跳过） *)
+           @ List.map
+               (fun (tn, e) ->
+                 SIf (EBin (Ne, EVar (vk, tp), EInt (-1L, tp), tp),
+                      [ SExpr (app_call ("set_" ^ tn) [ EVar (vk, tp); e ]) ],
+                      None, tp))
+               (List.rev !dynv)
            @ edge_stmts,
           tp)
 

@@ -581,6 +581,8 @@ let rec subst_expr map (e : expr) : expr =
   | EUnwrap (a, b, p) -> EUnwrap (subst_expr map a, subst_expr map b, p)
   | EPropagate (a, p) -> EPropagate (subst_expr map a, p)
   | ERemove (a, b, p) -> ERemove (subst_expr map a, subst_expr map b, p)
+  | ECopyOf (a, p) -> ECopyOf (subst_expr map a, p)
+  | EMoveOf (a, p) -> EMoveOf (subst_expr map a, p)
   | ELambda (l, p) ->
     let lparams =
       List.map
@@ -937,6 +939,7 @@ let pos_of_expr = function
   | EStructNew (_, _, p) | EField (_, _, p)
   | EAddrOf (_, p) | EDeref (_, p) | ENull p
   | EFail (_, _, p) | EPanic (_, _, p) | EUnwrap (_, _, p) | EPropagate (_, p)
+  | ECopyOf (_, p) | EMoveOf (_, p)
   | ERemove (_, _, p)
   | ELambda (_, p)
   | EBlock (_, p) -> p
@@ -951,6 +954,22 @@ let split_field_path (name : string) : (string * string list) option =
     if List.exists (fun s -> s = "") rest then None
     else Some (String.sub name 0 i, rest)
   | _ -> None
+
+(* 裸 struct 引用：RHS 是对既有值的别名式读取（变量/字段/元素链）——
+   赋值给它 = 隐式深拷贝，new.md #1 起必须写 copy(...) 或 move ...；
+   构造调用/函数调用/标记包装等产新值形式不在此列 *)
+let rec bare_struct_ref env (e : expr) : bool =
+  match e with
+  | EVar (n, _) when String.contains n '.' ->
+    (* 点路径（parser 合并 a.b.c）：首段是变量 → 字段链读取（裸引用）；
+       首段是类型名（枚举变体 Color.Green 等）→ 产新值，非裸引用 *)
+    (match split_field_path n with
+     | Some (first, _) -> lookup_var env first <> None
+     | None -> true)
+  | EVar _ | EIndex _ -> true
+  | EField (EVar (n, _), _, _) -> lookup_var env n <> None
+  | EField (b, _, _) -> bare_struct_ref env b
+  | _ -> false
 
 (* genv.structs -> sdef 列表（布局计算/sizeof 用） *)
 let structs_list (g : genv) : Hir.sdef list =
@@ -1938,6 +1957,14 @@ and check_expr env (e : expr) : texpr =
   | EStr (s, _) -> mk (EStrK s) TString
   | EChar (c, _) -> mk (ECharK c) TChar
   | EBool (b, _) -> mk (EBoolK b) TBool
+  | ECopyOf (a, _) ->
+    (* copy x（new.md #1）：显式深拷贝标记——与默认值语义一致，
+       仅作为 struct 赋值门禁的放行凭证；texpr 层无痕 *)
+    check_expr env a
+  | EMoveOf (a, _) ->
+    (* move x（new.md #1）：显式所有权转移——struct 现实现为
+       深拷贝 + 源变量标记 moved（此后使用报错）；无悬垂无双释放 *)
+    check_move_arg env a
   | EVar (name, p') ->
     let direct =
       match env.capctx with
@@ -1985,6 +2012,8 @@ and check_expr env (e : expr) : texpr =
         | Some (first, segs) ->
           (match lookup_var env first with
            | Some l ->
+             if Hashtbl.mem env.moved l.lslot then
+               terr p' "variable %s has been moved and cannot be used (reassign to revive it)" first;
              let root = { e = EVarK l.lslot; ety = l.lty; epos = p' } in
              field_chain env p' root segs
            | None ->
@@ -3142,7 +3171,7 @@ and check_move_arg env (e : expr) : texpr =
        if Hashtbl.mem env.moved l.lslot then
          terr p "variable %s has already been moved" name;
        (match resolve l.lty with
-        | TString | TArray _ | TList _ | TFile ->
+        | TString | TArray _ | TList _ | TFile | TStruct _ ->
           (* 先按普通读检查实参（此时尚未标记 moved），再标记已 move *)
           let te = check_expr env e in
           Hashtbl.replace env.moved l.lslot ();
@@ -3197,6 +3226,7 @@ and uses_of_expr (acc : (string * pos) list) (e : expr) : (string * pos) list =
     uses_of_expr acc b
   | EUnwrap (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | EPropagate (a, _) -> uses_of_expr acc a
+  | ECopyOf (a, _) | EMoveOf (a, _) -> uses_of_expr acc a
   | ERemove (b, i, _) -> uses_of_expr (uses_of_expr acc b) i
   | ELambda (lam, _) ->
     (* lambda 体独立成函数（不走本函数 move 分析），捕获登记在
@@ -3418,6 +3448,8 @@ and deref_refs (refs : string list) (body : block) : block =
     | EUnwrap (a, b, p) ->
       EUnwrap (re a, (match b with EBlock (blk, bp) -> EBlock (List.map rs blk, bp) | b2 -> b2), p)
     | EPropagate (a, p) -> EPropagate (re a, p)
+    | ECopyOf (a, p) -> ECopyOf (re a, p)
+    | EMoveOf (a, p) -> EMoveOf (re a, p)
     | ERemove (b, i, p) -> ERemove (re b, re i, p)
     (* 不会出现在普通 fn 参数体中，保守原样透传 *)
     | EBigInt _ -> e
@@ -4309,6 +4341,9 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
        | TStruct s -> check_struct_new env p s []
        | _ -> zero_of env p want)
     | Some init ->
+    if (match resolve want with TStruct _ -> true | _ -> false)
+       && bare_struct_ref env init then
+      terr p "struct initialization requires explicit copy(...) or move ... (no implicit deep copy)";
     (match resolve want, init with
      | TBool, EBool (b, _) ->
       { e = EBoolK b; ety = TBool; epos = p }
@@ -5029,6 +5064,9 @@ and check_stmt env (st : stmt) : tstmt =
                            { e = EVarK src_slot; ety = lty; epos = p2 }, false, true))
            | _ ->
              let lty = l.lty in
+             if (match resolve lty with TStruct _ -> true | _ -> false)
+                && bare_struct_ref env rhs' then
+               terr p' "struct assignment requires explicit copy(...) or move ... (no implicit deep copy)";
              let trhs =
                (match resolve lty with
                 | TFrac e when is_frac_arith rhs' ->
@@ -5092,6 +5130,9 @@ and check_stmt env (st : stmt) : tstmt =
                    if l.lconst then
                      terr p' "cannot assign to field of constant %s (const is deeply immutable)" first;
                    let (idxs, fty) = chain_fields env p' l.lty segs in
+                   if (match resolve fty with TStruct _ -> true | _ -> false)
+                      && bare_struct_ref env rhs' then
+                     terr p' "struct field assignment requires explicit copy(...) or move ... (no implicit deep copy)";
                    let trhs = check_expr env rhs' in
                    let trhs = coerce p' trhs fty in
                    mk (SFieldSetK ({ e = EVarK l.lslot; ety = l.lty; epos = p' },
@@ -6147,14 +6188,32 @@ let check_program (prog : program) : hir =
                 if refnames = [] then body else deref_refs refnames body in
               (* main 特例（new.md）：返回类型隐含 i32，裸 return 等价 return 0，
                  落到函数末尾由 MIR 隐式 TRet None → ret i32 0 *)
+              (* main 特例（new.md）：返回类型隐含 i32，裸 return 等价 return 0，
+                 落到函数末尾由 MIR 隐式 TRet None → ret i32 0。
+                 递归改写：if/while/for/match/块内嵌的裸 return 同样覆盖 *)
+              let rec fix_main_ret (sl : stmt list) : stmt list =
+                List.map
+                  (fun (st : stmt) ->
+                    match st with
+                    | SReturn (None, p) -> SReturn (Some (EInt (0L, p)), p)
+                    | SIf (c, a, b, p) -> SIf (c, fix_main_ret a,
+                                               Option.map fix_main_ret b, p)
+                    | SWhile (c, b, p) -> SWhile (c, fix_main_ret b, p)
+                    | SFor (is, c, ups, b, p) ->
+                      SFor (is, c, ups, fix_main_ret b, p)
+                    | SForIn (v, it, idx, b, p) ->
+                      SForIn (v, it, idx, fix_main_ret b, p)
+                    | SBlock (b, p) -> SBlock (fix_main_ret b, p)
+                    | SUnsafe (b, p) -> SUnsafe (fix_main_ret b, p)
+                    | SMatch (scr, arms, p) ->
+                      SMatch (scr,
+                              List.map (fun (a : marm) ->
+                                { a with mbody = fix_main_ret a.mbody }) arms, p)
+                    | st -> st)
+                  sl
+              in
               let body' =
-                if name = "main" then
-                  List.map
-                    (function
-                      | SReturn (None, p) -> SReturn (Some (EInt (0L, p)), p)
-                      | st -> st)
-                    body1
-                else body1 in
+                if name = "main" then fix_main_ret body1 else body1 in
               (* 自动 move 判定数据：函数体内全部变量出现位置（new2.md #1） *)
               env.uses <- List.rev (List.fold_left uses_of_stmt [] body');
               let tbody = check_block env body' in

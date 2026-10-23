@@ -153,7 +153,8 @@ fn main() 缩进块                                             # 入口特例
 ```
 
 - **main 特例**：必须写 `fn main()`（括号必须有）；不给返回类型（隐含 i32）、
-  不给参数；`return` 可省（隐式返回 0），裸 `return` ≡ `return 0`；
+  不给参数；`return` 可省（隐式返回 0），裸 `return` ≡ `return 0`
+  （任意嵌套深度的 if/循环/块内同样生效）；
   `return n` 的 n 成为进程退出码（0-255）。
 - 非 main 函数**返回类型必写**（void 或类型）。返回类型不支持 const/unred。
 - **参数一律 let 形式**：
@@ -532,8 +533,12 @@ fn main()
 - 下标/切片越界（含负下标）→ panic（exit 101），无 Python 式负索引。
 - i64 及以下整数溢出**静默回绕**；`/` `%` 向零截断（`-7 / 2 = -3`）。
 - 整数除零 = 硬件异常；frac 除零走 panic。
-- 所有权：返回数组/列表/string = 指针移交（RVO）；聚合赋值/传参默认深拷贝，
-  `move`/自动 move（源变量此后不再出现时）免拷贝。
+- 所有权：返回数组/列表/string = 指针移交（RVO）。
+  **struct 赋值/初始化取消隐式深拷贝**（new.md）：RHS 为既有值的变量/
+  字段/元素链时必须写 `copy(x)`（显式深拷贝）或 `move x`（所有权转移，
+  源变量此后使用报 E3013，重新赋值解除）；构造调用 `P(...)`、函数返回值、
+  枚举变体等产新值形式不需标记。数组/列表/string 聚合赋值/传参默认
+  深拷贝，`move`/自动 move（源变量此后不再出现时）免拷贝。
   **自动 move 循环限制**：循环体内（while/for 任意嵌套深度）的
   实参/赋值一律不自动 move、走克隆——源码位置判不出"下一轮迭代还会用"
   （`while` 里 `f(r)` 反复传同一列表是安全且常见的，误 move 会致
@@ -701,11 +706,15 @@ fn main()
 **属性标签（加入前，元素方法）**：`pos(x,y)` `size(w,h)` `text(s)`
 `color(rgb)`（面色/填充，0=主题默认）`text_color(rgb)` `radius(r)`
 （button 圆角）`value(v)`（slider/progress 初值 0..100）`rows(n)`
-（list 可见行数）`checked(b)`（check 初值）`add_item(s)`（list/menu 条目）。
+（list 可见行数）`checked(b)`（check 初值）`add_item(s)`（list/menu 条目）
+`visible(b)`（可见性，默认 true——flush 跳过绘制；带标签的元素每帧重申，
+运行期 `app.set_visible` 改不带标签的元素）`enable(b)`（可用性，默认
+true——事件忽略；同上每帧重申语义）。
 
 **属性标签（加入后，按元素下标）**：`app.set_text(k, s)` `set_pos(k, x, y)`
 `set_size(k, w, h)` `set_color(k, c)` `set_text_color(k, c)`
-`set_value(k, v)` `set_checked(k, b)` `app.add_item(k, s)`。
+`set_value(k, v)` `set_checked(k, b)` `set_visible(k, b)` `set_enable(k, b)`
+`app.add_item(k, s)`。
 
 **输出标签（`app.uis[k]` 只读，`app.step()` 后刷新）**：
 

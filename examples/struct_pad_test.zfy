@@ -45,7 +45,7 @@ fn main()
 
     // ② 位置构造（缺省字段走默认值）+ 整体赋值深拷贝
     let Rec b = Rec(1, "one")
-    let Rec c = b
+    let Rec c = copy(b)
     c.id = 2
     c.name = "two"
     c.v = 9
@@ -95,7 +95,7 @@ fn main()
     output(o.head, o.body.key, o.body.msg, o.tail)
 
     // ⑧ 外层整体赋值：嵌套 struct 深拷贝互不影响
-    let Outer o2 = o
+    let Outer o2 = copy(o)
     o2.body.key = 33
     output(o.body.key, o2.body.key)
     return 0

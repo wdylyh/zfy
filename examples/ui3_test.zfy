@@ -1,0 +1,75 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    if app.open(400, 320, "ve") != 0
+        return
+    app.t0 = tick_ms()
+    let i32 fails = 0
+    let i32 f = 0
+    while f < 20 and app.alive()
+        app.step()
+        ui button disabled_btn
+            x 20, y 60, w 140, h 34
+            text "禁用"
+            enable false
+            on_click ->
+                output("FAIL disabled fired\n")
+                fails++
+        ui label hidden_lbl
+            x 20, y 110
+            text "隐藏"
+            visible false
+        ui label greet
+            x 20, y 180
+            text "你好"
+        ui button hide_btn
+            x 20, y 140, w 140, h 34
+            text "隐藏greet"
+            on_click ->
+                app.set_visible(app.find_ui("greet"), false)
+        if f == 2
+            if app.uis[app.find_ui("disabled_btn")].enable
+                output("FAIL enable tag\n")
+                fails++
+            if app.uis[app.find_ui("hidden_lbl")].visible
+                output("FAIL visible tag\n")
+                fails++
+            // 禁用按钮：按下
+            app.mx = 60
+            app.my = 77
+            app.ldown = true
+            app.on_click()
+        if f == 3
+            // 释放禁用按钮（不应计数）
+            app.ldown = false
+            app.on_click()
+            if app.uis[app.find_ui("disabled_btn")].clicks != 0
+                output("FAIL disabled clicks\n")
+                fails++
+            if app.labels[0].visible
+                output("FAIL widget visible\n")
+                fails++
+            // 同帧按下 hide_btn
+            app.mx = 60
+            app.my = 157
+            app.ldown = true
+            app.on_click()
+        if f == 4
+            // 释放 hide_btn → on_click → set_visible(greet,false)
+            app.ldown = false
+            app.on_click()
+        if f == 6
+            if app.uis[app.find_ui("hide_btn")].clicks != 1
+                output("FAIL hide_btn click\n")
+                fails++
+            if app.uis[app.find_ui("greet")].visible
+                output("FAIL set_visible via on_click\n")
+                fails++
+        f++
+        gui_frame_sleep(app.t0)
+    if fails == 0
+        output("ve: all PASS\n")
+    app.close()
