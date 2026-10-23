@@ -430,7 +430,11 @@ let rec tag_of_zty (z : zty) : string =
   | TFrac e -> "frac" ^ tag_of_zty e
   | TArray (t, n) -> "a" ^ string_of_int n ^ "$" ^ tag_of_zty t
   | TList t -> "l$" ^ tag_of_zty t
-  | TErr _ | TFunSig _ | TVar _ | TError ->
+  | TErr e ->
+    (* T! 可作泛型实参（new.md 第1条）：tag 前缀 err$ 保证与源码标识符
+       及其他形态标签无碰撞（Box$i32err$i64 等） *)
+    "err$" ^ tag_of_zty e
+  | TFunSig _ | TVar _ | TError ->
     assert false   (* 类型实参校验拦截；TError 不做泛型实参 *)
 
 (* ---------- 内建容器 map<K,V> / set<T>（v3.6） ----------
@@ -552,6 +556,130 @@ let rec subst_ty_ast (map : (string * zty) list) (t : ty) : ty =
   | TFun (r, ts, sp) -> TFun (subst_ty_ast map r, List.map (subst_ty_ast map) ts, sp)
   | TApp (n, ts, sp) -> TApp (n, List.map (subst_ty_ast map) ts, sp)
 
+(* 体级类型替换（new.md 第1条：泛型函数/方法体内 let T 局部变量）：
+   实例化时把体内全部类型标注（声明/cast/struct 构造实参/lambda 参数等）
+   按类型实参映射替换，随后按普通函数检查 *)
+let rec subst_expr map (e : expr) : expr =
+  match e with
+  | EInt _ | EBigInt _ | EFloat _ | EStr _ | EChar _ | EBool _ | EVar _ | ENull _ -> e
+  | EBin (o, a, b, p) -> EBin (o, subst_expr map a, subst_expr map b, p)
+  | EUn (o, a, p) -> EUn (o, subst_expr map a, p)
+  | ECall (f, args, p) ->
+    ECall (subst_expr map f, List.map (subst_carg map) args, p)
+  | EIndex (a, i, p) -> EIndex (subst_expr map a, subst_expr map i, p)
+  | ESlice (a, x, y, st, p) ->
+    ESlice (subst_expr map a, subst_expr map x, subst_expr map y,
+            Option.map (subst_expr map) st, p)
+  | ECast (a, t, p) -> ECast (subst_expr map a, subst_ty_ast map t, p)
+  | EStructNew (n, args, p) -> EStructNew (n, List.map (subst_carg map) args, p)
+  | EField (a, f, p) -> EField (subst_expr map a, f, p)
+  | EBlock (b, p) -> EBlock (subst_block map b, p)
+  | EAddrOf (a, p) -> EAddrOf (subst_expr map a, p)
+  | EDeref (a, p) -> EDeref (subst_expr map a, p)
+  | EFail (a, b, p) -> EFail (subst_expr map a, subst_expr map b, p)
+  | EPanic (a, b, p) -> EPanic (Option.map (subst_expr map) a, subst_expr map b, p)
+  | EUnwrap (a, b, p) -> EUnwrap (subst_expr map a, subst_expr map b, p)
+  | EPropagate (a, p) -> EPropagate (subst_expr map a, p)
+  | ERemove (a, b, p) -> ERemove (subst_expr map a, subst_expr map b, p)
+  | ELambda (l, p) ->
+    let lparams =
+      List.map
+        (fun (lp : lparam) -> { lp with lpty = Option.map (subst_ty_ast map) lp.lpty })
+        l.lparams
+    in
+    let lbody =
+      match l.lbody with
+      | LExpr e -> LExpr (subst_expr map e)
+      | LBlock (b, t) -> LBlock (subst_block map b, Option.map (subst_ty_ast map) t)
+    in
+    ELambda ({ l with lparams; lbody }, p)
+
+and subst_carg map (c : call_arg) : call_arg =
+  match c with
+  | CPos e -> CPos (subst_expr map e)
+  | CNamed (n, e) -> CNamed (n, subst_expr map e)
+  | CMove e -> CMove (subst_expr map e)
+  | CCopy e -> CCopy (subst_expr map e)
+  | CRef e -> CRef (subst_expr map e)
+
+and subst_block map (b : block) : block = List.map (subst_stmt map) b
+
+and subst_stmt map (s : stmt) : stmt =
+  match s with
+  | SDecl (c, f, u, n, t, init, p) ->
+    SDecl (c, f, u, n, Option.map (subst_ty_ast map) t,
+           Option.map (subst_expr map) init, p)
+  | SSeqDecl (c, f, u, n, t, len, isl, inits, p) ->
+    SSeqDecl (c, f, u, n, subst_ty_ast map t, Option.map (subst_expr map) len,
+              isl, List.map (subst_expr map) inits, p)
+  | SDeclList ss -> SDeclList (List.map (subst_stmt map) ss)
+  | SAssign (a, b, p) -> SAssign (subst_expr map a, subst_expr map b, p)
+  | SAssignList (a, bs, p) ->
+    SAssignList (subst_expr map a, List.map (subst_expr map) bs, p)
+  | SAug (o, a, b, p) -> SAug (o, subst_expr map a, subst_expr map b, p)
+  | SInc (a, p) -> SInc (subst_expr map a, p)
+  | SDec (a, p) -> SDec (subst_expr map a, p)
+  | SExpr e -> SExpr (subst_expr map e)
+  | SReturn (e, p) -> SReturn (Option.map (subst_expr map) e, p)
+  | SIf (c, a, b, p) ->
+    SIf (subst_expr map c, subst_block map a,
+         Option.map (subst_block map) b, p)
+  | SWhile (c, b, p) -> SWhile (subst_expr map c, subst_block map b, p)
+  | SFor (inits, c, ups, b, p) ->
+    SFor (List.map (subst_finit map) inits, subst_expr map c,
+          List.map (subst_fupd map) ups, subst_block map b, p)
+  | SForIn (x, i, e, b, p) ->
+    SForIn (x, i, subst_expr map e, subst_block map b, p)
+  | SOutput (args, sep, end_, p) ->
+    SOutput (List.map (subst_expr map) args, Option.map (subst_expr map) sep,
+             Option.map (subst_expr map) end_, p)
+  | SInput (ts, d, p) ->
+    SInput
+      (List.map
+         (function
+           | InNew (n, t, pp) -> InNew (n, subst_ty_ast map t, pp)
+           | InUse _ as it -> it)
+         ts,
+       Option.map (subst_expr map) d, p)
+  | SReduce (a, b, c, p) ->
+    SReduce (subst_expr map a, subst_expr map b, subst_expr map c, p)
+  | SBreak _ | SContinue _ as s -> s
+  | SUnsafe (b, p) -> SUnsafe (subst_block map b, p)
+  | SFn (n, lps, ret, fr, b, p) ->
+    SFn (n,
+         List.map
+           (fun (lp : lparam) -> { lp with lpty = Option.map (subst_ty_ast map) lp.lpty })
+           lps,
+         Option.map (subst_ty_ast map) ret, fr, subst_block map b, p)
+  | SMatch (scr, arms, p) ->
+    SMatch (subst_expr map scr,
+            List.map
+              (fun (arm : marm) ->
+                { arm with
+                  mpat = (match arm.mpat with
+                          | PLit e -> PLit (subst_expr map e)
+                          | m -> m);
+                  mbody = subst_block map arm.mbody })
+            arms, p)
+  | SBlock (b, p) -> SBlock (subst_block map b, p)
+
+and subst_finit map (f : for_init) : for_init =
+  match f with
+  | FIDecl (c, fr, u, n, t, init, p) ->
+    FIDecl (c, fr, u, n, Option.map (subst_ty_ast map) t,
+            Option.map (subst_expr map) init, p)
+  | FIExpr (e, p) -> FIExpr (subst_expr map e, p)
+
+and subst_fupd map (f : for_update) : for_update =
+  match f with
+  | FUAssign (a, b, p) -> FUAssign (subst_expr map a, subst_expr map b, p)
+  | FUOp (o, a, b, p) -> FUOp (o, subst_expr map a, subst_expr map b, p)
+  | FUInc (a, p) -> FUInc (subst_expr map a, p)
+  | FUDec (a, p) -> FUDec (subst_expr map a, p)
+
+(* 泛型体替换入口别名（hook_impl / dry check / method hook 共用） *)
+let subst_body (map : (string * zty) list) (b : block) : block = subst_block map b
+
 let rec conv_ty (g : genv) p (t : ty) : zty =
   match t with
   | TNamed ("frac", pp) ->
@@ -672,7 +800,7 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
            (fun ta ->
              let z = resolve (conv_ty g pp ta) in
              (match z with
-              | TErr _ -> terr pp "T! cannot be a type argument"
+              | TErr _ -> ()   (* T! 可作泛型实参（new.md 第1条；字段聚合语义复用 T! 槽） *)
               | TFrac _ -> terr pp "frac cannot be a type argument"
               | TFile -> terr pp "File cannot be a type argument (move-only handle)"
               | TVar _ -> terr pp "a generic type argument must be a concrete type"
@@ -740,8 +868,6 @@ and instantiate_struct_zty (g : genv) (gname : string)
           (match resolve ft with
            | TStruct s2 when s2 = mangle ->
              terr sf.fpos "struct %s field type cannot be itself (infinite size)" mangle
-           | TErr _ ->
-             terr sf.fpos "T! cannot be a struct field (error values are aggregates and cannot be loaded as a field)"
            | TFile ->
              terr sf.fpos "File cannot be a struct field (move-only handle)"
            | _ -> ());
@@ -2246,6 +2372,9 @@ and check_expr env (e : expr) : texpr =
        check_iface_ctor env p' name args
      | EVar (name, np) ->
        (match name with
+        | "sort" ->
+          (* sort(内容..., max|min)（new.md 第3条）：排序表达式 *)
+          check_sort env p' args
         | "length" | "find" | "trim" | "split" | "replace" | "prec"
         | "utf8_len" | "utf8_char_at" | "utf8_sub"
         | "startswith" | "endswith" | "substr" | "to_str" | "format"
@@ -3791,6 +3920,89 @@ and coerce p (te : texpr) (want : zty) : texpr =
       terr p "type mismatch: expected %s, got %s (numeric conversion requires an explicit cast)"
         (pp_zty b) (pp_zty a)
 
+(* sort 内建（new.md 第3条）：sort(内容..., max|min) 表达式。
+   min 从小到大、max 从大到小；内容可为数组、列表或多个标量（逗号隔开，
+   可混合宽度与类型：string/char 按 ascii 码、bool 等价 0/1）。
+   单标量内容编译报错；const 定长数组元素 ≤1 编译报错；
+   其余单元素情形（非 const 容器/列表）运行期 die *)
+and check_sort env p (args : call_arg list) : texpr =
+  let mk k ty = { e = k; ety = ty; epos = p } in
+  let (order, rest) =
+    match List.rev args with
+    | CPos (EVar ((("max" | "min") as o), _)) :: r -> (o, List.rev r)
+    | _ ->
+      terr p "sort expects order max or min as its last argument (e.g. sort(xs, min))"
+  in
+  let desc = order = "max" in
+  let cargs =
+    List.map
+      (function
+        | CPos e | CMove e -> e
+        | _ -> terr p "sort content arguments must be positional values")
+      rest
+  in
+  if cargs = [] then
+    terr p "sort expects at least one content argument before the order";
+  let checked = List.map (check_expr env) cargs in
+  (* const 定长数组元素数 ≤1：编译期报错（new.md 第3条） *)
+  List.iter
+    (fun ((t : texpr), (a : expr)) ->
+      match a, resolve t.ety with
+      | EVar (n, _), TArray (_, len) ->
+        (match lookup_var env n with
+         | Some l when l.lconst && len < 2 ->
+           terr p "const array %s has %d element(s); sort needs at least 2" n len
+         | _ -> ())
+      | _ -> ())
+    (List.combine checked cargs);
+  match checked with
+  | [ single ] ->
+    (match resolve single.ety with
+     | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString | TVar _ ->
+       terr p "sort: a single scalar value cannot be sorted (give at least 2 values, or an array/list)"
+     | TList e | TArray (e, _) ->
+       (match resolve e with
+        | (TInt _ | TUint _ | TFloat _ | TString) as et ->
+          (* 数组实参展开为序列字面量（逐元素拷贝），统一走列表排序；
+             结果恒为新列表，源序列不变（值语义） *)
+          let src =
+            match resolve single.ety with
+            | TList _ -> single
+            | TArray (_, n) ->
+              let elems =
+                List.init n (fun i ->
+                  let iv = mk (EIntK (Int64.of_int i)) (TInt 64) in
+                  mk (ESeqGetK (single, iv)) et)
+              in
+              mk (ESeqLitK (et, elems)) (TList et)
+            | _ -> assert false
+          in
+          mk (ESortSeqK (src, et, desc)) (TList et)
+        | TBool | TChar ->
+          (* bool/char 容器：bool 按 0/1、char 按 ascii 码比，结果 list<i64> *)
+          mk (ESortMixK ([ single ], TInt 64, desc)) (TList (TInt 64))
+        | t -> terr p "sort does not support element type %s" (pp_zty t))
+     | t -> terr p "sort does not support argument type %s" (pp_zty t))
+  | multi ->
+    (* 多实参混合展平：任一浮点参与 → list<f64>，否则 list<i64>。
+       浮点字面量在检查期 ety=TVar 未定型，须按字面量子树形态判定 *)
+    let has_float =
+      List.exists
+        (fun (t : texpr) ->
+          match resolve t.ety with
+          | TFloat _ -> true
+          | TVar _ -> floaty_texpr t
+          | TList e | TArray (e, _) ->
+            (match resolve e with
+             | TFloat _ -> true
+             | TVar _ -> floaty_texpr t
+             | _ -> false)
+          | _ -> false)
+        multi
+    in
+    let elem = if has_float then TFloat 64 else TInt 64 in
+    mk (ESortMixK (multi, elem, desc)) (TList elem)
+
 (* 函数式内建：length / find / trim / split / replace。
    char/string 参数传变量直接用；其他类型强制转 string *)
 and check_builtin env p name (args : call_arg list) =
@@ -4248,9 +4460,13 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
                | TString -> trhs
                | t -> terr ip "string element concatenation requires string or char, got %s" (pp_zty t))
             end
-            else if (match resolve e with TErr _ -> true | _ -> false) then
-              terr ip "T! elements do not support augmented assignment (unwrap with ?? then reassign)"
-            else coerce ip trhs e in
+            else
+              (match resolve e with
+               | TErr e2 ->
+                 (* T! 元素复合赋值（new.md 第1条）：错误元素保持错误，
+                    成功元素取值参与运算再包装写回（降码在 mir SAugIndexK） *)
+                 coerce ip trhs e2
+               | _ -> coerce ip trhs e) in
           SAugIndexK ({ e = EVarK l.lslot; ety = l.lty; epos = ap },
                       e, ti, bop, trhs, grow)
         | TPtr t ->
@@ -4286,9 +4502,12 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
          | TString -> trhs
          | t -> terr ip "string element concatenation requires string or char, got %s" (pp_zty t))
       end
-      else if (match resolve e with TErr _ -> true | _ -> false) then
-        terr ip "T! elements do not support augmented assignment (unwrap with ?? then reassign)"
-      else coerce ip trhs e in
+      else
+        (match resolve e with
+         | TErr e2 ->
+           (* T! 元素复合赋值（new.md 第1条）：同变量元素路径，mir 降码 *)
+           coerce ip trhs e2
+         | _ -> coerce ip trhs e) in
     SAugIndexK (root, e, ti, bop, trhs, grow)
   | ESlice (EVar (arr, ap), a, b, step, sp) ->
      (* a[x,y:st] op= v：原地作用于原数组的区间元素（string/frac/f16/f128 不支持） *)
@@ -4349,7 +4568,11 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           in
           let needs_norm =
             (match resolve lty with TFrac _ -> not l.lunred | _ -> false) in
-          let trhs = coerce p' trhs lty in
+          let trhs =
+            (match resolve lty with
+             | TErr e2 -> coerce p' trhs e2
+             | _ -> coerce p' trhs lty)
+          in
           SAugVarK (slot, lty, bop, trhs, needs_norm))
      | None ->
        (* 整体 lookup 失败且名字含 '.'：struct 字段链复合赋值
@@ -5258,6 +5481,14 @@ and check_stmt env (st : stmt) : tstmt =
       (fun (ta : texpr) ->
         match resolve ta.ety with
         | TError -> ()   (* poison：不检查不转 string（n4） *)
+        | TErr e ->
+          (* T! 可整体 output（new.md 第1条）：成功打印元素值，
+             失败打印 err#<code>；元素限可打印标量/string *)
+          (match resolve e with
+           | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString -> ()
+           | _ ->
+             terr p "output does not support this error-value element type: %s"
+               (pp_zty (resolve e)))
         | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString | TFrac _ | TVar _ -> ()
         | TArray (_, _) | TList _ ->
           (* 数组/列表整体打印（w-013；w-015 #6 支持嵌套）：叶元素须为
@@ -5447,6 +5678,7 @@ let rec subst_ty (t : zty) : zty =
 
 (* 函数式内建名（用户自定义函数不得与之冲突） *)
 let builtin_names = [ "length"; "find"; "trim"; "split"; "replace"; "prec";
+                      "sort";
                       "open"; "read_all"; "read_line"; "write"; "writeln";
                       "close"; "exists"; "read_file"; "write_file"; "read_lines";
                       (* 时间内建（v3.3.6）+ 内建 datetime struct 名 *)
@@ -5563,8 +5795,6 @@ let check_program (prog : program) : hir =
               (match resolve ft with
                | TStruct s2 when s2 = name ->
                  terr sf.fpos "struct %s field type cannot be itself (infinite size)" name
-               | TErr _ ->
-                 terr sf.fpos "T! cannot be a struct field (error values are aggregates and cannot be loaded as a field)"
                | TFile ->
                  terr sf.fpos "File cannot be a struct field (move-only handle)"
                | _ -> ());
@@ -6052,7 +6282,7 @@ let check_program (prog : program) : hir =
         Hashtbl.replace g.fns mangle
           { params = ptys; prefs = List.map (fun _ -> false) ptys; ret = rty;
             runred = false };
-        (match check_one_fn mangle iparams gf.gbody gf.gpos with
+        (match check_one_fn mangle iparams (subst_body mapl gf.gbody) gf.gpos with
          | Some tf -> generic_fns_acc := !generic_fns_acc @ [ tf ]
          | None -> ())
       end;
@@ -6112,7 +6342,7 @@ let check_program (prog : program) : hir =
         (fun (mth : smethod) ->
           let iname = gname ^ "__" ^ mth.mname ^ "$" ^ tags in
           let params = mth_params mth in
-          match check_one_fn iname params mth.mbody mth.mpos with
+          match check_one_fn iname params (subst_body map mth.mbody) mth.mpos with
           | Some tf -> generic_fns_acc := !generic_fns_acc @ [ tf ]
           | None -> ())
         gs.gmethods);
@@ -6152,7 +6382,7 @@ let check_program (prog : program) : hir =
             Hashtbl.replace g.fns mangle
               { params = ptys; prefs = List.map (fun _ -> false) ptys;
                 ret = rty; runred = false };
-            match check_one_fn mangle iparams gf.gbody gf.gpos with
+            match check_one_fn mangle iparams (subst_body mapl gf.gbody) gf.gpos with
             | Some tf -> generic_fns_acc := !generic_fns_acc @ [ tf ]; true
             | None -> true
           end
@@ -6286,6 +6516,9 @@ let check_program (prog : program) : hir =
       | EPropagateK a -> (EPropagateK (fix_texpr a), ety)
       | EErrOkK a -> (EErrOkK (fix_texpr a), ety)
       | EFindK (s, c, k) -> (EFindK (fix_texpr s, fix_texpr c, fix_texpr k), ety)
+      | ESortSeqK (a, el, d) -> (ESortSeqK (fix_texpr a, subst_ty el, d), ety)
+      | ESortMixK (args, el, d) ->
+        (ESortMixK (List.map fix_texpr args, subst_ty el, d), ety)
       | EClNewK (m, ce, items) ->
         (EClNewK (m, ce, List.map fix_texpr items), ety)
       | EClCallK (cb, args) ->

@@ -953,6 +953,35 @@ void zfy_print_bool(int b) {
     fputs(b ? "true" : "false", stdout);
 }
 
+/* 输出 T! 错误值（new.md 第1条：T! 可整体 output）：
+ * 成功打印元素值，失败打印 err#<code>。
+ * kind：0=i64 1=u64 2=f64 3=bool 4=char 5=string 6=i128 7=u128 */
+void zfy_print_err(int32_t kind, void *errp) {
+    zfy_err *e = (zfy_err *)errp;
+    if (e->code != 0) {
+        printf("err#%d", e->code);
+        return;
+    }
+    switch (kind) {
+    case 0: zfy_print_i64(e->value.i); break;
+    case 1: zfy_print_u64((unsigned long long)e->value.i); break;
+    case 2: zfy_print_f64(e->value.d); break;
+    case 3: zfy_print_bool(e->value.i != 0); break;
+    case 4: zfy_print_char((char)e->value.i); break;
+    case 5: zfy_print_str(e->value.p ? (const char *)e->value.p : ""); break;
+    case 6: {
+        zfy_err_wide *w = (zfy_err_wide *)errp;
+        zfy_print_i128(w->value);
+        break;
+    }
+    default: {
+        zfy_err_wide *w = (zfy_err_wide *)errp;
+        zfy_print_u128((unsigned __int128)w->value);
+        break;
+    }
+    }
+}
+
 /* ---------- input 运行时支持 ---------- */
 
 /* stdin 快速缓冲读取：整块 fread 进自管缓冲，替代逐字符 getchar()
@@ -2114,6 +2143,116 @@ zfy_seq *zfy_reverse(zfy_seq *src) {
     }
     return s;
 }
+
+/* ---------- sort 内建（new.md 第3条）----------
+ * sort(内容..., max|min)：min 从小到大、max 从大到小。
+ * zfy_sort_chk_<TAG>：长度 <2 直接 die（编译期只挡 const 定长数组，
+ * 非 const 容器的单元素检查在运行期）；升序排序后按 desc 原地倒置。
+ * 调用方约定：传入的是调用方私有副本（列表 MCopy / 混合路径新建 acc），
+ * 原地排序不影响源序列（值语义） */
+#define DEF_SORT_CHK(TAG)                                                  \
+zfy_seq *zfy_sort_chk_##TAG(zfy_seq *src, int32_t desc) {                  \
+    if (!src || src->len < 2) zfy_die("sort: 至少需要 2 个元素");           \
+    zfy_seq *s = zfy_sort_##TAG(src);   /* 内部已克隆，返回新表 */           \
+    if (desc) {                                                            \
+        for (long long i = 0, j = s->len - 1; i < j; i++, j--) {           \
+            char tmp[16];                                                  \
+            void *a = (char *)s->data + i * s->elemsz;                     \
+            void *b = (char *)s->data + j * s->elemsz;                     \
+            memcpy(tmp, a, (size_t)s->elemsz);                             \
+            memcpy(a, b, (size_t)s->elemsz);                               \
+            memcpy(b, tmp, (size_t)s->elemsz);                             \
+        }                                                                  \
+    }                                                                      \
+    return s; }
+DEF_SORT_CHK(i8)
+DEF_SORT_CHK(i16)
+DEF_SORT_CHK(i32)
+DEF_SORT_CHK(i64)
+DEF_SORT_CHK(u8)
+DEF_SORT_CHK(u16)
+DEF_SORT_CHK(u32)
+DEF_SORT_CHK(u64)
+DEF_SORT_CHK(f32)
+DEF_SORT_CHK(f64)
+DEF_SORT_CHK(str)
+
+/* 混合排序的键提取：sk = 源元素类别
+ *   0=有符号整数 1=无符号整数 2=浮点 3=string(取首字节码) 4=bool 5=char
+ * string/char 按 ascii 码比、bool 等价 0/1（new.md 第3条） */
+static long long seq_key_i(zfy_seq *s, long long i, int sk) {
+    char *base = (char *)s->data + i * s->elemsz;
+    switch (sk) {
+    case 1:
+        switch (s->elemsz) {
+        case 1: return *(unsigned char *)base;
+        case 2: return *(unsigned short *)base;
+        case 4: return *(unsigned int *)base;
+        default: return (long long)*(unsigned long long *)base;
+        }
+    case 2:
+        return (long long)(s->elemsz == 4 ? (double)*(float *)base
+                                          : *(double *)base);
+    case 3: {
+        char *st = *(char **)base;
+        return st ? (long long)(unsigned char)st[0] : 0;
+    }
+    default: /* 0 / 4 / 5：按有符号读（bool/char 存储宽度即 elemsz） */
+        switch (s->elemsz) {
+        case 1: return *(signed char *)base;
+        case 2: return *(short *)base;
+        case 4: return *(int *)base;
+        default: return *(long long *)base;
+        }
+    }
+}
+
+static double seq_key_d(zfy_seq *s, long long i, int sk) {
+    char *base = (char *)s->data + i * s->elemsz;
+    if (sk == 2)
+        return s->elemsz == 4 ? (double)*(float *)base : *(double *)base;
+    if (sk == 3) {
+        char *st = *(char **)base;
+        return st ? (double)(unsigned char)st[0] : 0.0;
+    }
+    return (double)seq_key_i(s, i, sk);
+}
+
+/* dst 末尾追加一个 8 字节元素（len==cap 时倍增扩容） */
+static void seq_push8(zfy_seq *s, const void *v) {
+    if (s->len >= s->cap) {
+        s->cap = s->cap < 8 ? 8 : s->cap * 2;
+        s->data = realloc(s->data, (size_t)(s->cap * s->elemsz));
+        if (!s->data) zfy_die("sort: 内存分配失败");
+    }
+    memcpy((char *)s->data + s->len * s->elemsz, v, (size_t)s->elemsz);
+    s->len++;
+}
+
+/* zfy_seq_extend_num(dst, src, sk, dk)：把 src 的元素逐个转成数值键
+ * 追加到 dst（dk=0 → i64，dk=1 → f64）。混合排序的序列展平用 */
+void zfy_seq_extend_num(zfy_seq *dst, zfy_seq *src, int32_t sk, int32_t dk) {
+    if (!src) return;
+    for (long long i = 0; i < src->len; i++) {
+        if (dk == 0) {
+            long long v = (sk == 2) ? (long long)seq_key_d(src, i, sk)
+                                    : seq_key_i(src, i, sk);
+            seq_push8(dst, &v);
+        } else {
+            double v = seq_key_d(src, i, sk);
+            seq_push8(dst, &v);
+        }
+    }
+}
+
+/* string -> 排序键：首字节 ascii 码（空串 = 0） */
+long long zfy_str_code(const char *s) {
+    return (s && s[0]) ? (long long)(unsigned char)s[0] : 0;
+}
+
+/* 混合排序的标量追加（键 = i64 或 f64，元素宽 8 字节） */
+void zfy_sort_push_i(zfy_seq *dst, long long v) { seq_push8(dst, &v); }
+void zfy_sort_push_d(zfy_seq *dst, double v) { seq_push8(dst, &v); }
 
 /* join(xs, sep)：string 列表拼接（元素 strdup 后释放），sep 可空串 */
 char *zfy_join(zfy_seq *src, const char *sep) {

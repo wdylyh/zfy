@@ -49,7 +49,7 @@ fn main()
     for s in seen
         output(s)                    // 2
     // ---- 内建算法 ----
-    let i32[] s1 = sort(xs)
+    let i32[] s1 = sort(xs, min)
     output(s1)                       // [1, 2, 3]
     let i32[] r1 = reverse(xs)
     output(r1)                       // [2, 1, 3]

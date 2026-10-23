@@ -85,6 +85,16 @@ and texpr_kind =
   | EPropagateK of texpr            (* a?：a 为 TErr t；失败则从函数传播返回（ety = t） *)
   | EErrOkK of texpr                (* 成功包装：T 值包成 TErr T（赋值/传参/返回自动包装） *)
   | EFindK of texpr * texpr * texpr (* find(s, c, k)：ety = TErr (TInt 64)；找不到 = NOT_FOUND *)
+  | ESortSeqK of texpr * zty * bool
+    (* sort(seq, max|min)（new.md 第3条）：单容器实参。seq 已由 typeck 统一为
+       列表形态（数组实参展开为序列字面量拷贝）；elem = 元素类型（限整数/
+       浮点/string）；desc = true 时从大到小。语义：深拷贝后原地排序，
+       源序列不变；长度 <2 运行期 die。ety = TList elem *)
+  | ESortMixK of texpr list * zty * bool
+    (* sort(e1, ..., en, max|min)：多实参混合展平。实参可为标量（int/uint/
+       float/bool/char/string）或序列；string/char 按 ascii 码、bool 按 0/1；
+       任一浮点 → 结果 list<f64>，否则 list<i64>（ety 第三参）。长度合计
+       <2 运行期 die *)
 
 and tstmt =
   { s : tstmt_kind; spos : pos }

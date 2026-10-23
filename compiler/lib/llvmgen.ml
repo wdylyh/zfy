@@ -950,6 +950,18 @@ let gen_print_val fc (o : operand) =
       end else v
     in
     emitf fc "  call void @zfy_print_i64(i64 %s)" v64
+  | TErr e ->
+    (* T! 整体 output（new.md 第1条）：成功打印元素值，失败打印 err#<code>。
+       元素聚合按指针传入（24/32 字节错误值槽） *)
+    let (p, _) = ptr_of fc o in
+    let kind =
+      match Typeck.resolve e with
+      | TInt 128 -> 6 | TUint 128 -> 7
+      | TInt _ -> 0 | TUint _ -> 1 | TFloat _ -> 2 | TBool -> 3
+      | TChar -> 4 | TString -> 5
+      | _ -> lerr None "output does not support this error-value element type"
+    in
+    emitf fc "  call void @zfy_print_err(i32 %d, ptr %s)" kind p
   | _ -> lerr None "output does not support this argument type"
 
 (* 读入一段输入存入变量槽：runtime 按 delim 分段、解析并写入值槽
@@ -1515,6 +1527,10 @@ let gen_field_store ~(free_old : bool) fc (fp : string) (v : operand) : unit =
   | TStruct s ->
     let (sp, _) = ptr_of fc v in
     emitf fc "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" s fp sp
+  | TErr _ ->
+    (* T! 字段写入：memcpy 覆盖（旧 msg 按 strdup 泄漏约定不释放） *)
+    let (sp, _) = ptr_of fc v in
+    gen_memcpy fc fp sp (size_of fc.g v.oty)
   | _ ->
     let (vv, tt) = val_of fc v in
     emitf fc "  store %s %s, ptr %s" tt vv fp
@@ -2350,6 +2366,13 @@ let gen_instr fc (i : instr) : unit =
        emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty fty) addr;
        Hashtbl.replace fc.allocas d (addr, fty);
        emitf fc "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" s addr fp
+     | TErr _ ->
+       (* T! 字段（new.md 第1条：T! 可作泛型实参 → 实例字段）：聚合槽
+          memcpy 副本（msg strdup 泄漏约定下浅拷安全，free=no-op） *)
+       let addr = fresh_r fc in
+       emitf_entry fc "  %s = alloca %s" addr (ll_ty fty);
+       Hashtbl.replace fc.allocas d (addr, fty);
+       gen_memcpy fc addr fp (size_of fc.g fty)
      | TString | TArray _ | TList _ ->
        let r = fresh_r fc in
        emitf fc "  %s = load ptr, ptr %s" r fp;
@@ -3147,6 +3170,24 @@ let gen_program (m : mir) : string =
       "declare ptr @zfy_sort_f64(ptr)\n";
       "declare ptr @zfy_sort_str(ptr)\n";
       "declare ptr @zfy_reverse(ptr)\n";
+      (* sort 内建（new.md 第3条）：带长度检查与 desc 的排序入口 +
+         混合展平辅助 *)
+      "declare ptr @zfy_sort_chk_i8(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_i16(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_i32(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_i64(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_u8(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_u16(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_u32(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_u64(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_f32(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_f64(ptr, i32)\n";
+      "declare ptr @zfy_sort_chk_str(ptr, i32)\n";
+      "declare void @zfy_seq_extend_num(ptr, ptr, i32, i32)\n";
+      "declare void @zfy_sort_push_i(ptr, i64)\n";
+      "declare void @zfy_sort_push_d(ptr, double)\n";
+      "declare i64 @zfy_str_code(ptr)\n";
+      "declare void @zfy_print_err(i32, ptr)\n";
       "declare ptr @zfy_join(ptr, ptr)\n";
       "declare i32 @zfy_contains_i8(ptr, i8)\n";
       "declare i32 @zfy_contains_i16(ptr, i16)\n";

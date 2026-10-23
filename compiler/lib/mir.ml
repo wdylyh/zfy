@@ -174,6 +174,26 @@ let fresh l = l.nt <- l.nt + 1; Printf.sprintf "%%t%d" l.nt
 
 let op k t = { o = k; oty = t }
 
+(* sort 内建（new.md 第3条）：元素类型 → 运行时排序后缀 tag；
+   元素类型 → 混合键类别（0=有符号整数 1=无符号 2=浮点 3=string 4=bool 5=char）。
+   mir 阶段 TVar 已由 typeck 收尾求解落地，这里按字面类型分派 *)
+let resolve (t : zty) : zty = t
+
+let sort_tag (t : zty) =
+  match resolve t with
+  | TInt w -> "i" ^ string_of_int w
+  | TUint w -> "u" ^ string_of_int w
+  | TFloat w -> "f" ^ string_of_int w
+  | TString -> "str"
+  | _ -> assert false
+
+let seq_key_kind (t : zty) =
+  let e = (match t with TArray (e, _) | TList e -> e | _ -> t) in
+  match resolve e with
+  | TInt _ -> 0 | TUint _ -> 1 | TFloat _ -> 2
+  | TString -> 3 | TBool -> 4 | TChar -> 5
+  | _ -> assert false
+
 (* 需 RAII 释放的变量类型：string（堆串）、数组/列表（seq 资源）、struct（内含堆资源）。
    全局变量槽（'@' 前缀）不属于函数作用域，永不释放 *)
 let owned_ty (name : string) (t : zty) =
@@ -829,6 +849,72 @@ let rec lexpr l (e : texpr) : operand =
     let fn = (match oc.oty with TChar -> "zfy_err_find" | _ -> "zfy_err_find_str") in
     emit l (MCall (Some d, fn, [ os; oc; ok ], e.ety));
     op (OLocal d) e.ety
+  | ESortSeqK (src, elem, desc) ->
+    (* sort(seq, max|min)（new.md 第3条）：克隆源列表后原地排序
+       （长度 <2 运行期 die，克隆在运行时完成——mir 的 MCopy 临时会被
+       拷贝传播消除，不能用作防原地排序的副本）；desc=true 从大到小。
+       结果恒为新列表，源序列不变（值语义） *)
+    let osrc = lexpr l src in
+    let d = fresh l in
+    emit l (MCall (Some d, "zfy_sort_chk_" ^ sort_tag elem,
+                   [ osrc;
+                     op (OInt (if desc then 1L else 0L)) (TInt 32) ],
+                   TList elem));
+    add_temp l d (FSeq (elem = TString));
+    op (OLocal d) e.ety
+  | ESortMixK (args, elem, desc) ->
+    (* sort(e1..en, max|min) 混合展平：新列表逐实参追加（标量经键转换：
+       string/char 按 ascii 码、bool 按 0/1；序列运行时逐元素转换），
+       再整体排序。elem 限 TInt 64 / TFloat 64 *)
+    let dkind = (match elem with TFloat 64 -> 1 | _ -> 0) in
+    let acc = fresh l in
+    emit l (MEmptySeq (acc, TList elem));
+    List.iter
+      (fun (a : texpr) ->
+        match resolve a.ety with
+        | TList _ | TArray _ ->
+          let os = lexpr l a in
+          let sk = seq_key_kind (resolve a.ety) in
+          emit l (MCall (None, "zfy_seq_extend_num",
+                         [ op (OLocal acc) (TList elem); os;
+                           op (OInt (Int64.of_int sk)) (TInt 32);
+                           op (OInt (Int64.of_int dkind)) (TInt 32) ],
+                         TVoid))
+        | t ->
+          let ov = lexpr l a in
+          let (push_fn, keyop) =
+            match t, elem with
+            | TString, _ ->
+              let d = fresh l in
+              emit l (MCall (Some d, "zfy_str_code", [ ov ], TInt 64));
+              ("zfy_sort_push_i", op (OLocal d) (TInt 64))
+            | TFloat _, _ ->
+              (* 统一转 f64 键（f32 扩展） *)
+              let c = fresh l in
+              emit l (MCast (c, ov, TFloat 64));
+              ("zfy_sort_push_d", op (OLocal c) (TFloat 64))
+            | _, TFloat 64 ->
+              (* 整数/bool/char 键转 f64（u64 位型大值有精度损失，接受） *)
+              let c = fresh l in
+              emit l (MCast (c, ov, TFloat 64));
+              ("zfy_sort_push_d", op (OLocal c) (TFloat 64))
+            | _ ->
+              (* 整数/bool/char → i64 键（gen_cast：zext/sext/bitcast） *)
+              let c = fresh l in
+              emit l (MCast (c, ov, TInt 64));
+              ("zfy_sort_push_i", op (OLocal c) (TInt 64))
+          in
+          emit l (MCall (None, push_fn, [ op (OLocal acc) (TList elem); keyop ], TVoid)))
+      args;
+    let d = fresh l in
+    emit l (MCall (Some d, "zfy_sort_chk_" ^ sort_tag elem,
+                   [ op (OLocal acc) (TList elem);
+                     op (OInt (if desc then 1L else 0L)) (TInt 32) ],
+                   TList elem));
+    (* sort_chk 内部克隆：展平用临时列表就地释放 *)
+    emit l (MCall (None, "zfy_seq_free", [ op (OLocal acc) (TList elem) ], TVoid));
+    add_temp l d (FSeq false);
+    op (OLocal d) e.ety
 
 (* 可写 seq 槽地址（w-014 #3）：非变量槽根（字段链/解引用/元素槽）
    统一产出一个"持有 seq 指针的槽地址"寄存器操作数。
@@ -983,6 +1069,58 @@ and lstmt_inner l (s : tstmt) : unit =
           emit l (MFieldStore (op (OLocal rootn) rootty, rootty, idxs, v))
         | None -> merr lhs.epos "unsupported field assignment target")
      | _ -> merr lhs.epos "unsupported assignment target"))
+  | SAugIndexK (root, (TErr _ as elem), idx, bop, v, grow) ->
+    (* T! 元素复合赋值（new.md 第1条）：下标只求值一次。语义——
+       错误元素保持错误原样写回；成功元素取值参与运算后重新包装写回。
+       string 元素 += 走 zfy_str_concat（同非 T! 路径） *)
+    let inner = (match elem with TErr t -> t | _ -> assert false) in
+    let oi = lexpr l idx in
+    let (seqop, addr) =
+      match root.e with
+      | EVarK name -> (op (OLocal name) (TList elem), None)
+      | _ ->
+        let a = seq_slot_addr l root elem in
+        let sp = fresh l in
+        emit l (MLoadSeq (sp, a));
+        (op (OLocal sp) (TList elem), Some a)
+    in
+    let old = fresh l in
+    emit l (MSeqGet (old, seqop, oi, elem, l.unchecked));
+    let ov = lexpr l v in
+    let okr = fresh l in
+    emit l (MErrIsOk (okr, op (OLocal old) elem, elem));
+    let writeback vv =
+      match addr with
+      | None ->
+        (match root.e with
+         | EVarK name ->
+           emit l (MSeqSet (name, elem, oi, vv, grow, l.unchecked))
+         | _ -> assert false)
+      | Some a ->
+        emit l (MSeqSetAt (a, elem, oi, vv, grow, l.unchecked))
+    in
+    let bok = new_block l and berr = new_block l and bend = new_block l in
+    set_term l (TCondBr (op (OLocal okr) TBool, bok.bid, berr.bid));
+    (* 成功路径：取值 → 运算 → 包装 → 写回 *)
+    l.cur <- bok;
+    let dv = fresh l in
+    emit l (MErrValue (dv, op (OLocal old) elem, elem));
+    let r = fresh l in
+    if inner = TString then begin
+      if bop <> BAdd then merr root.epos "string elements only support +=";
+      emit l (MCall (Some r, "zfy_str_concat",
+                     [ op (OLocal dv) inner; ov ], inner))
+    end else
+      emit l (MBinop (r, bop, op (OLocal dv) inner, ov));
+    let na = fresh l in
+    emit l (MErrOk (na, elem, op (OLocal r) inner));
+    writeback (op (OLocal na) elem);
+    set_term l (TBr bend.bid);
+    (* 错误路径：保持错误，原样写回 *)
+    l.cur <- berr;
+    writeback (op (OLocal old) elem);
+    set_term l (TBr bend.bid);
+    l.cur <- bend
   | SAugIndexK (root, elem, idx, bop, v, grow) ->
     (* a[i] op= v：下标只求值一次（load + op + store 同一槽位）。
        槽根分派（w-014 #3）：变量槽直写；其余经槽地址 *)
@@ -1015,6 +1153,30 @@ and lstmt_inner l (s : tstmt) : unit =
         | _ -> assert false)
      | Some a ->
        emit l (MSeqSetAt (a, elem, oi, op (OLocal r) elem, grow, l.unchecked)))
+  | SAugVarK (name, (TErr _ as ty), bop, v, _) ->
+    (* T! 变量复合赋值（new.md 第1条）：成功取值运算后包装写回；
+       错误值保持不变（不消耗错误） *)
+    let inner = (match ty with TErr t -> t | _ -> assert false) in
+    let ov = lexpr l v in
+    let okr = fresh l in
+    emit l (MErrIsOk (okr, op (OLocal name) ty, ty));
+    let bok = new_block l and bend = new_block l in
+    set_term l (TCondBr (op (OLocal okr) TBool, bok.bid, bend.bid));
+    l.cur <- bok;
+    let dv = fresh l in
+    emit l (MErrValue (dv, op (OLocal name) ty, ty));
+    let r = fresh l in
+    if inner = TString then begin
+      if bop <> BAdd then merr s.spos "string values only support +=";
+      emit l (MCall (Some r, "zfy_str_concat",
+                     [ op (OLocal dv) inner; ov ], inner))
+    end else
+      emit l (MBinop (r, bop, op (OLocal dv) inner, ov));
+    let na = fresh l in
+    emit l (MErrOk (na, ty, op (OLocal r) inner));
+    emit l (MCopy (name, op (OLocal na) ty, ty));
+    set_term l (TBr bend.bid);
+    l.cur <- bend
   | SAugVarK (name, ty, bop, v, nn) ->
     (* x op= v：load + op + store 同一槽位；frac 槽走运行时分数四则
        （sret，聚合不可直接 MBinop） *)
