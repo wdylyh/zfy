@@ -602,7 +602,7 @@ let expand_uses (main : program) (main_dir : string)
       reg name fpos;
       out := IFn { name; params = fparams; ret = fret; rfrac = false;
                   runred = false; body = rw_block m fbody; pos = fpos;
-                  tparams = [] } :: !out
+                  tparams = []; tcons = [] } :: !out
     in
     let rec go_mod ns_mod mname its2 =
       List.iter
@@ -642,7 +642,10 @@ let expand_uses (main : program) (main_dir : string)
         | IStruct ({ name; methods; _ } as s) ->
           (* struct 原样并入（类型名无命名空间；重名由 typeck 统一报错）。
              v3.2：struct 方法脱糖为顶层函数 <S>__<m>（ns 前缀随文件），
-             隐式首参 self = ref let <S>；方法表供调用点分派 *)
+             隐式首参 self = ref let <S>；方法表供调用点分派。
+             v3.15：泛型 struct 方法不脱糖——留给 typeck 实例化 *)
+          if s.tparams <> [] then out := IStruct s :: !out
+          else
           (match methods with
            | [] -> out := IStruct s :: !out
            | _ ->
@@ -666,7 +669,7 @@ let expand_uses (main : program) (main_dir : string)
                  out := IFn { name = gname; params = selfp :: mth.mparams;
                               ret = mth.mret; rfrac = mth.mrfrac; runred = false;
                               body = rw_block mm mth.mbody; pos = mth.mpos;
-                              tparams = [] } :: !out)
+                              tparams = []; tcons = [] } :: !out)
                methods)
         | IExtern it ->
           (* extern "C" 原样并入（符号链接期解析；重名由 typeck 报错） *)
@@ -735,6 +738,9 @@ let desugar_main_methods (prog : program) : program =
   List.iter
     (fun it ->
       match it with
+      | IStruct ({ methods; _ } as s) when methods <> [] && s.tparams <> [] ->
+        (* v3.15：泛型 struct 方法不脱糖——留给 typeck 实例化 *)
+        out := IStruct s :: !out
       | IStruct ({ name; methods; _ } as s) when methods <> [] ->
         out := IStruct { s with methods = [] } :: !out;
         List.iter
@@ -748,7 +754,7 @@ let desugar_main_methods (prog : program) : program =
             in
             out := IFn { name = gname; params = selfp :: mth.mparams;
                          ret = mth.mret; rfrac = mth.mrfrac; runred = false;
-                         body = mth.mbody; pos = mth.mpos; tparams = [] } :: !out)
+                         body = mth.mbody; pos = mth.mpos; tparams = []; tcons = [] } :: !out)
           methods
       | it -> out := it :: !out)
     prog;

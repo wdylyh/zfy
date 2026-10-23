@@ -664,11 +664,11 @@ let resolve (main : program) (main_dir : string)
                      runred = f.runred;
                      body = rw_block m f.body;
                      pos = f.pos;
-                     tparams = f.tparams } :: !out
+                     tparams = f.tparams; tcons = f.tcons } :: !out
       | IStruct s ->
         out := IStruct { name = flat_prefix m.mpath ^ s.name; packed = s.packed;
                          fields = List.map (rw_field m) s.fields; pos = s.pos;
-                         tparams = s.tparams;
+                         tparams = s.tparams; tcons = s.tcons;
                          methods =
                            List.map
                              (fun mth ->

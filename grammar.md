@@ -1,6 +1,9 @@
-# zfy 语言规范（v3.13.0，2026-10-23）
+# zfy 语言规范（v3.15.0，2026-10-23）
 
 > 本版每一节都经过编译器实测校准（examples 全回归通过）。
+> 与 v3.13.0 的主要差异（v3.15.0 泛型轮）：
+> **泛型约束 <T: num|cmp>（§28.1）+ 泛型 struct 方法（§28.2）+ dry check**。
+>
 > 与 v3.12.0 的主要差异（v3.13.0 接口轮）：
 > **interface 接口与多态（§27）**——隐式实现、vtable 分派、接口值列表。
 >
@@ -1362,3 +1365,50 @@ fn main()
   （聚合返回不支持）；接口方法调用接收者须为变量；接口值浅拷贝（共享
   data 堆拷贝）；接口名经别名解析（`let Drawable d`），不可再嵌泛型实参。
 - self 约定与 struct 方法一致（隐式首参 = 接收者引用，方法体内 `self.x`）。
+
+## 28. 泛型约束与泛型 struct 方法（v3.15.0）
+
+### 28.1 约束语法
+
+```zfy
+fn <T: num> T gadd(let T a, let T b)
+    return a + b
+
+fn <T: cmp> i32 cmin(let T a, let T b) ...
+struct Pct<T: num>
+    T v = 0
+    ...
+```
+
+- 约束三档：**num** = 算术+比较（整数/浮点）；**cmp** = 比较（数值/string/
+  char/bool）；**any**（默认）= 无约束（仅值语义通用操作）。
+- **实例化实参校验**：调用点/构造点/显式类型实参处核对——违反报
+  `type argument string does not satisfy constraint 'num' of gadd`
+  （E3000，位置在调用处而非实例体内）。
+- **dry check（早暴露坏体）**：从未实例化、且类型参数全带 num/cmp 约束的
+  泛型函数，编译尾部用代表类型（num→i64/f64、cmp→i64/string 双代表）
+  实例检查一次——未定义变量等语义错误不再静默逃逸；任一代表通过即放行
+  （抑制误报）。无约束泛型不做 dry check（无法选代表）。
+
+### 28.2 泛型 struct 方法
+
+```zfy
+struct Pct<T: num>
+    T v = 0
+    fn T twice()
+        return self.v + self.v
+    fn f64 as_f()
+        return cast(self.v, f64)
+
+let Pct<i32> p = Pct(5)
+p.twice()   // 10——方法随实例化实例化，self 类型 = Pct<i32>
+```
+
+- 方法在 struct **实例化时**逐个实例化（`<S>__<m>$<实参tags>` 全局函数），
+  self 类型 = 实例（ref 传参）；方法表按 (实例名, 方法名) 分派。
+- 逐实例检查：i32 实例里 `self.v * 100.0` 报 E3190（混型）——与泛型函数
+  同一"按实例重查"语义，约束保证实参在允许集合内。
+- 已知限制（v1）：①方法体/泛型函数体内不能 `let T` 声明局部变量（体级
+  subst 未做，既有边界）；②泛型 struct 方法不参与 interface 实现；
+  ③字面量构造 `Pct(7)` 默认 i64——经 `let Pct<i32> p = Pct(7)` 或先声明
+  变量再 push 落型。

@@ -1,0 +1,49 @@
+// v3.15.0：泛型约束 <T: num|cmp> + 泛型 struct 方法实例化
+// num = 算术+比较（整数/浮点）；cmp = 比较（数值/string/char/bool）
+fn <T: num> T gadd(let T a, let T b)
+    return a + b
+
+fn <T: cmp> i32 cmin(let T a, let T b)
+    if a < b
+        return 1
+    return 0
+
+fn <T: cmp> i32 ceq(let T a, let T b)
+    if a == b
+        return 1
+    return 0
+
+struct Pct<T: num>
+    T v = 0
+
+    fn T twice()
+        return self.v + self.v
+
+    fn f64 as_f()
+        return cast(self.v, f64)
+
+    fn f64 scaled(let T base)
+        return cast(self.v * base, f64)
+
+fn main()
+    // num 约束：整数/浮点两实例
+    output(gadd(1, 2))
+    output(gadd(1.5, 2.5))
+    // cmp 约束：数值与 string
+    output(cmin(3, 7))
+    output(cmin("apple", "banana"))
+    output(ceq(3, 4))
+    // 泛型 struct 方法：随实例化实例化，self 类型 = 实例
+    let Pct<i32> p = Pct(5)
+    output(p.twice())
+    output(p.as_f())
+    output(p.scaled(3))
+    let Pct<f64> q = Pct(0.25)
+    output(q.twice())
+    output(q.as_f())
+    // 接口值列表里的泛型实例不受影响（回归）
+    let Pct<i32>[] ps
+    let Pct<i32> p7 = Pct(7)
+    ps = push(ps, p7)
+    output(ps[0].twice())
+    return

@@ -271,12 +271,25 @@ let rec parse_ty ?(allow_fun = false) p =
     err tp "'[]T' / '[T;N]' (slice/array type) syntax removed"
   | _ -> err tp (Printf.sprintf "expected a type, got %s" (pp_token tk))
 
-(* 泛型类型参数列表 <T, U>：泛型函数/struct 声明处（仅 Ident 名单） *)
+(* 泛型类型参数列表 <T, U> / <T: num, U: cmp>（v3.15 约束）：泛型函数/struct
+   声明处（仅 Ident 名单 + 可选 `: 约束名`，约束 ∈ num/cmp/any） *)
 and parse_tparams p =
   expect p Lt "<";
+  let parse_constr npos =
+    match peek p with
+    | (Ident c, _) when c = "num" || c = "cmp" || c = "any" ->
+      ignore (next p); c
+    | (_, cp) ->
+      err cp "expected a constraint (num/cmp/any) after ':' for type parameter"
+  in
   let rec go acc =
     let n = expect_ident p "type parameter" in
-    let acc = n :: acc in
+    let c =
+      match peek p with
+      | (Colon, _) -> ignore (next p); parse_constr n
+      | _ -> "any"
+    in
+    let acc = (n, c) :: acc in
     match peek p with
     | (Comma, _) -> ignore (next p); go acc
     | (Gt, _) -> ignore (next p); List.rev acc
@@ -285,7 +298,7 @@ and parse_tparams p =
   let tps = go [] in
   (* 泛型参数注册为已知类型名：fn <T> 的返回类型/参数/函数体内 let T 声明、
      struct Box<T> 的字段类型都按类型名识别 *)
-  p.tynames <- tps @ p.tynames;
+  p.tynames <- List.map fst tps @ p.tynames;
   tps
 
 (* 泛型实参列表 <i32, T*>：类型位置 T 后跟 <（仅类型位置无歧义，表达式
@@ -1983,10 +1996,12 @@ and parse_item p =
     in
     let name = expect_ident p "struct name" in
     (* 泛型 struct：struct Box<T, U>（名字后跟类型参数列表） *)
-    let tparams =
+    let (tparams, tcons) =
       match peek p with
-      | (Lt, _) -> parse_tparams p
-      | _ -> []
+      | (Lt, _) ->
+        let ps = parse_tparams p in
+        (List.map fst ps, List.map snd ps)
+      | _ -> ([], [])
     in
     let (fields, methods) =
       match peek p with
@@ -2024,7 +2039,7 @@ and parse_item p =
       | _ -> parse_struct_fields p [] []
     in
     p.tynames <- name :: p.tynames;
-    IStruct { name; packed; fields; pos = tp; tparams; methods }
+    IStruct { name; packed; fields; pos = tp; tparams; tcons; methods }
   | Keyword KExtern ->
     (* extern "C"：缩进块内每行一个 C 函数声明（类型 (frac)? 名字(参数)），
        解析为多个 IExtern 函数（块结构不保留） *)
@@ -2080,10 +2095,12 @@ and parse_item p =
        fn (返回类型)? (frac)? (const)? (unred)? 名字(参数) 块
        main 特例：fn main()——不给返回类型（隐含 i32）、无参数、return 可省 *)
     ignore (next p);
-    let tparams =
+    let (tparams, tcons) =
       match peek p with
-      | (Lt, _) -> parse_tparams p
-      | _ -> []
+      | (Lt, _) ->
+        let ps = parse_tparams p in
+        (List.map fst ps, List.map snd ps)
+      | _ -> ([], [])
     in
     let ty_opt =
       match peek p with
@@ -2143,7 +2160,7 @@ and parse_item p =
       | None -> err tp "function declaration requires a return type (or use void)"
     in
     IFn { name; params; ret; rfrac = is_frac; runred = is_unred;
-          body; pos = tp; tparams }
+          body; pos = tp; tparams; tcons }
   | Ident _ ->
     if looks_like_decl p then
       err tp "declaration syntax: let TYPE (frac)? (const)? (unred)? NAME [= init] (declarations must start with 'let')"

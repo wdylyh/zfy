@@ -213,13 +213,16 @@ type item =
        use a::b::{x, y as z}; binds=[("x", [...;"x"]); ("z", [...;"y"])]
        use a::b as m;       binds=[("m", ["a";"b"])]（绑定模块） *)
   | IFn of { name : string; params : param list; ret : ty option; rfrac : bool;
-             runred : bool; body : block; pos : pos; tparams : string list }
+             runred : bool; body : block; pos : pos; tparams : string list;
+             tcons : string list }
     (* fn 前缀函数（new.md 2026-10-10）：fn (类型)? (frac)? (const)? (unred)? 名(参数)；
        ret=None 仅限 main（隐含 i32，return 可省）；runred：返回类型带 unred
-       （返回值不做 frac 归一）；tparams：泛型类型参数（fn <T, U> ...），空 = 普通 *)
+       （返回值不做 frac 归一）；tparams：泛型类型参数（fn <T, U> ...），空 = 普通；
+       tcons：与 tparams 等长的约束列表（"num"/"cmp"/"any"，v3.15） *)
   | IStruct of { name : string; packed : bool; fields : sfield list; pos : pos;
-                 tparams : string list; methods : smethod list }
-    (* tparams：泛型类型参数（struct Box<T, U>），空 = 普通 struct *)
+                 tparams : string list; tcons : string list;
+                 methods : smethod list }
+    (* tparams：泛型类型参数（struct Box<T, U>），空 = 普通 struct；tcons 同 IFn *)
   | IMod of string * item list * pos
     (* 内联模块 mod name（缩进块体，可嵌套）；resolve 展开为扁平名 *)
   | IModFile of string * pos

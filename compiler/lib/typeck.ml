@@ -136,9 +136,28 @@ type fn_sig = { params : zty list; prefs : bool list; ret : zty; runred : bool }
 type sdefk = { spacked : bool; sfields : (string * zty * expr option) list }
 
 (* 泛型声明模板（new2.md 第2条 方案B）：tparams 非空才入表 *)
-type gstructk = { gtp : string list; gpacked : bool; gfields : sfield list; gpos : pos }
-type gfnk = { gtp : string list; gparams : param list; gret : ty option;
-              grfrac : bool; gbody : block; gpos : pos }
+type gstructk = { gtp : string list; gcons : string list; gpacked : bool;
+                  gfields : sfield list; gmethods : smethod list; gpos : pos }
+type gfnk = { gtp : string list; gcons : string list; gparams : param list;
+              gret : ty option; grfrac : bool; gbody : block; gpos : pos }
+
+(* 约束判定（v3.15）：num = 算术+比较（整数/浮点）；cmp = 比较（数值/string/
+   char/bool）；any/空 = 无约束。实参校验与 dry check 代表类型共用 *)
+let constr_ok (c : string) (z : zty) : bool =
+  match c with
+  | "num" ->
+    (match z with TInt _ | TUint _ | TFloat _ -> true | _ -> false)
+  | "cmp" ->
+    (match z with
+     | TInt _ | TUint _ | TFloat _ | TString | TChar | TBool -> true
+     | _ -> false)
+  | _ -> true
+
+(* dry check 代表类型：num/cmp → i64（体在此类操作上具代表性）；any → None
+   （无法代表，跳过该参数——全约束才可 dry check） *)
+let constr_rep (c : string) : zty option =
+  match c with "num" | "cmp" -> Some (TInt 64) | _ -> None
+
 
 type genv = { fns : (string, fn_sig) Hashtbl.t;
               structs : (string, sdefk) Hashtbl.t;
@@ -155,7 +174,17 @@ type genv = { fns : (string, fn_sig) Hashtbl.t;
                    struct mangle 名 enum$<名>)——统一编译为 tag+载荷 struct；
                    载荷字段按类型分槽（同类型变体载荷共享槽），槽映射把每个
                    变体的第 j 载荷映射到字段序（不含 tag 偏移） *)
-              closigs : (string, zty list * zty) Hashtbl.t }
+              closigs : (string, zty list * zty) Hashtbl.t;
+              gused : (string, unit) Hashtbl.t }
+                (* 已实例化泛型名（fn 与 struct 基名）：编译尾部对从未实例化
+                   的泛型做 dry check（v3.15，早暴露坏体） *)
+(* 泛型 struct 方法实例化 hook（v3.15）：instantiate_struct_zty 注册实例后
+   调用——hook 内为每个方法登记 method_tbl (实例名, 方法名) → 实例全局名，
+   并按实例类型实参 subst + check_one_fn 检查方法体（先登记全部签名再查体，
+   兄弟 self.m2 调用可命中）。check_program 里赋值（需 check_one_fn 闭包） *)
+let method_inst_hook :
+  (genv -> string -> (string * zty) list -> string -> pos -> unit) ref =
+  ref (fun _ _ _ _ _ -> ())
                 (* 闭包类型签名（v3.7）：closure$... mangled 名 -> (参数, 返回) *)
 
 type local = { lconst : bool; lty : zty; lslot : string; lunred : bool;
@@ -651,6 +680,13 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
              z)
            targs
        in
+       (* 约束校验（v3.15）：显式实参须满足声明处 <T: 约束> *)
+       List.iter2
+         (fun c z ->
+           if not (constr_ok c z) then
+             terr pp "type argument %s does not satisfy constraint '%s'"
+               (pp_zty z) c)
+         gs.gcons ztys;
        instantiate_struct_zty g n (List.combine gs.gtp ztys) pp)
   | TSeq (t', pp) ->
     (* T[]：动态数组/列表（类型后缀形式，w-014 #1）；
@@ -677,6 +713,7 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
    值形态自引用由字段自查拦截，跨实例值环由检查末尾的循环嵌套复检拦截 *)
 and instantiate_struct_zty (g : genv) (gname : string)
     (map : (string * zty) list) (p : pos) : zty =
+  Hashtbl.replace g.gused gname ();
   let gs = Hashtbl.find g.gstructs gname in
   let mangle =
     gname ^ "$" ^ String.concat "$" (List.map (fun (_, z) -> tag_of_zty z) map) in
@@ -716,6 +753,8 @@ and instantiate_struct_zty (g : genv) (gname : string)
     in
     Hashtbl.replace g.structs mangle { spacked = gs.gpacked; sfields };
     Hashtbl.replace g.gtargs mangle (List.map snd map);
+    (* v3.15：实例化方法（如有）——登记 method_tbl + 逐方法实例检查 *)
+    if gs.gmethods <> [] then !method_inst_hook g gname map mangle p;
     TStruct mangle
   end
 
@@ -3586,6 +3625,13 @@ and check_struct_new_generic env p name (args : call_arg list) : texpr =
     | Some hl -> hl
     | None -> List.map (fun tp -> (tp, List.assoc tp !mref)) gs.gtp
   in
+  (* 约束校验（v3.15）：推断/期望得到的实参须满足声明处 <T: 约束> *)
+  List.iter2
+    (fun c (_, z) ->
+      if not (constr_ok c z) then
+        terr p "type argument %s does not satisfy constraint '%s' of %s"
+          (pp_zty z) c name)
+    gs.gcons mapl;
   let mangled =
     match instantiate_struct_zty env.g name mapl p with
     | TStruct m -> m
@@ -5440,7 +5486,8 @@ let check_program (prog : program) : hir =
       gstructs = Hashtbl.create 8; gfns = Hashtbl.create 8;
       gtargs = Hashtbl.create 8; gstructpos = Hashtbl.create 8;
       enums = Hashtbl.create 8;
-      closigs = Hashtbl.create 16 } in
+      closigs = Hashtbl.create 16;
+      gused = Hashtbl.create 16 } in
   (* 接口表重置（v3.13，与 method_tbl 同策略：单文件单进程防御性重置） *)
   Hashtbl.reset iface_tbl;
   Hashtbl.reset iface_impls;
@@ -5484,7 +5531,7 @@ let check_program (prog : program) : hir =
   let struct_pos : (string, pos) Hashtbl.t = g.gstructpos in
   List.iter
     (function
-      | IStruct { name; packed; fields; pos; tparams } ->
+      | IStruct { name; packed; fields; pos; tparams; tcons; methods } ->
         if List.mem name builtin_names then
           terr pos "struct name %s conflicts with a builtin, rename it" name;
         if Hashtbl.mem fn_names name then
@@ -5494,7 +5541,8 @@ let check_program (prog : program) : hir =
           if List.length (List.sort_uniq compare tparams) <> List.length tparams then
             terr pos "duplicate type parameter in %s" name;
           Hashtbl.replace g.gstructs name
-            { gtp = tparams; gpacked = packed; gfields = fields; gpos = pos };
+            { gtp = tparams; gcons = tcons; gpacked = packed;
+              gfields = fields; gmethods = methods; gpos = pos };
           Hashtbl.replace struct_pos name pos
         end
         else begin
@@ -5575,7 +5623,7 @@ let check_program (prog : program) : hir =
   (* 第一遍 B：收集函数签名（参数含数组/列表/frac） *)
   List.iter
     (function
-      | IFn { name; params; ret; rfrac; runred; pos; body; tparams } ->
+      | IFn { name; params; ret; rfrac; runred; pos; body; tparams; tcons } ->
         if List.mem name builtin_names then
           terr pos "function name %s conflicts with a builtin, rename it" name;
         if tparams <> [] then begin
@@ -5601,8 +5649,8 @@ let check_program (prog : program) : hir =
               | _ -> ())
             params;
           Hashtbl.replace g.gfns name
-            { gtp = tparams; gparams = params; gret = ret; grfrac = rfrac;
-              gbody = body; gpos = pos }
+            { gtp = tparams; gcons = tcons; gparams = params; gret = ret;
+              grfrac = rfrac; gbody = body; gpos = pos }
         end
         else begin
         if Hashtbl.mem g.fns name then
@@ -5965,6 +6013,14 @@ let check_program (prog : program) : hir =
             terr p "cannot infer type argument for %s (in call to %s)" tp name)
         gf.gtp;
       let mapl = List.map (fun tp -> (tp, List.assoc tp !mref)) gf.gtp in
+      (* 约束校验（v3.15）：实参须满足声明处 <T: num|cmp> *)
+      List.iter2
+        (fun c (_, z) ->
+          if not (constr_ok c z) then
+            terr p "type argument %s does not satisfy constraint '%s' of %s"
+              (pp_zty z) c name)
+        gf.gcons mapl;
+      Hashtbl.replace g.gused name ();
       let mangle =
         name ^ "$" ^ String.concat "$" (List.map (fun (_, z) -> tag_of_zty z) mapl) in
       if not (Hashtbl.mem g.fns mangle) then begin
@@ -6003,6 +6059,121 @@ let check_program (prog : program) : hir =
       mangle
   in
   generic_call_hook := hook_impl;
+  (* 泛型 struct 方法实例化 hook（v3.15）：instantiate_struct_zty 注册实例
+     struct 后回调。两段式——先登记全部 method_tbl 与签名（兄弟 self.m2
+     调用可命中），再逐方法 subst + check_one_fn 查体。
+     已知限制：方法体不能 let T 声明（与泛型函数体同一既有边界） *)
+  method_inst_hook :=
+    (fun g gname map mangle p ->
+      let gs = Hashtbl.find g.gstructs gname in
+      let tags = String.concat "$" (List.map (fun (_, z) -> tag_of_zty z) map) in
+      let mth_params (mth : smethod) =
+        let selfp =
+          { pname = "self"; pty = TNamed (mangle, mth.mpos); pfrac = false;
+            pseq = PScalar; pconst = false; punred = false; pref = true;
+            ppos = mth.mpos }
+        in
+        selfp ::
+        List.map
+          (fun (pd : param) -> { pd with pty = subst_ty_ast map pd.pty })
+          mth.mparams
+      in
+      let mth_sig (mth : smethod) params =
+        let prev = ref [] in
+        let ptys =
+          List.map
+            (fun (pd : param) ->
+              let t = conv_param g mth.mpos !prev pd in
+              prev := pd.pname :: !prev;
+              (* ref 参数签名侧降为指针（与非泛型 IFn 注册同规则） *)
+              if pd.pref then TPtr t else t)
+            params
+        in
+        let rty =
+          match Option.map (subst_ty_ast map) mth.mret with
+          | None -> TVoid
+          | Some t -> conv_ty g mth.mpos t
+        in
+        (ptys, rty)
+      in
+      (* 第一段：登记 method_tbl + 签名 *)
+      List.iter
+        (fun (mth : smethod) ->
+          let iname = gname ^ "__" ^ mth.mname ^ "$" ^ tags in
+          Hashtbl.replace method_tbl (mangle, mth.mname) iname;
+          let (ptys, rty) = mth_sig mth (mth_params mth) in
+          Hashtbl.replace g.fns iname
+            { params = ptys;
+              prefs = List.map (fun (pd : param) -> pd.pref) (mth_params mth);
+              ret = rty; runred = false })
+        gs.gmethods;
+      (* 第二段：逐方法查体（实例 tfn 下传 codegen） *)
+      List.iter
+        (fun (mth : smethod) ->
+          let iname = gname ^ "__" ^ mth.mname ^ "$" ^ tags in
+          let params = mth_params mth in
+          match check_one_fn iname params mth.mbody mth.mpos with
+          | Some tf -> generic_fns_acc := !generic_fns_acc @ [ tf ]
+          | None -> ())
+        gs.gmethods);
+  (* dry check（v3.15）：从未实例化、且类型参数全带 num/cmp 约束的泛型函数，
+     用代表类型实例化检查一次——坏体（未定义变量等语义错误）早暴露，
+     不再静默逃逸。误报抑制：逐代表类型尝试（num→[i64;f64]、cmp→[i64;string]），
+     任一通过即放行；全部失败才报错（报第一个错误的声明处位置） *)
+  Hashtbl.iter
+    (fun name gf ->
+      if not (Hashtbl.mem g.gused name) && gf.gtp <> []
+         && List.for_all (fun c -> constr_rep c <> None) gf.gcons then begin
+        let try_rep zs =
+          let mapl = List.combine gf.gtp zs in
+          let mangle =
+            name ^ "$" ^ String.concat "$" (List.map tag_of_zty zs) in
+          if Hashtbl.mem g.fns mangle then true
+          else begin
+            let iparams =
+              List.map
+                (fun (pd : param) -> { pd with pty = subst_ty_ast mapl pd.pty })
+                gf.gparams
+            in
+            let prev = ref [] in
+            let ptys =
+              List.map
+                (fun (pd : param) ->
+                  let t = conv_param g gf.gpos !prev pd in
+                  prev := pd.pname :: !prev;
+                  t)
+                iparams
+            in
+            let rty =
+              match gf.gret with
+              | None -> TVoid
+              | Some t -> conv_ty g gf.gpos (subst_ty_ast mapl t)
+            in
+            Hashtbl.replace g.fns mangle
+              { params = ptys; prefs = List.map (fun _ -> false) ptys;
+                ret = rty; runred = false };
+            match check_one_fn mangle iparams gf.gbody gf.gpos with
+            | Some tf -> generic_fns_acc := !generic_fns_acc @ [ tf ]; true
+            | None -> true
+          end
+        in
+        let reps_lists =
+          match gf.gcons with
+          | cs when List.for_all (fun c -> c = "num") cs ->
+            [ List.map (fun _ -> TInt 64) cs; List.map (fun _ -> TFloat 64) cs ]
+          | cs when List.for_all (fun c -> c = "cmp") cs ->
+            [ List.map (fun _ -> TInt 64) cs; List.map (fun _ -> TString) cs ]
+          | _ ->
+            (* 混合约束：统一用各参数自己的代表类型，单次尝试 *)
+            [ List.map (fun c -> Option.get (constr_rep c)) gf.gcons ]
+        in
+        let ok = List.exists try_rep reps_lists in
+        if not ok then
+          terr gf.gpos
+            "generic function %s was never instantiated and its body fails to check (dry check with representative types)"
+            name
+      end)
+    g.gfns;
   let hfns =
     List.filter_map
       (function

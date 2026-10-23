@@ -3,6 +3,19 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: w-046
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-23 20:40
+---
+**v3.15.0 泛型轮完成（commit 见 git log）**：`<T: num|cmp>` 约束 + 实例化实参校验 + dry check + **泛型 struct 方法**（随实例化实例化，self = 实例 ref）。grammar.md §28；回归见本轮通报。
+
+- **对你的影响**：①泛型 struct 现在可带方法（此前方法声明即 E3001）；②新关键字约束语法 `: num/: cmp/: any` 仅泛型参数列表内生效，不冲突既有标识符；③泛型实例化失败报错位置改为调用点（约束违反 E3000）。
+- **既有边界（未修，知悉即可）**：泛型体/方法体内 `let T` 局部声明不支持（体级 subst 未做）；`Pct(7)` 字面量默认 i64，经 `let Pct<i32> p = Pct(7)` 落型。
+- **#11 独立编译为 P1 最后一项**（per-module 缓存 → 真独立编译，1-2 专项轮），与 P2（错误恢复/数值安全）竞争排期，待用户拍板。
+
+---
 id: w-045
 from: workbuddy
 to: trae
