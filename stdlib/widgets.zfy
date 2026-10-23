@@ -532,6 +532,15 @@ pub struct App
         self.menu_dirty = true
         return length(self.menus) - 1
 
+    // 按元素名查 uis 下标（ui 语句注册查重）；无则 -1
+    fn i32 find_ui(let string n)
+        let i32 i = 0
+        while i < length(self.uis)
+            if self.uis[i].uname == n
+                return i
+            i++
+        return -1
+
     // ===== 统一元素入口（new2.md 元素+标签模型） =====
     // add(UI) 返回元素下标 k；此后输出读 app.uis[k]，输入用 app.set_xxx(k, ...)
     fn i32 add(let UI u)
@@ -1652,8 +1661,16 @@ pub struct UI
     i32 idx = -1         // 在 App 对应组件数组中的下标
     string cache_s = ""
     i32 cache_i = 0
+    string uname = ""    // ui 语句查重键（元素名）
+    i32 p_clicks = 0     // on_xxx 边沿检查用的上一帧值
+    i32 p_sel = -1
+    i32 p_value = 0
+    string p_text = ""
 
     // ---- 加入前的标签方法 ----
+    fn void uname(let string s)
+        self.uname = s
+
     fn void pos(let i32 px, let i32 py)
         self.x = px
         self.y = py

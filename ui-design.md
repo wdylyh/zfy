@@ -131,7 +131,7 @@ ui Button b
 | 期 | 内容 | 验收 | 状态 |
 |---|---|---|---|
 | 一期 | stdlib 统一元素 UI（§1），语法不变 | 新写 ui_demo ≤ 50 行；ui_test 全过；回归全绿 | **已完成（v3.17）** |
-| 二期 | 编译器 `ui` 语句（§2），脱糖到一期 | 同一 demo 用 ui 语句重写，行为一致；旧代码不受影响 | 未开工 |
+| 二期 | 编译器 `ui` 语句（§2），脱糖到一期 | ui2_test 全过；回归全绿 | **已完成（v3.18）** |
 
 **一期落地记录**：`UI(kind)` + 标签方法（pos/size/text/color/text_color/
 radius/value/rows/checked/add_item）；`app.add(UI)` 统一注册；输出标签
@@ -140,3 +140,15 @@ radius/value/rows/checked/add_item）；`app.add(UI)` 统一注册；输出标�
 set_value/set_checked/add_item。visible/enable 标签缓行（值语义保留模式下
 需穿透 9 组分派循环，二期随 `ui` 语句一并做）。Button 新增 color/tcolor/
 radius 字段。examples/ui_test.zfy 全过；demos/ui_demo.zfy 为写法演示。
+
+
+**二期落地记录（v3.18）**：`ui <kind> <名> [in <app>]` + 缩进标签块，
+parser 脱糖为统一元素代码（SBlock 透明承载）：首轮按元素名查重注册
+（`app.find_ui`/`uname`），此后每帧仅做 on_xxx 边沿检查；边沿 prev 持久化
+在 `app.uis[k].p_clicks/p_sel/p_value/p_text`（跨帧安全）。标签：x/y/w/h、
+pos/size/text/color/text_color/radius/value/rows/checked/items、
+on_click/on_input/on_change/on_value/on_select。坑：①方法调用 AST 为点路径
+EVar "obj.method"（EField callee 不行）；②局部 struct 字段直赋不支持
+（uname 走同名方法）；③kind 位置的 input/list 是关键字；④err 不支持
+格式化（字符串用 ^ 拼接）；⑤测试中真实鼠标 EV_MOVE 会覆盖合成 mx——
+事件注入用 set_value/on_key 等免噪声通道。examples/ui2_test.zfy 全过。

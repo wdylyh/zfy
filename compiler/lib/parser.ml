@@ -47,6 +47,9 @@ let rec skip_trivia p =
     err sp "semicolon is only allowed in for headers"
   | _ -> ()
 
+(* ui 语句唯一编号（v3.18）：合成隐藏变量名防碰撞 *)
+let ui_seq = ref 0
+
 let expect p t what =
   let (tk, tp) = peek p in
   if tk = t then ignore (next p)
@@ -1131,6 +1134,167 @@ and parse_match_decl p tp name ty_opt is_const is_frac is_unred =
             SMatch (scrut, arms2, tp) ],
           tp)
 
+(* ui 语句（v3.18，new2.md「元素+标签」模型）：ui <kind> <名> [in <app>]
+   缩进标签块。标签：x/y/w/h（坐标大小，注册时合成 pos/size）、
+   pos/size/text/color/text_color/radius/value/rows/checked、items 列表、
+   on_click/on_change/on_select/on_input/on_value -> 块（每帧边沿检查）。
+   脱糖（SBlock 透明承载，状态全部存 app.uis，循环内安全）：
+     let i32 ui_k_N = -1
+     let UI <名> = UI("<kind>")
+     <名>.uname = "<名>"                       -- 注册查重键
+     <标签方法调用...>
+     ui_k_N = <app>.find_ui("<名>")
+     if ui_k_N == -1
+         ui_k_N = <app>.add(<名>)              -- 首帧注册一次
+         <app>.uis[ui_k_N].p_sel = -1          -- 防边沿首帧误触发
+         <app>.uis[ui_k_N].p_value = -999
+     if <app>.uis[ui_k_N].clicks != <app>.uis[ui_k_N].p_clicks
+         <app>.uis[ui_k_N].p_clicks = <app>.uis[ui_k_N].clicks
+         <on_click 体>                         -- 其余 on_xxx 同理 *)
+and parse_ui_stmt p tp =
+  (* kind 位置兼容关键字 input（KInput） *)
+  let kind =
+    match peek p with
+    | (Ident k, _) -> ignore (next p); k
+    | (Keyword KInput, _) -> ignore (next p); "input"
+    | (Keyword KList, _) -> ignore (next p); "list"
+    | (_, kp) -> err kp "element kind expected (label/button/input/slider/progress/list/check/menu/textarea)"
+  in
+  (match kind with
+   | "label" | "button" | "input" | "slider" | "progress"
+   | "list" | "check" | "menu" | "textarea" -> ()
+   | _ ->
+     err tp ("unknown ui element kind '" ^ kind ^ "' (label/button/input/slider/progress/list/check/menu/textarea)"));
+  let name = expect_ident p "element name" in
+  let appname =
+    match peek p with
+    | (Keyword KIn, _) -> ignore (next p); expect_ident p "app variable name"
+    | _ -> "app"
+  in
+  end_of_stmt p;
+  (match peek p with
+   | (Indent, _) -> ignore (next p)
+   | (_, ep) -> err ep "ui requires a newline and an indented tag block");
+  incr ui_seq;
+  let uid = string_of_int !ui_seq in
+  let vk = "ui_k_" ^ uid in
+  let xr = ref None and yr = ref None and wr = ref None and hr = ref None in
+  let props = ref [] in       (* 标签方法调用，逆序 *)
+  let texpr = ref None in     (* text 标签表达式（on_input 初值对齐） *)
+  let vexpr = ref None in     (* value 标签表达式（on_value 初值对齐） *)
+  let evs = ref [] in         (* (事件名, 块, pos)，逆序 *)
+  let tag_call m args =
+    (* 方法调用在 AST 中为点路径 EVar "obj.method"（typeck try_method 分派） *)
+    SExpr (ECall (EVar (name ^ "." ^ m, tp), List.map (fun e -> CPos e) args, tp))
+  in
+  let app_call m args =
+    ECall (EVar (appname ^ "." ^ m, tp), List.map (fun e -> CPos e) args, tp)
+  in
+  let rec tags () =
+    skip_trivia p;
+    match peek p with
+    | (Dedent, _) -> ignore (next p)
+    | (Eof, ep) -> err ep "unterminated ui tag block"
+    | (Comma, _) -> ignore (next p); tags ()   (* 同行多标签：逗号分隔 *)
+    | _ ->
+      (match peek p with
+       | (Ident tname, tpos) ->
+         ignore (next p);
+         (match tname with
+          | "x" | "y" | "w" | "h" ->
+            let e = parse_expr p in
+            end_of_stmt p;
+            (match tname with
+             | "x" -> xr := Some e
+             | "y" -> yr := Some e
+             | "w" -> wr := Some e
+             | _ -> hr := Some e)
+          | "pos" | "size" ->
+            let a = parse_expr p in
+            expect p Comma ",";
+            let b = parse_expr p in
+            end_of_stmt p;
+            props := tag_call tname [ a; b ] :: !props
+          | "text" | "color" | "text_color" | "radius" | "value" | "rows" | "checked" ->
+            let e = parse_expr p in
+            end_of_stmt p;
+            (match tname with
+             | "text" -> texpr := Some e
+             | "value" -> vexpr := Some e
+             | _ -> ());
+            props := tag_call tname [ e ] :: !props
+          | "items" ->
+            let rec items acc =
+              let e = parse_expr p in
+              let acc = e :: acc in
+              match peek p with
+              | (Comma, _) -> ignore (next p); items acc
+              | _ -> List.rev acc
+            in
+            let es = items [] in
+            end_of_stmt p;
+            List.iter (fun e -> props := tag_call "add_item" [ e ] :: !props) es
+          | ("on_click" | "on_change" | "on_select" | "on_input" | "on_value") as ev ->
+            expect p ThinArrow "->";
+            (match peek p with
+             | (Newline, _) -> ignore (next p)
+             | _ -> ());
+            let blk = parse_block p in
+            evs := (ev, blk, tpos) :: !evs
+          | _ -> err tpos ("unknown ui tag '" ^ tname ^ "'"));
+         tags ()
+       | (_, ep) -> err ep "expect a ui tag (x/y/w/h/pos/size/text/color/...)")
+  in
+  tags ();
+  let uis fld =
+    EField (EIndex (EField (EVar (appname, tp), "uis", tp), EVar (vk, tp), tp), fld, tp)
+  in
+  (* 注册块：find/add → 边沿初值（标签每帧已应用于 <名>，注册时随 add 存入） *)
+  let register_stmts =
+    [ SAssign (EVar (vk, tp), app_call "add" [ EVar (name, tp) ], tp);
+        SAssign (uis "p_text",
+                 (match !texpr with Some e -> e | None -> EStr ("", tp)), tp);
+        SAssign (uis "p_value",
+                 (match !vexpr with Some e -> e | None -> EInt (0L, tp)), tp) ]
+  in
+  let edge_stmts =
+    List.flatten
+      (List.map
+         (fun (ev, blk, epos) ->
+           (* on_change：changed 本身已是单帧边沿标志，直接作条件；
+              其余：当前输出 != 持久 prev（存于 app.uis[k].p_*，跨帧） *)
+           match ev with
+           | "on_change" -> [ SIf (uis "changed", blk, None, epos) ]
+           | _ ->
+             let (fld, pfld) =
+               match ev with
+               | "on_click" -> ("clicks", "p_clicks")
+               | "on_select" -> ("sel", "p_sel")
+               | "on_input" -> ("text_out", "p_text")
+               | _ -> ("value", "p_value")
+             in
+             [ SIf (EBin (Ne, uis fld, uis pfld, epos),
+                    [ SAssign (uis pfld, uis fld, epos) ] @ blk,
+                    None, epos) ])
+         (List.rev !evs))
+  in
+  SBlock ([ SDecl (false, false, false, vk, None, Some (EInt (-1L, tp)), tp);
+            SDecl (false, false, false, name, Some (TNamed ("UI", tp)),
+                   Some (EStructNew ("UI", [ CPos (EStr (kind, tp)) ], tp)), tp) ]
+           @ List.rev !props
+           @ (match !xr, !yr with
+              | Some a, Some b -> [ tag_call "pos" [ a; b ] ]
+              | _ -> [])
+           @ (match !wr, !hr with
+              | Some a, Some b -> [ tag_call "size" [ a; b ] ]
+              | _ -> [])
+           @ tag_call "uname" [ EStr (name, tp) ] :: [ SAssign (EVar (vk, tp),
+                        app_call "find_ui" [ EStr (name, tp) ], tp);
+               SIf (EBin (Eq, EVar (vk, tp), EInt (-1L, tp), tp),
+                    register_stmts, None, tp) ]
+           @ edge_stmts,
+          tp)
+
 and parse_stmt p =
   let (tk, tp) = peek p in
   match tk with
@@ -1218,6 +1382,12 @@ and parse_stmt p =
     expect p RParen ")";
     end_of_stmt p;
     SReduce (a, b, c, tp)
+  | Keyword KUi ->
+    (* ui 语句（v3.18，new2.md「元素+标签」）：ui <kind> <名> [in <app>]
+       缩进标签块 → 脱糖为统一元素 UI 代码（SBlock 透明承载）：
+       注册（app.find_ui 查重，首帧一次）+ on_xxx 边沿检查（每帧） *)
+    ignore (next p);
+    parse_ui_stmt p tp
   | Semicolon -> skip_trivia p; parse_stmt p
   | _ -> parse_expr_stmt p
 

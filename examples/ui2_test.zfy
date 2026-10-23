@@ -1,0 +1,132 @@
+// examples/ui2_test.zfy —— 编译器级 ui 语句测试（v3.18，new2.md 元素+标签）
+// 覆盖：kind/标签解析、循环内注册查重（只 add 一次）、on_click/on_input/
+//       on_change/on_value/on_select 边沿触发且不重复触发
+mod gui;
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let i32 fails = 0
+    let App app = App()
+    if app.open(480, 420, "ui2_test") != 0
+        output("SKIP open failed")
+        return 0
+    app.t0 = tick_ms()
+
+    let i32 f = 0
+    while f < 12 and app.alive()
+        app.step()
+
+        // ---- ui 语句：声明 + 标签 + 事件（每帧执行，注册自动查重） ----
+        ui button btn
+            x 20, y 50, w 130, h 36
+            text "按钮"
+            color 0x17405A
+            on_click ->
+                app.set_text(app.find_ui("title"),
+                             "点击 " + cast(app.uis[app.find_ui("btn")].clicks, string))
+
+        ui label title
+            x 20, y 16
+            text "ui 语句测试"
+
+        ui input box
+            x 20, y 100, w 280
+            on_input ->
+                app.set_text(app.find_ui("tin"),
+                             "输入 " + app.uis[app.find_ui("box")].text_out)
+            on_change ->
+                app.set_text(app.find_ui("tchg"),
+                             "变更 " + app.uis[app.find_ui("box")].text_out)
+
+        ui slider sld
+            x 20, y 150, w 280
+            value 30
+            on_value ->
+                app.set_value(app.find_ui("bar"), app.uis[app.find_ui("sld")].value)
+
+        ui progress bar
+            x 20, y 190, w 280
+
+        ui list lst
+            x 20, y 224, w 200, rows 4
+            items "alpha", "beta", "gamma"
+            on_select ->
+                app.set_text(app.find_ui("tsel"),
+                             "选中 " + app.uis[app.find_ui("lst")].text_out)
+
+        ui label tin
+            x 240, y 100
+            text "输入 -"
+        ui label tchg
+            x 240, y 124
+            text "变更 -"
+        ui label tsel
+            x 240, y 148
+            text "选中 -"
+
+        // ---- 事件注入（按帧次序；元素在 f==0 注册） ----
+        if f == 1
+            app.mx = 60
+            app.my = 68
+            app.ldown = true
+            app.on_click()
+        if f == 2
+            app.ldown = false
+            app.on_click()
+        if f == 3
+            // 拖动机制由 widgets_test/ui_test 覆盖；此处用 set_value 注入
+            // （避开真实鼠标 EV_MOVE 噪声），验证 on_value 边沿与联动
+            app.set_value(app.find_ui("sld"), 55)
+        if f == 4
+            app.inputs[0].set_focus(true)
+            app.on_key(65)
+        if f == 5
+            app.lists[0].sel = 1
+        f++
+        gui_frame_sleep(app.t0)
+
+    // ---- 断言 ----
+    if app.uis[app.find_ui("btn")].clicks != 1
+        output("FAIL clicks")
+        fails++
+    if app.labels[0].text != "点击 1"
+        output("FAIL on_click body (title=" + app.labels[0].text + ")")
+        fails++
+    if app.uis[app.find_ui("sld")].value != 55
+        output("FAIL slider set_value")
+        fails++
+    if app.uis[app.find_ui("bar")].value != app.uis[app.find_ui("sld")].value
+        output("FAIL on_value body")
+        fails++
+    if app.uis[app.find_ui("box")].text_out != "A"
+        output("FAIL input text")
+        fails++
+    if app.labels[1].text != "输入 A"
+        output("FAIL on_input body (tin=" + app.labels[1].text + ")")
+        fails++
+    if app.labels[2].text != "变更 A"
+        output("FAIL on_change body (tchg=" + app.labels[2].text + ")")
+        fails++
+    if app.uis[app.find_ui("lst")].sel != 1
+        output("FAIL list sel")
+        fails++
+    if app.labels[3].text != "选中 beta"
+        output("FAIL on_select body (tsel=" + app.labels[3].text + ")")
+        fails++
+
+    // 注册查重：循环 40 帧，元素只应各有一份
+    if length(app.buttons) != 1 or length(app.inputs) != 1 or length(app.lists) != 1
+        output("FAIL duplicate registration")
+        fails++
+    if length(app.uis) != 9
+        output("FAIL uis count")
+        fails++
+
+    app.close()
+    if fails == 0
+        output("ui2_test: all PASS")
+        return 0
+    output(fails, " failures")
+    return 1

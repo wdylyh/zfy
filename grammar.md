@@ -628,7 +628,37 @@ let u8 y = -1            // E3155：负值不在 u8 范围
 > damage 脏区跟踪，只重绘变化的组件）→ **L3** 应用（examples/demos）。
 > 仅 Windows（Win32 + GDI）；非 Windows 平台 GUI 桩全部返回失败/空。
 
-### 18.0 统一元素 UI（推荐路径）
+### 18.0 ui 语句（元素+标签，最简写法）
+
+`ui <kind> <名> [in <app>]` + 缩进标签块——编译期脱糖为统一元素代码，
+注册自动查重（循环内安全），on_xxx 为每帧边沿触发：
+
+```
+ui button btn
+    x 20, y 50, w 130, h 36     // 坐标/大小（等价 pos/size 标签）
+    text "点我 +1"
+    color C_ACCENT
+    on_click ->
+        app.set_text(app.find_ui("title"),
+                     "点击 " + cast(app.uis[app.find_ui("btn")].clicks, string))
+```
+
+- **kind**：label/button/input/slider/progress/list/check/menu/textarea
+  （input/list 为关键字，直接写）。
+- **标签**：`x/y/w/h expr`（可同行逗号分隔）、`pos a, b`、`size a, b`、
+  `text/color/text_color/radius/value/rows/checked expr`、
+  `items e1, e2, ...`、`on_xxx ->` 缩进块。
+- **事件**：`on_click`（点击）、`on_input`（文本变化）、`on_change`
+  （值/文本/选中变化，单帧边沿）、`on_value`（滑杆/进度值变化）、
+  `on_select`（列表/菜单选中）。同一 ui 语句可写多个 on_xxx。
+- **语义**：语句须置于帧循环内（`app.step()` 之后）；首轮注册一次
+  （按元素名查重），此后每帧只做边沿检查；边沿状态存于
+  `app.uis[k]` 内部字段（p_clicks 等），无需业务管理。
+- `in <app>`：App 变量名非 `app` 时显式指定。
+- 元素变量（如 `btn`）仅在注册帧生效；运行期读写一律走
+  `app.uis[app.find_ui("名")]` 或 `app.set_xxx(app.find_ui("名"), ...)`。
+
+### 18.0a 统一元素 UI（标签袋 API）
 
 **一个元素类型 + 标签袋**：先定义元素（`UI(kind)`），给它打标签
 （坐标/颜色/形状/大小/内容），再注册；输入=改标签，输出=读标签。
