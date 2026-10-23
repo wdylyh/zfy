@@ -12,3 +12,5 @@ compiler/_build/
 echo
 _fracdemo2_tmp.*
 _longmap_tmp.*
+.zfydeps
+*.zfydeps
