@@ -1412,3 +1412,13 @@ p.twice()   // 10——方法随实例化实例化，self 类型 = Pct<i32>
   subst 未做，既有边界）；②泛型 struct 方法不参与 interface 实现；
   ③字面量构造 `Pct(7)` 默认 i64——经 `let Pct<i32> p = Pct(7)` 或先声明
   变量再 push 落型。
+
+### 28.3 增量构建缓存（v3.15，#11 v1）
+
+- `zfyc build` 成功后写 `<输出名>.zfydeps` 依赖清单：主文件 + 全部 mod/use
+  加载的模块文件（含 stdlib）+ runtime.c + zfyc 自身的内容 hash。
+- 下次 build：清单存在、全部 hash 未变且 exe 存在 → 跳过编译链接，
+  打印 `zfy: up to date: <exe> (ZFY_FORCE=1 to rebuild)`。
+- `ZFY_FORCE=1` 强制全量重建；任一依赖（源文件/runtime/编译器本体）变化
+  即自动全量重编。注意这是**构建级缓存**（非 per-module 独立编译）——
+  模块级增量仍在 #11 路线图上（per-module 缓存 → 真独立编译）。

@@ -113,9 +113,14 @@ let visible (cur : modt) (target_mpath : string list) (pub : bool) : bool =
 
 (* ---------- 主流程 ---------- *)
 
+(* v3.15 增量构建：本次 resolve 实际加载的模块文件路径（driver 写依赖
+   清单用；resolve 入口重置） *)
+let loaded_mod_files : string list ref = ref []
+
 let resolve (main : program) (main_dir : string)
     (rerrs : (rerr_kind * pos * string) list ref) : program option =
   collected := [];
+  loaded_mod_files := [];
   let root = mk_mod [] main_dir in
 
   (* ---- 阶段1：模块树构建（含文件模块加载与 include 环检测） ---- *)
@@ -254,6 +259,7 @@ let resolve (main : program) (main_dir : string)
                let c = mk_mod (modt.mpath @ [ name ]) (Filename.dirname path) in
                c.parent <- Some modt;
                Hashtbl.replace loaded norm c;
+               loaded_mod_files := path :: !loaded_mod_files;
                let body =
                  fixup_uses (Filename.dirname path) (anc_mod_names modt)
                    (read_parse path)

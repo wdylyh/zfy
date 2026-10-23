@@ -1063,7 +1063,66 @@ let prompt_selection (errs : zerr list) (fixable : zerr list) : zerr list =
       要修哪些（空格/逗号分隔序号），选中项直接写回源文件；
    3. 重跑编译（≤4 轮），残余错误再次报告。
    选了修复 → 产出 exe 时随报告打印修复明细；不修/不可全修失败 → exit 1 *)
+(* ---- 增量构建缓存（v3.15，#11 v1）----
+   构建成功后写 <exe>.zfydeps 清单（依赖文件路径 + 内容 hash，含主文件、
+   全部 mod/use 加载的模块文件、runtime.c 与 zfyc 自身）；下次 build 时全部
+   hash 未变且 exe 存在 → 跳过编译链接。ZFY_FORCE=1 或清单/exe 缺失重建。
+   注意：这是构建级缓存（非 per-module 独立编译）——任一依赖变化即全量重编 *)
+let sha1_file (p : string) : string = Digest.to_hex (Digest.file p)
+
+let deps_manifest (base : string) : string = base ^ ".zfydeps"
+
+let dep_files (path : string) : string list =
+  let runtime =
+    match find_runtime () with
+    | Some rt -> [ rt ]
+    | None -> []
+  in
+  path :: !Resolve.loaded_mod_files @ runtime @ [ Sys.executable_name ]
+
+let up_to_date (base : string) : bool =
+  let mf = deps_manifest base in
+  if not (Sys.file_exists mf) then false
+  else begin
+    let ok = ref true in
+    (try
+       let ic = open_in mf in
+       (try
+          while ok.contents do
+            match input_line ic with
+            | line when line <> "" ->
+              (match String.index_opt line ' ' with
+               | Some i ->
+                 let h = String.sub line 0 i in
+                 let f = String.sub line (i + 1) (String.length line - i - 1) in
+                 if not (Sys.file_exists f) || sha1_file f <> h then ok.contents <- false
+               | None -> ok.contents <- false)
+            | _ -> ok.contents <- false
+          done
+        with End_of_file -> ());
+       close_in ic
+     with Sys_error _ -> ok := false);
+    !ok && Sys.file_exists (base ^ if Sys.win32 then ".exe" else "")
+  end
+
+let write_manifest (base : string) : unit =
+  let oc = open_out (deps_manifest base) in
+  List.iter
+    (fun f ->
+      if Sys.file_exists f then
+        output_string oc (sha1_file f ^ " " ^ f ^ "
+"))
+    (dep_files base);
+  close_out oc
+
 let compile path : string =
+  let base0 = Filename.remove_extension path in
+  if Sys.getenv_opt "ZFY_FORCE" <> Some "1" && up_to_date base0 then begin
+    Printf.eprintf "zfy: up to date: %s%s (ZFY_FORCE=1 to rebuild)
+"
+      base0 (if Sys.win32 then ".exe" else "");
+    exit 0
+  end;
   let mode = fix_mode () in
   let rec go round =
     match run_checked ~auto:(mode = `All) ~round path with
@@ -1141,4 +1200,5 @@ let compile path : string =
     Printf.eprintf "zfy:error[E5004] in 0 of %s because (link failed (clang exit code %d))\n" path code;
     exit 1
   end;
+  write_manifest base;
   exe

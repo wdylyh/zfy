@@ -14,8 +14,10 @@
 >   评估结论：per-instantiation body check 其实早已存在（实例化时
 >   check_one_fn 用具体类型重查），原分析"体只检查一次"过时。
 >   余项：泛型体 let T 声明（体级 subst）、interface × 泛型方法。
-> - **#11 独立编译/增量构建**：driver 文本内联合并 + 单 LLVM module 是
->   根基约束；增量需 per-file module + 链接编排 + 跨文件 typeck 边界
+> - **#11 独立编译/增量构建**：**v3.15 已落 v1（构建级缓存，§28.3）**——
+>   .zfydeps 依赖清单 + hash 比对，未变跳过编译链接（ZFY_FORCE=1 强制）。
+>   剩余（架构级）：driver 文本内联合并 + 单 LLVM module 是
+>   根基约束；per-module 增量需 per-file module + 链接编排 + 跨文件 typeck 边界
 >   （导入文件类型/函数一致性检查）。建议路径：先做 per-module 缓存
 >   （.zfy hash → 跳过 parse/typeck 的模块级缓存），再做真独立编译。
 >   二者工作量均为 1-2 个专项轮，需与 P2 清单（错误恢复/数值安全）竞争排期。
@@ -55,6 +57,7 @@
 | 6 | 容器遍历无 for-in/迭代器 | P1 | `for let i32 i = 0, i < length(xs), i++` 样板每处重写 |
 | 7 | 无内建排序/查找/反转等容器算法 | P1 | videolib 排序靠手写插入排序；无 sort/reverse/join |
 | 8 | 字符串设施薄弱 | P1 | 无 format/插值/startswith/join/正则；length 是字节数 |
+| 11 | 独立编译 | P1 v1 ✅ | 构建级缓存已落地；per-module 增量/真独立编译待专项轮 |
 | 9 | 泛型受限 | P1 ✅（v3.15） | 约束/方法已落地；余项：体级 let T、显式实例化语法 |
 | 10 | 无接口/继承/多态 | P1 | 组件库无法抽象"可绘制物"，只能 each-type-if |
 | 11 | 无独立编译/增量构建/包管理 | P1 | 全部源文件文本合并每次全量重编；依赖靠复制文件 |
