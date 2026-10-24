@@ -129,6 +129,19 @@ let widen_target (a : zty) (b : zty) : zty =
     let (ws, wu) = if sa then (wa, wb) else (wb, wa) in
     if ws >= 2 * wu then (if sa then a else b) else TUint (max ws wu)
 
+(* move-only 类型（P0-1，v3.27）：File、句柄（mutex$/thread$/chan$<tag>）、
+   接口（iface$X）、闭包（closure$<sig>）——变量间转移 = 所有权转移
+   （源槽清空），值语义拷贝废止 *)
+let is_move_only_ty (t : zty) : bool =
+  match t with
+  | TFile -> true
+  | TStruct s ->
+    s = "mutex$" || s = "thread$"
+    || (String.length s > 5 && String.sub s 0 5 = "chan$")
+    || is_iface_name s
+    || (String.length s > 8 && String.sub s 0 8 = "closure$")
+  | _ -> false
+
 (* ---------- 环境 ---------- *)
 
 type fn_sig = { params : zty list; prefs : bool list; ret : zty; runred : bool }
@@ -1469,6 +1482,16 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
         | TPtr (TFunSig (ps, r)) -> ensure_clo_struct env.g r ps
         | _ -> terr p "spawn expects a lambda or function name (fn() -> void)"
       in
+      (* P0-1c：spawn 移交闭包所有权——实参变量标记 moved（源槽清空） *)
+      (match f.e with
+       | EVarK n2 ->
+         (match lookup_var env n2 with
+          | Some src ->
+            (match resolve src.lty with
+             | TStruct s2 when s2 = cs -> Hashtbl.replace env.moved src.lslot ()
+             | _ -> ())
+          | None -> ())
+       | _ -> ());
       mkf "zfy_thread_spawn" [ TStruct cs ]
         (TStruct (ensure_handle_struct env.g "thread$"))
     | "join", [ t ] ->
@@ -4728,13 +4751,13 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
   let needs_norm =
     (match resolve want with TFrac _ -> true | _ -> false) && not is_unred
   in
-  (* File move-only（design_fileio.md）：声明初始化 `File g = f` 为所有权
-     转移（mir 侧清空源槽，运行期失效兜底）；编译期标记源变量已 move，
-     同块复用报错 *)
+  (* move-only（P0-1）：声明初始化 `T g = v`（File/句柄/接口/闭包）为
+     所有权转移（mir 侧清空源槽，运行期失效兜底）；编译期标记源变量
+     已 move，同块复用报错 *)
   (match resolve want, init with
-   | TFile, Some (EVar (n2, _)) ->
+   | ty, Some (EVar (n2, _)) when is_move_only_ty ty ->
      (match lookup_var env n2 with
-      | Some src when resolve src.lty = TFile -> Hashtbl.replace env.moved src.lslot ()
+      | Some src -> Hashtbl.replace env.moved src.lslot ()
       | _ -> ())
    | _ -> ());
   SDeclK (isconst, slot, want, tinit, needs_norm)
@@ -5422,12 +5445,12 @@ and check_stmt env (st : stmt) : tstmt =
                 mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, false, false))
               | _, _ ->
                 let trhs = coerce p' trhs lty in
-                (* File move-only：变量到变量赋值 = 所有权转移（mir 侧清源槽） *)
+                (* move-only（P0-1）：变量到变量赋值 = 所有权转移
+                   （File/句柄/接口/闭包；mir 侧清源槽） *)
                 (match resolve lty, rhs' with
-                 | TFile, EVar (n2, _) ->
+                 | ty, EVar (n2, _) when is_move_only_ty ty ->
                    (match lookup_var env n2 with
-                    | Some src when resolve src.lty = TFile ->
-                      Hashtbl.replace env.moved src.lslot ()
+                    | Some src -> Hashtbl.replace env.moved src.lslot ()
                     | _ -> ())
                  | _ -> ());
                 (* s = s + p1 + ... + pn（T7 优化）：concat 链根为槽本身时
@@ -6187,6 +6210,8 @@ let check_program (prog : program) : hir =
                  terr sf.fpos "struct %s field type cannot be itself (infinite size)" name
                | TFile ->
                  terr sf.fpos "File cannot be a struct field (move-only handle)"
+               | TStruct s2 when is_move_only_ty (TStruct s2) ->
+                 terr sf.fpos "move-only type %s cannot be a struct field (ownership cannot be copied)" (pp_zty ft)
                | _ -> ());
               (sf.fname, ft, sf.fdefault))
             fields

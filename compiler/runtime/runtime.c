@@ -51,7 +51,7 @@ static void zfy_die(const char *msg) {
  * 错误值 zfy_err = { int32_t code; char* msg; value 容器 }，LLVM 侧布局
  * %err.<T> = { i32, ptr, i64/double/ptr }，二者偏移一致（24 字节）。
  * 约定：code=0 表示成功（value 有效，msg=NULL）；code≠0 时 value 未定义。
- * msg 一律 strdup，永不释放（有意的最小泄漏，免生命周期管理）。
+ * msg 一律走受跟踪分配器（zfy_msg_strdup），进程退出时统一释放（零泄漏）。
  * 自定义错误码 ≥ 100 由源码直接写字面量；0-99 为标准码：
  * OK=0 DIV_ZERO=1 OOB=2 NOT_FOUND=3 IO=4 CAST=5 INPUT=6 EOF=7 */
 enum {
@@ -82,27 +82,43 @@ void zfy_set_panic_handler(void (*h)(int32_t, char *)) {
 }
 
 char *zfy_strdup(const char *s); /* 前向声明（zfy_strdup 定义在后） */
+char *zfy_msg_strdup(const char *s); /* 前向声明：受跟踪的错误消息串（退出时统一释放） */
 
 /* panic：不可恢复。有 handler 先调用（用户可自定义输出），随后退出进程。
-   handler 是 zfy 函数，string 参数按所有权约定接管——调用方须克隆（同
-   普通函数传参的值语义）；panic 随后 exit，克隆无人释放（最小泄漏，无碍） */
-/* ---- panic 恢复（v3.20，new.md：panic 策略可配置）----
- * try(f) 内建：活动恢复帧存在时 panic 不再退出，保存消息后 longjmp
- * 回 zfy_try（返回 0=发生 panic / 1=正常完成）；无帧时走原策略
- * （handler 或打印 + exit(101)）。v1 单层帧（嵌套 try 内层覆盖）。 */
+   handler 是 zfy 函数，string 参数按所有权约定接管——克隆走受跟踪分配器，
+   退出时统一释放（P0-1d 零泄漏口径）。 */
+/* ---- panic 恢复（v3.27 P0-4：链表帧栈 + 行为档位）----
+ * try(f) 内建：帧栈（jmp_buf + 前驱指针）支持任意嵌套深度——panic 弹
+ * 最近帧 longjmp 回对应 zfy_try（返回 0=发生 panic / 1=正常完成）。
+ * 无帧时走 handler 或打印 + 退出。
+ * 退出行为可配置（P0-4a/d）：
+ *   - zfy_panic_exit：退出码（默认 101，编译器 --panic-exit <n> 设置）；
+ *   - zfy_panic_abort：非 0 时 abort()（调试器断点场景，--panic-mode abort）。
+ * 编译器生成侧在 MPanic 调用前补 RAII 释放（emit_frees + unlock 回卷），
+ * 覆盖 panic 语句所在函数的局部资源与锁。 */
 #include <setjmp.h>
-static jmp_buf zfy_try_jmp;
-static volatile int zfy_try_active = 0;
+typedef struct zfy_try_frame {
+    struct zfy_try_frame *prev;
+    jmp_buf jb;
+} zfy_try_frame;
+static zfy_try_frame *zfy_try_top = NULL;
 static char zfy_panic_msg_buf[512];
 
+int zfy_panic_exit = 101;        /* panic 退出码（--panic-exit 可改） */
+int zfy_panic_abort = 0;         /* 1 = abort()（--panic-mode abort） */
+void zfy_set_panic_exit(int code) { zfy_panic_exit = code; }
+void zfy_set_panic_abort(int on) { zfy_panic_abort = on; }
+
 int zfy_try(void (*fn)(void *), void *env) {
-    if (setjmp(zfy_try_jmp) == 0) {
-        zfy_try_active = 1;
+    zfy_try_frame fr;
+    fr.prev = zfy_try_top;
+    if (setjmp(fr.jb) == 0) {
+        zfy_try_top = &fr;
         fn(env);
-        zfy_try_active = 0;
+        zfy_try_top = fr.prev;   /* 正常完成：弹栈 */
         return 1;
     }
-    zfy_try_active = 0;
+    /* longjmp 回来时 zfy_panic 已弹栈（zfy_try_top = fr.prev） */
     return 0;
 }
 
@@ -112,14 +128,15 @@ const char *zfy_panic_msg(void) {
 
 void zfy_panic(int32_t code, char *msg) {
     fflush(stdout);
-    if (zfy_try_active) {
+    if (zfy_try_top) {
         snprintf(zfy_panic_msg_buf, sizeof(zfy_panic_msg_buf), "%s",
                  msg ? msg : "");
-        zfy_try_active = 0;
-        longjmp(zfy_try_jmp, 1);
+        zfy_try_frame *fr = zfy_try_top;
+        zfy_try_top = fr->prev;  /* 弹栈后再跳（嵌套外层帧继续可捕） */
+        longjmp(fr->jb, 1);
     }
     if (zfy_panic_handler) {
-        zfy_panic_handler(code, zfy_strdup(msg ? msg : ""));
+        zfy_panic_handler(code, zfy_msg_strdup(msg ? msg : ""));
     } else if (code == 0) {
         fprintf(stderr, "panic: %s\n", msg ? msg : "");
     } else {
@@ -128,13 +145,14 @@ void zfy_panic(int32_t code, char *msg) {
     if (zfy_cur_line > 0 && !zfy_panic_handler) {
         fprintf(stderr, "  at %s:%d\n", zfy_cur_file ? zfy_cur_file : "?", zfy_cur_line);
     }
-    exit(101);
+    if (zfy_panic_abort) abort();
+    exit(zfy_panic_exit);
 }
 
 /* 错误值快捷填充 */
 static void err_set(zfy_err *out, int32_t code, const char *msg) {
     out->code = code;
-    out->msg = zfy_strdup(msg);
+    out->msg = zfy_msg_strdup(msg);
     out->value.i = 0;
 }
 
@@ -165,7 +183,7 @@ typedef struct zfy_err_wide {
 
 static void err_wide_set(zfy_err_wide *out, int32_t code, const char *msg) {
     out->code = code;
-    out->msg = zfy_strdup(msg);
+    out->msg = zfy_msg_strdup(msg);
     out->value = 0;
 }
 
@@ -531,6 +549,47 @@ char *zfy_strdup(const char *s) {
     if (!r) zfy_die("内存分配失败");
     memcpy(r, s, n);
     return r;
+}
+
+/* ---- 受跟踪的错误消息串（P0-1d：取消"有意最小泄漏"口径）----
+ * 错误值 msg / panic handler 消息 / panic_msg 缓冲来源等纯诊断字符串
+ * 无法静态判定生命周期（TErr 值可任意传递/存容器），统一走本分配器
+ * 登记，atexit 统一释放。进程生命周期内任何路径（正常退出 / panic
+ * 退出 / handler 自定义退出——atexit 在 exit 时仍会执行）都回收。 */
+typedef struct zfy_msg_node {
+    struct zfy_msg_node *next;
+    char *s;
+} zfy_msg_node;
+static zfy_msg_node *zfy_msg_list = NULL;
+static void zfy_msg_atexit(void); /* 前向声明 */
+
+char *zfy_msg_strdup(const char *s) {
+    static int hooked = 0;
+    if (!hooked) {
+        hooked = 1;
+        atexit(zfy_msg_atexit);
+    }
+    char *r = zfy_strdup(s);
+    if (r) {
+        zfy_msg_node *n = (zfy_msg_node *)malloc(sizeof(zfy_msg_node));
+        if (n) {
+            n->s = r;
+            n->next = zfy_msg_list;
+            zfy_msg_list = n;
+        }
+    }
+    return r;
+}
+
+static void zfy_msg_atexit(void) {
+    zfy_msg_node *n = zfy_msg_list;
+    while (n) {
+        zfy_msg_node *nx = n->next;
+        free(n->s);
+        free(n);
+        n = nx;
+    }
+    zfy_msg_list = NULL;
 }
 
 /* ---------- f64 -> int64 化整：乘 10^n 直到整数值 ---------- */
@@ -2536,11 +2595,74 @@ void zfy_assert_eq_str(const char *a, const char *b) {
  *   h = *(void**)clo; code = *(void**)h; code(h, ...)。
  * 裸函数名在 typeck 包装为空捕获 wrapper 闭包（env 无关）。
 
-/* env 堆块分配：不回收（闭包/捕获生命周期 = 进程，v1 设计） */
+/* ---- 句柄引用计数（v3.27 P0-1a）----
+ * chan 对象 / mutex CS / 闭包 env / iface 装箱统一带 8 字节原子 rc 头。
+ * 背景：assign 是浅拷共享（同一堆对象多槽引用），单主 free 会双释放/
+ * 悬垂（thread_test 双闭包捕 chan、iface 进数组后 d1/d2/shapes 共享）。
+ * 约定：new = rc(1)；LLVM 侧 assign 浅拷后调 zfy_rc_retain；
+ * 释放侧一律 zfy_rc_release(p, dtor)——rc 归零才执行 dtor + free。
+ * spawn 移交 = 宿主槽 rc 份额移交线程（spawn 后宿主槽裸置空不再释放） */
+#ifdef _WIN32
+static long long *zfy_rc_of(void *p) { return ((long long *)p) - 1; }
+static long long zfy_rc_alloced = 0, zfy_rc_freed = 0;   /* 泄漏统计（ZFY_LEAK_DEBUG） */
+static void zfy_rc_report(void);
+void *zfy_rc_alloc(size_t payload) {
+    static int rep_hooked = 0;
+    if (!rep_hooked) { rep_hooked = 1; atexit(zfy_rc_report); }
+    long long *raw = (long long *)malloc(payload + 8);
+    if (!raw) zfy_die("rc: 内存分配失败");
+    *raw = 1;
+    zfy_rc_alloced++;
+    return (void *)(raw + 1);
+}
+void zfy_rc_retain(void *p) {
+    if (p) InterlockedIncrement64(zfy_rc_of(p));
+}
+void zfy_rc_release(void *p, void (*dtor)(void *)) {
+    if (!p) return;
+    if (InterlockedDecrement64(zfy_rc_of(p)) == 0) {
+        zfy_rc_freed++;
+        if (dtor) dtor(p);
+        free(zfy_rc_of(p));
+    }
+}
+#else
+static long long *zfy_rc_of(void *p) { return ((long long *)p) - 1; }
+static long long zfy_rc_alloced = 0, zfy_rc_freed = 0;
+static void zfy_rc_report(void);
+void *zfy_rc_alloc(size_t payload) {
+    static int rep_hooked = 0;
+    if (!rep_hooked) { rep_hooked = 1; atexit(zfy_rc_report); }
+    long long *raw = (long long *)malloc(payload + 8);
+    if (!raw) zfy_die("rc: 内存分配失败");
+    *raw = 1;
+    zfy_rc_alloced++;
+    return (void *)(raw + 1);
+}
+void zfy_rc_retain(void *p) { if (p) (*zfy_rc_of(p))++; }
+void zfy_rc_release(void *p, void (*dtor)(void *)) {
+    if (!p) return;
+    if (--*zfy_rc_of(p) == 0) {
+        zfy_rc_freed++;
+        if (dtor) dtor(p);
+        free(zfy_rc_of(p));
+    }
+}
+#endif
+/* 泄漏报告（P0-1a 验证）：ZFY_LEAK_DEBUG=1 时 atexit 打印 rc 对象
+ * 分配/回收差值（>0 = 泄漏的闭包 env/chan/mutex/iface 装箱数） */
+static void zfy_rc_report(void) {
+    if (getenv("ZFY_LEAK_DEBUG") != NULL && zfy_rc_alloced != zfy_rc_freed)
+        fprintf(stderr, "[zfy-leak] rc 对象泄漏: %lld (alloc %lld / freed %lld)\n",
+                zfy_rc_alloced - zfy_rc_freed, zfy_rc_alloced, zfy_rc_freed);
+}
+
+/* env 堆块分配（v3.27 P0-1 引用计数）：头 8 字节 = 原子 rc（初始 1），
+ * 返回 payload 指针（字段偏移不受影响）。闭包 env / iface 装箱共用——
+ * assign 浅拷共享时 LLVM 侧调 zfy_rc_retain，释放统一走 zfy_rc_release
+ * （归零才级联释放 + free），杜绝浅拷共享场景的双释放/悬垂 */
 void *zfy_env_new(long long n) {
-    void *p = malloc(n > 0 ? (size_t)n : 1);
-    if (!p) zfy_die("out of memory (closure env)");
-    return p;
+    return zfy_rc_alloc((size_t)(n > 0 ? n : 1));
 }
 
 /* 从闭包槽解出调用入口 */
@@ -3942,28 +4064,60 @@ int32_t zfy_gui_text_w(char *s) { (void)s; return 0; }
  *   - 线程/互斥/channel 句柄 = 单 ptr 字段 struct（{ptr h}），
  *     操作函数收槽地址（void**）解一层取 h（与 map 同款）；
  *   - spawn 收闭包句柄（解一层 = env 块地址，首字段 = code），
- *     线程体直接调 code(env)；env 堆块生命周期 = 进程，
- *     天然适配线程（无 GC，无所有权回收问题）；
+ *     线程体调 code(env) 后释放 env 堆块（v3.27 P0-1c：env 所有权
+ *     随 spawn 移交线程，线程侧释放；编译器保证 spawn 后宿主不再使用）；
  *   - 原子操作直接作用于变量地址（&g 取址），限 32/64 位整型；
  *   - channel 为无界队列（send 不阻塞），recv 阻塞直至有值或
  *     关闭且排空（后者产 NOT_FOUND 错误值，与 map 缺键同款）；
- *   - 已知限制 v1：join 后句柄置 null（重复 join 报错）；
- *     mutex/chan 不回收（生命周期 = 进程）；map/列表等容器
+ *   - 句柄 RAII（v3.27 P0-1a）：作用域退出由编译器发 zfy_mutex_free /
+ *     zfy_chan_free（chan free 前未 close 则终止）；全局句柄登记到
+ *     资源注册表（zfy_global_reg），atexit 统一释放（P0-1d）；
+ *   - join 后句柄置 null（重复 join 报错）；map/列表等容器
  *     非线程安全，跨线程共享须用 mutex 外部保护。
  * ================================================================== */
 #ifdef _WIN32
 #include <process.h>
 
 /* ---- 线程 ---- */
+typedef struct {
+    void *env;
+    void (*dtor)(void *);                /* env 析构器（级联释放捕获副本 + free 块） */
+} zfy_thr_pack;
+
+static unsigned __stdcall zfy_thr_proc_d(void *p) {
+    zfy_thr_pack *pk = (zfy_thr_pack *)p;
+    void *env = pk->env;
+    void (*dtor)(void *) = pk->dtor;
+    free(pk);
+    void *code = *(void **)env;
+    ((void (*)(void *))code)(env);
+    if (dtor) dtor(env);                 /* P0-1c：dtor（clofree）内部自带 rc release */
+    else zfy_rc_release(env, NULL);      /* 无 dtor：直接释放（rc 归零语义） */
+    return 0;
+}
+
 static unsigned __stdcall zfy_thr_proc(void *p) {
     void *env = p;                       /* env 块：首字段 = code */
     void *code = *(void **)env;
     ((void (*)(void *))code)(env);
+    zfy_rc_release(env, NULL);           /* P0-1c：env 所有权随 spawn 移交，线程侧释放 */
     return 0;
 }
 void zfy_thread_spawn(void **out, void *clo_slot) {
     void *env = *(void **)clo_slot;      /* 闭包句柄解一层 = env 块 */
     uintptr_t th = _beginthreadex(NULL, 0, zfy_thr_proc, env, 0, NULL);
+    if (th == 0) zfy_die("spawn: 线程创建失败");
+    *out = (void *)th;
+}
+/* 带析构器版（P0-1c）：dtor 在线程体结束后调用（级联释放捕获的
+ * string/seq 副本再 free env 块，零泄漏）；dtor 为 NULL 时仅 free */
+void zfy_thread_spawn_d(void **out, void *clo_slot, void (*dtor)(void *)) {
+    void *env = *(void **)clo_slot;
+    zfy_thr_pack *pk = (zfy_thr_pack *)malloc(sizeof(zfy_thr_pack));
+    if (!pk) zfy_die("spawn: 分配失败");
+    pk->env = env;
+    pk->dtor = dtor;
+    uintptr_t th = _beginthreadex(NULL, 0, zfy_thr_proc_d, pk, 0, NULL);
     if (th == 0) zfy_die("spawn: 线程创建失败");
     *out = (void *)th;
 }
@@ -3974,11 +4128,19 @@ void zfy_thread_join(void **slot) {
     CloseHandle((HANDLE)h);
     *slot = NULL;
 }
+/* 句柄 RAII（P0-1a）：作用域退出未 join 的线程句柄——句柄本身不持堆
+ * 资源（env 已移交线程自释放），只 CloseHandle 防句柄泄漏 */
+void zfy_thread_free(void **slot) {
+    void *h = *slot;
+    if (h) {
+        CloseHandle((HANDLE)h);
+        *slot = NULL;
+    }
+}
 
 /* ---- 互斥锁（CRITICAL_SECTION） ---- */
 void zfy_mutex_new(void **out) {
-    CRITICAL_SECTION *cs = (CRITICAL_SECTION *)malloc(sizeof(CRITICAL_SECTION));
-    if (!cs) zfy_die("mutex_new: 分配失败");
+    CRITICAL_SECTION *cs = (CRITICAL_SECTION *)zfy_rc_alloc(sizeof(CRITICAL_SECTION));
     InitializeCriticalSection(cs);
     *out = cs;
 }
@@ -3991,6 +4153,17 @@ void zfy_mutex_unlock(void **slot) {
     void *h = *slot;
     if (!h) zfy_die("unlock: 互斥锁未初始化（先 mutex_new）");
     LeaveCriticalSection((CRITICAL_SECTION *)h);
+}
+/* rc 归零 dtor：销毁 CS（引用计数 P0-1a——assign 浅拷共享同一 CS） */
+static void zfy_mutex_dtor(void *h) {
+    DeleteCriticalSection((CRITICAL_SECTION *)h);
+}
+/* 句柄 RAII（P0-1a）：作用域退出释放互斥锁（持锁释放 = 死锁隐患，
+ * 编译器保证 lock 块先行回卷；防御性再查一次）。引用计数释放 */
+void zfy_mutex_free(void **slot) {
+    void *h = *slot;
+    *slot = NULL;
+    zfy_rc_release(h, zfy_mutex_dtor);
 }
 
 /* ---- 原子操作（作用于变量地址；返回旧值语义与
@@ -4040,8 +4213,7 @@ typedef struct {
 } zfy_chan;
 
 void zfy_chan_new(void **out) {
-    zfy_chan *c = (zfy_chan *)malloc(sizeof(zfy_chan));
-    if (!c) zfy_die("chan_new: 分配失败");
+    zfy_chan *c = (zfy_chan *)zfy_rc_alloc(sizeof(zfy_chan));
     InitializeCriticalSection(&c->cs);
     InitializeConditionVariable(&c->cv);
     c->head = c->tail = NULL;
@@ -4149,13 +4321,83 @@ long long zfy_chan_len(void **slot) {
     return n;
 }
 
+/* rc 归零 dtor：隐式 close（唤醒对端 recv 使其返回 miss）后丢弃残留
+ * 消息节点（收端已无法再取）。不强制显式 close：作用域退出自动回收是
+ * P0-1a 的目标语义，未 close 的残留消息属程序放弃的数据，静默清理
+ * （string 元素 free 防泄漏） */
+static void zfy_chan_dtor(void *v) {
+    zfy_chan *c = (zfy_chan *)v;
+    EnterCriticalSection(&c->cs);
+    c->closed = 1;
+    WakeAllConditionVariable(&c->cv);
+    zfy_chan_node *n = c->head;
+    while (n) {
+        zfy_chan_node *nx = n->next;
+        if (n->p) free(n->p);
+        free(n);
+        n = nx;
+    }
+    c->head = c->tail = NULL;
+    LeaveCriticalSection(&c->cs);
+    DeleteCriticalSection(&c->cs);
+}
+/* 句柄 RAII（P0-1a）：引用计数释放——assign 浅拷共享同一 chan（跨
+ * 闭包捕获/传参），最后一个持有者归零时才真正回收 */
+void zfy_chan_free(void **slot) {
+    void *c = *slot;
+    *slot = NULL;
+    zfy_rc_release(c, zfy_chan_dtor);
+}
+
+/* ---- 全局资源注册表（P0-1d）----
+ * 全局句柄/闭包 env 等进程级资源在 main 前后由编译器生成的初始化代码
+ * 登记（zfy_global_reg），atexit 统一释放——任何退出路径（正常 / panic
+ * / handler 自定义退出）都回收，文档可承诺零泄漏。
+ * 环境变量 ZFY_LEAK_DEBUG=1 时打印回收清单（Debug 泄漏报告）。 */
+typedef struct zfy_gres {
+    void **slot;                 /* 资源槽地址（全局变量槽） */
+    void (*release)(void **);    /* 释放函数（收槽地址，幂等） */
+    const char *name;            /* 诊断用资源名 */
+    struct zfy_gres *next;
+} zfy_gres;
+static zfy_gres *zfy_gres_list = NULL;
+static void zfy_gres_atexit(void); /* 前向声明 */
+
+void zfy_global_reg(void **slot, void (*release)(void **), const char *name) {
+    static int hooked = 0;
+    if (!hooked) {
+        hooked = 1;
+        atexit(zfy_gres_atexit);
+    }
+    zfy_gres *g = (zfy_gres *)malloc(sizeof(zfy_gres));
+    if (!g) return;                      /* 登记失败降级为不兜底（不致命） */
+    g->slot = slot;
+    g->release = release;
+    g->name = name;
+    g->next = zfy_gres_list;
+    zfy_gres_list = g;
+}
+
+static void zfy_gres_atexit(void) {
+    int report = getenv("ZFY_LEAK_DEBUG") != NULL;
+    for (zfy_gres *g = zfy_gres_list; g; g = g->next) {
+        if (*g->slot) {
+            if (report) fprintf(stderr, "[zfy-leak] 回收全局资源 %s\n", g->name);
+            g->release(g->slot);
+        }
+    }
+}
+
 #else
 /* 非 Windows：桦实现（调用即终止，zfy v1 并发仅支持 Windows） */
 void zfy_thread_spawn(void **o, void *c) { (void)o; (void)c; zfy_die("spawn: 仅支持 Windows"); }
+void zfy_thread_spawn_d(void **o, void *c, void (*d)(void *)) { (void)o; (void)c; (void)d; zfy_die("spawn: 仅支持 Windows"); }
 void zfy_thread_join(void **s) { (void)s; zfy_die("join: 仅支持 Windows"); }
+void zfy_thread_free(void **s) { (void)s; }
 void zfy_mutex_new(void **o) { (void)o; zfy_die("mutex: 仅支持 Windows"); }
 void zfy_mutex_lock(void **s) { (void)s; }
 void zfy_mutex_unlock(void **s) { (void)s; }
+void zfy_mutex_free(void **s) { (void)s; }
 int32_t zfy_atomic_load_32(void *p) { (void)p; return 0; }
 void zfy_atomic_store_32(void *p, int32_t v) { (void)p; (void)v; }
 int32_t zfy_atomic_add_32(void *p, int32_t v) { (void)p; (void)v; return 0; }
@@ -4175,6 +4417,10 @@ void zfy_chan_recv_err_f64(zfy_err *o, void **s) { (void)o; (void)s; MAP_MISS(o)
 void zfy_chan_recv_err_str(zfy_err *o, void **s) { (void)o; (void)s; MAP_MISS(o); }
 void zfy_chan_close(void **s) { (void)s; }
 long long zfy_chan_len(void **s) { (void)s; return 0; }
+void zfy_chan_free(void **s) { (void)s; }
+void zfy_global_reg(void **slot, void (*release)(void **), const char *name) {
+    (void)slot; (void)release; (void)name;
+}
 #endif
 
 /* ---------- 字符串设施补齐（v3.9.2）---------- */

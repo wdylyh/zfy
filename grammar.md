@@ -1,4 +1,4 @@
-# zfy 语言规范（v3.26.0，2026-10-24）
+# zfy 语言规范（v3.27.0，2026-10-24）
 
 > 本规范只描述当前语法。旧语法一律删除、不再保留历史版本描述。
 > 适用编译器：`compiler/_build/zfyc.exe` 当前构建。
@@ -1463,7 +1463,7 @@ p.twice()   // 10——方法随实例化实例化，self 类型 = Pct<i32>
   即自动全量重编。注意这是**构建级缓存**（非 per-module 独立编译）——
   模块级增量仍在 #11 路线图上（per-module 缓存 → 真独立编译）。
 
-## 29. panic 策略可配置：try / panic_msg
+## 29. panic 策略可配置：try / panic_msg / 退出档位
 
 ```zfy
 fn void risky()
@@ -1485,8 +1485,34 @@ fn main()
   捕获并返回 false。带参闭包编译期报错。
 - `panic_msg()`：返回最近一次被 try 捕获的 panic 消息；无捕获上下文时为
   空串。消息在下次 try 调用时重置。
-- 捕获实现 = runtime setjmp/longjmp（单层恢复帧）；被捕获的 panic 不走
-  panic_handler、不 exit 101，控制流回到 try 调用点。
-- 未被 try 包裹的 panic 行为完全不变（panic_handler 或打印位置 + exit 101）。
-- 注意：try 捕获后 f 中已分配的堆资源（string 列表等 RAII）随栈回退由
-  进程级策略处理；v1 不保证捕获点局部资源的即时释放（与进程退出同语义）。
+- 捕获实现 = runtime setjmp/longjmp（**链表帧栈，v3.27 起支持任意嵌套
+  深度**：内层 try 先捕获，未处理 panic 向外层传播）；被捕获的 panic 不走
+  panic_handler、不 exit 101，控制流回到对应 try 调用点。
+- 未被 try 包裹的 panic 行为完全不变（panic_handler 或打印位置 + 退出）。
+- **退出档位（v3.27，zfyc 编译选项）**：
+  - `--panic-exit <n>`：panic 退出码改为 n（默认 101）；
+  - `--panic-mode abort`：panic 改为 abort()（调试器断点场景；默认 exit）。
+  两档只影响未捕获 panic 的进程终止方式，try 捕获路径不受影响。
+- try 捕获后 f 中已分配的堆资源：句柄类（chan/mutex/闭包 env/iface 装箱）
+  走引用计数（§30），栈回退丢弃的 rc 份额由其余持有者或全局注册表回收；
+  string/seq 局部资源 v1 不保证即时释放（与进程退出同语义）。
+
+## 30. 资源管理与引用计数（v3.27）
+
+- **move-only 类型**：`File`、`mutex$`、`thread$`、`chan$<T>`、`iface$X`、
+  `closure$<sig>`——赋值/传参 = 所有权转移（源槽失效），move 后使用报
+  运行期错误；此类类型**不能作 struct 字段**（编译期拒绝）。
+- **作用域退出自动释放（RAII）**：句柄变量离开作用域自动释放
+  （mutex DestroyCS / thread CloseHandle / chan 隐式 close + 清残留消息 /
+  iface 走 vtable release / 闭包 env 级联释放捕获副本）。显式 close/join
+  后句柄置空，重复释放安全。
+- **引用计数**：chan 对象、mutex CS、闭包 env 块、iface 装箱堆块带原子
+  rc 头——浅拷共享（闭包捕获 chan、iface 进数组/赋值、闭包赋值）自动
+  retain，最后一个持有者释放时才真正回收（杜绝共享双释放/悬垂）。
+  thread 句柄除外（OS HANDLE 不可计数，语义为 move-only）。
+- **spawn 移交**：spawn 实参闭包的 env 所有权移交线程——线程体结束线程侧
+  释放（含捕获副本级联）；宿主槽置空不再释放。
+- **全局资源兜底**：全局句柄/容器登记进程级注册表，任何退出路径
+  （正常/panic/handler 自定义退出）atexit 统一回收——零泄漏承诺。
+  `ZFY_LEAK_DEBUG=1` 运行时 stderr 打印回收清单与 rc 差值报告
+  （`[zfy-leak] rc 对象泄漏: N`，N=0 为平衡）。

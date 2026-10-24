@@ -72,6 +72,8 @@ type instr =
   | MPrintSeqNest of operand * int * int * operand (* output(嵌套序列)（w-015 #6）：(序列槽, 剩余层数, 叶元素类型码, sep) *)
   | MInput of string * zty * operand             (* input：delim 是 string 值（空串 = 默认换行和空白字符集） *)
   | MFreeVar of string * zty                     (* RAII：作用域退出释放变量持有的资源 *)
+  | MFreeClo of string * string                  (* RAII（P0-1c）：释放闭包槽持有的 env 块
+                                                    （槽名, clenv 布局名——级联释放捕获副本后 free 块） *)
   | MFreeTemp of string                          (* 语句末释放临时堆�?*)
   | MFreeSeqTemp of string * bool                (* 语句末释放临�?seq（bool=元素是否 string�?*)
   | MFreeVal of operand * zty
@@ -145,6 +147,7 @@ type free_kind =
   | FStr                          (* 寄存器堆串（regs）：zfy_free_str *)
   | FSeq of bool                  (* 寄存器 seq（regs）：zfy_seq_free（元素是否 string） *)
   | FStruct of zty                (* 槽 struct（allocas）：zfy_struct_free_<名> *)
+  | FClo of string                (* 闭包句柄槽：env 块释放（clenv 布局名，P0-1c） *)
 
 (* ---------- 降码上下�?---------- *)
 
@@ -160,6 +163,8 @@ type lctx = {
   mutable frunred : bool;    (* 当前函数返回类型带 unred：return 不做 frac 归一（new.md） *)
   mutable locks : operand list;  (* v3.26 P0-3：lock 块栈——return/break/continue
                                     穿越时按栈逆序补 zfy_mutex_unlock（配对回卷） *)
+  mutable clo_envs : (string * string) list;  (* P0-1c：闭包变量槽 -> clenv 布局名
+                                                （EClNewK 临时移入变量时登记，MFreeVar 级联释放用） *)
   unreds : (string, bool) Hashtbl.t;  (* unred frac 数组/列表槽名集合：元素存入不归一 *)
 }
 
@@ -198,10 +203,30 @@ let seq_key_kind (t : zty) =
   | _ -> assert false
 
 (* 需 RAII 释放的变量类型：string（堆串）、数组/列表（seq 资源）、struct（内含堆资源）。
-   全局变量槽（'@' 前缀）不属于函数作用域，永不释放 *)
+   全局变量槽（'@' 前缀）不属于函数作用域，永不释放。
+   v3.27 P0-1：句柄（mutex$/chan$/thread$）、接口（iface$X）、闭包
+   （closure$*）也是 owned——声明作用域退出自动释放（free_kind/llvmgen 分派） *)
+let is_handle_sname (s : string) =
+  s = "mutex$" || s = "thread$"
+  || (String.length s > 5 && String.sub s 0 5 = "chan$")
+let is_iface_sname (s : string) =
+  String.length s > 6 && String.sub s 0 6 = "iface$"
+let is_clo_sname (s : string) =
+  String.length s > 8 && String.sub s 0 8 = "closure$"
+let is_move_only_sname (s : string) =
+  is_handle_sname s || is_iface_sname s || is_clo_sname s
+
 let owned_ty (name : string) (t : zty) =
   match t with
   | TString | TArray _ | TList _ | TStruct _ | TFile -> name.[0] <> '@'
+  | _ -> false
+
+(* move-only 类型（P0-1a/b/c）：句柄/接口/闭包——变量间转移 = 所有权
+   转移（源槽清空），值语义拷贝废止 *)
+let move_only_ty (t : zty) =
+  match t with
+  | TFile -> true
+  | TStruct s -> is_move_only_sname s
   | _ -> false
 
 (* 在当前作用域登记需 RAII 释放的变量（后声明先释放） *)
@@ -245,6 +270,7 @@ let move_owned_temp l (name : string) (v : operand) (ty : zty) : bool =
     | FStr, TString -> true
     | FSeq _, (TArray _ | TList _) -> true
     | FStruct _, TStruct _ -> true
+    | FClo _, TStruct s -> is_clo_sname s
     | _ -> false
   in
   match v.o, ty with
@@ -253,6 +279,9 @@ let move_owned_temp l (name : string) (v : operand) (ty : zty) : bool =
       | [] -> false
       | (n, kind) :: rest when n = d && kind_matches kind ->
         l.stmt_temps <- List.rev_append acc rest;
+        (match kind with
+         | FClo clenv -> l.clo_envs <- (name, clenv) :: l.clo_envs
+         | _ -> ());
         emit l (MMoveSeq (name, v, ty));
         true
       | x :: rest -> go (x :: acc) rest
@@ -291,7 +320,8 @@ let finish_stmt_temps l =
         match kind with
         | FStr -> emit l (MFreeTemp n)
         | FSeq is_str -> emit l (MFreeSeqTemp (n, is_str))
-        | FStruct t -> emit l (MFreeStructTemp (n, t)))
+        | FStruct t -> emit l (MFreeStructTemp (n, t))
+        | FClo clenv -> emit l (MFreeClo (n, clenv)))
       ts
 
 (* RAII：从作用域栈顶释放到深度 depth（不含），内层作用域先释放�?   层内后声明先释放；skip 中的变量名不释放（如�?return 转移的返回值） *)
@@ -300,7 +330,14 @@ let emit_frees_from_skip l depth skip =
     | [] -> ()
     | top :: rest when List.length rest >= depth ->
       List.iter
-        (fun (n, t) -> if not (List.mem n skip) then emit l (MFreeVar (n, t)))
+        (fun (n, t) ->
+          if not (List.mem n skip) then
+            match t with
+            | TStruct s when is_clo_sname s ->
+              (match List.assoc_opt n l.clo_envs with
+               | Some clenv -> emit l (MFreeClo (n, clenv))
+               | None -> emit l (MFreeVar (n, t)))
+            | _ -> emit l (MFreeVar (n, t)))
         !top;
       go rest
     | _ -> ()
@@ -530,6 +567,40 @@ let rec lexpr l (e : texpr) : operand =
     emit l (MCall (Some d, "zfy_panic_msg", [], TString));
     op (OLocal d) e.ety
   | ECallK (f, args, moves) ->
+    (* spawn 特判（P0-1c 类别 2）：env 所有权移交线程（线程体结束线程侧
+       释放）。实参为语句临时闭包时从 stmt_temps 摘除（宿主不再释放）；
+       为变量槽时调用后清槽（typeck 已标记 moved） *)
+    if f = "zfy_thread_spawn" then begin
+      match args with
+      | [ cb ] ->
+        let oc = lexpr l cb in
+        let need_clear =
+          match oc.o with
+          | OLocal n when n.[0] = '%' ->
+            let rec go acc = function
+              | [] -> false
+              | (m, FClo _) :: rest when m = n ->
+                l.stmt_temps <- List.rev_append acc rest; true
+              | x :: rest -> go (x :: acc) rest
+            in
+            go [] l.stmt_temps
+          | OLocal n when n.[0] <> '@' -> true
+          | _ -> false
+        in
+        let d = fresh l in
+        (* ret 类型 = e.ety（thread$）：dst 槽是 thread 句柄槽；
+           用 oc.oty（closure）会让 thread$ 变量槽 alloca 成闭包槽，
+           RAII 按 thread$ 释放时 free 错地址 → AV *)
+        emit l (MCall (Some d, "zfy_thread_spawn", [ oc ], e.ety));
+        (* 清槽在调用之后：spawn 需读闭包 env 指针移交线程 *)
+        (match oc.o with
+         | OLocal n when n.[0] <> '@' && n.[0] <> '%' -> emit l (MClear (n, oc.oty))
+         | _ -> ());
+        ignore need_clear;
+        op (OLocal d) e.ety
+      | _ -> merr e.epos "spawn expects exactly one argument"
+    end
+    else
     (* 用户函数：所有权传参。先求值全部实参，再逐个判定可移动性
        （本语句临时直接移交；显式 move 实参（f(move x)）移交并清槽，
        其余由调用方克隆保持值语义）。
@@ -541,9 +612,12 @@ let rec lexpr l (e : texpr) : operand =
         (fun i o ->
           match List.nth_opt moves i with
           | Some true ->
-            (* 显式 move：typeck 已保证局部 owned 变量（string/数组/列表/File） *)
+            (* 显式 move：typeck 已保证局部 owned 变量（string/数组/列表/
+               File/句柄/接口/闭包，P0-1 扩展） *)
             (match o.o, o.oty with
              | OLocal n, (TString | TArray _ | TList _ | TFile) when n.[0] <> '@' ->
+               (true, Some (n, o.oty))
+             | OLocal n, TStruct s when is_move_only_sname s && n.[0] <> '@' ->
                (true, Some (n, o.oty))
              | _ -> (false, None))
           | _ -> arg_moveable l o)
@@ -800,10 +874,12 @@ let rec lexpr l (e : texpr) : operand =
     emit l (MFunAddr (d, f));
     op (OLocal d) e.ety
   | EClNewK (mangle, clenv, items) ->
-    (* 闭包构造（v3.7）：分配堆块写入 code+捕获，句柄值 = 堆块地址 *)
+    (* 闭包构造（v3.7）：分配堆块写入 code+捕获，句柄值 = 堆块地址。
+       登记为 FClo 语句临时（P0-1c：语句末未移交则级联释放 env） *)
     let oitems = List.map (lexpr l) items in
     let d = fresh l in
     emit l (MClNew (d, mangle, clenv, oitems, e.ety));
+    add_temp l d (FClo clenv);
     op (OLocal d) e.ety
   | EClCallK (cb, args) ->
     (* 闭包调用（v3.7）：call code(env=堆块, args)。
@@ -845,9 +921,14 @@ let rec lexpr l (e : texpr) : operand =
     emit l (MErrNew (d, e.ety, oc, om));
     op (OLocal d) e.ety
   | EPanicK (code, msg) ->
-    (* panic：调用运行时后不返回；后继代码落入死块（死代码消除删除） *)
+    (* panic：调用运行时后不返回；后继代码落入死块（死代码消除删除）。
+       P0-4c：panic 路径 RAII 回卷——先释放本函数局部资源、回卷锁栈，
+       再调 zfy_panic（try 帧栈恢复后不留悬垂句柄/死锁） *)
     let oc = Option.map (lexpr l) code in
     let om = lexpr l msg in
+    finish_stmt_temps l;
+    emit_frees_from l 0;
+    emit_unlocks l;
     emit l (MPanic (oc, om));
     set_term l TUnreachable;
     l.cur <- new_block l;
@@ -1014,20 +1095,24 @@ and lstmt_inner l (s : tstmt) : unit =
   match s.s with
   | SDeclK (_, name, ty, init, nn) ->
     (* 标量声明：变量永远有值，必有初值；非 unred frac 存入后约分。
-       初值是本语句的 seq 临时（如 split 结果）时直接 move 所有权免克隆。
-       File（move-only）：初值为局部变量槽时为所有权转移（清空源槽，
-       运行期失效兜底；design_fileio.md） *)
+       初值是本语句的 seq/struct/闭包临时（如 split 结果、构造调用）时
+       直接 move 所有权免克隆。File/句柄/接口/闭包（move-only，P0-1）：
+       初值为局部变量槽时为所有权转移（清空源槽，运行期失效兜底） *)
     declare_owned l name ty;
     let v = lexpr l init in
     let moved =
       match ty, v.o with
-      | TFile, OLocal src when src.[0] <> '%' && src.[0] <> '@' ->
-        emit l (MCopy (name, v, ty));
+      | (TFile | TStruct _), OLocal src when src.[0] <> '%' && src.[0] <> '@'
+        && move_only_ty ty ->
+        (* 所有权转移：位拷贝接管（rc 引用计数不动）+ 清空源槽——
+           用 MCopy（assign retain）会 +1 而源槽 MClear 裸 null 不减，泄漏 *)
+        emit l (MMoveSeq (name, v, ty));
         emit l (MClear (src, ty));
         true
       | _ ->
         (match ty with
-         | TString | TArray _ | TList _ -> move_owned_temp l name v ty
+         | TString | TArray _ | TList _ | TStruct _ ->
+           move_owned_temp l name v ty
          | _ -> false)
     in
     if not moved then begin
@@ -1081,25 +1166,28 @@ and lstmt_inner l (s : tstmt) : unit =
          (* move 赋值（new2.md #1：自动 move/显式 move）：源为变量槽时
             所有权直接转移（释放目标旧值 + 接管指针），随后清空源槽防双释放 *)
          (match lhs.ety, v.o with
-          | (TString | TArray _ | TList _ | TFile), OLocal src ->
-            emit l (MMoveSeq (name, v, lhs.ety));
-            emit l (MClear (src, lhs.ety))
+          | ((TString | TArray _ | TList _ | TFile | TStruct _) as ty), OLocal src ->
+            emit l (MMoveSeq (name, v, ty));
+            emit l (MClear (src, ty))
           | _ -> merr lhs.epos "move assignment requires an aggregate variable source")
        end
-       else if lhs.ety = TFile then begin
-         (* File move-only（design_fileio.md）：变量到变量赋值 = 所有权
-            转移（typeck 已标记源变量 moved）；目标旧句柄自动 close *)
+       else if move_only_ty lhs.ety then begin
+         (* move-only 类型（File/句柄/接口/闭包，P0-1）：变量到变量赋值 =
+            所有权转移（typeck 已标记源变量 moved）；目标旧句柄自动释放 *)
          (match v.o with
           | OLocal src when src.[0] <> '%' && src.[0] <> '@' ->
             emit l (MMoveSeq (name, v, lhs.ety));
             emit l (MClear (src, lhs.ety))
-          | _ -> emit l (MCopy (name, v, lhs.ety)))
+          | _ ->
+            if not (move_owned_temp l name v lhs.ety) then
+              emit l (MCopy (name, v, lhs.ety)))
        end
        else begin
          (* 聚合整体赋值：值为本语句临时（切片/split/调用结果等）时 move 免克隆 *)
          let moved =
            match lhs.ety with
-           | TString | TArray _ | TList _ -> move_owned_temp l name v lhs.ety
+           | TString | TArray _ | TList _ | TStruct _ ->
+             move_owned_temp l name v lhs.ety
            | _ -> false
          in
          if not moved then begin
@@ -1650,7 +1738,7 @@ let lower_fn (h : hir) (f : tfn) : mfn =
   let l =
     { blocks = Hashtbl.create 8; nb = 0; nt = 0; cur = Obj.magic 0;
       loops = []; scopes = []; stmt_temps = []; unchecked = false;
-      frunred = f.frunred; locks = []; unreds = Hashtbl.create 8 }
+      frunred = f.frunred; locks = []; clo_envs = []; unreds = Hashtbl.create 8 }
   in
   let entry = new_block l in
   l.cur <- entry;
@@ -1669,11 +1757,13 @@ let lower_fn (h : hir) (f : tfn) : mfn =
       end)
     !lets;
   (* 函数体整体作为顶层 RAII 作用域；string 参数在入口 strdup、数组/列表参数
-     在入口 clone（一律拷贝语义，gen_fn 落槽），参数槽登记为 owned 以便函数退出时释放 *)
+     在入口 clone（一律拷贝语义，gen_fn 落槽），参数槽登记为 owned 以便函数退出时释放。
+     P0-1：句柄/接口/闭包参数 = 借用（调用方持有并释放；被调方只读使用，
+     不登记 owned——否则被调方退出会释放调用方的资源） *)
   l.scopes <- ref [] :: l.scopes;
   List.iter
     (fun (_, n, t, u) ->
-      declare_owned l n t;
+      if not (move_only_ty t) then declare_owned l n t;
       (* 非 unred frac 参数入口归一（new.md：传参也要自动约分）。
          参数在 llvmgen 入口已值拷贝（memcpy 语义），此处原地归一
          只影响本函数的参数副本，调用方源槽不变 *)
@@ -1765,6 +1855,7 @@ let uses_of (i : instr) : string list =
     name :: List.concat_map operand_names ops
   | MMoveSeq (_, v, _) -> operand_names v
   | MClear _ -> []
+  | MFreeClo _ -> []   (* 槽释放：def 而非 use（槽随后清空） *)
   | MBinop (_, _, a, b) -> operand_names a @ operand_names b
   | MUnop (_, _, a) -> operand_names a
   | MCast (_, a, _) -> operand_names a

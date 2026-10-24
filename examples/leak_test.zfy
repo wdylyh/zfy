@@ -1,0 +1,54 @@
+// P0-1a 专项：句柄引用计数（rc）各共享路径——零崩溃 + 零 rc 泄漏
+// 验证方式：ZFY_LEAK_DEBUG=1 运行，stderr 无 "[zfy-leak] rc 对象泄漏" 行
+// 覆盖：①chan 跨多闭包捕获 ②mutex 共享 ③闭包赋值共享 env ④iface 进数组
+//       ⑤iface 赋值共享装箱 ⑥spawn 移交 rc 平衡
+
+interface Shape
+    fn i64 area()
+
+struct Box
+    i64 v = 0
+
+    fn i64 area()
+        return self.v
+
+fn main()
+  // ①chan：两个闭包捕获同一 chan，先发送后接收（thread_test 场景）
+  let chan<string> ch
+  let p1 = spawn(fn() => chan_send(ch, "a"))
+  let p2 = spawn(fn() => chan_send(ch, "b"))
+  output(chan_recv(ch) ?? "miss")
+  output(chan_recv(ch) ?? "miss")
+  join(p1)
+  join(p2)
+  chan_close(ch)
+  output(chan_recv(ch) ?? "miss")
+
+  // ②mutex：嵌套作用域 RAII（锁回卷 + 作用域退出释放）
+  let m = mutex_new()
+  lock(m)
+  unlock(m)
+  output("mutex ok")
+
+  // ③闭包 move 转移：源槽清空、单持有释放
+  let fn() -> i64 f1 = fn() -> i64
+    return 7
+  let fn() -> i64 f2 = move f1
+  output(f2())
+
+  // ④iface 进数组：装箱共享（seq ops copy = assign retain）
+  let Shape[] xs
+  xs = push(xs, Shape(Box(1)))
+  xs = push(xs, Shape(Box(2)))
+  let i64 total = 0
+  for s in xs
+    total = total + s.area()
+  output(total)
+
+  // ⑥spawn 变量闭包移交：宿主槽 rc 份额随 move 清空移交线程
+  let i64 base = 0
+  let fn() -> void job = fn() -> void
+    let i64 _ = atomic_add(&base, 5)
+  let t = spawn(job)
+  join(t)
+  output(base)

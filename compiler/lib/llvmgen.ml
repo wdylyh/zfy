@@ -49,6 +49,12 @@ let rec ll_ty (t : zty) : string =
 (* frac 与 struct 是真正的 LLVM 聚合；数组/列表槽是 ptr 标量 *)
 let is_agg = function TFrac _ | TStruct _ | TErr _ -> true | _ -> false
 
+(* panic 退出档位（P0-4，v3.27）：driver 经 set_panic_opts 传入——
+   exit 模式（默认，code 默认 1）调 exit(code)；abort 模式调 abort() *)
+let panic_mode = ref "exit"
+let panic_exit_code = ref 1
+let set_panic_opts mode code = panic_mode := mode; panic_exit_code := code
+
 let width_of (t : zty) : int =
   match t with
   | TInt n | TUint n -> n
@@ -67,6 +73,8 @@ type gctx = {
   globals : (string, unit) Hashtbl.t;  (* 顶层变量槽（'@' 前缀）去重表 *)
   srcfiles : (string, string) Hashtbl.t; (* panic 行号（v3.5 DX）：文件名 → 常量全局名 *)
   structs : sdef list;             (* struct 定义表（布局与辅助函数生成用） *)
+  clo_envs : (string, string) Hashtbl.t; (* P0-1c：闭包签名 mangle -> clenv 布局名 *)
+  clofrees : (string, string) Hashtbl.t; (* P0-1c：clenv 名 -> env 析构器符号（缓存） *)
 }
 
 let struct_ty_name (s : string) : string = Printf.sprintf "%%struct.%s" s
@@ -266,6 +274,7 @@ type fctx = {
   regs : (string, string) Hashtbl.t;           (* 纯临时名 -> LLVM 寄存器 *)
   fret : zty;
   mutable nl : int;                            (* 内联边界检查的局部标签计数 *)
+  fname : string;                              (* 当前函数名（zfy.globals 判定用） *)
 }
 
 let fresh_r fc = fc.nr <- fc.nr + 1; Printf.sprintf "%%r%d" fc.nr
@@ -1066,8 +1075,50 @@ let bool_i32_rts =
     "zfy_contains_u32"; "zfy_contains_u64"; "zfy_contains_f32";
     "zfy_contains_f64"; "zfy_contains_str" ]
 
+(* P0-1c：惰性生成 clenv 析构器 @zfy.clofree$<clenv>（rc release：归零才
+   级联释放捕获副本 + free env 块）；clofrees 缓存去重。spawn 移交与闭包
+   变量 RAII 共用。env 块带 rc 头（zfy_env_new），浅拷共享（闭包赋值/
+   容器存闭包）由 assign 侧 retain 配平 *)
+let ensure_clofree (g : gctx) (clenv : string) : string =
+  let sym = Printf.sprintf "@zfy.clofree$%s" clenv in
+  if not (Hashtbl.mem g.clofrees clenv) then begin
+    Hashtbl.replace g.clofrees clenv sym;
+    (* null 安全：move 后槽/零值槽 field0 = null——跳过释放防段错误 *)
+    Buffer.add_string g.mbuf
+      (Printf.sprintf
+         "define internal void @zfy.clofree$%s(ptr %%env) {\n  %%z = icmp eq ptr %%env, null\n  br i1 %%z, label %%skip, label %%do\nskip:\n  ret void\ndo:\n  call void @zfy_rc_release(ptr %%env, ptr @zfy_struct_free_%s)\n  ret void\n}\n"
+         clenv clenv)
+  end;
+  sym
+
 let gen_call fc dst name (args : operand list) (ret_ty : zty) =
-  if name = "zfy_stoi_wide" then begin
+  if name = "zfy_thread_spawn" then begin
+    (* spawn（P0-1c 类别 2）：env 所有权移交线程。改调 zfy_thread_spawn_d
+       附带 env 析构器（线程体结束：级联释放捕获副本 + free env 块）；
+       闭包签名 → clenv 映射缺失（跨函数返回的闭包）时退回旧接口 *)
+    (match dst, args with
+     | Some d, [ clo ] ->
+       let (op, _) = ptr_of fc clo in
+       let dtor =
+         match clo.oty with
+         | TStruct mangle ->
+           (match Hashtbl.find_opt fc.g.clo_envs mangle with
+            | Some clenv -> Some (ensure_clofree fc.g clenv)
+            | None -> None)
+         | _ -> None
+       in
+       (match dtor with
+        | Some sym ->
+          let (dp, _) =
+            match Hashtbl.find_opt fc.allocas d with
+            | Some (a, _) -> (a, "ptr")
+            | None -> (d, "ptr")
+          in
+          emitf fc "  call void @zfy_thread_spawn_d(ptr %s, ptr %s, ptr %s)" dp op sym
+        | None -> emitf fc "  call void @zfy_thread_spawn(ptr %s, ptr %s)" d op)
+     | _ -> lerr None "zfy_thread_spawn call shape error")
+  end
+  else if name = "zfy_stoi_wide" then begin
     (* string → 128 位整数 fail-fast 转换（t-016 遗留修复）：运行时以
        返回值写低 64 位、指针写高 64 位（规避 win32 __int128 返回值
        ABI 的 sret 隐藏指针约定），LLVM 侧拼装 i128 *)
@@ -1192,8 +1243,11 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
           let (srcp, _) = ptr_of fc src in
           let blk = fresh_r fc in
           emitf_entry fc "  %s = call ptr @zfy_env_new(i64 %d)" blk sz;
-          emitf fc "  call void @llvm.memcpy.p0.p0.i64(ptr %s, ptr %s, i64 %d, i1 false)"
-            blk srcp sz;
+          (* P0-1b：深拷贝替代 memcpy（src 内含 string/seq 字段时浅拷
+             会共享——release 时双释放）；zeroinit 后逐字段 assign *)
+          emitf fc "  call void @llvm.memset.p0.i64(ptr %s, i8 0, i64 %d, i1 false)"
+            blk sz;
+          emitf fc "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" sname blk srcp;
           let (addr, _) = Hashtbl.find fc.allocas d in
           let ifty = ll_ty (TStruct ("iface$" ^ iname)) in
           let d0 = gen_gep fc addr ifty 0 in
@@ -1795,7 +1849,8 @@ let gen_instr fc (i : instr) : unit =
     end
   | MErrNew (d, ty, code, msg) ->
     (* fail(code, msg)：错误值槽清零后写 code/msg（value 保持 0 = 元素零值，
-       误读安全）；msg strdup 一份永不释放（有意的最小泄漏，免生命周期管理） *)
+       误读安全）；msg 经 zfy_msg_strdup 进入跟踪分配器（atexit 统一释放，
+       v3.27 P0-1 零泄漏） *)
     let addr = fresh_r fc in
     emitf_entry fc "  %s = alloca %s" addr (ll_ty ty);
     Hashtbl.replace fc.allocas d (addr, ty);
@@ -1807,7 +1862,7 @@ let gen_instr fc (i : instr) : unit =
     let mp = gen_gep fc addr (ll_ty ty) 1 in
     let (mv, _) = val_of fc msg in
     let r = fresh_r fc in
-    emitf fc "  %s = call ptr @zfy_strdup(ptr %s)" r mv;
+    emitf fc "  %s = call ptr @zfy_msg_strdup(ptr %s)" r mv;
     emitf fc "  store ptr %s, ptr %s" r mp
   | MErrOk (d, ty, v) ->
     (* 成功包装：错误值槽清零（code=0, msg=null）后写 value 字段。
@@ -1994,7 +2049,35 @@ let gen_instr fc (i : instr) : unit =
       if not (Hashtbl.mem fc.g.globals name) then begin
         Hashtbl.replace fc.g.globals name ();
         Buffer.add_string fc.g.mbuf
-          (Printf.sprintf "%s = global %s zeroinitializer\n" gname (ll_ty ty))
+          (Printf.sprintf "%s = global %s zeroinitializer\n" gname (ll_ty ty));
+        (* P0-1d：owned 全局资源（string/seq/File/struct 持堆资源）登记进
+           进程退出兜底注册表——gfree wrapper（按类型分派释放）+ 在
+           zfy.globals 体内调 zfy_global_reg（atexit 回收 + ZFY_LEAK_DEBUG
+           泄漏清单） *)
+        let emit_wrap free_body =
+          let sanitize c = if c = '@' then '_' else c in
+          let wrap =
+            Printf.sprintf "@zfy.gfree$%s" (String.map sanitize (String.sub name 1 (String.length name - 1))) in
+          Buffer.add_string fc.g.mbuf
+            (Printf.sprintf
+               "define internal void %s(ptr %%p) {\n%s  ret void\n}\n" wrap free_body);
+          wrap
+        in
+        let wrap =
+          match ty with
+          | TString ->
+            emit_wrap "  %v = load ptr, ptr %p\n  call void @zfy_free_str(ptr %v)"
+          | TArray _ | TList _ ->
+            emit_wrap "  %v = load ptr, ptr %p\n  call void @zfy_seq_free(ptr %v)"
+          | TFile ->
+            emit_wrap "  %v = load ptr, ptr %p\n  call void @zfy_file_autoclose(ptr %v)"
+          | TStruct s ->
+            emit_wrap (Printf.sprintf "  call void @zfy_struct_free_%s(ptr %%p)" s)
+          | _ -> ""
+        in
+        if wrap <> "" && fc.fname = "zfy.globals" then
+          emitf fc "  call void @zfy_global_reg(ptr %s, ptr %s, ptr %s)"
+            gname wrap (intern_string fc.g name)
       end;
       Hashtbl.replace fc.allocas name (gname, ty)
     end
@@ -2171,6 +2254,16 @@ let gen_instr fc (i : instr) : unit =
           emitf fc "  call void @zfy_file_autoclose(ptr %s)" sp;
           emitf fc "  store ptr null, ptr %s" addr
         | _ -> ())
+     | None -> lerr None "undefined variable %s" name)
+  | MFreeClo (name, clenv) ->
+    (* RAII（P0-1c）：闭包槽 field0 = env 块地址（块头即 code）——
+       rc release（归零才级联释放捕获副本 + free 块，P0-1a 引用计数） *)
+    (match Hashtbl.find_opt fc.allocas name with
+     | Some (addr, _) ->
+       let h = fresh_r fc in
+       emitf fc "  %s = load ptr, ptr %s" h addr;
+       emitf fc "  call void @zfy_rc_release(ptr %s, ptr @zfy_struct_free_%s)" h clenv;
+       emitf fc "  store ptr null, ptr %s" addr
      | None -> lerr None "undefined variable %s" name)
   | MFreeTemp name ->
     (* 语句末释放临时堆串（寄存器中持有 malloc 指针） *)
@@ -2519,6 +2612,7 @@ let gen_instr fc (i : instr) : unit =
        let addr = fresh_r fc in
        emitf_entry fc "  %s = alloca %s" addr (ll_ty (TStruct mangle));
        Hashtbl.replace fc.allocas d (addr, TStruct mangle);
+       Hashtbl.replace fc.g.clo_envs mangle clenv;   (* P0-1c：析构器解析用 *)
        emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty (TStruct mangle)) addr;
        let blk = fresh_r fc in
        emitf fc "  %s = call ptr @zfy_env_new(i64 %d)" blk sz;
@@ -2625,7 +2719,7 @@ let gen_fn g (f : mfn) : string =
   let body = Buffer.create 512 in
   let fc =
     { g; buf = body; ebuf; nr = 0; allocas = Hashtbl.create 16; regs = Hashtbl.create 16;
-      fret = f.mret; nl = 0 }
+      fret = f.mret; nl = 0; fname = f.mname }
   in
   let ret_ll = if is_agg f.mret then "void" else ll_ty f.mret in
   let params_ll =
@@ -2704,36 +2798,95 @@ let gen_struct_type_def (_ : gctx) (sd : sdef) : string =
   else
     Printf.sprintf "%s = type { %s }\n" (struct_ty_name sd.sname) body
 
+(* move-only struct 名判定（llvmgen 侧，与 mir.move_only_ty 对应）：
+   句柄 mutex$/thread$/chan$<tag>、接口 iface$X、闭包 closure$<sig> *)
+let is_move_only_sname_ll (s : string) : bool =
+  s = "mutex$" || s = "thread$"
+  || (String.length s > 5 && String.sub s 0 5 = "chan$")
+  || (String.length s > 6 && String.sub s 0 6 = "iface$")
+  || (String.length s > 8 && String.sub s 0 8 = "closure$")
+
 (* 生成 @zfy_struct_free_<名>(ptr)：逐字段释放堆资源
-   （string/seq/嵌套 struct 递归；运行时 free 函数均 NULL 安全） *)
-let gen_struct_free_fn (sd : sdef) : string =
+   （string/seq/嵌套 struct 递归；运行时 free 函数均 NULL 安全）。
+   v3.27 P0-1 专属释放：
+   - mutex$/thread$/chan$<tag>：单 ptr 字段 → runtime 句柄释放；
+   - iface$X：{ data, vt } → vtable 末槽 release 间接调用（深释放 data）；
+   - closure$<sig>：field0 = env 块地址 → @zfy.clofree$<clenv>（级联释放
+     捕获副本 + free 块）。clenv 映射来自 g.clo_envs（MClNew 时登记，
+     故本函数必须在 gen_fn 全部完成后生成——调用点已挪至 gen_program 末尾）。
+   字段级 move-only 类型（嵌套句柄/接口/闭包借拷）跳过——级联会双释放 *)
+let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
+  let sn = struct_ty_name sd.sname in
   (* 内建容器 map$/set$（v3.6）：句柄 struct 整体走 runtime 深释放 *)
   if Typeck.is_map_struct sd.sname || (String.length sd.sname > 4 && String.sub sd.sname 0 4 = "set$") then
     Printf.sprintf
       "define void @zfy_struct_free_%s(ptr %%p) {\n  call void @zfy_map_free(ptr %%p)\n  ret void\n}\n"
       sd.sname
+  (* 互斥/线程句柄：field0 = runtime 句柄指针；free 接收槽地址（void**） *)
+  else if sd.sname = "mutex$" || sd.sname = "thread$" then
+    let fre = if sd.sname = "mutex$" then "zfy_mutex_free" else "zfy_thread_free" in
+    Printf.sprintf
+      "define void @zfy_struct_free_%s(ptr %%p) {\n  call void @%s(ptr %%p)\n  ret void\n}\n"
+      sd.sname fre
+  (* channel 句柄：chan$<elem> *)
+  else if String.length sd.sname > 5 && String.sub sd.sname 0 5 = "chan$" then
+    Printf.sprintf
+      "define void @zfy_struct_free_%s(ptr %%p) {\n  call void @zfy_chan_free(ptr %%p)\n  ret void\n}\n"
+      sd.sname
+  (* 接口值：{ data, vt } → vtable 末槽 release(data) *)
+  else if String.length sd.sname > 6 && String.sub sd.sname 0 6 = "iface$" then
+    let iname = String.sub sd.sname 6 (String.length sd.sname - 6) in
+    let nslots =
+      match Hashtbl.find_opt Typeck.iface_tbl iname with
+      | Some ms -> List.length ms
+      | None -> lerr None "undefined interface %s" iname
+    in
+    Printf.sprintf
+      "define void @zfy_struct_free_%s(ptr %%p) {\n  %%d = load ptr, ptr %%p\n  %%z = icmp eq ptr %%d, null\n  br i1 %%z, label %%skip, label %%do\nskip:\n  ret void\ndo:\n  %%vtp = getelementptr inbounds %s, ptr %%p, i32 0, i32 1\n  %%vt = load ptr, ptr %%vtp\n  %%fp = getelementptr [ %d x ptr ], ptr %%vt, i64 0, i32 %d\n  %%rel = load ptr, ptr %%fp\n  call void %%rel(ptr %%d)\n  ret void\n}\n"
+      sd.sname sn (nslots + 1) nslots
+  (* 闭包句柄：field0 = env 块地址（块头即 code）→ clofree 析构器 *)
+  else if String.length sd.sname > 8 && String.sub sd.sname 0 8 = "closure$" then
+    (match Hashtbl.find_opt g.clo_envs sd.sname with
+     | Some clenv ->
+       let sym = ensure_clofree g clenv in
+       Printf.sprintf
+         "define void @zfy_struct_free_%s(ptr %%p) {\n  %%h = load ptr, ptr %%p\n  call void %s(ptr %%h)\n  ret void\n}\n"
+         sd.sname sym
+     | None ->
+       (* 映射缺失（该签名从未在本程序 MClNew——不可达；防御性 no-op） *)
+       Printf.sprintf
+         "define void @zfy_struct_free_%s(ptr %%p) {\n  ret void\n}\n"
+         sd.sname)
   else begin
   let b = Buffer.create 128 in
   let emit : 'a. ('a, unit, string, unit) format4 -> 'a =
     fun fmt -> Printf.ksprintf (fun s -> Buffer.add_string b (s ^ "\n")) fmt
   in
-  let sn = struct_ty_name sd.sname in
+  (* clenv$N（clenv 布局）：捕获副本是独立 rc 份额（assign 时 retain 过），
+     move-only 字段须递归 release（chan 捕获等）——用户 struct 的 move-only
+     字段是共享借拷才 skip，此处不可跳过（泄漏） *)
+  let is_clenv =
+    String.length sd.sname > 6 && String.sub sd.sname 0 6 = "clenv$" in
   emit "define void @zfy_struct_free_%s(ptr %%p) {" sd.sname;
   List.iteri
     (fun i (_, fty) ->
+      let fp = Printf.sprintf "%%f%d" i and v = Printf.sprintf "%%v%d" i in
       match fty with
+      | TStruct s2 when is_move_only_sname_ll s2 && not is_clenv -> ()
+        (* move-only 字段：共享借用拷，不级联（双释放） *)
+      | TStruct s2 when is_move_only_sname_ll s2 ->
+        (* clenv 捕获副本：递归 rc release *)
+        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+        emit "  call void @zfy_struct_free_%s(ptr %s)" s2 fp
       | TString ->
-        let fp = Printf.sprintf "%%f%d" i and v = Printf.sprintf "%%v%d" i in
         emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
         emit "  %s = load ptr, ptr %s" v fp;
         emit "  call void @zfy_free_str(ptr %s)" v
       | TArray _ | TList _ ->
-        let fp = Printf.sprintf "%%f%d" i and v = Printf.sprintf "%%v%d" i in
         emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
         emit "  %s = load ptr, ptr %s" v fp;
         emit "  call void @zfy_seq_free(ptr %s)" v
       | TStruct s2 ->
-        let fp = Printf.sprintf "%%f%d" i in
         emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
         emit "  call void @zfy_struct_free_%s(ptr %s)" s2 fp
       | _ -> ())
@@ -2752,6 +2905,19 @@ let gen_struct_assign_fn (sd : sdef) : string =
     Printf.sprintf
       "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n  call void @zfy_map_assign(ptr %%dst, ptr %%src)\n  ret void\n}\n"
       sd.sname
+  (* 句柄 struct（v3.27 P0-1a 引用计数）：浅拷共享堆对象 + retain 配平。
+     mutex$/chan$/closure$ 单 ptr；iface$ 两 ptr（retain data）。
+     thread$ 例外：HANDLE 不可计数，assign 视为 move（源槽随 move 清空） *)
+  else if sd.sname = "mutex$" || (String.length sd.sname > 5 && String.sub sd.sname 0 5 = "chan$")
+          || (String.length sd.sname > 8 && String.sub sd.sname 0 8 = "closure$") then
+    Printf.sprintf
+      "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n  %%v = load ptr, ptr %%src\n  call void @zfy_rc_retain(ptr %%v)\n  store ptr %%v, ptr %%dst\n  ret void\n}\n"
+      sd.sname
+  else if String.length sd.sname > 6 && String.sub sd.sname 0 6 = "iface$" then
+    let sn = struct_ty_name sd.sname in
+    Printf.sprintf
+      "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n  %%d = getelementptr inbounds %s, ptr %%dst, i32 0, i32 0\n  %%s0 = getelementptr inbounds %s, ptr %%src, i32 0, i32 0\n  %%v = load ptr, ptr %%s0\n  call void @zfy_rc_retain(ptr %%v)\n  store ptr %%v, ptr %%d\n  %%d1 = getelementptr inbounds %s, ptr %%dst, i32 0, i32 1\n  %%s1 = getelementptr inbounds %s, ptr %%src, i32 0, i32 1\n  %%t = load ptr, ptr %%s1\n  store ptr %%t, ptr %%d1\n  ret void\n}\n"
+      sd.sname sn sn sn sn
   else begin
   let b = Buffer.create 256 in
   let emit : 'a. ('a, unit, string, unit) format4 -> 'a =
@@ -2762,9 +2928,18 @@ let gen_struct_assign_fn (sd : sdef) : string =
   List.iteri
     (fun i (_, fty) ->
       let dp = Printf.sprintf "%%d%d" i and sp = Printf.sprintf "%%s%d" i in
+      let v = Printf.sprintf "%%v%d" i in
       emit "  %s = getelementptr inbounds %s, ptr %%dst, i32 0, i32 %d" dp sn i;
       emit "  %s = getelementptr inbounds %s, ptr %%src, i32 0, i32 %d" sp sn i;
       match fty with
+      | TStruct s2 when is_move_only_sname_ll s2 ->
+        (* move-only 字段：仅 clenv 捕获可达（用户 struct 禁 move-only
+           字段）——浅拷句柄指针共享（free 侧按 clenv 递归 release），
+           不深拷不释放 dst 旧值。rc 句柄 retain 配平（thread$ 除外） *)
+        emit "  %s = load ptr, ptr %s" v sp;
+        emit "  store ptr %s, ptr %s" v dp;
+        if s2 <> "thread$" then
+          emit "  call void @zfy_rc_retain(ptr %s)" v
       | TString ->
         let old = Printf.sprintf "%%o%d" i in
         let nv = Printf.sprintf "%%n%d" i in
@@ -2797,7 +2972,8 @@ let gen_struct_assign_fn (sd : sdef) : string =
 let gen_program (m : mir) : string =
   let g =
     { mbuf = Buffer.create 512; nstr = 0; globals = Hashtbl.create 16;
-      srcfiles = Hashtbl.create 4; structs = m.mstructs }
+      srcfiles = Hashtbl.create 4; structs = m.mstructs;
+      clo_envs = Hashtbl.create 8; clofrees = Hashtbl.create 8 }
   in
   (* 显式声明模块 triple：与 clang --target=x86_64-w64-mingw32 的推断一致，
      消除链接阶段 "overriding the module target triple" 警告（w-015 #8） *)
@@ -2829,14 +3005,10 @@ let gen_program (m : mir) : string =
       Buffer.add_string g.mbuf
         (Printf.sprintf "%%err.%s = type { i32, ptr, %s }\n" suf vll))
     err_defs;
-  (* struct 类型定义与深拷贝/释放辅助函数（嵌套引用同模块前向合法） *)
+  (* struct 类型定义（布局；辅助函数生成挪至 gen_fn 之后——closure$ 的
+     free fn 依赖 gen 期间登记的 clo_envs 映射，见 gen_struct_free_fn 注释） *)
   List.iter
     (fun sd -> Buffer.add_string g.mbuf (gen_struct_type_def g sd))
-    m.mstructs;
-  List.iter
-    (fun sd ->
-      Buffer.add_string g.mbuf (gen_struct_free_fn sd);
-      Buffer.add_string g.mbuf (gen_struct_assign_fn sd))
     m.mstructs;
   (* 接口 thunk 与 vtable（v3.13）：对每个已实现 (iface, struct)——
      thunk 转发到脱糖全局方法（self ptr 首参）；@vt$I$S = thunk 数组常量。
@@ -2846,6 +3018,15 @@ let gen_program (m : mir) : string =
       match Hashtbl.find_opt Typeck.iface_tbl iname with
       | None -> ()
       | Some imethods ->
+        let nslots = List.length imethods in
+        (* P0-1b：release fn（vtable 末槽）——iface$X free fn 间接调用：
+           rc release（归零才深释放实现 struct 堆资源 + free data 块）。
+           data 装箱经 zfy_env_new 分配（带 rc 头），多 iface 值共享同一
+           装箱（进数组/赋值）由 assign 侧 retain 配平 *)
+        Buffer.add_string g.mbuf
+          (Printf.sprintf
+             "define internal void @zfy_ifrel$%s$%s(ptr %%data) {\n  call void @zfy_rc_release(ptr %%data, ptr @zfy_struct_free_%s)\n  ret void\n}\n"
+             iname sname sname);
         let thunks =
           List.map
             (fun (mn, ptys, ret) ->
@@ -2882,9 +3063,9 @@ let gen_program (m : mir) : string =
             imethods
         in
         Buffer.add_string g.mbuf
-          (Printf.sprintf "@vt$%s$%s = constant [ %d x ptr ] [ %s ]\n"
-             iname sname (List.length thunks)
-             (String.concat ", " thunks)))
+          (Printf.sprintf "@vt$%s$%s = constant [ %d x ptr ] [ %s, ptr @zfy_ifrel$%s$%s ]\n"
+             iname sname (nslots + 1)
+             (String.concat ", " thunks) iname sname))
     Typeck.iface_impls;
   (* 每个 struct 的元素操作对（w-014 #2）：struct 作 seq 元素时
      zfy_seq_set_agg/get_agg/free 按头部 ops 深拷贝/释放 *)
@@ -2938,6 +3119,9 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_gui_fill_grad(i32, i32, i32, i32, i32, i32, i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
+  Buffer.add_string g.mbuf "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n";
+  (* C 标准库（P0-1c 释放 / P0-4 退出） *)
+  Buffer.add_string g.mbuf "declare void @free(ptr)\n";
   (* output 运行时函数 *)
   Buffer.add_string g.mbuf "declare void @zfy_print_str(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_print_i64(i64)\n";
@@ -2950,6 +3134,16 @@ let gen_program (m : mir) : string =
   (* 释放辅助 *)
   Buffer.add_string g.mbuf "declare void @zfy_free_str(ptr)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_strdup(ptr)\n";
+  (* P0-1/P0-4（v3.27）：跟踪错误消息分配、全局资源注册表、句柄释放、
+     线程移交 spawn、panic 退出档位 *)
+  Buffer.add_string g.mbuf "declare ptr @zfy_msg_strdup(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_global_reg(ptr, ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_mutex_free(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_chan_free(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_thread_free(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_thread_spawn_d(ptr, ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_set_panic_exit(i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_set_panic_abort(i32)\n";
   (* 值 -> string 转换（sep/end/delim 与内建参数的强转） *)
   Buffer.add_string g.mbuf "declare ptr @zfy_tostr_char(i8)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_tostr_bool(i32)\n";
@@ -3100,6 +3294,8 @@ let gen_program (m : mir) : string =
     "declare void @zfy_file_write_file_err(ptr sret(%err.i64), ptr, ptr)\n";
   (* 闭包（v3.7）：env 堆块分配（不回收——生命周期 = 进程） *)
   Buffer.add_string g.mbuf "declare ptr @zfy_env_new(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_rc_retain(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_rc_release(ptr, ptr)\n";
   (* 并发（v3.8）：线程/互斥/原子/sleep/channel。
      句柄构造（spawn/mutex_new/chan_new）走 sret out 槽约定（首参写回） *)
   List.iter
@@ -3285,6 +3481,7 @@ let gen_program (m : mir) : string =
     || (String.length n > 0 && n.[0] = '$')   (* $ifnew$/$ifcall$ 内部调用，不 declare *)
     || String.length n >= 4 && String.sub n 0 4 = "zfy_"
     || String.length n >= 4 && String.sub n 0 4 = "zfy."
+    || n = "free"   (* P0-1c：prelude 手写 declare，防重复 declare 报错 *)
     || n = "str_len" || n = "zfy.prec" || n = "abs"
     || n = "pow" || n = "powf"   (* ** 幂与 pow 内建共用 prelude declare，避免重复声明 *)
   in
@@ -3333,20 +3530,28 @@ let gen_program (m : mir) : string =
       if f.mname = "main" then main_ret := Some f.mret;
       Buffer.add_string fbuf (gen_fn g f))
     m.mfns;
-  (* main 包装：C 运行时要求 i32 main()；最先执行 zfy.globals 完成顶层变量初始化 *)
+  (* main 包装：C 运行时要求 i32 main()；最先执行 zfy.globals 完成顶层变量初始化。
+     P0-4：入口先配置 panic 退出档位（exit 模式设退出码；abort 模式走 abort） *)
+  let panic_setup =
+    if !panic_mode = "abort" then "  call void @zfy_set_panic_abort(i32 1)\n"
+    else Printf.sprintf "  call void @zfy_set_panic_exit(i32 %d)\n" !panic_exit_code
+  in
+  let wrap_main body = "define i32 @main() {\n" ^ panic_setup ^ body ^ "}\n" in
   (match !main_ret with
    | Some TVoid ->
      Buffer.add_string fbuf
-       "define i32 @main() {\n  call void @zfy.globals()\n  call void @zfy.main()\n  ret i32 0\n}\n"
+       (wrap_main "  call void @zfy.globals()\n  call void @zfy.main()\n  ret i32 0\n")
    | Some (TInt 32 as rt) ->
      Buffer.add_string fbuf
-       (Printf.sprintf
-          "define i32 @main() {\n  call void @zfy.globals()\n  %%r = call %s @zfy.main()\n  ret i32 %%r\n}\n"
-          (ll_ty rt))
+       (wrap_main
+          (Printf.sprintf
+             "  call void @zfy.globals()\n  %%r = call %s @zfy.main()\n  ret i32 %%r\n"
+             (ll_ty rt)))
    | Some (TInt 64 as rt) ->
      Buffer.add_string fbuf
-       (Printf.sprintf
-          "define i32 @main() {\n  call void @zfy.globals()\n  %%r = call i64 @zfy.main()\n  %%t = trunc i64 %%r to i32\n  ret i32 %%t\n}\n")
+       (wrap_main
+          (Printf.sprintf
+             "  call void @zfy.globals()\n  %%r = call i64 @zfy.main()\n  %%t = trunc i64 %%r to i32\n  ret i32 %%t\n"))
    | Some rt ->
      lerr None "main's return type must be void, i32 or i64, got %s" (Hir.pp_zty rt)
    | None -> ());
@@ -3354,4 +3559,11 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf (Buffer.contents thunk_buf);
   Hashtbl.reset thunk_cache;
   Buffer.reset thunk_buf;
+  (* struct 深拷贝/释放辅助函数（P0-1c：挪至 gen_fn 之后——closure$ free fn
+     依赖 clo_envs 与 clofree$ 析构器；LLVM 同模块前向引用合法，顺序无关） *)
+  List.iter
+    (fun sd ->
+      Buffer.add_string g.mbuf (gen_struct_free_fn g sd);
+      Buffer.add_string g.mbuf (gen_struct_assign_fn sd))
+    m.mstructs;
   Buffer.contents g.mbuf ^ Buffer.contents fbuf

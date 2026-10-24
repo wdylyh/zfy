@@ -87,8 +87,40 @@ let dispatch argv =
     Printf.eprintf "zfy:error[E5006] in 0 of (cli) because (usage: zfyc <tokens|ast|hir|mir|llvm|build> <file.zfy>)\n";
     exit 2
 
+(* 全局 flags（P0-4，v3.27）：--panic-mode exit|abort、--panic-exit <n>
+   （默认 exit/1）。从 argv 提取后调 Llvmgen.set_panic_opts，剩余参数
+   继续走 dispatch *)
+let extract_flags (argv : string array) : string array =
+  let rest = ref [] in
+  let rec go i =
+    if i >= Array.length argv then ()
+    else if argv.(i) = "--panic-mode" && i + 1 < Array.length argv then begin
+      let m = argv.(i + 1) in
+      if m <> "exit" && m <> "abort" then begin
+        Printf.eprintf "zfy:error[E5007] (cli) because (--panic-mode expects exit|abort, got %s)\n" m;
+        exit 2
+      end;
+      Llvmgen.set_panic_opts m !Llvmgen.panic_exit_code;
+      go (i + 2)
+    end
+    else if argv.(i) = "--panic-exit" && i + 1 < Array.length argv then begin
+      (match int_of_string_opt argv.(i + 1) with
+       | Some c -> Llvmgen.set_panic_opts !Llvmgen.panic_mode c
+       | None ->
+         Printf.eprintf "zfy:error[E5007] (cli) because (--panic-exit expects an integer, got %s)\n" argv.(i + 1);
+         exit 2);
+      go (i + 2)
+    end
+    else begin
+      rest := argv.(i) :: !rest;
+      go (i + 1)
+    end
+  in
+  go 0;
+  Array.of_list (List.rev !rest)
+
 let () =
-  try dispatch Sys.argv with
+  try dispatch (extract_flags Sys.argv) with
   | Lexer.LexError (p, m) ->
     Printf.eprintf "lex error %s: %s\n" (pp_pos p) m;
     exit 1
