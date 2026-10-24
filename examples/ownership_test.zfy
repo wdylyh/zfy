@@ -1,0 +1,47 @@
+// 所有权系统综合测试：copy / move / borrow 字段粒度与联动（v3.22）
+struct Bag
+    i32 a
+    i32 m
+
+fn i32 read(ref let i32 v)
+    return v
+
+fn void take(let i32[] xs)
+    output(length(xs))
+
+fn main()
+    // 1) 字段粒度借用：借用 b.a，写兄弟字段 b.m 放行
+    let Bag b = Bag(a=1, m=2)
+    let i32* const pa = borrow(b.a)
+    b.m = 5
+    output(pa^)                 // 1
+    output(b.m)                 // 5
+
+    // 2) 整体借用：指针读 + ref 传参共存
+    let i32 x = 7
+    let i32* const px = borrow(x)
+    output(px^)                 // 7
+    output(read(ref x))         // 7
+
+    // 3) 无类型标注的借用：自动落 const 槽（只读保护）
+    let py = borrow(x)
+    output(py^)                 // 7
+
+    // 4) 数组 move 后重赋值 revive
+    let i32[] ys = 1, 2
+    output(length(ys))          // 2
+    let i32[] zs = move ys
+    output(length(zs))          // 2
+    ys = 7, 8, 9                // 重赋值：move 状态解除
+    output(length(ys))          // 3
+
+    // 5) struct 显式 copy / move
+    let Bag b2 = copy(b)
+    let Bag b3 = move b2
+    output(b3.a)                // 1
+    output(b3.m)                // 5
+
+    // 6) move 传参免克隆（最后使用自动 move 同语义）
+    let i32[] ws = 4, 5, 6
+    take(move ws)               // 3
+    output("ok")

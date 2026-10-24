@@ -213,7 +213,7 @@ type env = {
   mutable in_unsafe : bool;                  (* 是否在 unsafe 块内（指针算术门禁） *)
   mutable in_unwrap : bool;                  (* 是否在 ?? 解包块内（块末兜底值表达式合法） *)
   mutable moved : (string, unit) Hashtbl.t;  (* 已被显式 move 的变量槽（使用报错；写回解除） *)
-  mutable borrowed : (string, unit) Hashtbl.t;
+  mutable borrowed : (string, string list list) Hashtbl.t;  (* slot -> 被借用路径的列表；每条路径 = 字段段列表（[] = 整体；["a"] = 字段 a） *)
     (* 被只读借用的变量槽（borrow x，v3.21）：借用期内 move 源报错；
        v1 粗粒度——登记后到函数尾（或 lambda 保存/恢复）才解除 *)
   mutable uses : (string * pos) list;        (* 当前函数体内全部 EVar 出现位置
@@ -1999,12 +1999,24 @@ and check_expr env (e : expr) : texpr =
        in
        if not (locatable a) then
          terr p' "borrow can only borrow a variable/field/element";
-       (* 借用前核对源未被 move；登记根变量槽（字段/元素借用也按根记） *)
+       (* 借用前核对源未被 move；按字段路径粒度登记（根槽 -> 相对路径列表）：
+          borrow(s) = 整体 []；borrow(s.a) = ["a"]；元素/解引用借用 = 整体 [] *)
        let rec root_var (e : expr) =
          match e with
-         | EVar (n, _) -> Some n
+         | EVar (n, _) ->
+           (* 点路径 b.a 的根是 b（字段借用也登记到根变量槽） *)
+           Some (match split_field_path n with Some (f, _) -> f | None -> n)
          | EField (b, _, _) | EIndex (b, _, _) | EDeref (b, _) -> root_var b
          | _ -> None
+       in
+       let rec bpath (e : expr) : string list =
+         match e with
+         | EVar (n, _) ->
+           (match split_field_path n with
+            | Some (_, rest) -> rest
+            | None -> [])
+         | EField (b, seg, _) -> bpath b @ [ seg ]
+         | _ -> []
        in
        (match root_var a with
         | Some n ->
@@ -2014,7 +2026,11 @@ and check_expr env (e : expr) : texpr =
                terr p' "cannot borrow %s: it has been moved" n;
              if l.lslot.[0] = '@' then
                terr p' "cannot borrow global variable %s" n;
-             Hashtbl.replace env.borrowed l.lslot ()
+             let prev =
+               (match Hashtbl.find_opt env.borrowed l.lslot with
+                | Some ps -> ps
+                | None -> []) in
+             Hashtbl.replace env.borrowed l.lslot (bpath a :: prev)
            | None -> ())
         | None -> ());
        let t1 = check_expr env a in
@@ -3285,6 +3301,44 @@ and check_move_arg env (e : expr) : texpr =
      | None -> check_expr env e)
   | _ -> terr (pos_of_expr e) "move can only apply to a local variable"
 
+(* 借用重叠：任一方为整体([])或一方是另一方前缀（写 s.a 与 borrow(s.a.b) 冲突等） *)
+and borrow_overlap (w : string list) (b : string list) : bool =
+  let rec pre a b =
+    match a, b with
+    | [], _ -> true
+    | _, [] -> false
+    | x :: xs, y :: ys -> x = y && pre xs ys
+  in
+  match w, b with
+  | [], _ | _, [] -> true
+  | _ -> pre w b || pre b w
+
+(* 赋值失效检查：写目标与在借路径重叠 → 报错（借用期内源不可写，
+   赋值会使借用指向的旧数据失效）；写兄弟字段放行（字段粒度借用） *)
+and check_borrow_write env (lhs : expr) (p : pos) : unit =
+  let rec rp (e : expr) : (string * string list) option =
+    match e with
+    | EVar (n, _) ->
+      (match split_field_path n with
+       | Some (r, rest) -> Some (r, rest)
+       | None -> Some (n, []))
+    | EField (b, seg, _) ->
+      (match rp b with Some (r, ps) -> Some (r, ps @ [ seg ]) | None -> None)
+    | EIndex (b, _, _) ->
+      (match rp b with Some (r, ps) -> Some (r, ps) | None -> None)
+    | _ -> None
+  in
+  match rp lhs with
+  | Some (r, wp) ->
+    (match lookup_var env r with
+     | Some rl ->
+       (match Hashtbl.find_opt env.borrowed rl.lslot with
+        | Some bs when List.exists (borrow_overlap wp) bs ->
+          terr p "%s is borrowed (borrow) and cannot be assigned while the borrow is alive" r
+        | _ -> ())
+     | None -> ())
+  | None -> ()
+
 (* ---------- move/ref/copy 三选一与自动 move（new2.md #1） ---------- *)
 
 (* 位置先后比较（同一函数体内，行/列序） *)
@@ -4530,8 +4584,17 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
        | None -> check_expr env init))
   in
   let tinit = coerce p tinit want in
+  (* borrow 初始化：默认落 const 槽（只读借用）；用户显式写 `let T* p`（非 const
+     指针类型）接借用 → 编译期报错，防止绕过只读保护 *)
+  (match init, ty_opt with
+   | Some (EBorrow (_, bp)), Some _ ->
+     (match ty with
+      | TPtrC _ -> ()
+      | _ -> terr bp "borrow result must be stored in a const pointer slot: let T* const p")
+   | _ -> ());
   declare env name { lconst = isconst; lty = want; lslot = ""; lunred = is_unred;
-                     lconstp = (match ty with TPtrC _ -> true | _ -> false) };
+                     lconstp = (match ty with TPtrC _ -> true | _ -> false)
+                                || (match init with Some (EBorrow _) -> true | _ -> false) };
   (* const 整数变量记录编译期值（数组长度用；非 const 不算常量） *)
   let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
   if isconst then
@@ -5027,6 +5090,7 @@ and check_stmt env (st : stmt) : tstmt =
         | Some l ->
           if Hashtbl.mem env.moved l.lslot then
             terr ap "array %s has been moved and cannot be written" arr;
+          check_borrow_write env lhs ap;
           (match resolve l.lty with
            | TArray (e, _) | TList e as seqty ->
              if l.lconst then
@@ -5121,6 +5185,7 @@ and check_stmt env (st : stmt) : tstmt =
              terr ap "cannot modify elements of constant %s (const is deeply immutable)" arr
            | _ -> ())
         | _ -> ());
+       check_borrow_write env lhs fp;
        let tb = check_expr env b in
        (match tb.e with
         | ESeqGetK _ when (match resolve tb.ety with TStruct _ -> true | _ -> false) ->
@@ -5158,6 +5223,11 @@ and check_stmt env (st : stmt) : tstmt =
         | Some l ->
           if l.lconst then
             terr p' "cannot assign to constant %s (declared const)" name;
+          check_borrow_write env lhs p';
+          (match rhs' with
+           | EBorrow (_, bp) when not l.lconstp ->
+             terr bp "borrow result must be stored in a const pointer slot: let T* const p"
+           | _ -> ());
           Hashtbl.remove env.moved l.lslot;  (* 重新赋值：move 状态解除 *)
           let slot = l.lslot in
           let lty = l.lty in
@@ -5240,6 +5310,7 @@ and check_stmt env (st : stmt) : tstmt =
                  | TStruct _ | TPtr (TStruct _) ->
                    if l.lconst then
                      terr p' "cannot assign to field of constant %s (const is deeply immutable)" first;
+                   check_borrow_write env lhs p';
                    let (idxs, fty) = chain_fields env p' l.lty segs in
                    if (match resolve fty with TStruct _ -> true | _ -> false)
                       && bare_struct_ref env rhs' then
@@ -5263,6 +5334,7 @@ and check_stmt env (st : stmt) : tstmt =
         | Some l ->
           if l.lconst then
             terr p' "cannot assign to constant %s (declared const)" name;
+          check_borrow_write env lhs p';
           Hashtbl.remove env.moved l.lslot;
           (match resolve l.lty with
            | TArray (e, _) | TList e as seqty ->
@@ -5291,6 +5363,7 @@ and check_stmt env (st : stmt) : tstmt =
                  | TStruct _ | TPtr (TStruct _) ->
                    if l.lconst then
                      terr p' "cannot assign to field of constant %s (const is deeply immutable)" first;
+                   check_borrow_write env lhs p';
                    let (idxs, fty) = chain_fields env p' l.lty segs in
                    (match resolve fty with
                     | TList e ->
@@ -5365,6 +5438,10 @@ and check_stmt env (st : stmt) : tstmt =
         | EUnwrap (a, EBlock (blk, wp), _) -> mk (check_unwrap env wp a blk `Return)
         | _ -> assert false)
      | Some e' ->
+       (match e' with
+        | EBorrow (_, bp) ->
+          terr bp "cannot return a borrow (it would dangle after the function returns)"
+        | _ -> ());
        let te =
          (match resolve env.fncur_ret with
           | TFrac e when is_frac_arith e' ->
