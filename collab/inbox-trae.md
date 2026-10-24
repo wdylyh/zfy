@@ -950,3 +950,22 @@ created: 2026-10-24
   本次文档同步标注。
 - 顺带修 insert_at_cursor 行中粘贴光标错位的既有 bug。
 - widgets_test 1c + textarea_test 全过；回归 failures: 0。
+
+---
+id: w-054
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-24
+---
+**v3.22 所有权系统完善（copy/move/borrow 全模型）**。
+
+- borrow 升级**字段粒度**：`borrow(b.a)` 只锁 b.a——借用期内写 b.a 报
+  E3000、move b 报 E3000，写兄弟字段 b.m 放行；`borrow(b)` 整体锁全部。
+  顺带修关键字 bug：点路径借用的根解析错误导致字段借用此前完全没登记。
+- **只读性强制**：`let T* p = borrow(x)` 编译期报错（必须 T* const；
+  `let p = borrow(x)` 自动 const）——v1 "赋给普通指针绕过只读"的洞已堵。
+- **借用期写失效**：赋值/序列字面量/元素写命中被借路径即 E3000。
+- **逃逸禁止**：return borrow 报错；borrow 全局禁止（原有）。
+- grammar §15 = copy（显式深拷贝）/ move（转移+revive）/ borrow（只读
+  借用+联动）三件套完整模型；ownership_test 正例 + 8 负例；回归 0 失败。
