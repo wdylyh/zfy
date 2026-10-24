@@ -1,0 +1,32 @@
+// NLL-lite 借用存活测试（v3.23）：绑定借用随作用域结束失效，
+// 临时借用（表达式/实参位置）随语句结束失效
+struct Bag
+    i32 a
+    i32 m
+
+fn void take(let i32[] xs)
+    output(length(xs))
+
+fn main()
+    // 1) 临时借用：解引用读一次即弃，语句结束失效，随后可写
+    let i32 x = 1
+    let i32 y = (borrow(x))^
+    output(y)                       // 期望 1
+    x = 2
+    output(x)                       // 期望 2
+
+    // 2) 绑定借用随块作用域结束失效：块外写放行
+    let Bag b = Bag(a=3, m=4)
+    if true
+        let i32* const pa = borrow(b.a)
+        output(pa^)                 // 期望 3
+    b.a = 30                        // 作用域已结束，放行
+    output(b.a)                     // 期望 30
+
+    // 3) 绑定借用随作用域结束后可 move 源
+    let i32[] ys = 1, 2
+    if true
+        let i32[]* const py = borrow(ys)
+        output(py^[0])              // 期望 1
+    take(move ys)                   // 借用已随块结束，move 放行
+    output("ok")

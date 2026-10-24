@@ -1,0 +1,19 @@
+// 嵌套路径借用粒度测试（v3.23）：borrow(s.ix.x) 两层路径重叠判定
+struct Inner
+    i32 x
+    i32 y
+struct Outer
+    Inner ix
+    i32 other
+
+fn main()
+    let Outer s = Outer(ix=Inner(x=1, y=2), other=3)
+    let i32* const px = borrow(s.ix.x)
+    output(px^)                     // 期望 1
+    s.ix.y = 20                     // 兄弟字段（路径前缀不重叠）放行
+    s.other = 30                    // 另一子树放行
+    output(s.ix.y)                  // 期望 20
+    output(s.other)                 // 期望 30
+    // 借用期内读本体放行
+    output(s.ix.x)                  // 期望 1
+    output("ok")

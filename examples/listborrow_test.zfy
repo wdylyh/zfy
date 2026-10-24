@@ -1,0 +1,16 @@
+// 列表整体借用测试（v3.23）：T[]* const 类型语法 + borrow(列表) 整体只读借用
+fn i32 total(let i32[]* xs)
+    let i32 s = 0
+    let i64 n = length(xs^)
+    for let i64 i = 0, i < n, i = i + 1
+        s = s + xs^[i]
+    return s
+
+fn main()
+    let i32[] xs = 1, 2, 3
+    let i32[]* const p = borrow(xs)
+    output(p^[1])                   // 期望 2
+    output(total(p))                // 期望 6
+    // 借用期内读源本体放行（只读借用不锁读）
+    output(length(xs))              // 期望 3
+    output("ok")

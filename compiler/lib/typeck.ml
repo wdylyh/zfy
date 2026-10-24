@@ -215,7 +215,14 @@ type env = {
   mutable moved : (string, unit) Hashtbl.t;  (* 已被显式 move 的变量槽（使用报错；写回解除） *)
   mutable borrowed : (string, string list list) Hashtbl.t;  (* slot -> 被借用路径的列表；每条路径 = 字段段列表（[] = 整体；["a"] = 字段 a） *)
     (* 被只读借用的变量槽（borrow x，v3.21）：借用期内 move 源报错；
-       v1 粗粒度——登记后到函数尾（或 lambda 保存/恢复）才解除 *)
+       v3.23 起存活精确化：绑定到指针变量的借用随该变量作用域结束失效，
+       语句内临时借用（直接传参等）随语句结束失效（NLL-lite） *)
+  mutable scope_borrows : (string * string list) list list;
+    (* 与 scopes 平行的借用登记栈：每层作用域在本层登记的 (槽, 路径) 列表；
+       pop_scope 时逐条从 borrowed 摘除（绑定借用的作用域级失效） *)
+  mutable borrow_temps : (string * string list) list;
+    (* 本语句内新登记、尚未被指针绑定认领的借用：check_block 每条语句
+       结束后统一摘除（临时借用的语句级失效，NLL-lite） *)
   mutable uses : (string * pos) list;        (* 当前函数体内全部 EVar 出现位置
                                                 （自动 move 后向判定用，new2.md #1） *)
   mutable ldepth : int;                      (* 循环嵌套深度（while/for 体检查时 +1）：
@@ -287,8 +294,25 @@ let lookup_var env name =
   in
   go env.scopes
 
-let push_scope env = env.scopes <- Hashtbl.create 8 :: env.scopes
-let pop_scope env = env.scopes <- List.tl env.scopes
+(* 从 borrowed 表摘除一条借用登记（容错：不存在则忽略——lambda/函数
+   边界整体换表后，旧登记的摘除自然成为空操作） *)
+let kill_borrow_one env (slot, path) =
+  match Hashtbl.find_opt env.borrowed slot with
+  | Some ps ->
+    let ps' = List.filter (fun q -> q <> path) ps in
+    if ps' = [] then Hashtbl.remove env.borrowed slot
+    else Hashtbl.replace env.borrowed slot ps'
+  | None -> ()
+
+let push_scope env =
+  env.scopes <- Hashtbl.create 8 :: env.scopes;
+  env.scope_borrows <- [] :: env.scope_borrows
+let pop_scope env =
+  (* 本层作用域登记的借用随作用域结束失效（NLL-lite：绑定借用的作用域级存活） *)
+  (match env.scope_borrows with
+   | h :: t -> List.iter (kill_borrow_one env) h; env.scope_borrows <- t
+   | [] -> ());
+  env.scopes <- List.tl env.scopes
 
 (* ---------- did you mean（n4） ---------- *)
 
@@ -2030,7 +2054,14 @@ and check_expr env (e : expr) : texpr =
                (match Hashtbl.find_opt env.borrowed l.lslot with
                 | Some ps -> ps
                 | None -> []) in
-             Hashtbl.replace env.borrowed l.lslot (bpath a :: prev)
+             let bp' = bpath a in
+             Hashtbl.replace env.borrowed l.lslot (bp' :: prev);
+             (* 双登记（NLL-lite）：作用域栈（绑定借用的作用域级失效）
+                + 语句临时表（check_block 语句结束摘除，除非被指针绑定认领） *)
+             (match env.scope_borrows with
+              | h :: t -> env.scope_borrows <- ((l.lslot, bp') :: h) :: t
+              | [] -> env.scope_borrows <- [ [ (l.lslot, bp') ] ]);
+             env.borrow_temps <- (l.lslot, bp') :: env.borrow_temps
            | None -> ())
         | None -> ());
        let t1 = check_expr env a in
@@ -4440,6 +4471,9 @@ and zty_to_ast (p : pos) (t : Hir.zty) : ty =
   | _ -> raise ZtyToAstFail
 
 and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
+  (* NLL-lite：借用初始化时登记进 borrow_temps 的条目由本声明"认领"
+     （随声明变量作用域存活）；快照在检查初值前取 *)
+  let temps0 = env.borrow_temps in
   (* ---- let 类型省略推断（new.md 2026-10-10）----
      字面量形式直接定型：整数字面量→i32（超 i64 十进制→i128）、浮点→f64、
      n/d 数值字面量除式→i32 frac（分数字面量语义）、string/char/bool 按字面量；
@@ -4589,8 +4623,11 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
   (match init, ty_opt with
    | Some (EBorrow (_, bp)), Some _ ->
      (match ty with
-      | TPtrC _ -> ()
+      | TPtrC _ -> env.borrow_temps <- temps0 (* 认领：借用随 p 的作用域存活 *)
       | _ -> terr bp "borrow result must be stored in a const pointer slot: let T* const p")
+   | Some (EBorrow _), None ->
+     (* 类型省略：推断出的指针槽即 const 槽，同样认领 *)
+     env.borrow_temps <- temps0
    | _ -> ());
   declare env name { lconst = isconst; lty = want; lslot = ""; lunred = is_unred;
                      lconstp = (match ty with TPtrC _ -> true | _ -> false)
@@ -4941,6 +4978,10 @@ and check_block env (stmts : stmt list) : tblock =
         None
     in
     while List.length env.scopes > depth do pop_scope env done;
+    (* NLL-lite：本语句内未被指针绑定认领的临时借用，语句结束即失效
+       （借用作实参/表达式位置用完即弃；成功与失败路径都要清理） *)
+    List.iter (kill_borrow_one env) env.borrow_temps;
+    env.borrow_temps <- [];
     (* poison（n4）：声明失败的变量以 TError 入作用域（在恢复后的语句级
        scope 声明），后续引用静默通过——否则每个引用点都报 undefined/
        类型错（级联噪声）。变量可能已被声明到一半（报错点在右值），查重后再补 *)
@@ -5224,9 +5265,11 @@ and check_stmt env (st : stmt) : tstmt =
           if l.lconst then
             terr p' "cannot assign to constant %s (declared const)" name;
           check_borrow_write env lhs p';
+          let temps0 = env.borrow_temps in   (* NLL-lite：认领快照 *)
           (match rhs' with
            | EBorrow (_, bp) when not l.lconstp ->
              terr bp "borrow result must be stored in a const pointer slot: let T* const p"
+           | EBorrow _ -> env.borrow_temps <- temps0 (* 认领：借用随 p 存活 *)
            | _ -> ());
           Hashtbl.remove env.moved l.lslot;  (* 重新赋值：move 状态解除 *)
           let slot = l.lslot in
@@ -6277,7 +6320,7 @@ let check_program (prog : program) : hir =
     { g; scopes = []; fncur_ret = TVoid; slotn = 0;
       fnvars = Hashtbl.create 8; const_vals = Hashtbl.create 16;
       in_unsafe = false; in_unwrap = false; moved = Hashtbl.create 8;
-      borrowed = Hashtbl.create 8; uses = [];
+      borrowed = Hashtbl.create 8; scope_borrows = []; borrow_temps = []; uses = [];
       ldepth = 0; capctx = None }
   in
   (* 全局作用域：顶层声明（const 内联；非 const 为全局可变变量） *)
