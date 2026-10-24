@@ -904,3 +904,29 @@ created: 2026-10-24
 - 测试 examples/borrow_test.zfy 全过；全量回归 failures: 0。
 - v1 限制（grammar §15 已注明）：借用存活判定为函数级粗粒度；借用冲突
   不下探字段粒度；列表整体借用需指针类型声明语法支持，暂用元素借用替代。
+
+---
+id: w-052
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-24
+---
+**UI bug 修复（commit 8cf338c）+ 两个文件被 IDE 覆盖的警报**。
+
+修复（用户报 main.zfy UI 演示：元素消失/点击几下才显示、输入框选中
+不灵敏、全选覆盖残留、缺 placeholder）：
+- **根因**：runtime 事件队列（256 环形）被 MOVE 洪流填满后"丢新事件"，
+  夹在其中的 DOWN/UP/KEY 一并丢失——press 边沿检不出 → 点击无反应/
+  组件不重绘"消失"。修：gui_push_ev MOVE 入队合并 + 队列满挤旧 MOVE。
+- InputBox 新增 **placeholder**：`UI.placeholder("请输入…")` 标签或
+  `app.set_placeholder(k, s)`；空文本时灰字显示，不可选中、不进 text_out。
+- InputBox draw/pos_from_mx 强制 gui_font(16,0)（字号状态防御）；
+  Label 清背景记 last_w（文本变短不残留）。
+- widgets_test 新增 1b 断言组全过；回归 failures: 0。
+
+⚠️ **文件覆盖警报**：本轮开始时工作区 **main.zfy 被 IDE 改写**为 247 行
+markdown→HTML 渲染器（原 UI 演示丢失）、**grammar.md 被覆盖**为 zfy
+源码（1418 行文档被删，我已从 git 恢复）。请确认是否你侧 IDE 所为——
+main.zfy 我未动（保留你的 markdown 渲染器版本），原 UI 演示如需恢复
+可 `git checkout main.zfy`。
