@@ -887,9 +887,15 @@ and wrap_ty_group (g : expr option) (b : ty) : ty =
    类型省略仅标量合法（由初值推断） *)
 and parse_let_stmt p tp =
   ignore (next p);   (* 消费 let *)
+  (* v3.26 P0-3：可选 shared 修饰（仅顶层合法，typeck 侧校验） *)
+  let is_shared =
+    match peek p with
+    | (Keyword KShared, _) -> ignore (next p); true
+    | _ -> false
+  in
   let (ty_opt, is_frac, is_const, is_unred) = parse_let_head p in
   let rec go acc =
-    let st = parse_declarator p tp ty_opt is_const is_frac is_unred in
+    let st = parse_declarator p tp ty_opt is_shared is_const is_frac is_unred in
     let acc = st :: acc in
     match peek p with
     | (Comma, _) -> ignore (next p); go acc
@@ -928,7 +934,7 @@ and parse_name_groups p : expr option list =
 (* 单个声明器：名字 + 数组/列表组（类型侧+名字侧可叠加）+ 可选初值。
    类型可省（推断路径，仅标量）；frac 数组/列表合法（new.md：
    let f64 frac y[128]），元素存入后自动约分（unred 数组不约分） *)
-and parse_declarator p tp ty_opt is_const is_frac is_unred =
+and parse_declarator p tp ty_opt is_shared is_const is_frac is_unred =
   let (base_ty, tgroups) =
     match ty_opt with
     | Some ty -> collect_ty_groups ty
@@ -945,14 +951,14 @@ and parse_declarator p tp ty_opt is_const is_frac is_unred =
      | None -> err tp "let without a type only supports scalar declarations"
      | Some _ -> ());
     let inits = parse_seq_inits p in
-    SSeqDecl (is_const, is_frac, is_unred, name, ety, None, true, inits, tp)
+    SSeqDecl (is_const, is_frac, is_unred, is_shared, name, ety, None, true, inits, tp)
   | (ety, Some len, false, _) ->
     (* 定长数组：[长度]（变量维度为定长） *)
     (match ty_opt with
      | None -> err tp "let without a type only supports scalar declarations"
      | Some _ -> ());
     let inits = parse_seq_inits p in
-    SSeqDecl (is_const, is_frac, is_unred, name, ety, Some len, false, inits, tp)
+    SSeqDecl (is_const, is_frac, is_unred, is_shared, name, ety, Some len, false, inits, tp)
   | (ety, None, false, []) ->
     (* 标量：类型与初值二选一或都写（都无时 frac 修饰可顶替类型，
        由 typeck 校验）；初值可省略（省略时填零值）；const 必须带初值。
@@ -968,12 +974,12 @@ and parse_declarator p tp ty_opt is_const is_frac is_unred =
           (match is_const, Some e with
            | true, None -> err tp "const requires an initializer"
            | _ -> ());
-          SDecl (is_const, is_frac, is_unred, name, ty_opt, Some e, tp))
+          SDecl (is_const, is_frac, is_unred, is_shared, name, ty_opt, Some e, tp))
      | _ ->
        (match is_const with
         | true -> err tp "const requires an initializer"
         | false -> ());
-       SDecl (is_const, is_frac, is_unred, name, ty_opt, None, tp))
+       SDecl (is_const, is_frac, is_unred, is_shared, name, ty_opt, None, tp))
 
 (* 语句位置 let 声明：一行多声明器——let i32 a, b = 1, c[3], d[]，逗号分隔，
    共享类型与前缀修饰符，初值各自独立 *)
@@ -1144,7 +1150,7 @@ and parse_match_decl p tp name ty_opt is_const is_frac is_unred =
           err a.mpos "match initializer arms must be a single expression statement")
       arms
   in
-  SBlock ([ SDecl (false, is_frac, is_unred, name, ty_opt, None, tp);
+  SBlock ([ SDecl (false, is_frac, is_unred, false, name, ty_opt, None, tp);
             SMatch (scrut, arms2, tp) ],
           tp)
 
@@ -1295,8 +1301,8 @@ and parse_ui_stmt p tp =
                     None, epos) ])
          (List.rev !evs))
   in
-  SBlock ([ SDecl (false, false, false, vk, None, Some (EInt (-1L, tp)), tp);
-            SDecl (false, false, false, name, Some (TNamed ("UI", tp)),
+  SBlock ([ SDecl (false, false, false, false, vk, None, Some (EInt (-1L, tp)), tp);
+            SDecl (false, false, false, false, name, Some (TNamed ("UI", tp)),
                    Some (EStructNew ("UI", [ CPos (EStr (kind, tp)) ], tp)), tp) ]
            @ List.rev !props
            @ (match !xr, !yr with
@@ -1323,7 +1329,10 @@ and parse_stmt p =
   let (tk, tp) = peek p in
   match tk with
   | Keyword KLet -> parse_let_stmt p tp
-  | Ident _ when looks_like_decl p ->
+  | Ident _ when
+      (match tk with
+       | Ident "lock" -> false   (* lock 块语句（下方分支），非声明 *)
+       | _ -> looks_like_decl p) ->
     err tp "declaration syntax: let TYPE (frac)? (const)? (unred)? NAME [= init] (declarations must start with 'let')"
   | Keyword (KConst | KFrac | KUnreduced) when looks_like_decl p ->
     err tp "declaration syntax: let TYPE (frac)? (const)? (unred)? NAME [= init] (declarations must start with 'let')"
@@ -1383,6 +1392,14 @@ and parse_stmt p =
     ignore (next p);
     let b = parse_block p in
     SUnsafe (b, tp)
+  | Ident "lock" when (match peek2 p with (LParen, _) | (Dot, _) -> false | _ -> true) ->
+    (* lock 块（v3.26 P0-3）：lock m { }——m 为 mutex 句柄变量表达式。
+       `lock(` 保持表达式调用（zfy_mutex_lock 语句形式）；`lock m {` 为块形式，
+       自动配对解锁（含提前 return/break 路径） *)
+    ignore (next p);
+    let m = parse_expr p in
+    let b = parse_block p in
+    SLock (m, b, tp)
   | Keyword KFn ->
     (* 语句位置 fn（v3.7）：`fn 类型? 名(...)` = 嵌套函数定义；
        `fn (` / `fn [` / `fn =>` = lambda 表达式（落表达式语句）。

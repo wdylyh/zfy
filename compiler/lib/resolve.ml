@@ -281,7 +281,7 @@ let resolve (main : program) (main_dir : string)
     | IExtern e ->
       List.iter (fun fn -> add_local modt fn.ename pub "extern" fn.epos) e.funcs;
       modt.raw <- modt.raw @ [ it ]
-    | IDecl (SDecl (_, _, _, n, _, _, p), _) when modt.mpath <> [] ->
+    | IDecl (SDecl (_, _, _, _, n, _, _, p), _) when modt.mpath <> [] ->
       (* 模块内：只允许 const 标量（root 顶层全局变量合法，原样放行） *)
       add_local modt n pub "const" p; modt.raw <- modt.raw @ [ it ]
     | IDecl (_, p) when modt.mpath <> [] ->
@@ -585,11 +585,12 @@ let resolve (main : program) (main_dir : string)
     and rw_block m bl = List.map (rw_stmt m) bl
     and rw_stmt m (s : stmt) : stmt =
       match s with
-      | SDecl (a, b, c, n, t, ie, p) ->
-        SDecl (a, b, c, n, Option.map (rw_ty m) t, Option.map (rw_expr m) ie, p)
-      | SSeqDecl (a, f2, u2, n, t, len, isl, inits, p) ->
-        SSeqDecl (a, f2, u2, n, rw_ty m t, Option.map (rw_expr m) len, isl,
+      | SDecl (a, b, c, sh, n, t, ie, p) ->
+        SDecl (a, b, c, sh, n, Option.map (rw_ty m) t, Option.map (rw_expr m) ie, p)
+      | SSeqDecl (a, f2, u2, sh, n, t, len, isl, inits, p) ->
+        SSeqDecl (a, f2, u2, sh, n, rw_ty m t, Option.map (rw_expr m) len, isl,
                   List.map (rw_expr m) inits, p)
+      | SLock (mx, b, p) -> SLock (rw_expr m mx, rw_block m b, p)
       | SDeclList ss -> SDeclList (List.map (rw_stmt m) ss)
       | SAssign (l, r, p) -> SAssign (rw_expr m l, rw_expr m r, p)
       | SAssignList (l, rs, p) ->
@@ -638,6 +639,7 @@ let resolve (main : program) (main_dir : string)
         SForIn (n, idx, rw_expr m sx, rw_block m b, p)
       | SBlock (bs, p) -> SBlock (rw_block m bs, p)
       | SUnsafe (b, p) -> SUnsafe (rw_block m b, p)
+      | SLock (mx, b, p) -> SLock (rw_expr m mx, rw_block m b, p)
       | SFn (nm, params, ret, fr, body, p) ->
         SFn (nm, params, Option.map (rw_ty m) ret, fr, rw_block m body, p)
       | SMatch (sx, arms, p) ->
@@ -712,10 +714,10 @@ let resolve (main : program) (main_dir : string)
         out := ITypeAlias { name = flat_prefix m.mpath ^ a.name;
                             ty = rw_ty m a.ty; pos = a.pos } :: !out
       | IExtern e -> out := IExtern e :: !out   (* C 符号名不改 *)
-      | IDecl (SDecl (a, b, c, n, t, ie, p), pd) ->
+      | IDecl (SDecl (a, b, c, sh, n, t, ie, p), pd) ->
         (* 顶层 const：名字也要扁平化（与引用处的 resolve_name 对齐） *)
         out := IDecl
-                 (SDecl (a, b, c, flat_prefix m.mpath ^ n, Option.map (rw_ty m) t,
+                 (SDecl (a, b, c, sh, flat_prefix m.mpath ^ n, Option.map (rw_ty m) t,
                          Option.map (rw_expr m) ie, p),
                  pd) :: !out
       | IDecl (d, p) -> out := IDecl (rw_stmt m d, p) :: !out

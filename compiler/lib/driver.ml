@@ -524,10 +524,12 @@ let expand_uses (main : program) (main_dir : string)
   and rw_block m bl = List.map (rw_stmt m) bl
   and rw_stmt m (s : stmt) : stmt =
     match s with
-    | SDecl (a, b, c, n, t, e, p) -> SDecl (a, b, c, n, t, Option.map (rw_expr m) e, p)
-    | SSeqDecl (a, f2, u2, n, t, len, isl, inits, p) ->
-      SSeqDecl (a, f2, u2, n, t, Option.map (rw_expr m) len, isl,
+    | SDecl (a, b, c, sh, n, t, e, p) ->
+      SDecl (a, b, c, sh, n, t, Option.map (rw_expr m) e, p)
+    | SSeqDecl (a, f2, u2, sh, n, t, len, isl, inits, p) ->
+      SSeqDecl (a, f2, u2, sh, n, t, Option.map (rw_expr m) len, isl,
                 List.map (rw_expr m) inits, p)
+    | SLock (mx, b, p) -> SLock (rw_expr m mx, rw_block m b, p)
     | SDeclList ss -> SDeclList (List.map (rw_stmt m) ss)
     | SAssign (l, r, p) -> SAssign (rw_expr m l, rw_expr m r, p)
     | SAug (op, l, r, p) -> SAug (op, rw_expr m l, rw_expr m r, p)
@@ -620,7 +622,7 @@ let expand_uses (main : program) (main_dir : string)
         | IDecl (d, dp) ->
           (* 子文件顶层 const 原样并入（全局编译期常量） *)
           (match d with
-           | SDecl (_, _, _, n, _, _, p) -> reg n p
+           | SDecl (_, _, _, _, n, _, _, p) -> reg n p
            | _ -> reg "_" dp);
           out := IDecl (d, dp) :: !out
         | IMod (mname, its2, p) ->

@@ -1,0 +1,4 @@
+// 报错类（P0-3）：函数内 shared 声明 → 编译期拒绝
+fn main()
+  let shared i64 x = 0
+  output(x)

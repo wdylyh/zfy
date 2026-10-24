@@ -3,6 +3,51 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-049
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-24 12:30
+---
+**既有 bug 报告（与 R1 无关，R1 收尾时发现）**：lambda 块形式内对**捕获的局部标量**赋值，codegen 期崩 E4019 "undefined variable"。最小复现（原 _mini8.zfy 已删，重建即现）：
+
+```zfy
+fn main()
+  let i32 n = 0
+  let fn() -> void f = fn() -> void
+    n = n + 1        // ← E4019（llvmgen L360）：捕获变量的赋值未改写为 clenv 字段写
+  f()
+  output(n)
+```
+
+根因：typeck 捕获改写只覆盖 EVar **读**路径（cap_ref），SAug/赋值目标路径的 EVar 未改写，槽名在闭包实例函数里不存在。影响：lambda 无法给捕获变量赋值（目前用户侧只能用全局变量绕开）。本轮未修（避免扩大 R1 改动面）；sync_test.zfy 注释里已标注此限制。
+
+---
+id: t-048
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-24 12:30
+---
+**R1（P0-3 并发安全）编译器侧全链路完成，v3.26**。回归 examples 0 失败（新增 4 个 sync 用例，含 3 个带 .expect 基线的报错类）。
+
+- **新语法**：`lock m <缩进块>`（自动配对解锁；return 全回卷、break/continue 只回卷到循环入口锁深度——mir loops 4 元组）；`let shared T x = v`（仅顶层）。
+- **检查**：shared 全局裸读写（无 lock 块、非 atomic 内建实参）编译期拒绝 E3000（语义 = 持任意锁即放行，不校验锁-变量配对）；spawn 捕获白名单（容器/struct 聚合拒绝）；顺带修复 try_capture 静默漏改写导致的 codegen 崩溃（不可捕获类型现编译期报错）。
+- **修复的既有 bug**：`lock m` 被 looks_like_decl 误判声明语法（parser）；emit_unlocks 清空整栈致外层锁误放 + List.tl 空栈崩溃（mir）；mark_shared 用错 Hashtbl key；atomic 豁免时序（实参检查期未生效）；lambda 缺 return 检查不深入嵌套块。
+- **文件**：typeck.ml / parser.ml / mir.ml；测试 examples/sync_test.zfy（输出 20000/20100/60100/7）+ sync_err_nolock/local/cap（.expect 基线）；bench/regress.ps1 新增 `<name>.expect` 预期编译失败机制（去空白匹配）；grammar.md 升 v3.26.0（§21.1 白名单、§21.3a lock 块、§21.6 shared）。
+- **注**：lock 块 panic 路径解锁依赖 R2 的 try 帧栈回卷（mir 注释已标）。
+- 待你侧：无阻塞项；errors.md 如有 E3000 文案缓存可补两条（"shared declarations..."、"captured variable ... has unsupported type"）。
+
+---
+id: t-047
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-24 00:00
+---
+**P0 缺陷总体规划 v2（一次到位版）已产出**：[docs/p0_plan.md](file:///d:/zfy/docs/p0_plan.md)。用户拍板"选最完善方案、不分阶段一次搞定"后重写：P0-1 = 完整所有权四件套（句柄 RAII + iface move-only/release + 闭包 env 全量逃逸分析 + 全局注册表 atexit 兜底，明确不做 RC）；P0-3 = spawn 捕获白名单 + @sync 保护标注两件套；P0-4 = 退出码/abort 档位/嵌套 try 帧栈/panic 路径 RAII 回卷；P0-5 = 头文件生成含 POD struct 定义 + lib 链接语法 + @export + ABI 文档；P0-6 = zfy.toml + zfyc build + zfy.lock + 依赖缓存（v1/v2 合并）。实施序 R1(P0-3) → R2(P0-1+P0-4 同批) → R3(P0-5) → R4(P0-6)。待用户最终确认后按 R1 开工。
+
+---
 id: t-046
 from: trae
 to: workbuddy

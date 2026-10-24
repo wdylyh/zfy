@@ -196,7 +196,8 @@ let default_synth_hook :
                 (* 闭包类型签名（v3.7）：closure$... mangled 名 -> (参数, 返回) *)
 
 type local = { lconst : bool; lty : zty; lslot : string; lunred : bool;
-               lconstp : bool }   (* 指向 const 的指针（T const*，9c）：解引用写报错 *)
+               lconstp : bool;          (* 指向 const 的指针（T const*，9c）：解引用写报错 *)
+               lshared : bool }         (* v3.26 P0-3：shared 共享全局（锁外裸读写报错） *)
 
 (* lambda 捕获上下文（v3.7）：caps = 名字 -> (clenv 字段序号, 是否引用捕获,
    类型, 使用位置)；clenv = env 块 struct 名；base = lambda 检查起点的
@@ -232,6 +233,11 @@ type env = {
     (* lambda 体检查上下文（v3.7）：Some cc = 正在检查 lambda 体——
        本地 miss 的 EVar 逐个登记为捕获（与 clenv$N 字段序一致，0=code 头）；
        EVar 直接改写为 env 字段访问 texpr *)
+  mutable locks : string list;
+    (* v3.26 P0-3：当前持有的 mutex 槽名（lock 块入口压入、块尾弹出）。
+       shared 全局的裸读写须命中本集合或豁免上下文（atomic 内建实参） *)
+  mutable atomic_exempt : bool;
+    (* atomic_load/store/add/inc 实参检查期间置位：&x 取址绕过锁外访问检查 *)
 }
 
 (* 内建函数表（与 hir.ml builtin_fns 同步） *)
@@ -644,11 +650,11 @@ and subst_block map (b : block) : block = List.map (subst_stmt map) b
 
 and subst_stmt map (s : stmt) : stmt =
   match s with
-  | SDecl (c, f, u, n, t, init, p) ->
-    SDecl (c, f, u, n, Option.map (subst_ty_ast map) t,
+  | SDecl (c, f, u, sh, n, t, init, p) ->
+    SDecl (c, f, u, sh, n, Option.map (subst_ty_ast map) t,
            Option.map (subst_expr map) init, p)
-  | SSeqDecl (c, f, u, n, t, len, isl, inits, p) ->
-    SSeqDecl (c, f, u, n, subst_ty_ast map t, Option.map (subst_expr map) len,
+  | SSeqDecl (c, f, u, sh, n, t, len, isl, inits, p) ->
+    SSeqDecl (c, f, u, sh, n, subst_ty_ast map t, Option.map (subst_expr map) len,
               isl, List.map (subst_expr map) inits, p)
   | SDeclList ss -> SDeclList (List.map (subst_stmt map) ss)
   | SAssign (a, b, p) -> SAssign (subst_expr map a, subst_expr map b, p)
@@ -1430,10 +1436,36 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
     (* ---------- 并发内建（v3.8）：线程/互斥/原子/sleep/channel ---------- *)
     | "spawn", [ f ] ->
       (* spawn(闭包或函数名) -> thread$ 句柄；裸函数名（EFunPtrK）先注册
-         签名对应的闭包 struct，对齐处自动包 wrapper（与容器谓词同机制） *)
+         签名对应的闭包 struct，对齐处自动包 wrapper（与容器谓词同机制）。
+         v3.26 P0-3：spawn 实参闭包的捕获字段走跨线程白名单——标量/
+         string/bool/char/句柄（thread/mutex/chan）/闭包句柄放行（捕获 =
+         深拷贝快照，与源隔离）；容器（map/set/list）/普通 struct/frac
+         拒绝（提示经 chan 传值）。比普通闭包捕获（cap_ty_ok）更严：
+         普通调用捕获共享宿主线程内存无跨线程风险 *)
+      let spawn_cap_ok (z : zty) =
+        match resolve z with
+        | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString -> true
+        | TStruct s ->
+          is_clo_struct s || is_thr_struct s || is_mtx_struct s
+          || is_chan_struct s
+        | _ -> false
+      in
+      let check_spawn_caps cs =
+        match Hashtbl.find_opt env.g.structs cs with
+        | Some sd ->
+          List.iter
+            (fun (fn', ft, _) ->
+              if fn' <> "h" && not (spawn_cap_ok ft) then
+                terr p
+                  "spawn: captured variable of type %s cannot cross threads (capture scalars/string/handles, or pass via chan)"
+                  (pp_zty ft))
+            (List.tl sd.sfields)
+        | None -> ()
+      in
       let cs =
         match resolve f.ety with
-        | TStruct s when is_clo_struct s -> s
+        | TStruct s when is_clo_struct s ->
+          check_spawn_caps s; s
         | TPtr (TFunSig (ps, r)) -> ensure_clo_struct env.g r ps
         | _ -> terr p "spawn expects a lambda or function name (fn() -> void)"
       in
@@ -1451,32 +1483,53 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
          mkf ("zfy_mutex_" ^ kn) [ TStruct s ] TVoid
        | _ -> terr p "%s expects a mutex handle (from mutex_new)" kn)
     | "atomic_load", [ x ] ->
-      (* 原子读：实参 &var（TPtr），限 32/64 位整数；返回变量类型 *)
-      (match resolve x.ety with
-       | TPtr ((TInt 32 | TUint 32) as e) -> mkf "zfy_atomic_load_32" [ x.ety ] e
-       | TPtr ((TInt 64 | TUint 64) as e) -> mkf "zfy_atomic_load_64" [ x.ety ] e
-       | _ -> terr p "atomic_load expects &var of a 32/64-bit integer")
+      (* 原子读：实参 &var（TPtr），限 32/64 位整数；返回变量类型。
+         P0-3：实参检查期间豁免 shared 锁外访问检查（原子访问即合法同步） *)
+      env.atomic_exempt <- true;
+      let r =
+        (match resolve x.ety with
+         | TPtr ((TInt 32 | TUint 32) as e) -> mkf "zfy_atomic_load_32" [ x.ety ] e
+         | TPtr ((TInt 64 | TUint 64) as e) -> mkf "zfy_atomic_load_64" [ x.ety ] e
+         | _ -> terr p "atomic_load expects &var of a 32/64-bit integer")
+      in
+      env.atomic_exempt <- false;
+      r
     | "atomic_store", [ x; v ] ->
-      (match resolve x.ety with
-       | TPtr ((TInt 32 | TUint 32) as e) ->
-         mkf "zfy_atomic_store_32" [ x.ety; e ] TVoid
-       | TPtr ((TInt 64 | TUint 64) as e) ->
-         mkf "zfy_atomic_store_64" [ x.ety; e ] TVoid
-       | _ -> terr p "atomic_store expects &var of a 32/64-bit integer")
+      env.atomic_exempt <- true;
+      let r =
+        (match resolve x.ety with
+         | TPtr ((TInt 32 | TUint 32) as e) ->
+           mkf "zfy_atomic_store_32" [ x.ety; e ] TVoid
+         | TPtr ((TInt 64 | TUint 64) as e) ->
+           mkf "zfy_atomic_store_64" [ x.ety; e ] TVoid
+         | _ -> terr p "atomic_store expects &var of a 32/64-bit integer")
+      in
+      env.atomic_exempt <- false;
+      r
     | "atomic_add", [ x; v ] ->
-      (* 原子加：返回加前旧值（fetch_add 语义） *)
-      (match resolve x.ety with
-       | TPtr ((TInt 32 | TUint 32) as e) ->
-         mkf "zfy_atomic_add_32" [ x.ety; e ] e
-       | TPtr ((TInt 64 | TUint 64) as e) ->
-         mkf "zfy_atomic_add_64" [ x.ety; e ] e
-       | _ -> terr p "atomic_add expects &var of a 32/64-bit integer")
+      (* 原子加：返回加前旧值（fetch_add 语义）。实参豁免 shared 锁检查 *)
+      env.atomic_exempt <- true;
+      let r =
+        (match resolve x.ety with
+         | TPtr ((TInt 32 | TUint 32) as e) ->
+           mkf "zfy_atomic_add_32" [ x.ety; e ] e
+         | TPtr ((TInt 64 | TUint 64) as e) ->
+           mkf "zfy_atomic_add_64" [ x.ety; e ] e
+         | _ -> terr p "atomic_add expects &var of a 32/64-bit integer")
+      in
+      env.atomic_exempt <- false;
+      r
     | "atomic_inc", [ x ] ->
-      (* 原子自增：void 返回（语句级可用，免值丢弃检查） *)
-      (match resolve x.ety with
-       | TPtr (TInt 32 | TUint 32) -> mkf "zfy_atomic_inc_32" [ x.ety ] TVoid
-       | TPtr (TInt 64 | TUint 64) -> mkf "zfy_atomic_inc_64" [ x.ety ] TVoid
-       | _ -> terr p "atomic_inc expects &var of a 32/64-bit integer")
+      (* 原子自增：void 返回（语句级可用，免值丢弃检查）。实参豁免同上 *)
+      env.atomic_exempt <- true;
+      let r =
+        (match resolve x.ety with
+         | TPtr (TInt 32 | TUint 32) -> mkf "zfy_atomic_inc_32" [ x.ety ] TVoid
+         | TPtr (TInt 64 | TUint 64) -> mkf "zfy_atomic_inc_64" [ x.ety ] TVoid
+         | _ -> terr p "atomic_inc expects &var of a 32/64-bit integer")
+      in
+      env.atomic_exempt <- false;
+      r
     | "sleep", [ ms ] -> mkf "zfy_sleep_ms" [ TInt 64 ] TVoid
     | "chan_send", [ c; v ] ->
       (match resolve c.ety with
@@ -1640,7 +1693,12 @@ and try_capture env name p' =
       match go 0 env.scopes with
       | Some l
         when not (String.length l.lslot > 0 && l.lslot.[0] = '@')
-             && not l.lconst && cap_ty_ok l.lty ->
+             && not l.lconst ->
+        (* v3.26 P0-3：不可捕获类型（数组/列表/struct 等内联值）编译期报错，
+           不再静默落回外层槽引用（那会在 codegen 期崩 E4019） *)
+        if not (cap_ty_ok l.lty) then
+          terr p' "captured variable '%s' has unsupported type %s (arrays/lists/structs cannot be captured; use a global, pass elements, or send via chan)"
+            name (pp_zty l.lty);
         (match Hashtbl.find_opt cc.caps name with
          | Some (idx, is_ref, ty, _) -> Some (cap_ref env idx is_ref ty p')
          | None ->
@@ -1740,7 +1798,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
       push_scope env;
       declare env "$env"
         { lconst = false; lty = TPtr (TStruct clenv_name); lslot = "";
-          lunred = false; lconstp = false };
+          lunred = false; lconstp = false; lshared = false };
       let envslot =
         match lookup_var env "$env" with
         | Some l -> l.lslot | None -> assert false
@@ -1749,7 +1807,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
         List.map2
           (fun (prm : lparam) z ->
             declare env prm.lpname
-              { lconst = false; lty = z; lslot = ""; lunred = false; lconstp = false };
+              { lconst = false; lty = z; lslot = ""; lunred = false; lconstp = false; lshared = false };
             let slot =
               match lookup_var env prm.lpname with
               | Some l -> l.lslot | None -> assert false
@@ -1796,12 +1854,24 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
          (match resolve r with
           | TVoid -> ()
           | _ ->
+            let rec stmt_has_ret (st : tstmt) =
+              match st.s with
+              | SReturnK _ -> true
+              | SUnwrapBlockK (_, true, _, _, _, _, _) -> true
+              | SIfK (_, a, b) ->
+                block_has_ret a || block_has_ret b
+              | SWhileK (_, b) | SLockK (_, b) | SUnsafeK b | SBlockK b ->
+                block_has_ret b
+              | SForK (inits, _, ups, b) ->
+                block_has_ret b
+                || List.exists stmt_has_ret inits
+                || List.exists stmt_has_ret ups
+              | _ -> false
+            and block_has_ret (b : tblock) =
+              List.exists stmt_has_ret b
+            in
             let has_ret =
-              List.exists (fun (st : tstmt) ->
-                match st.s with
-                | SReturnK _ -> true
-                | SUnwrapBlockK (_, true, _, _, _, _, _) -> true
-                | _ -> false) tbody
+              block_has_ret tbody
               ||
               (match List.rev tbody with
                | { s = SExprK _; _ } :: _ -> true
@@ -2091,6 +2161,12 @@ and check_expr env (e : expr) : texpr =
     let norm l =
       if Hashtbl.mem env.moved l.lslot then
         terr p' "variable %s has been moved and cannot be used (reassign to revive it)" name;
+      (* v3.26 P0-3：shared 全局锁外裸访问拦截——须处于任一 lock 块内
+         （锁与全局变量无语言级关联，持任意互斥锁即视为受保护）
+         或 atomic 内建实参上下文。赋值目标亦经此路径，读写一并覆盖 *)
+      if l.lshared && not env.atomic_exempt && env.locks = [] then
+        terr p'
+          "shared global '%s' must be accessed inside `lock m { ... }` or via atomic builtins" name;
       (* const 整数：使用处直接内联编译期值（含顶层 const） *)
       (match l.lty, Hashtbl.find_opt env.const_vals l.lslot with
        | (TInt _ | TUint _), Some v when l.lconst ->
@@ -2782,8 +2858,15 @@ and check_expr env (e : expr) : texpr =
                            let (targs, origs, modes) = check_args_modes env args in
                            check_call env p' np name targs origs modes))
                    | None ->
-                     (* 普通函数调用：走统一实参分派（自动 move/copy/ref） *)
+                     (* 普通函数调用：走统一实参分派（自动 move/copy/ref）。
+                        P0-3：atomic 四内建的实参在分派期检查——豁免须包住
+                        实参检查本身（内建分派收到的是已检查的 texpr） *)
+                     let exempt =
+                       List.mem name
+                         ["atomic_load"; "atomic_store"; "atomic_add"; "atomic_inc"] in
+                     if exempt then env.atomic_exempt <- true;
                      let (targs, origs, modes) = check_args_modes env args in
+                     if exempt then env.atomic_exempt <- false;
                      check_call env p' np name targs origs modes)))))
      | EField (b, seg, pp) ->
        (* 元素/表达式接收者的方法调用（v3.3.8）：arr[i].m(...) / a.b[i].m(...)。
@@ -3425,11 +3508,13 @@ and uses_of_expr (acc : (string * pos) list) (e : expr) : (string * pos) list =
 
 and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
   match s with
-  | SDecl (_, _, _, _, _, init, _) ->
+  | SDecl (_, _, _, _, _, _, init, _) ->
     (match init with Some e -> uses_of_expr acc e | None -> acc)
-  | SSeqDecl (_, _, _, _, _, len, _, inits, _) ->
+  | SSeqDecl (_, _, _, _, _, _, len, _, inits, _) ->
     let acc = (match len with Some e -> uses_of_expr acc e | None -> acc) in
     List.fold_left uses_of_expr acc inits
+  | SLock (m, b, _) ->
+    List.fold_left uses_of_stmt (uses_of_expr acc m) b
   | SDeclList ss -> List.fold_left uses_of_stmt acc ss
   | SAssign (a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | SForIn (_, _, sx, b, _) ->
@@ -3657,11 +3742,11 @@ and deref_refs (refs : string list) (body : block) : block =
     | SAug (o, l, r, p) -> SAug (o, lhs l, re r, p)
     | SInc (l, p) -> SInc (lhs l, p)
     | SDec (l, p) -> SDec (lhs l, p)
-    | SDecl (c, f, u, n, t, init, p) ->
+    | SDecl (c, f, u, sh, n, t, init, p) ->
       (* deref_refs 不改类型（仅解引用改写），ty option 原样透传 *)
-      SDecl (c, f, u, n, t, (match init with Some e -> Some (re e) | None -> None), p)
-    | SSeqDecl (c, f2, u2, n, t, len, isl, inits, p) ->
-      SSeqDecl (c, f2, u2, n, t, (match len with Some e -> Some (re e) | None -> None), isl,
+      SDecl (c, f, u, sh, n, t, (match init with Some e -> Some (re e) | None -> None), p)
+    | SSeqDecl (c, f2, u2, sh, n, t, len, isl, inits, p) ->
+      SSeqDecl (c, f2, u2, sh, n, t, (match len with Some e -> Some (re e) | None -> None), isl,
                 List.map re inits, p)
     | SDeclList ss -> SDeclList (List.map rs ss)
     | SExpr e -> SExpr (re e)
@@ -3703,6 +3788,7 @@ and deref_refs (refs : string list) (body : block) : block =
       SInput (tgts, (match delim with Some e -> Some (re e) | None -> None), p)
     | SReduce (a, b, c, p) -> SReduce (re a, re b, re c, p)
     | SUnsafe (blk, p) -> SUnsafe (List.map rs blk, p)
+    | SLock (mx, blk, p) -> SLock (re mx, List.map rs blk, p)
     | SBreak _ | SContinue _ -> s
     | SForIn (x, i, seqx, b, p) ->
       (* v3.21 修复：ref 参数作 for-in 序列须解引用改写（此前透传导致
@@ -4631,7 +4717,8 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
    | _ -> ());
   declare env name { lconst = isconst; lty = want; lslot = ""; lunred = is_unred;
                      lconstp = (match ty with TPtrC _ -> true | _ -> false)
-                                || (match init with Some (EBorrow _) -> true | _ -> false) };
+                                || (match init with Some (EBorrow _) -> true | _ -> false);
+                     lshared = false };
   (* const 整数变量记录编译期值（数组长度用；非 const 不算常量） *)
   let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
   if isconst then
@@ -4904,7 +4991,7 @@ and check_unwrap env p (a : expr) (blk : block) target =
          terr p "??-block declaration type must be the element type T (without '!')"
        | _ -> ());
       unify p elem want;
-      declare env name { lconst = isconst; lty = want; lslot = ""; lunred = false; lconstp = false };
+      declare env name { lconst = isconst; lty = want; lslot = ""; lunred = false; lconstp = false; lshared = false };
       let s = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
       (s, want)
     | `Assign name ->
@@ -4925,7 +5012,7 @@ and check_unwrap env p (a : expr) (blk : block) target =
       ("", elem)
   in
   push_scope env;
-  declare env "err" { lconst = true; lty = TStruct "Err"; lslot = ""; lunred = false; lconstp = false };
+  declare env "err" { lconst = true; lty = TStruct "Err"; lslot = ""; lunred = false; lconstp = false; lshared = false };
   let errslot = (match lookup_var env "err" with Some l -> l.lslot | None -> assert false) in
   let saved_unwrap = env.in_unwrap in
   env.in_unwrap <- true;
@@ -4971,6 +5058,7 @@ and check_block env (stmts : stmt list) : tblock =
   in
   let recover s =
     let depth = List.length env.scopes in
+    let lkd = List.length env.locks in
     let r =
       try Some (check_stmt env s)
       with TypeError (p, m) ->
@@ -4978,6 +5066,8 @@ and check_block env (stmts : stmt list) : tblock =
         None
     in
     while List.length env.scopes > depth do pop_scope env done;
+    (* lock 块：语句失败恢复时锁集合同步回卷（异常会跳过配对的弹出） *)
+    env.locks <- List.filteri (fun i _ -> i < lkd) env.locks;
     (* NLL-lite：本语句内未被指针绑定认领的临时借用，语句结束即失效
        （借用作实参/表达式位置用完即弃；成功与失败路径都要清理） *)
     List.iter (kill_borrow_one env) env.borrow_temps;
@@ -4986,11 +5076,11 @@ and check_block env (stmts : stmt list) : tblock =
        scope 声明），后续引用静默通过——否则每个引用点都报 undefined/
        类型错（级联噪声）。变量可能已被声明到一半（报错点在右值），查重后再补 *)
     (match s with
-     | SDecl (_, _, _, name, _, _, _) | SSeqDecl (_, _, _, name, _, _, _, _, _) ->
+     | SDecl (_, _, _, _, name, _, _, _) | SSeqDecl (_, _, _, _, name, _, _, _, _, _) ->
        if lookup_var env name = None then
          declare env name
            { lconst = false; lty = TError; lslot = "<err>";
-             lunred = false; lconstp = false }
+             lunred = false; lconstp = false; lshared = false }
      | _ -> ());
     r
   in
@@ -5041,7 +5131,7 @@ and check_seq_decl env p isconst is_frac is_unred name e len is_list inits =
      let ti = check_expr env ie in
      let copy_list () =
        declare env name
-         { lconst = isconst; lty = TList e; lslot = ""; lunred = is_unred; lconstp = false };
+         { lconst = isconst; lty = TList e; lslot = ""; lunred = is_unred; lconstp = false; lshared = false };
        let slot =
          (match lookup_var env name with
           | Some l -> l.lslot
@@ -5056,7 +5146,7 @@ and check_seq_decl env p isconst is_frac is_unred name e len is_list inits =
         (* 回退：逐元素初值 *)
         let tinits = List.map check_elem inits in
         declare env name
-          { lconst = isconst; lty = TList e; lslot = ""; lunred = is_unred; lconstp = false };
+          { lconst = isconst; lty = TList e; lslot = ""; lunred = is_unred; lconstp = false; lshared = false };
         let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
         SSeqDeclK (isconst, slot, e, 0L, true, tinits, enn))
   (* 数组整体初值：T array b[N] = 源（源为同元素类型数组/列表 → 深拷贝） *)
@@ -5066,7 +5156,7 @@ and check_seq_decl env p isconst is_frac is_unred name e len is_list inits =
       | TArray (e2, n2) when resolve e2 = resolve e && n2 = Int64.to_int vlen ->
         declare env name
           { lconst = isconst; lty = TArray (e, Int64.to_int vlen);
-            lslot = ""; lunred = is_unred; lconstp = false };
+            lslot = ""; lunred = is_unred; lconstp = false; lshared = false };
         let slot =
           (match lookup_var env name with
            | Some l -> l.lslot
@@ -5076,7 +5166,7 @@ and check_seq_decl env p isconst is_frac is_unred name e len is_list inits =
       | TList e2 when resolve e2 = resolve e ->
         declare env name
           { lconst = isconst; lty = TList e;
-            lslot = ""; lunred = is_unred; lconstp = false };
+            lslot = ""; lunred = is_unred; lconstp = false; lshared = false };
         let slot =
           (match lookup_var env name with
            | Some l -> l.lslot
@@ -5088,7 +5178,7 @@ and check_seq_decl env p isconst is_frac is_unred name e len is_list inits =
         declare env name
           { lconst = isconst;
             lty = TArray (e, Int64.to_int vlen);
-            lslot = ""; lunred = is_unred; lconstp = false };
+            lslot = ""; lunred = is_unred; lconstp = false; lshared = false };
         let slot =
           (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
         SSeqDeclK (isconst, slot, e, vlen, is_list, tinits, enn))
@@ -5098,24 +5188,50 @@ and check_seq_decl env p isconst is_frac is_unred name e len is_list inits =
      declare env name
        { lconst = isconst;
          lty = if is_list then TList e else TArray (e, Int64.to_int vlen);
-         lslot = ""; lunred = is_unred; lconstp = false };
+         lslot = ""; lunred = is_unred; lconstp = false; lshared = false };
      let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
      SSeqDeclK (isconst, slot, e, vlen, is_list, tinits, enn))
 
 and check_stmt env (st : stmt) : tstmt =
   let mk k = { s = k; spos = pos_of_stmt st } in
   match st with
-  | SDecl (isconst, is_frac, is_unred, name, ty_opt, init, p) when init <> None && is_unwrap_block (Option.get init) ->
+  | SDecl (isconst, is_frac, is_unred, is_shared, name, ty_opt, init, p) when init <> None && is_unwrap_block (Option.get init) ->
     (match ty_opt with
      | Some ty ->
+       if is_shared then
+         terr p "shared declarations are only allowed at the top level (let shared T name = value)";
        if is_frac || is_unred then
          terr p "frac/unred does not support ??-block initialization";
        mk (check_unwrap_decl env p isconst name ty (Option.get init))
      | None ->
        terr p "??-block initialization requires an explicit type (let T x = a ?? ...)")
-  | SDecl (isconst, is_frac, is_unred, name, ty_opt, init, p) ->
+  | SLock (mx, blk, p) ->
+    (* lock 块（v3.26 P0-3）：mutex 求值（须为 mutex$）→ 锁集压栈检查块体
+       → 产 SLockK（mir 侧配对解锁含跳转路径回卷） *)
+    let tm = check_expr env mx in
+    (match resolve tm.ety with
+     | TStruct s when is_mtx_struct s -> ()
+     | t -> terr p "lock expects a mutex handle (from mutex_new), got %s" (pp_zty t));
+    (* 锁对象须可定位（变量名）——mir 侧解锁按同一表达式求值，v1 限纯
+       变量（无副作用表达式），防止 lock m { m = ... } 悬垂。
+       按源码变量名登记锁集（local 槽名/闭包捕获名统一覆盖） *)
+    let mslot =
+      match mx with
+      | EVar (name, _) -> name
+      | _ -> terr p "lock target must be a mutex variable"; "?"
+    in
+    let saved = env.locks in
+    env.locks <- mslot :: env.locks;
+    let tb = check_block env blk in
+    env.locks <- saved;
+    mk (SLockK (tm, tb))
+  | SDecl (isconst, is_frac, is_unred, is_shared, name, ty_opt, init, p) ->
+    if is_shared then
+      terr p "shared declarations are only allowed at the top level (let shared T name = value)";
     mk (check_decl env p isconst is_frac is_unred name ty_opt init)
-  | SSeqDecl (isconst, is_frac, is_unred, name, ety, len, is_list, inits, p) ->
+  | SSeqDecl (isconst, is_frac, is_unred, is_shared, name, ety, len, is_list, inits, p) ->
+    if is_shared then
+      terr p "shared declarations are only allowed at the top level (let shared T name = value)";
     mk (check_seq_decl env p isconst is_frac is_unred name (conv_ty env.g p ety) len is_list inits)
   | SAssign (lhs, rhs, p) when is_unwrap_block rhs ->
     (* x = a ?? 缩进块 *)
@@ -5562,7 +5678,7 @@ and check_stmt env (st : stmt) : tstmt =
     let mkx k ety = { e = k; ety; epos = p } in
     let fresh nm lty : local =
       declare env nm { lconst = false; lty; lslot = ""; lunred = false;
-                       lconstp = false };
+                       lconstp = false; lshared = false };
       (match lookup_var env nm with Some l -> l | None -> assert false)
     in
     let ts = check_expr env seqx in
@@ -5680,7 +5796,7 @@ and check_stmt env (st : stmt) : tstmt =
     end;
     let fresh nm lty : local =
       declare env nm { lconst = false; lty; lslot = ""; lunred = false;
-                       lconstp = false };
+                       lconstp = false; lshared = false };
       (match lookup_var env nm with Some l -> l | None -> assert false)
     in
     let mv = fresh "match$scr" tscr.ety in
@@ -5830,7 +5946,7 @@ and check_stmt env (st : stmt) : tstmt =
           | InNew (name, ty, p') ->
             let t = conv_ty env.g p' ty in
             check_input_ty p' t;
-            declare env name { lconst = false; lty = t; lslot = ""; lunred = false; lconstp = false };
+            declare env name { lconst = false; lty = t; lslot = ""; lunred = false; lconstp = false; lshared = false };
             let slot = (match lookup_var env name with Some l -> l.lslot | None -> assert false) in
             { tname = slot; tnew = true; tty = t }
           | InUse (name, p') ->
@@ -5896,7 +6012,7 @@ and check_stmt env (st : stmt) : tstmt =
     let tcl = check_lambda env lam p' (Some nm) in
     (* 名字绑定为局部变量（闭包句柄）：声明即初始化 *)
     declare env nm
-      { lconst = false; lty = tcl.ety; lslot = ""; lunred = false; lconstp = false };
+      { lconst = false; lty = tcl.ety; lslot = ""; lunred = false; lconstp = false; lshared = false };
     let slot =
       match lookup_var env nm with
       | Some l -> l.lslot | None -> assert false
@@ -5912,14 +6028,15 @@ and check_for_update env (u : for_update) : tstmt =
   | FUDec (e, p) -> check_stmt env (SDec (e, p))
 
 and pos_of_stmt = function
-  | SDecl (_, _, _, _, _, _, p) | SAssign (_, _, p) | SAssignList (_, _, p)
+  | SDecl (_, _, _, _, _, _, _, p) | SAssign (_, _, p) | SAssignList (_, _, p)
   | SAug (_, _, _, p)
   | SInc (_, p) | SDec (_, p)
   | SReturn (_, p) | SIf (_, _, _, p)
   | SWhile (_, _, p) | SFor (_, _, _, _, p) | SForIn (_, _, _, _, p) | SReduce (_, _, _, p)
   | SOutput (_, _, _, p) | SInput (_, _, p)
-  | SSeqDecl (_, _, _, _, _, _, _, _, p)
+  | SSeqDecl (_, _, _, _, _, _, _, _, _, p)
   | SUnsafe (_, p)
+  | SLock (_, _, p)
   | SFn (_, _, _, _, _, p)
   | SMatch (_, _, p)
   | SBlock (_, p)
@@ -6321,7 +6438,8 @@ let check_program (prog : program) : hir =
       fnvars = Hashtbl.create 8; const_vals = Hashtbl.create 16;
       in_unsafe = false; in_unwrap = false; moved = Hashtbl.create 8;
       borrowed = Hashtbl.create 8; scope_borrows = []; borrow_temps = []; uses = [];
-      ldepth = 0; capctx = None }
+      ldepth = 0; capctx = None;
+      locks = []; atomic_exempt = false }
   in
   (* 全局作用域：顶层声明（const 内联；非 const 为全局可变变量） *)
   push_scope env;
@@ -6334,6 +6452,17 @@ let check_program (prog : program) : hir =
        | None -> ())
     | [] -> ()
   in
+  (* v3.26 P0-3：把顶层槽标记为 shared 共享全局（norm 读路径按此拦截）。
+     注意按迭代的原 key（变量名）replace——查找走变量名，改槽名键会
+     新增条目而原条目 lshared 保持 false *)
+  let mark_shared slot =
+    match env.scopes with
+    | sc :: _ ->
+      Hashtbl.iter
+        (fun k l -> if l.lslot = slot then Hashtbl.replace sc k { l with lshared = true })
+        sc
+    | [] -> ()
+  in
   let ginit = ref [] in                       (* 全局初始化语句（zfy.globals 执行） *)
   let gdeclared = ref [] in                   (* (槽名, 类型) *)
   (* 顶层声明逐项处理：单条出错记录后继续（多错误收集） *)
@@ -6342,8 +6471,9 @@ let check_program (prog : program) : hir =
       | IDecl (d, _) ->
         (try
            (match d with
-            | SDecl (true, false, false, name, ty, init, p) ->
+            | SDecl (true, false, false, sh, name, ty, init, p) ->
               (* 顶层 const：编译期常量（整数使用处内联，保持原语义） *)
+              if sh then terr p "shared does not apply to const (const values are immutable)";
               if lookup_var env name <> None then
                 terr p "duplicate top-level constant: %s" name;
               let _t : tstmt = { s = check_decl env p true false false name ty init; spos = p } in
@@ -6353,10 +6483,11 @@ let check_program (prog : program) : hir =
                   | TInt _ | TUint _ -> ()
                   | _ -> terr p "top-level const currently supports only integer types, got %s" (pp_zty l.lty))
                | None -> ())
-            | SDecl (true, is_frac, is_unred, name, ty, init, p) ->
+            | SDecl (true, is_frac, is_unred, sh, name, ty, init, p) ->
               (* 顶层 const frac/unred（w-015 #5）：按全局常量槽处理——
                  槽名 @g.<名>、lconst=true（赋值被拒）、ginit 初始化，
                  不做整数内联。const+frac 在函数内已合法（check_decl 支持） *)
+              if sh then terr p "shared does not apply to const (const values are immutable)";
               if lookup_var env name <> None then
                 terr p "duplicate top-level constant: %s" name;
               let st = { s = check_decl env p true is_frac is_unred name ty init; spos = p } in
@@ -6369,21 +6500,24 @@ let check_program (prog : program) : hir =
                   s = (match st.s with
                        | SDeclK (c, _, t, e, nn) -> SDeclK (c, slot, t, e, nn)
                        | s' -> s') } :: !ginit
-            | SDecl (is_const, is_frac, is_unred, name, ty, init, p) ->
-              (* 非 const 标量（含 frac）：全局可变变量 *)
+            | SDecl (is_const, is_frac, is_unred, is_shared, name, ty, init, p) ->
+              (* 非 const 标量（含 frac）：全局可变变量。
+                 v3.26 P0-3：is_shared = 共享全局——lshared 置位，
+                 锁外裸读写报错（须经 lock 块或 atomic 内建访问） *)
               if lookup_var env name <> None then
                 terr p "duplicate top-level variable: %s" name;
               let st = { s = check_decl env p is_const is_frac is_unred name ty init; spos = p } in
               let lty = (match lookup_var env name with Some l -> l.lty | None -> assert false) in
               let slot = "@g." ^ name in
               set_global_slot name slot;
+              if is_shared then mark_shared slot;
               gdeclared := (slot, lty) :: !gdeclared;
               ginit :=
                 { st with
                   s = (match st.s with
                        | SDeclK (c, _, t, e, nn) -> SDeclK (c, slot, t, e, nn)
                        | s' -> s') } :: !ginit
-            | SSeqDecl (isconst, is_frac, is_unred, name, ety, len, is_list, inits, p) ->
+            | SSeqDecl (isconst, is_frac, is_unred, is_shared, name, ety, len, is_list, inits, p) ->
               (* 顶层数组/列表：全局可变变量（const 也可，元素修改受 const 约束） *)
               if lookup_var env name <> None then
                 terr p "duplicate top-level variable: %s" name;
@@ -6393,6 +6527,7 @@ let check_program (prog : program) : hir =
               let lty = (match lookup_var env name with Some l -> l.lty | None -> assert false) in
               let slot = "@g." ^ name in
               set_global_slot name slot;
+              if is_shared then mark_shared slot;
               gdeclared := (slot, lty) :: !gdeclared;
               ginit :=
                 { st with
@@ -6428,7 +6563,8 @@ let check_program (prog : program) : hir =
                     declare env pd.pname
                       { lconst = pd.pconst; lty = pty; lslot = "";
                         lunred = pd.punred;
-                        lconstp = (match pd.pty with TPtrC _ -> true | _ -> false) };
+                        lconstp = (match pd.pty with TPtrC _ -> true | _ -> false);
+                        lshared = false };
                     let slot = (match lookup_var env pd.pname with
                                 | Some l -> l.lslot | None -> assert false) in
                     (false, slot, pty, pd.punred))
@@ -6457,6 +6593,7 @@ let check_program (prog : program) : hir =
                       SForIn (v, it, idx, fix_main_ret b, p)
                     | SBlock (b, p) -> SBlock (fix_main_ret b, p)
                     | SUnsafe (b, p) -> SUnsafe (fix_main_ret b, p)
+                    | SLock (mx, b, p) -> SLock (mx, fix_main_ret b, p)
                     | SMatch (scr, arms, p) ->
                       SMatch (scr,
                               List.map (fun (a : marm) ->
@@ -6482,6 +6619,7 @@ let check_program (prog : program) : hir =
                     | SIfK (_, a, b) -> has_return a || has_return b
                     | SBlockK b | SUnsafeK b -> has_return b
                     | SWhileK (_, b) | SForK (_, _, _, b) -> has_return b
+                    | SLockK (_, b) -> has_return b
                     | _ -> false) sl
                 in
                 let has_ret =
@@ -6932,6 +7070,7 @@ let check_program (prog : program) : hir =
       | SAugDerefK (p, op, v) -> SAugDerefK (fix_texpr p, op, fix_texpr v)
       | SUnsafeK b -> SUnsafeK (List.map fix_stmt b)
       | SBlockK b -> SBlockK (List.map fix_stmt b)
+      | SLockK (m, b) -> SLockK (fix_texpr m, List.map fix_stmt b)
       | k -> k
     in
     { s = s'; spos = s.spos }

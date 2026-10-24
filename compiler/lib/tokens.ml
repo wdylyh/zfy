@@ -10,7 +10,7 @@ type keyword =
   | KFail | KPanic | KErr
   | KStruct | KPacked | KMove | KCopy | KBorrow | KRef | KNull | KUnsafe | KExtern | KType
   | KEnum | KMatch | KInterface | KUi
-  | KLet | KFn | KIn
+  | KShared | KLet | KFn | KIn
 
 let keyword_table =
   [ "if", KIf; "else", KElse;
@@ -32,7 +32,8 @@ let keyword_table =
     "unsafe", KUnsafe; "extern", KExtern; "type", KType;
     "let", KLet; "fn", KFn; "in", KIn;
     "enum", KEnum; "match", KMatch; "interface", KInterface;
-    "ui", KUi ]
+    "ui", KUi;
+    "shared", KShared ]
 
 type token =
   | IntLit of int64
@@ -87,6 +88,7 @@ let pp_keyword = function
   | KArray -> "array" | KList -> "list"
   | KLet -> "let" | KFn -> "fn" | KIn -> "in"
   | KEnum -> "enum" | KMatch -> "match" | KInterface -> "interface" | KUi -> "ui"
+  | KShared -> "shared"
 let pp_token = function
   | IntLit n -> Printf.sprintf "Int %Ld" n
   | BigIntLit s -> Printf.sprintf "Big %s" s

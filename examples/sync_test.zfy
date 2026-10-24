@@ -1,0 +1,72 @@
+// v3.26 P0-3 并发安全专项（R1）：spawn 捕获白名单 + shared 全局 + lock 块
+// 预期输出：
+// 20000        （双线程各 1 万次 lock 块递增，互斥保护精确）
+// 20100        （lock 块内 return 穿越后互斥锁已回卷解锁，二次加锁不死锁）
+// 60100        （atomic_inc 原子豁免路径：shared 全局锁外原子访问合法）
+// 7            （lock 块内声明的局部变量 + break 穿越后锁正常释放）
+// 注：线程内循环计数用各自全局变量（lambda 捕获变量的函数内赋值
+// 走 clenv 快照，主线程不可见——见 collab t-049 已知问题）
+let shared i64 counter = 0
+let i64 done1 = 0
+let i64 done2 = 0
+let i64 done3 = 0
+let i64 done4 = 0
+
+fn main()
+  let m = mutex_new()
+
+  // 1. 双线程 lock 块竞争递增（互斥精确性）
+  let fn() -> void body1 = fn() -> void
+    while done1 < 10000
+      lock m
+        counter = counter + 1
+      done1 = done1 + 1
+  let fn() -> void body2 = fn() -> void
+    while done2 < 10000
+      lock m
+        counter = counter + 1
+      done2 = done2 + 1
+  let t1 = spawn(body1)
+  let t2 = spawn(body2)
+  join(t1)
+  join(t2)
+  lock m
+    output(counter)
+
+  // 2. lock 块内 return 穿越 → 解锁回卷；随后二次加锁不死锁
+  //    （mutex 句柄类型用户侧不可名状，经闭包捕获传入）
+  let fn() -> i32 guarded = fn() -> i32
+    lock m
+      counter = counter + 100
+      return 42
+  let _r = guarded()
+  let i64 c1 = 0
+  lock m
+    c1 = counter
+  output(c1)          // 20100（guarded 已写入；本 lock 未死锁）
+
+  // 3. atomic 内建豁免：shared 全局锁外原子访问（2 线程 × 2 万）
+  let fn() -> void inc1 = fn() -> void
+    while done3 < 20000
+      atomic_inc(&counter)
+      done3 = done3 + 1
+  let fn() -> void inc2 = fn() -> void
+    while done4 < 20000
+      atomic_inc(&counter)
+      done4 = done4 + 1
+  let a1 = spawn(inc1)
+  let a2 = spawn(inc2)
+  join(a1)
+  join(a2)
+  lock m
+    output(counter)     // 20100 + 40000 = 60100（i64 全程无窄化）
+
+  // 4. lock 块内声明变量 + break 穿越
+  let k = 0
+  lock m
+    let tmp = 0
+    while k < 10
+      tmp = tmp + 1
+      if tmp == 7
+        break
+    output(tmp)

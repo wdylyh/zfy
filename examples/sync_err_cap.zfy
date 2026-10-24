@@ -1,0 +1,9 @@
+// 报错类（P0-3）：闭包捕获数组（内联聚合）→ 编译期拒绝 E3000
+// "captured variable 'xs' has unsupported type i32[3]"
+// （数组/列表/struct 不可捕获；跨线程传值走全局 shared 或 chan）
+fn main()
+  let i32 xs[3] = 1, 2, 3
+  let fn() -> void body = fn() -> void
+    output(xs[0])
+  let t = spawn(body)
+  join(t)

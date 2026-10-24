@@ -153,11 +153,13 @@ type lctx = {
   mutable nb : int;
   mutable nt : int;
   mutable cur : block;
-  mutable loops : (int * int * int) list;  (* (break 目标, continue 目标, 循环体作用域深度) *)
+  mutable loops : (int * int * int * int) list;  (* (break 目标, continue 目标, 循环体作用域深度, 循环入口锁栈深度) *)
   mutable scopes : (string * zty) list ref list;  (* RAII 作用域栈：每层收集需释放变量 *)
   mutable stmt_temps : (string * free_kind) list;  (* 当前语句拥有的临时：(名, 释放类别) *)
   mutable unchecked : bool;  (* unsafe 块内：下标读写关闭越界检查（new2.md #3/@unchecked） *)
   mutable frunred : bool;    (* 当前函数返回类型带 unred：return 不做 frac 归一（new.md） *)
+  mutable locks : operand list;  (* v3.26 P0-3：lock 块栈——return/break/continue
+                                    穿越时按栈逆序补 zfy_mutex_unlock（配对回卷） *)
   unreds : (string, bool) Hashtbl.t;  (* unred frac 数组/列表槽名集合：元素存入不归一 *)
 }
 
@@ -306,6 +308,22 @@ let emit_frees_from_skip l depth skip =
   go l.scopes
 
 let emit_frees_from l depth = emit_frees_from_skip l depth []
+
+(* v3.26 P0-3：锁栈回卷——把锁栈回卷到 depth（对 depth 之上的锁按入栈
+   逆序发 zfy_mutex_unlock）。return 全回卷（depth=0）；break/continue 只
+   回卷到循环入口深度（外层 lock 块仍持有，不得误放） *)
+let emit_unlocks_to l depth =
+  let rec go n = function
+    | mo :: rest when n > depth ->
+      emit l (MCall (None, "zfy_mutex_unlock", [ mo ], TVoid));
+      go (n - 1) rest
+    | _ -> ()
+  in
+  let len = List.length l.locks in
+  go len l.locks;
+  l.locks <- List.filteri (fun i _ -> i < depth) l.locks
+
+let emit_unlocks l = emit_unlocks_to l 0
 
 (* frac 运行时函数名（运算结果由运行时自动约分到最简�?*)
 let frac_rt_name (bop : binop) (elem : zty) : string =
@@ -1340,6 +1358,19 @@ and lstmt_inner l (s : tstmt) : unit =
   | SBlockK b ->
     (* 透明块（v3.6 for-in 降码承载）：平铺，无独立作用域 *)
     lblock l b
+  | SLockK (m, blk) ->
+    (* lock 块（v3.26 P0-3）：入口加锁 + 块体 + 正常路径解锁。
+       提前跳转（return/break/continue）由各自降码点的 emit_unlocks 回卷；
+       panic 直接终止进程（OS 回收锁），try 恢复路径待 P0-4 帧栈回卷 *)
+    let mo = lexpr l m in
+    emit l (MCall (None, "zfy_mutex_lock", [ mo ], TVoid));
+    l.locks <- mo :: l.locks;
+    lblock l blk;
+    if l.cur.term = None then begin
+      emit l (MCall (None, "zfy_mutex_unlock", [ mo ], TVoid));
+      l.locks <- List.tl l.locks
+    end
+    (* term 已设（块内 return/break/continue）：锁由跳转点回卷，栈保持 *)
   | SExprK e ->
     (* 语句级 fail(code, msg)（w-009）：构造错误值后按 ? 失败路径终止
        函数（RAII 释放局部资源 + 错误值 memcpy 到 sret 返回槽 + ret
@@ -1376,6 +1407,7 @@ and lstmt_inner l (s : tstmt) : unit =
       | _ -> []
     in
     emit_frees_from_skip l 0 skip;
+    emit_unlocks l;
     set_term l (TRet v)
   | SIfK (c, tb, eb) ->
     let cv = lexpr l c in
@@ -1403,7 +1435,8 @@ and lstmt_inner l (s : tstmt) : unit =
     (* 循环体单独作用域：每轮结束（�?break/continue 路径）释�?*)
     l.scopes <- ref [] :: l.scopes;
     let body_depth = List.length (List.tl l.scopes) in
-    l.loops <- (bend.bid, bcond.bid, body_depth) :: l.loops;
+    let locks_depth = List.length l.locks in
+    l.loops <- (bend.bid, bcond.bid, body_depth, locks_depth) :: l.loops;
     l.cur <- bbody;
     lblock l body;
     emit_frees_from l body_depth;
@@ -1422,9 +1455,10 @@ and lstmt_inner l (s : tstmt) : unit =
     set_term l (TCondBr (cv, bbody.bid, bend.bid));
     l.scopes <- ref [] :: l.scopes;
     let body_depth = List.length (List.tl l.scopes) in
+    let locks_depth = List.length l.locks in
     (* 循环上下文：break -> bend；continue -> bupd（continue/break 前
        需先释放 body 层，bupd/bend 都在 body 作用域之外） *)
-    l.loops <- (bend.bid, bupd.bid, body_depth) :: l.loops;
+    l.loops <- (bend.bid, bupd.bid, body_depth, locks_depth) :: l.loops;
     l.cur <- bbody;
     lblock l body;
     emit_frees_from l body_depth;
@@ -1480,16 +1514,19 @@ and lstmt_inner l (s : tstmt) : unit =
      | _ -> merr x.epos "reduce target must be a frac-typed local variable")
   | SBreakK ->
     (match l.loops with
-     | (bk, _, body_depth) :: _ ->
-       (* 跳出前释放循环体内层作用域的全部资源 *)
+     | (bk, _, body_depth, locks_depth) :: _ ->
+       (* 跳出前释放循环体内层作用域的全部资源；穿越的 lock 块逆序解锁
+          （只回卷到循环入口深度——外层 lock 块仍持有，不得误放） *)
        emit_frees_from l body_depth;
+       emit_unlocks_to l locks_depth;
        set_term l (TBr bk);
        l.cur <- new_block l            (* 后续死代码放入孤立块 *)
      | [] -> merr s.spos "break outside a loop")
   | SContinueK ->
     (match l.loops with
-     | (_, ck, body_depth) :: _ ->
+     | (_, ck, body_depth, locks_depth) :: _ ->
        emit_frees_from l body_depth;
+       emit_unlocks_to l locks_depth;
        set_term l (TBr ck);
        l.cur <- new_block l
      | [] -> merr s.spos "continue outside a loop")
@@ -1583,6 +1620,7 @@ let rec collect_lets acc (stmts : tblock) =
       | SWhileK (_, b) -> collect_lets acc b
       | SBlockK b -> collect_lets acc b
       | SUnsafeK b -> collect_lets acc b
+      | SLockK (_, b) -> collect_lets acc b
       | SForK (inits, _, _, b) ->
         List.iter
           (fun (s : tstmt) ->
@@ -1612,7 +1650,7 @@ let lower_fn (h : hir) (f : tfn) : mfn =
   let l =
     { blocks = Hashtbl.create 8; nb = 0; nt = 0; cur = Obj.magic 0;
       loops = []; scopes = []; stmt_temps = []; unchecked = false;
-      frunred = f.frunred; unreds = Hashtbl.create 8 }
+      frunred = f.frunred; locks = []; unreds = Hashtbl.create 8 }
   in
   let entry = new_block l in
   l.cur <- entry;

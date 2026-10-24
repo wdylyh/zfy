@@ -172,6 +172,10 @@ and tstmt_kind =
   | SBlockK of tblock
     (* 透明块（v3.6 for-in 降码承载）：纯顺序组合，无独立作用域/栈帧。
        mir/llvmgen 平铺为指令序列 *)
+  | SLockK of texpr * tblock
+    (* lock 块（v3.26 P0-3）：(mutex 表达式, 块)——mir 降码：入口
+       zfy_mutex_lock + 块体 + 正常路径 zfy_mutex_unlock；return/break/
+       continue 穿越时按锁栈逆序解锁（l.locks 回卷） *)
 
 and tblock = tstmt list
 

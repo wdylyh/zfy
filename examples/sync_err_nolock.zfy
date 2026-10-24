@@ -1,0 +1,5 @@
+// 报错类（P0-3）：shared 全局锁外裸写 → 编译期拒绝
+let shared i64 counter = 0
+
+fn main()
+  counter = counter + 1
