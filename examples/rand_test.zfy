@@ -1,0 +1,122 @@
+// rand 内建测试（v3.28 new.md 第1条）：种子可复现 + 区间/形态属性断言
+// 失败 exit 1；通过输出 "rand_test OK"
+fn void pick_bad()
+    // sample k>n：运行期 panic
+    let i32[] a = 1, 2, 3
+    let i32[] s = rand.sample(a, num=5)
+    output(s[0])
+    return
+
+fn main()
+    let i32 bad = 0
+    // ---- 种子可复现 ----
+    rand.seed(42)
+    let i64 r1 = rand(0, 1000)
+    rand.seed(42)
+    let i64 r2 = rand(0, 1000)
+    if r1 != r2
+        bad++
+    // ---- 整数闭区间（含 A 和 B）----
+    let i32 lo = 0
+    let i32 hi = 0
+    let i32 i = 0
+    rand.seed(7)
+    while i < 300
+        let i64 v = rand(2, 5)
+        if v < 2 or v > 5
+            bad++
+        if v == 2
+            lo++
+        if v == 5
+            hi++
+        i++
+    if lo == 0 or hi == 0
+        bad++
+    // ---- 浮点区间 ----
+    i = 0
+    while i < 100
+        let f64 v = rand(1.5, 2.5)
+        if v < 1.5 or v > 2.5
+            bad++
+        i++
+    // ---- bool 各半（忽略 A,B 值）----
+    rand.seed(9)
+    let i32 tr = 0
+    i = 0
+    while i < 1000
+        if rand(false, true)
+            tr++
+        i++
+    if tr < 350 or tr > 650
+        bad++
+    // ---- char 区间（ascii 码）----
+    i = 0
+    while i < 50
+        let char c = rand('a', 'e')
+        if c < 'a' or c > 'e'
+            bad++
+        i++
+    // ---- 字符串单参：随机码点必属原串 ----
+    i = 0
+    while i < 30
+        let string ch = rand("AB中文")
+        if ch != "A" and ch != "B" and ch != "中" and ch != "文"
+            bad++
+        i++
+    // ---- frac 区间：在 [1/2, 3/2] 内（自动约分）----
+    rand.seed(11)
+    i = 0
+    while i < 50
+        let i64 frac f = rand(1/2, 3/2)
+        if f < 1/2 or f > 3/2
+            bad++
+        i++
+    // ---- choice 列表形态（可重复，源不动）----
+    rand.seed(13)
+    let i32[] src = 10, 20, 30
+    let i32[] cs = rand.choice(src, num=4)
+    i = 0
+    while i < 4
+        if cs[i] != 10 and cs[i] != 20 and cs[i] != 30
+            bad++
+        i++
+    if src[0] != 10 or src[1] != 20 or src[2] != 30
+        bad++
+    // ---- choice 多值形态 ----
+    let i64[] m = rand.choice(7, 14, num=5)
+    i = 0
+    while i < 5
+        if m[i] != 7 and m[i] != 14
+            bad++
+        i++
+    // ---- sample 无放回：两元素互异且 ∈ {7, 11, 13} ----
+    let i32[] tri = 7, 11, 13
+    let i32[] sp = rand.sample(tri, num=2)
+    if sp[0] == sp[1]
+        bad++
+    let i64 ss = cast(sp[0], i64) + cast(sp[1], i64)
+    if ss != 18 and ss != 20 and ss != 24
+        bad++
+    // 源列表不动
+    if tri[0] != 7 or tri[1] != 11 or tri[2] != 13
+        bad++
+    // ---- shuffle 原地（数组变量）----
+    rand.seed(3)
+    let i32[] arr = 1, 2, 3
+    rand.shuffle(arr)
+    let i64 sm = cast(arr[0], i64) + cast(arr[1], i64) + cast(arr[2], i64)
+    if sm != 6
+        bad++
+    // ---- shuffle 多值：返回新列表 ----
+    let i64[] sh = rand.shuffle(4, 5, 6)
+    if sh[0] + sh[1] + sh[2] != 15
+        bad++
+    // ---- sample k>n → panic 捕获 ----
+    let bool p1 = try(pick_bad)
+    if p1
+        bad++
+    if bad != 0
+        return 1
+    output("rand_test OK")
+    output("\n")
+    return 0

@@ -1,0 +1,60 @@
+// timer 内建测试（v3.28 new.md 第2条）：add/start/stop/now/sleep 计时
+// 失败 exit 1；通过输出 "timer_test OK"
+fn void now_bad()
+    // 未 add 的线程号：timer.now 运行期 panic
+    let f64 v = timer.now(77)
+    output(v)
+    return
+
+fn main()
+    let i32 bad = 0
+    // ---- timer.now()：Unix 时间戳（合理范围 2020-2070）----
+    let i64 ts = timer.now()
+    if ts < 1577836800 or ts > 3187296000
+        bad++
+    // ---- add 不连续序号 + start/stop 计时 ----
+    timer.add(18)
+    timer(0.2, 18, start)
+    time.sleep(0.15)
+    timer(18, stop)
+    let f64 e1 = timer.now(18)
+    // 冻结后 now 不再增长
+    time.sleep(0.05)
+    let f64 e2 = timer.now(18)
+    if e2 != e1
+        bad++
+    // 0.15s 睡眠实际耗时偏长（调度余量），但不应少于 0.1s、不应超 2s
+    if e1 < 0.1 or e1 > 2.0
+        bad++
+    // ---- 起始数 x：now 应含起始值 ----
+    timer.add(5)
+    timer(10.0, 5, start)
+    let f64 e3 = timer.now(5)
+    timer(5, stop)
+    let f64 e4 = timer.now(5)
+    if e3 < 10.0 or e3 > 13.0
+        bad++
+    if e4 < e3
+        bad++
+    // ---- 再 start：start(x) 将计数值重置为 x（起始数语义）----
+    time.sleep(0.1)
+    timer(0.0, 5, start)
+    time.sleep(0.1)
+    timer(5, stop)
+    let f64 e5 = timer.now(5)
+    if e5 < 0.05 or e5 > 2.0
+        bad++
+    // ---- remove 后 now → panic 捕获 ----
+    timer.remove(5)
+    let bool p1 = try(now_bad)
+    if p1
+        bad++
+    // ---- remove 不存在的线程 → panic 捕获 ----
+    let bool p2 = try(now_bad)
+    if p2
+        bad++
+    if bad != 0
+        return 1
+    output("timer_test OK")
+    output("\n")
+    return 0

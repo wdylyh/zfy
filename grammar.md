@@ -1,4 +1,4 @@
-# zfy 语言规范（v3.27.0，2026-10-24）
+# zfy 语言规范（v3.28.0，2026-10-24）
 
 > 本规范只描述当前语法。旧语法一律删除、不再保留历史版本描述。
 > 适用编译器：`compiler/_build/zfyc.exe` 当前构建。
@@ -211,8 +211,8 @@ struct Counter
 - **const 接收者调方法报错**（方法可能改状态）；方法不支持命名实参；
   方法名不能是关键字（`float`/`int` 等不行，换 `uniform` 这类名字）。
 - 方法调用与字段访问不冲突：`rng.s0` 是字段，`rng.next_u64()` 是方法。
-- 跨文件 use 导入 struct 后方法照常可用（`mod random; use random::Random`
-  → `rng.next_u64()`）。
+- 跨文件 use 导入 struct 后方法照常可用（`mod util; use util::Helper`
+  → `h.next_u64()`）。
 - **泛型 struct 方法**见 §28.2。
 
 ## 8. 语句全集
@@ -426,57 +426,86 @@ v 为 string 或 char。
 
 **string 是字节串**：`length("中文")` = 6（字节数）；按码点操作用 utf8_* 组。
 
-### 12.1 随机数标准库（stdlib/random.zfy）
+### 12.1 内建随机：rand 系（v3.28，替代 stdlib/random）
 
-`stdlib/` 目录下的文件模块可被任意源文件引用（resolve 沿父目录链查
-`<祖先>/stdlib/名.zfy`）。用法：
+随机为编译器内建（xoshiro256\*\* 引擎 + SplitMix64 播种，Lemire 无偏采样）。
+`rand` / `rand.seed` / `rand.choice` / `rand.sample` / `rand.shuffle` 为保留
+调用名。未 `rand.seed` 直接使用 → 自动以种子 0 播种（可复现）。
 
 ```
-mod random;
-use random::{Random, seed_from_u64, seed_from_entropy, SecureRandom, secure_new}
-
-fn main()
-    let Random rng = seed_from_u64(42)     # 可复现
-    let i64 n = rng.int_range(1, 100)      # [1, 100) 无偏
-    let f64 x = rng.uniform()              # [0, 1) 53 位精度
-    let SecureRandom sr = secure_new()     # OS 熵源 + ChaCha20
-    let string tok = sr.token(32)          # base64url 字符集 token
+rand.seed(42)                  # 语句：设种子（整数）
+rand(A, B)                     # 表达式：闭区间 [A, B] 内均匀取一
+rand(S)                        # 表达式：串 S 内随机一个码点（返回 string）
+rand.choice(N, num=K)          # 从 N 选 K 个（可重复），返回列表
+rand.sample(N, num=K)          # 从 N 无放回抽 K 个（K>n 运行期 panic）
+rand.shuffle(xs)               # 列表/数组变量：原地打乱（void）
+rand.shuffle(v1, v2, ...)      # 多个同型值：返回打乱后的新列表
 ```
 
-**Random（非加密，xoshiro256\*\*，周期 2^256-1）**：
+**rand(A, B) 类型规则**：A、B 必须同类型（整数可宽化统一；128 位整数不
+支持）：
 
-| API | 说明 |
+| A/B 类型 | 语义 |
 |---|---|
-| `next_u64()` / `next_u32()` | 引擎原语 |
-| `uniform()` / `uniform32()` | [0,1)，f64 取高 53 位 / f32 取高 24 位（不会取到 1.0） |
-| `boolean()` / `boolean_p(p)` | p=0.5 / 伯努利 P(true)=p |
-| `int_range(lo,hi)` / `int_range_incl(lo,hi)` | i64 半开 [lo,hi) / 闭 [lo,hi] |
-| `uint_range(lo,hi)` / `uint_range_incl(lo,hi)` | u64 同上 |
-| `normal(mean,stddev)` / `exponential(lambda)` / `geometric(p)` | Box-Muller 正态 / 指数 / 几何（试验次数口径 ≥1） |
-| `shuffle(ref xs)` / `shuffle_u64(ref xs)` | Fisher-Yates 洗牌（i32/u64 列表，原地） |
-| `choice(xs)` / `sample(xs,k)` | 均匀选一（空表 panic）/ 无放回抽 k（k>n 截断） |
-| `fill_bytes(ref buf)` / `hex_string(n)` / `ascii_char()` | 随机字节 / 小写 hex 串 / 可见 ASCII 字符 |
+| 整数（i/u 8..64） | 闭区间 [A, B]，含两端 |
+| f32 / f64 | 浮点闭区间（混合字面量按 f64） |
+| char | 按 ascii 码区间随机，返回 char |
+| bool | 忽略 A、B 值，P(true) = 0.5 |
+| frac（i8..i64/u8..u64 元素） | 区间内随机分数，自动约分 |
+| string | 只有单参形态 `rand(S)`：随机一码点（返回 string，char 装不下多字节） |
 
-构造：`seed_from_i64` / `seed_from_u64` / `seed_from_string`（FNV-1a）/ 
-`seed_from_entropy()`（OS 熵源）。播种一律 SplitMix64 扩展（相近种子不相关）。
+**choice / sample / shuffle 规则**：
+- `N` 可以是单个列表/数组，或多个同型标量值（多值自动打包临时列表）。
+- 多值形态元素类型必须一致：数值实参统一宽化（混入浮点 → f64，全整数
+  字面量 → i64）；非数值（string/bool/char/frac）要求完全一致，混型编译错。
+- `num=K` 命名参数必填；K ≤ 0 字面量编译期拒绝（非字面量运行期 panic）。
+- `sample` 无放回：K 大于元素个数 → 运行期 panic（索引池部分洗牌，源不动）。
+- `choice` 可重复；源列表/数组不被修改。
+- `shuffle` 单列表/数组变量（含数组）：data 原地重排；多值形态返回新列表。
 
-**SecureRandom（加密，ChaCha20 纯 zfy 实现）**：
+```zfy
+rand.seed(7)
+let i64 n = rand(2, 5)             # 2..5
+let f64 x = rand(1.5, 2.5)
+let char c = rand('a', 'e')
+let bool b = rand(false, true)
+let i64 frac f = rand(1/2, 3/2)
+let string ch = rand("AB中文")      # "A" / "B" / "中" / "文" 之一
+let i32[] xs = 1, 2, 3
+let i32[] cs = rand.choice(xs, num=4)
+let i32[] sp = rand.sample(xs, num=2)
+rand.shuffle(xs)                    # xs 原地打乱
+let i64[] sh = rand.shuffle(4, 5, 6)
+```
 
-| API | 说明 |
-|---|---|
-| `next_u64()` / `next_u32()` / `boolean()` / `boolean_p(p)` / `uniform()` | 同 Random 语义 |
-| `int_range` / `int_range_incl` / `uint_range` / `uint_range_incl` / `uint_below` | 同 Random 语义 |
-| `fill_bytes(ref buf)` | 随机字节 |
-| `token(n)` / `hex_token(n)` | base64url 字符集（A-Z a-z 0-9 - _，每字符 6 位熵，无偏）/ 小写 hex |
-| `reseed()` | 重新从 OS 熵源播种 |
+### 12.2 内建计时：timer 系 + time.sleep（v3.28，替代旧时间语义）
 
-构造：`secure_new()`（OS 熵源：Windows SystemFunction036 / POSIX getentropy）/
-`secure_from_string(s)`（可复现，仅测试用）。状态布局：sigma 常数 + 256 位 key
-+ counter + 96 位 nonce，块用尽自动递增 counter。
+计时器为固定 4096 槽表（序号可不连续），单调钟（QPC）计时：
 
-**设计要点**：区间采样用 Lemire 无偏乘法（u128 高 64 位 + 阈值拒绝），
-杜绝 `x % n` 模偏差；`Random`/`SecureRandom` 类型隔离（加密强度显式选择）。
+```
+timer.add(x)        # 语句：登记第 x 号计时线程（0..4095，重登记即重置）
+timer.remove(x)     # 语句：删除第 x 号线程（不存在 → panic）
+timer(x, n, start)  # 语句：第 n 号线程从起始数 x（f64，秒）开始计时
+timer(n, stop)      # 语句：冻结第 n 号线程当前值（未在计时则无事发生）
+time.sleep(x)       # 语句：休眠 x 秒（f64，整数宽化）
+timer.now(n)        # 表达式：第 n 号线程当前秒数（f64；线程不存在 → panic）
+timer.now()         # 表达式：当前 Unix 时间戳（秒，i64）
+```
 
+`timer.now(n)` 返回 `base + 自 start 起的增量`；`stop` 后为冻结值；
+再次 `start(x)` 将计数值重置为 x。
+
+```zfy
+timer.add(18)
+timer(0.2, 18, start)    # 从 0.2 秒起计
+time.sleep(0.15)
+timer(18, stop)
+let f64 e = timer.now(18)
+let i64 ts = timer.now()   # Unix 秒
+```
+
+> 旧内建 `tick_ms / localtime / mktime / sleep_ms` 仍保留（见 §12 内建
+> 函数表），但推荐用 timer 系。
 ## 13. output 与 input（行为详述）
 
 **output**：
@@ -630,7 +659,7 @@ let u8 y = -1            // E3155：负值不在 u8 范围
 - `n/d` 字面量除式按分数字面量语义处理（§5），浮点缩放常量请写成
   科学计数法（如 `1.1102230246251565e-16`）而非 `1.0/9007199254740992.0`。
 - 跨文件 use 的 struct/类型别名作声明类型：解析器按"Ident 后跟 Ident"
-  形状识别，`let Pt p` / `let Random rng` 均可。
+  形状识别，`let Pt p` / `let Pair<int,string> pr` 均可。
 - **`**` 整数幂**：≤64 位走 zfy_pow_ll/ull；
   i128/u128 走 zfy_pow_u128/i128（64 位对接口，指数支持完整 128 位，
   如 `2 ** 2^64`）；跨宽度提升与通用算术一致（`u64 ** i32` 隐式宽化）；

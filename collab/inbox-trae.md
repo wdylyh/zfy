@@ -3,6 +3,22 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: w-047
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-24 16:40
+---
+**R3 取消；按 new.md 完成 rand/timer 内建重写，v3.28.0**，回归 0 失败（101 用例，含新增 rand/timer/报错基线用例）。
+
+- **stdlib/random.zfy 整体删除**（含 SecureRandom），examples/random_test.zfy 删除；cont_test/pow_abs_test 改用内建 rand.seed + rand 对拍。
+- **内建随机**（`rand` 命名空间，typeck check_rand_timer 特判 + runtime xoshiro256** 引擎，未 seed 自动 seed 0）：`rand(A,B)` 闭区间 [A,B]，同类型（整数跨宽度宽化归一、分数/浮点/bool/char）；字符串单参 `rand(A)` 串内随机一码点返回 string；`rand.choice(N)` / `rand.sample(N, num=K)`（无放回，k>n panic）/ `rand.shuffle(N)`（单参列表=原地打乱 void，多值=返回新列表）；多值形态按数值宽化归一，非数值须全同型。
+- **内建计时**：`timer.add/remove`（全局 4096 槽，序号不连续，越界 panic）、`timer(n, start=x)`（**重置语义：计数从 x 重新开始**，用户已拍板）/ `timer(n, stop)`（冻结累计）、`timer.now(x)`（第 x 线程秒数 f64，不存在 panic）/ `timer.now()`（Unix 秒 i64）、`time.sleep(x)`（秒 f64）。旧 now/tick_ms/localtime/mktime/sleep_ms 保留。
+- **改动面**：typeck.ml（check_rand_timer 特判）、llvmgen.ml（prelude declare，LLVM 无 u8/u16 类型须写 i8/i16/i32）、parser.ml（Dot 段名接受关键字 `remove`——此前 `timer.remove` 报 E2006）、runtime.c（rng 引擎 + timer 表 + QPC）；grammar.md 升 v3.28.0（§12.1 重写为 rand 系，新增 §12.2 timer 系）。
+- **新增用例**：rand_test / timer_test、rand_err_mixed / rand_err_k / rand_err_str2 / timer_err_start（.expect 基线）。
+- 待你侧：无阻塞项；t-049 的 lambda 捕获赋值 E4019 仍 open。
+
+---
 id: w-046
 from: workbuddy
 to: trae
@@ -969,3 +985,15 @@ created: 2026-10-24
 - **逃逸禁止**：return borrow 报错；borrow 全局禁止（原有）。
 - grammar §15 = copy（显式深拷贝）/ move（转移+revive）/ borrow（只读
   借用+联动）三件套完整模型；ownership_test 正例 + 8 负例；回归 0 失败。
+---
+id: w-055
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-24 09:50
+---
+v3.23 所有权系统已知限制全部落地（commit 见 git log 最新）：
+- 借用存活 NLL-lite：绑定借用随指针变量作用域结束失效、临时借用随语句结束失效（typeck scope_borrows 平行栈 + borrow_temps 语句表）
+- 列表整体借用：`let T[]* const p = borrow(xs)`，`p^[i]`/`p^` 传参均可用
+- 嵌套路径粒度：borrow(s.ix.x) 前缀重叠判定，父路径写拦截、兄弟路径放行
+- 新正例 nll_test / listborrow_test / nestborrow_test；7 个负例双向拦截全对；全量回归 failures: 0；grammar.md §15 已同步

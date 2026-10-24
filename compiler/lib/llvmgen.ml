@@ -3092,6 +3092,38 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_time_sleep(i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_time_local(ptr, i64)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_time_mktime(i64, i64, i64, i64, i64, i64)\n";
+  (* 内建随机/计时（v3.28 new.md）：rand 系 + timer 系 + time.sleep(f)。
+     frac 随机为 sret 形态（首参 = 结果 frac 槽，MCall is_agg 自动落） *)
+  let rand_if_sufs =
+    [ "i8", "i8"; "i16", "i16"; "i32", "i32";
+      "u8", "i8"; "u16", "i16"; "u32", "i32" ] in
+  List.iter
+    (fun (suf, lt) ->
+      Buffer.add_string g.mbuf
+        (Printf.sprintf "declare %s @zfy_rand_%s(%s, %s)\n" lt suf lt lt))
+    rand_if_sufs;
+  Buffer.add_string g.mbuf "declare i64 @zfy_rand_i64(i64, i64)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_rand_u64(i64, i64)\n";
+  Buffer.add_string g.mbuf "declare float @zfy_rand_f32(float, float)\n";
+  Buffer.add_string g.mbuf "declare double @zfy_rand_f64(double, double)\n";
+  Buffer.add_string g.mbuf "declare i1 @zfy_rand_bool()\n";
+  Buffer.add_string g.mbuf "declare i8 @zfy_rand_char(i64, i64)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_rand_char_in(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_rand_seed(i64)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_choice_seq(ptr, i64)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_sample_seq(ptr, i64)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_shuffle_seq(ptr)\n";
+  List.iter
+    (fun suf ->
+      Buffer.add_string g.mbuf
+        (Printf.sprintf "declare void @zfy_rand_frac_%s(ptr sret(%%frac.%s), ptr, ptr)\n" suf suf))
+    [ "i8"; "i16"; "i32"; "i64"; "u8"; "u16"; "u32"; "u64" ];
+  Buffer.add_string g.mbuf "declare void @zfy_timer_add(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_timer_remove(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_timer_start(i64, double)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_timer_stop(i64)\n";
+  Buffer.add_string g.mbuf "declare double @zfy_timer_now(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_time_sleep_f(double)\n";
   (* GUI 核心层（v3.3.7 design_gui.md L0；stdlib/gui.zfy extern 声明同名符号，
      declare 收集器对 zfy_ 前缀豁免，故在此统一定义） *)
   Buffer.add_string g.mbuf "declare i32 @zfy_gui_open(i32, i32, ptr)\n";

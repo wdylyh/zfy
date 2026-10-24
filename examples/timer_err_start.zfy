@@ -1,0 +1,6 @@
+// 报错用例：start 缺起始数（timer(n, start) 非法）
+fn main()
+    timer.add(1)
+    timer(1, start)
+    return 0
+

@@ -586,7 +586,15 @@ and parse_postfix_rest p e =
        err tp "invalid syntax 'a..b': slice syntax is s[a,b:step] (comma-separated, both ends inclusive)"
      | _ -> ());
     ignore (next p);
-    let seg = expect_ident p "namespace member or field name" in
+    (* 段名允许关键字拼写字面（如内建 timer.remove 的 "remove"——点号后
+       跟关键字按其拼写当普通段名，避免与语句关键字冲突） *)
+    let seg =
+      let (tk, tp) = peek p in
+      match tk with
+      | Ident s -> ignore (next p); s
+      | Keyword KRemove -> ignore (next p); "remove"
+      | _ -> err tp (Printf.sprintf "expected namespace member or field name (identifier), got %s" (pp_token tk))
+    in
     (match e with
      | EVar (base, _) -> parse_postfix_rest p (EVar (base ^ "." ^ seg, tp))
      | _ -> parse_postfix_rest p (EField (e, seg, tp)))

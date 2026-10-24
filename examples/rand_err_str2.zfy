@@ -1,0 +1,6 @@
+// 报错用例：字符串 rand 只有单参形态
+fn main()
+    let string c = rand("ab", "cd")
+    output(c)
+    return 0
+

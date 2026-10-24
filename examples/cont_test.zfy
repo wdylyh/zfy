@@ -1,9 +1,5 @@
 // cont_test —— 行尾运算符自动续行 + use 分组折行（v3.5 DX）
 // 期望输出：6 / a-bc-d / true / 12 / 3 / true / 2
-use random::{
-    Random,
-    seed_from_i64,
-}
 fn string mk(let string a, let string b, let string c, let string d)
     return a + "-" + b +
            c + "-" + d
@@ -29,10 +25,10 @@ fn main()
     let i32 arrv = 10
     output(arrv ==
            10)
-    let Random rng = seed_from_i64(42)
-    let i64 r1 = rng.int_range(0, 1000)
-    let Random rng2 = seed_from_i64(42)
-    let i64 r2 = rng2.int_range(0, 1000)
+    rand.seed(42)
+    let i64 r1 = rand(0, 1000)
+    rand.seed(42)
+    let i64 r2 = rand(0, 1000)
     if r1 != r2
         return 1
     if r1 < 0 or r1 >= 1000

@@ -3496,6 +3496,314 @@ int64_t zfy_time_mktime(int64_t y, int64_t mo, int64_t d,
     return (t == (time_t)-1) ? -1 : (int64_t)t;
 }
 
+/* ---------- 内建随机 + 计时器（v3.28 new.md 第1、2条）----------
+ * rand 系：xoshiro256** 引擎 + SplitMix64 播种（全局单序列；未 seed 先用
+ * 自动种子 0）。choice/sample/shuffle 泛型走 zfy_seq（elemsz 逐元素拷贝，
+ * string 列表按 kind strdup 保证元素所有权独立）。timer 系：固定 4096 槽
+ * 表（序号可不连续）+ QPC 单调计时；base 累计已冻结秒数，running 时叠加
+ * 自 stamp 起的增量。 */
+
+static uint64_t g_rng_s[4];
+static int g_rng_seeded = 0;
+
+static uint64_t rng_splitmix64(uint64_t *x) {
+    uint64_t z = (*x += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+void zfy_rand_seed(int64_t seed) {
+    uint64_t x = (uint64_t)seed;
+    for (int i = 0; i < 4; i++) g_rng_s[i] = rng_splitmix64(&x);
+    g_rng_seeded = 1;
+}
+
+static uint64_t rng_next(void) {
+    if (!g_rng_seeded) zfy_rand_seed(0);
+    /* xoshiro256**：result = rotl(s[1] * 5, 7) * 9 */
+    uint64_t r5 = g_rng_s[1] * 5ULL;
+    uint64_t result = ((r5 << 7) | (r5 >> 59)) * 9ULL;
+    uint64_t t = g_rng_s[1] << 17;
+    g_rng_s[2] ^= g_rng_s[0];
+    g_rng_s[3] ^= g_rng_s[1];
+    g_rng_s[1] ^= g_rng_s[2];
+    g_rng_s[0] ^= g_rng_s[3];
+    g_rng_s[2] ^= t;
+    g_rng_s[3] = (g_rng_s[3] << 45) | (g_rng_s[3] >> 19);
+    return result;
+}
+
+/* Lemire 无偏 [0, n) */
+static uint64_t rng_below(uint64_t n) {
+    uint64_t x = rng_next();
+    __uint128_t m = (__uint128_t)x * n;
+    uint64_t l = (uint64_t)m;
+    if (l < n) {
+        uint64_t t = (uint64_t)(0 - n) % n;
+        while (l < t) {
+            x = rng_next();
+            m = (__uint128_t)x * n;
+            l = (uint64_t)m;
+        }
+    }
+    return (uint64_t)(m >> 64);
+}
+
+/* 128 位宽度的无偏 [0, span)（frac 宽区间用） */
+static uint64_t rng_below128(unsigned __int128 span) {
+    unsigned __int128 wrap = ((unsigned __int128)0 - span) % span;
+    unsigned __int128 r;
+    do {
+        r = ((unsigned __int128)rng_next() << 64) | rng_next();
+    } while (r < wrap);
+    return (uint64_t)(r % span);
+}
+
+int64_t zfy_rand_i64(int64_t a, int64_t b) {
+    if (a > b) { int64_t t = a; a = b; b = t; }
+    if (a == INT64_MIN && b == INT64_MAX) return (int64_t)rng_next();
+    uint64_t span = (uint64_t)(b - a);
+    return a + (int64_t)rng_below(span + 1);
+}
+
+uint64_t zfy_rand_u64(uint64_t a, uint64_t b) {
+    if (a > b) { uint64_t t = a; a = b; b = t; }
+    uint64_t span = b - a;
+    if (span == UINT64_MAX) return rng_next();
+    return a + rng_below(span + 1);
+}
+
+#define DEF_RANDI(SUF, T)                                                  \
+T zfy_rand_##SUF(T a, T b) {                                               \
+    if (a > b) { T t = a; a = b; b = t; }                                  \
+    return (T)zfy_rand_i64((int64_t)a, (int64_t)b); }
+
+DEF_RANDI(i8, int8_t)
+DEF_RANDI(i16, int16_t)
+DEF_RANDI(i32, int32_t)
+DEF_RANDI(u8, uint8_t)
+DEF_RANDI(u16, uint16_t)
+DEF_RANDI(u32, uint32_t)
+
+double zfy_rand_f64(double a, double b) {
+    if (a > b) { double t = a; a = b; b = t; }
+    return a + (b - a) * (double)(rng_next() >> 11) * 0x1.0p-53;
+}
+
+float zfy_rand_f32(float a, float b) {
+    if (a > b) { float t = a; a = b; b = t; }
+    return (float)((double)a + ((double)b - (double)a)
+                   * (double)(rng_next() >> 11) * 0x1.0p-53);
+}
+
+_Bool zfy_rand_bool(void) { return rng_below(2) != 0; }
+
+int8_t zfy_rand_char(int64_t a, int64_t b) {
+    return (int8_t)zfy_rand_i64(a, b);
+}
+
+/* rand(A)：字符串 A 内随机一个 UTF-8 码点，返回单码点堆串 */
+char *zfy_rand_char_in(const char *s) {
+    if (!s || !s[0]) zfy_die("rand: 空字符串没有可随机字符");
+    long long n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if ((*p & 0xC0) != 0x80) n++;
+    if (n == 0) zfy_die("rand: 空字符串没有可随机字符");
+    long long idx = (long long)rng_below((uint64_t)n);
+    const unsigned char *p = (const unsigned char *)s;
+    for (long long k = 0; k < idx; k++) {
+        p++;
+        while ((*p & 0xC0) == 0x80) p++;
+    }
+    int len = 1;
+    while (p[len] && (p[len] & 0xC0) == 0x80) len++;
+    char *out = (char *)malloc((size_t)len + 1);
+    if (!out) zfy_die("内存分配失败");
+    memcpy(out, p, (size_t)len);
+    out[len] = '\0';
+    return out;
+}
+
+/* 元素拷贝（string 列表 strdup 保证所有权独立） */
+static void seq_copy_elem(zfy_seq *dst, long long di, zfy_seq *src, long long si) {
+    const char *e = (const char *)src->data + si * src->elemsz;
+    char *d = (char *)dst->data + di * dst->elemsz;
+    if (src->kind == 1)
+        *(char **)d = zfy_strdup(*(const char **)e);
+    else
+        memcpy(d, e, (size_t)src->elemsz);
+}
+
+zfy_seq *zfy_choice_seq(zfy_seq *src, int64_t k) {
+    if (!src) zfy_die("choice: 源为空");
+    if (k <= 0) zfy_die("choice: num 必须大于 0");
+    if (src->len == 0) zfy_die("choice: 空列表");
+    zfy_seq *out = zfy_seq_new_k(k, k, src->elemsz, src->kind, NULL);
+    for (int64_t i = 0; i < k; i++)
+        seq_copy_elem(out, i, src, (long long)rng_below((uint64_t)src->len));
+    return out;
+}
+
+zfy_seq *zfy_sample_seq(zfy_seq *src, int64_t k) {
+    if (!src) zfy_die("sample: 源为空");
+    if (k <= 0) zfy_die("sample: num 必须大于 0");
+    if (k > src->len) zfy_die("sample: num 大于元素个数（无放回抽样）");
+    /* 索引池部分洗牌：不动源列表 */
+    int64_t *pool = (int64_t *)malloc(sizeof(int64_t) * (size_t)src->len);
+    if (!pool) zfy_die("内存分配失败");
+    for (int64_t i = 0; i < src->len; i++) pool[i] = i;
+    zfy_seq *out = zfy_seq_new_k(k, k, src->elemsz, src->kind, NULL);
+    for (int64_t i = 0; i < k; i++) {
+        int64_t j = i + (int64_t)rng_below((uint64_t)(src->len - i));
+        int64_t t = pool[i]; pool[i] = pool[j]; pool[j] = t;
+        seq_copy_elem(out, i, src, pool[i]);
+    }
+    free(pool);
+    return out;
+}
+
+/* Fisher-Yates 原地洗牌；返回 src 本身（多值形态回传临时列表） */
+zfy_seq *zfy_shuffle_seq(zfy_seq *s) {
+    if (!s) zfy_die("shuffle: 源为空");
+    for (int64_t i = s->len - 1; i > 0; i--) {
+        int64_t j = (int64_t)rng_below((uint64_t)(i + 1));
+        char *a = (char *)s->data + i * s->elemsz;
+        char *b = (char *)s->data + j * s->elemsz;
+        for (int by = 0; by < s->elemsz; by++) {
+            char t = a[by]; a[by] = b[by]; b[by] = t;
+        }
+    }
+    return s;
+}
+
+/* frac 区间随机：k ∈ [A.num*B.den, B.num*B.den? ] 统一格点 —— 先符号归一
+ * （分母转正、必要时交换 A/B），k 在 [A.num*B.den, B.num*A.den? ] 由
+ * an*bd 起、跨度 bn*ad - an*bd 内均匀取，结果 k/(ad*bd) 后约分 */
+static unsigned __int128 gcd128_u(unsigned __int128 x, unsigned __int128 y) {
+    while (y) { unsigned __int128 t = x % y; x = y; y = t; }
+    return x;
+}
+
+#define DEF_RANDFRAC(SUF, T)                                                   \
+void zfy_rand_frac_##SUF(zfy_frac_##SUF *out, const zfy_frac_##SUF *a,         \
+                         const zfy_frac_##SUF *b) {                            \
+    __int128 an = (__int128)a->n, ad = (__int128)a->d;                         \
+    __int128 bn = (__int128)b->n, bd = (__int128)b->d;                         \
+    if (ad == 0 || bd == 0) zfy_die("rand: 分母为零");                          \
+    if (ad < 0) { ad = -ad; an = -an; }                                        \
+    if (bd < 0) { bd = -bd; bn = -bn; }                                        \
+    if (an * bd > bn * ad) {                                                   \
+        __int128 tn = an, tdd = ad; an = bn; ad = bd; bn = tn; bd = tdd;       \
+    }                                                                          \
+    unsigned __int128 span = (unsigned __int128)(bn * ad - an * bd);           \
+    if (span == 0) { out->n = a->n; out->d = a->d; return; }                   \
+    __int128 kk = an * bd + (__int128)rng_below128(span);                      \
+    unsigned __int128 dd = (unsigned __int128)(ad * bd);                       \
+    unsigned __int128 uk = kk < 0 ? (unsigned __int128)(-kk) : (unsigned __int128)kk; \
+    unsigned __int128 g = gcd128_u(uk, dd);                                    \
+    __int128 rn = kk / (__int128)g;                                            \
+    __int128 rd = (__int128)(dd / g);                                          \
+    if (rn != (T)rn || rd != (T)rd) zfy_die("rand: frac 结果溢出 " #SUF);       \
+    out->n = (T)rn; out->d = (T)rd; }
+
+DEF_RANDFRAC(i8, int8_t)
+DEF_RANDFRAC(i16, int16_t)
+DEF_RANDFRAC(i32, int32_t)
+DEF_RANDFRAC(i64, int64_t)
+DEF_RANDFRAC(u8, uint8_t)
+DEF_RANDFRAC(u16, uint16_t)
+DEF_RANDFRAC(u32, uint32_t)
+DEF_RANDFRAC(u64, uint64_t)
+
+/* ---------- 计时器（timer 系，new.md 第2条） ---------- */
+
+#define ZFY_TIMER_SLOTS 4096
+static struct {
+    int active;      /* 槽已登记 */
+    int running;     /* 正在计时 */
+    double base;     /* 已冻结的累计秒数（含 start 起始值） */
+    int64_t stamp_q; /* 最近 start 时的 QPC/单调钟读数 */
+} g_timers[ZFY_TIMER_SLOTS];
+
+static int64_t qpc_val(void) {
+#ifdef _WIN32
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif
+}
+
+static double qpc_seconds_since(int64_t stamp) {
+#ifdef _WIN32
+    static double qpf = 0.0;
+    if (qpf == 0.0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        qpf = (double)f.QuadPart;
+    }
+    return (double)(qpc_val() - stamp) / qpf;
+#else
+    return (double)(qpc_val() - stamp) / 1e9;
+#endif
+}
+
+static void timer_check(int64_t x) {
+    if (x < 0 || x >= ZFY_TIMER_SLOTS || !g_timers[x].active)
+        zfy_die("timer: 该序号的计时线程不存在（0..4095，须先 timer.add）");
+}
+
+void zfy_timer_add(int64_t x) {
+    if (x < 0 || x >= ZFY_TIMER_SLOTS)
+        zfy_die("timer.add: 序号越界（0..4095）");
+    g_timers[x].active = 1;
+    g_timers[x].running = 0;
+    g_timers[x].base = 0.0;
+    g_timers[x].stamp_q = 0;
+}
+
+void zfy_timer_remove(int64_t x) {
+    timer_check(x);
+    g_timers[x].active = 0;
+}
+
+void zfy_timer_start(int64_t n, double x) {
+    timer_check(n);
+    g_timers[n].base = x;
+    g_timers[n].stamp_q = qpc_val();
+    g_timers[n].running = 1;
+}
+
+void zfy_timer_stop(int64_t n) {
+    timer_check(n);
+    if (g_timers[n].running) {
+        g_timers[n].base += qpc_seconds_since(g_timers[n].stamp_q);
+        g_timers[n].running = 0;
+    }
+}
+
+double zfy_timer_now(int64_t n) {
+    timer_check(n);
+    return g_timers[n].base
+           + (g_timers[n].running ? qpc_seconds_since(g_timers[n].stamp_q) : 0.0);
+}
+
+void zfy_time_sleep_f(double sec) {
+    if (sec < 0) sec = 0;
+#ifdef _WIN32
+    Sleep((DWORD)(sec * 1000.0));
+#else
+    struct timespec req;
+    req.tv_sec = (time_t)sec;
+    req.tv_nsec = (long)((sec - (double)req.tv_sec) * 1e9);
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) { /* 重试剩余部分 */ }
+#endif
+}
+
 /* ==================== GUI 核心层（v3.3.7 design_gui.md L0） ====================
  * 架构（速度保障）：
  *  - CreateDIBSection 32bpp 帧缓冲：zfy/C 直接写像素内存，无 GDI 逐像素开销

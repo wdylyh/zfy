@@ -1,8 +1,4 @@
 // ** 幂 / |e| 绝对值 / sqrt 表达式（v3.3）回归：断言失败 exit 1
-mod random;
-
-use random::{Random, seed_from_i64}
-
 fn i64 ipow(let i64 b, let i32 e)
     // 对照实现：循环乘（验证 ** 与手写幂一致）
     let i64 r = 1
@@ -110,12 +106,12 @@ fn main()
     if |m|**2**2 != 2401
         bad++
     // 随机数组合：幂在区间上下界可复现（种子固定）
-    let Random r = seed_from_i64(9)
+    rand.seed(9)
     let i32 hits = 0
     let i32 i = 0
     while i < 100
-        let i64 v = r.int_range(2, 5)
-        if v**2 >= 4 and v**2 <= 16
+        let i64 v = rand(2, 5)
+        if v**2 >= 4 and v**2 <= 25
             hits++
         i++
     if hits != 100

@@ -1,0 +1,6 @@
+// 报错用例：choice 多值混类型（编译错）
+fn main()
+    let i64[] m = rand.choice(1, "a", num=2)
+    output(m[0])
+    return 0
+

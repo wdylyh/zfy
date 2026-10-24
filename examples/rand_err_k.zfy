@@ -1,0 +1,6 @@
+// 报错用例：num=0 编译期拒绝
+fn main()
+    let i64[] m = rand.choice(1, 2, num=0)
+    output(m[0])
+    return 0
+

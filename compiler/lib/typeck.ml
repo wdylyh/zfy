@@ -2607,6 +2607,11 @@ and check_expr env (e : expr) : texpr =
         | "sort" ->
           (* sort(内容..., max|min)（new.md 第3条）：排序表达式 *)
           check_sort env p' args
+        | "rand" | "rand.seed" | "rand.choice" | "rand.sample" | "rand.shuffle"
+        | "timer" | "timer.add" | "timer.remove" | "timer.now" | "time.sleep" ->
+          (* 内建随机/计时（v3.28 new.md 第1、2条）：rand/timer 系替代
+             stdlib/random；这些名字成为保留字面量调用名 *)
+          check_rand_timer env p' name args
         | "length" | "find" | "trim" | "split" | "replace" | "prec"
         | "utf8_len" | "utf8_char_at" | "utf8_sub"
         | "startswith" | "endswith" | "substr" | "to_str" | "format"
@@ -4539,6 +4544,286 @@ and check_builtin env p name (args : call_arg list) =
     mk (ECallK ("zfy_utf8_sub", [ ts; ta; tb' ], [])) TString
   | _ ->
     terr p "malformed argument list for builtin %s (positional arguments must precede named ones)" name
+
+(* 内建随机 / 计时（v3.28 new.md 第1、2条）：rand / timer / time.sleep 系。
+   语义要点（用户拍板）：
+   - rand(A,B)：同类型闭区间 [A,B]；整数可宽化统一；char 按 ascii 码；
+     bool 忽略 A,B 各半；frac 区间内随机分数自动约分；字符串只有单参形态
+     （在 A 串内随机一个码点，返回 string——char 装不下多字节码点）
+   - choice/sample/shuffle 多值形态元素类型必须完全一致（混类型编译错）；
+     choice 可重复；sample 无放回（k>n 运行期 panic，索引池部分洗牌）；
+     shuffle 单列表/数组 = 原地打乱（void），多同型值 = 返回新列表 *)
+and check_rand_timer env p name (args : call_arg list) =
+  let mk k ty = { e = k; ety = ty; epos = p } in
+  let pos_args =
+    List.filter_map
+      (function
+        | CPos e | CCopy e -> Some e
+        | CRef _ | CMove _ -> terr p "%s does not support ref/move arguments" name
+        | _ -> None)
+      args in
+  let named = List.filter_map (function CNamed (n, e) -> Some (n, e) | _ -> None) args in
+  let no_named () =
+    if named <> [] then terr p "%s takes no named arguments" name in
+  let cast e t = if resolve e.ety = t then e else mk (ECastK (e, t)) t in
+  (* num=K 抽取：命名参数必须为 num，正整数字面量编译期拒绝，其余运行期 panic *)
+  let get_k () =
+    match named with
+    | [ ("num", ke) ] ->
+      let tk = check_expr env ke in
+      (match resolve tk.ety with
+       | TInt _ | TUint _ | TVar _ ->
+         (match tk.e with
+          | EIntK v when v <= 0L ->
+            terr p "rand.%s: num must be a positive integer, got %Ld"
+              (String.sub name 5 (String.length name - 5)) v
+          | _ -> cast tk (TInt 64))
+       | t -> terr p "rand.%s: num must be an integer, got %s"
+                (String.sub name 5 (String.length name - 5)) (pp_zty t))
+    | _ -> terr p "rand.%s requires a named argument num=K (number of picks)" name
+  in
+  (* 元素容器支持检查：嵌套容器/struct 元素不做（所有权语义不明确） *)
+  let elem_ok e =
+    match e with
+    | TList _ | TArray _ | TStruct _ ->
+      terr p "%s does not support nested container/struct elements" name
+    | _ -> () in
+  (* 多值形态展平：数值实参统一宽化（混入浮点 → f64，全整数字面量 → i64），
+     非数值（string/bool/char/frac）要求类型完全一致（混类型编译错） *)
+  let seq_of_vals vals =
+    match vals with
+    | [] -> terr p "%s expects at least one value" name
+    | _ ->
+      let checked = List.map (check_expr env) vals in
+      let is_concrete (t : texpr) =
+        match resolve t.ety with TVar _ -> false | _ -> true in
+      let is_numty ty =
+        match ty with TInt _ | TUint _ | TFloat _ -> true | TVar _ -> true | _ -> false in
+      let nonnum =
+        List.exists (fun (t : texpr) -> not (is_numty (resolve t.ety))) checked in
+      let tgt =
+        if nonnum then
+          (* 非数值：取第一个定型元素的类型 *)
+          (match List.find_opt is_concrete checked with
+           | Some t -> resolve t.ety
+           | None -> terr p "%s: cannot infer element type (annotate explicitly)" name)
+        else
+          let floaty =
+            List.exists
+              (fun (t : texpr) ->
+                match resolve t.ety with
+                | TFloat 64 -> true
+                | TVar _ -> floaty_texpr t
+                | _ -> false)
+              checked in
+          if floaty then TFloat 64
+          else
+            match List.find_opt
+                    (fun (t : texpr) ->
+                      match resolve t.ety with
+                      | TInt _ | TUint _ | TFloat _ -> true | _ -> false)
+                    checked with
+            | Some t -> (match resolve t.ety with
+                         | TFloat 64 -> TFloat 64
+                         | ty -> ty)
+            | None -> TInt 64
+      in
+      elem_ok tgt;
+      let elems =
+        List.map
+          (fun (t : texpr) ->
+            let ty = resolve t.ety in
+            if is_numty ty <> is_numty tgt then
+              terr p "%s: mixed element types are not allowed (all values must be %s, got %s)"
+                name (pp_zty tgt) (pp_zty ty);
+            (* 非数值混型 / 数值与浮点混型（floaty 已统一 f64）之外：
+               非数值要求完全一致；数值统一 cast 到 tgt *)
+            if not (is_numty tgt) && ty <> tgt then
+              terr p "%s: mixed element types are not allowed (all values must be %s, got %s)"
+                name (pp_zty tgt) (pp_zty ty);
+            if ty = tgt then t else mk (ECastK (t, tgt)) tgt)
+          checked
+      in
+      mk (ESeqLitK (tgt, elems)) (TList tgt)
+  in
+  match name, pos_args with
+  | "rand", [ a ] ->
+    no_named ();
+    let ta = check_expr env a in
+    (match resolve ta.ety with
+     | TString -> mk (ECallK ("zfy_rand_char_in", [ ta ], [])) TString
+     | t ->
+       terr p "rand with a single argument expects a string (pick one char), got %s"
+         (pp_zty t))
+  | "rand", [ a; b ] ->
+    no_named ();
+    let ta = check_expr env a and tb = check_expr env b in
+    let rt0 = resolve ta.ety and rt1 = resolve tb.ety in
+    let is_f64ish (t : texpr) =
+      match resolve t.ety with
+      | TFloat 64 -> true
+      | TVar _ -> floaty_texpr t
+      | _ -> false in
+    let concrete_num ty =
+      match ty with
+      | TInt _ | TUint _ | TFloat _ -> true
+      | _ -> false in
+    if is_f64ish ta || is_f64ish tb then
+      (* 任一侧 f64/浮点字面量 → 统一 f64 区间 *)
+      mk (ECallK ("zfy_rand_f64", [ cast ta (TFloat 64); cast tb (TFloat 64) ], []))
+        (TFloat 64)
+    else
+      (match rt0, rt1 with
+       | TFloat 32, TFloat 32 ->
+         mk (ECallK ("zfy_rand_f32", [ ta; tb ], [])) (TFloat 32)
+       | (TInt _ | TUint _), (TInt _ | TUint _)
+       | (TInt _ | TUint _), TVar _
+       | TVar _, (TInt _ | TUint _) when concrete_num rt0 || concrete_num rt1 ->
+         let tgt =
+           match rt0, rt1 with
+           | (TInt _ | TUint _ as x), (TInt _ | TUint _ as y) -> widen_target x y
+           | (TInt _ | TUint _ as x), _ -> x
+           | _, (TInt _ | TUint _ as y) -> y
+           | _ -> TInt 64
+         in
+         (match tgt with
+          | TInt 128 | TUint 128 ->
+            terr p "rand does not support 128-bit integer ranges"
+          | _ ->
+            mk (ECallK (Printf.sprintf "zfy_rand_%s" (Hir.suffix_of tgt),
+                        [ cast ta tgt; cast tb tgt ], [])) tgt)
+       | TVar _, TVar _ ->
+         (* 两侧均为未定型整数字面量：默认 i64 *)
+         mk (ECallK ("zfy_rand_i64", [ cast ta (TInt 64); cast tb (TInt 64) ], []))
+           (TInt 64)
+       | TChar, TChar ->
+         (* char 按 ascii 码区间随机，结果回到 char *)
+         mk (ECallK ("zfy_rand_char", [ cast ta (TInt 64); cast tb (TInt 64) ], [])) TChar
+       | TBool, TBool ->
+         (* P(true) = 0.5，忽略 A,B 值（用户拍板） *)
+         mk (ECallK ("zfy_rand_bool", [], [])) TBool
+       | TFrac e1, TFrac e2 when e1 = e2 ->
+         (* frac：sret 写 (num,den)，区间内随机分数自动约分 *)
+         (match e1 with
+          | TInt 8 | TInt 16 | TInt 32 | TInt 64
+          | TUint 8 | TUint 16 | TUint 32 | TUint 64 ->
+            mk (ECallK (Printf.sprintf "zfy_rand_frac_%s" (Hir.suffix_of e1),
+                        [ ta; tb ], [])) rt0
+          | _ -> terr p "rand does not support frac element type %s" (pp_zty e1))
+       | TString, TString ->
+         terr p "rand for strings only takes one argument: rand(A) picks a char from A"
+       | _ ->
+         terr p "rand(A, B) requires two values of the same type, got %s and %s"
+           (pp_zty rt0) (pp_zty rt1))
+  | "rand", _ -> terr p "rand expects 1 or 2 arguments: rand(A) / rand(A, B)"
+  | "rand.seed", [ a ] ->
+    no_named ();
+    let ta = check_expr env a in
+    (match resolve ta.ety with
+     | TInt _ | TUint _ | TVar _ ->
+       mk (ECallK ("zfy_rand_seed", [ cast ta (TInt 64) ], [])) TVoid
+     | t -> terr p "rand.seed expects an integer seed, got %s" (pp_zty t))
+  | "rand.seed", _ -> terr p "rand.seed takes one integer argument"
+  | ("rand.choice" | "rand.sample"), _ ->
+    let k = get_k () in
+    let src, elem =
+      match pos_args with
+      | [ v ] ->
+        let tv = check_expr env v in
+        (match resolve tv.ety with
+         | TList e -> elem_ok e; (tv, e)
+         | TArray (e, n) ->
+           elem_ok e;
+           (* 数组展开为元素拷贝的临时列表（与 sort 同款），源数组不动 *)
+           let elems =
+             List.init n (fun i ->
+               let iv = mk (EIntK (Int64.of_int i)) (TInt 64) in
+               mk (ESeqGetK (tv, iv)) e)
+           in
+           ((mk (ESeqLitK (e, elems)) (TList e)), e)
+         | t -> terr p "%s expects a list or array, got %s" name (pp_zty t))
+      | _ :: _ ->
+        let s = seq_of_vals pos_args in
+        (match resolve s.ety with TList e -> (s, e) | _ -> assert false)
+      | [] -> terr p "%s expects a source (list/array or multiple values)" name
+    in
+    let fn = if name = "rand.choice" then "zfy_choice_seq" else "zfy_sample_seq" in
+    mk (ECallK (fn, [ src; k ], [])) (TList elem)
+  | "rand.shuffle", [ v ] ->
+    no_named ();
+    let tv = check_expr env v in
+    (match resolve tv.ety with
+     | TList _ | TArray _ ->
+       (* 单列表/数组变量：原地打乱（seq 指针传入，data 就地重排） *)
+       mk (ECallK ("zfy_shuffle_seq", [ tv ], [])) TVoid
+     | t ->
+       terr p "rand.shuffle expects a list/array variable or multiple values, got %s"
+         (pp_zty t))
+  | "rand.shuffle", _ :: _ ->
+    (* 多同型值：打包临时列表打乱后返回新列表 *)
+    let s = seq_of_vals pos_args in
+    mk (ECallK ("zfy_shuffle_seq", [ s ], [])) (resolve s.ety)
+  | "rand.shuffle", [] -> terr p "rand.shuffle expects a list/array or multiple values"
+  | ("timer.add" | "timer.remove"), [ a ] ->
+    no_named ();
+    let ta = check_expr env a in
+    (match resolve ta.ety with
+     | TInt _ | TUint _ | TVar _ ->
+       mk (ECallK ((if name = "timer.add" then "zfy_timer_add" else "zfy_timer_remove"),
+                   [ cast ta (TInt 64) ], [])) TVoid
+     | t -> terr p "%s expects an integer timer number, got %s" name (pp_zty t))
+  | ("timer.add" | "timer.remove"), _ ->
+    terr p "%s takes one integer timer number" name
+  | "timer", [ x; n; t ] ->
+    no_named ();
+    (match t with
+     | EVar ("start", _) ->
+       let tx = check_expr env x in
+       (match resolve tx.ety with
+        | TInt _ | TUint _ | TFloat _ | TVar _ -> ()
+        | ty -> terr p "timer start value must be numeric, got %s" (pp_zty ty));
+       let tn = check_expr env n in
+       (match resolve tn.ety with
+        | TInt _ | TUint _ | TVar _ -> ()
+        | ty -> terr p "timer thread number must be an integer, got %s" (pp_zty ty));
+       mk (ECallK ("zfy_timer_start", [ cast tn (TInt 64); cast tx (TFloat 64) ], []))
+         TVoid
+     | _ ->
+       terr p "timer(x, n, t): t must be start (for stop use timer(n, stop))")
+  | "timer", [ n; t ] ->
+    no_named ();
+    (match t with
+     | EVar ("stop", _) ->
+       let tn = check_expr env n in
+       (match resolve tn.ety with
+        | TInt _ | TUint _ | TVar _ -> ()
+        | ty -> terr p "timer thread number must be an integer, got %s" (pp_zty ty));
+       mk (ECallK ("zfy_timer_stop", [ cast tn (TInt 64) ], [])) TVoid
+     | EVar ("start", _) ->
+       terr p "timer(n, start): start requires the start value — timer(x, n, start)"
+     | _ -> terr p "timer(n, t): t must be stop (or timer(x, n, start))")
+  | "timer", _ -> terr p "timer expects (x, n, start) or (n, stop)"
+  | "time.sleep", [ a ] ->
+    no_named ();
+    let ta = check_expr env a in
+    (match resolve ta.ety with
+     | TInt _ | TUint _ | TFloat _ | TVar _ ->
+       mk (ECallK ("zfy_time_sleep_f", [ cast ta (TFloat 64) ], [])) TVoid
+     | t -> terr p "time.sleep expects a number of seconds, got %s" (pp_zty t))
+  | "time.sleep", _ -> terr p "time.sleep takes one numeric argument (seconds)"
+  | "timer.now", [] ->
+    (* timer.now()：当前 Unix 时间戳（秒，i64） *)
+    no_named ();
+    mk (ECallK ("zfy_time_now", [], [])) (TInt 64)
+  | "timer.now", [ a ] ->
+    no_named ();
+    let ta = check_expr env a in
+    (match resolve ta.ety with
+     | TInt _ | TUint _ | TVar _ ->
+       mk (ECallK ("zfy_timer_now", [ cast ta (TInt 64) ], [])) (TFloat 64)
+     | t -> terr p "timer.now expects a timer number, got %s" (pp_zty t))
+  | "timer.now", _ -> terr p "timer.now takes one timer number (or none for unix time)"
+  | _ -> terr p "malformed argument list for %s" name
 
 (* char 参数（find 用） *)
 and char_of_expr env (e : expr) what =
