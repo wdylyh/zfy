@@ -720,12 +720,13 @@ fn main()
 （list 可见行数）`checked(b)`（check 初值）`add_item(s)`（list/menu 条目）
 `visible(b)`（可见性，默认 true——flush 跳过绘制；带标签的元素每帧重申，
 运行期 `app.set_visible` 改不带标签的元素）`enable(b)`（可用性，默认
-true——事件忽略；同上每帧重申语义）。
+true——事件忽略；同上每帧重申语义）`placeholder(s)`（input 专属：
+text 为空时框内显示的灰色提示——不是文本内容、不可选中、不进 text_out）。
 
 **属性标签（加入后，按元素下标）**：`app.set_text(k, s)` `set_pos(k, x, y)`
 `set_size(k, w, h)` `set_color(k, c)` `set_text_color(k, c)`
 `set_value(k, v)` `set_checked(k, b)` `set_visible(k, b)` `set_enable(k, b)`
-`app.add_item(k, s)`。
+`set_placeholder(k, s)`（input）`app.add_item(k, s)`。
 
 **输出标签（`app.uis[k]` 只读，`app.step()` 后刷新）**：
 

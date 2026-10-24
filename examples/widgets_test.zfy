@@ -3,6 +3,7 @@
 mod gui;
 mod widgets;
 use widgets::{App, Label, Button, InputBox, Slider, ProgressBar, ListBox, C_BG, C_OK}
+use gui::{KEY_CTRL}
 use gui::{gui_frame_sleep}
 
 fn main()
@@ -49,6 +50,40 @@ fn main()
         fails++
     if ib0.handle_key(bs)
         output("FAIL backspace on empty should be noop")
+        fails++
+
+    // ===== 1b) 全选覆盖 / 多字节选区 / placeholder / 点击定位（w-052） =====
+    let i64 ctrl_a = KEY_CTRL + 65
+    let InputBox ib1 = InputBox(x=0, y=0, w=200)
+    ib1.text = "hello"
+    ib1.cx = 5
+    ib1.sel_a = 0
+    if not ib1.handle_key(ctrl_a)
+        output("FAIL ctrl-a")
+        fails++
+    if not ib1.handle_key(ch_A) or ib1.text != "A"
+        output("FAIL sel-overwrite: " + ib1.text)
+        fails++
+    let InputBox ib2 = InputBox(x=0, y=0, w=200)
+    ib2.text = "你好"          // 6 字节 UTF-8
+    ib2.cx = 6
+    ib2.sel_a = 0
+    if not ib2.handle_key(ch_B) or ib2.text != "B"
+        output("FAIL multibyte sel-overwrite: " + ib2.text)
+        fails++
+    let InputBox ib3 = InputBox(x=0, y=0, w=200)
+    ib3.ph = "请输入"
+    if ib3.text != "" or ib3.cx != 0
+        output("FAIL placeholder not content")
+        fails++
+    ib3.draw()                 // 冒烟：空文本 + placeholder 绘制不崩
+    let InputBox ib4 = InputBox(x=0, y=0, w=200)
+    ib4.text = "AB"
+    if ib4.pos_from_mx(-5) != 0
+        output("FAIL pos left")
+        fails++
+    if ib4.pos_from_mx(10000) != 2
+        output("FAIL pos right")
         fails++
 
     let ListBox lb0 = ListBox(x=0, y=0, w=160, rows=3)

@@ -3430,8 +3430,28 @@ static gui_win g_wins[GUI_MAXWIN];
 static gui_win *g_cur = NULL;
 
 static void gui_push_ev(gui_win *w, int64_t t, int64_t x, int64_t y, int64_t k) {
+    /* MOVE 合并：队列尾已有未消费的 MOVE 时直接覆盖坐标（只保留最新位置）。
+       鼠标快速移动会产生事件洪流——旧实现队列满后"丢弃新事件"会把夹在
+       MOVE 洪流中的 DOWN/UP/KEY 一并丢掉（表现为点击无效、组件"点了没
+       反应、点几下才显示"，w-052）。合并 MOVE 后 DOWN/UP 永不被挤掉。 */
+    if (t == GUI_EV_MOVE && w->qt != w->qh) {
+        long prv = (w->qt + GUI_EVQ - 1) % GUI_EVQ;
+        if (w->q[prv].t == GUI_EV_MOVE) {
+            w->q[prv].x = x;
+            w->q[prv].y = y;
+            return;
+        }
+    }
     long nxt = (w->qt + 1) % GUI_EVQ;
-    if (nxt == w->qh) return;              /* 队列满：丢弃新事件 */
+    if (nxt == w->qh) {
+        /* 队列满：新事件若非 MOVE，挤掉队头 MOVE 腾位（保 DOWN/UP/KEY）；
+           新事件本身是 MOVE 则直接丢弃 */
+        if (t == GUI_EV_MOVE) return;
+        if (w->q[w->qh].t == GUI_EV_MOVE) {
+            w->qh = (w->qh + 1) % GUI_EVQ;
+            nxt = (w->qt + 1) % GUI_EVQ;
+        } else return;
+    }
     w->q[w->qt].t = t; w->q[w->qt].x = x;
     w->q[w->qt].y = y; w->q[w->qt].k = k;
     w->qt = nxt;

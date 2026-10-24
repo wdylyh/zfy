@@ -55,6 +55,7 @@ pub struct Label
     i32 fs = 16          // 字号（逻辑 px）
     bool bold = false
     bool nobg = false    // true=不清背景（叠加在渐变带等自绘背景上）
+    i32 last_w = 0       // 上次清背景宽度（文本变短时按更宽者清，防残影）
     bool visible = true
     bool enable = true
     bool dirty = true
@@ -66,6 +67,11 @@ pub struct Label
         gui_font(self.fs, b)
         let i32 tw = gui_text_w(self.text)
         let i32 cw = self.bg_w
+        if cw < tw
+            cw = tw
+        if cw < self.last_w
+            cw = self.last_w
+        self.last_w = cw
         if cw <= 0
             cw = tw + 4
         if not self.nobg
@@ -137,6 +143,7 @@ pub struct InputBox
     i32 cx = 0            // 光标字节位置（码点对齐）
     i32 sel_a = 0         // 选区锚点（字节）；cx==sel_a 即无选区
     bool dragging = false
+    string ph = ""        // placeholder：text 为空时显示的灰色提示（不参与文本/选中）
 
     fn bool hit(let i32 mx, let i32 my)
         return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + LH() + 8 * SC() / 100
@@ -151,6 +158,7 @@ pub struct InputBox
 
     // 像素 → 字节光标位置（最近码点起点；右侧空白落行尾）
     fn i32 pos_from_mx(let i32 mx)
+        gui_font(16, 0)     // 宽度测量必须与 draw 同字号（防上游字号状态污染）
         let i32 u = SC()
         let i32 target = mx - self.x - 8 * u / 100
         let i32 n = length(self.text)
@@ -316,9 +324,19 @@ pub struct InputBox
         return false
 
     fn void draw()
+        gui_font(16, 0)     // 本组件一律 16 号（测量/绘制/命中三处一致）
         let i32 u = SC()
         let i32 hh = LH() + 8 * u / 100
         gui_round_rect(self.x, self.y, self.w, hh, 4 * u / 100, C_PANEL, C_BORDER)
+        if length(self.text) == 0 and length(self.ph) > 0
+            // placeholder：灰字提示，仅视觉——不是文本内容、不可选中、text_out 仍为空
+            gui_draw_text(self.x + 8 * u / 100, self.y + 5 * u / 100, self.ph, C_SUB)
+            if self.focus
+                gui_fill_rect(self.x + 1, self.y + hh - 2 * u / 100, self.w - 2, 2 * u / 100, C_ACCENT)
+                gui_fill_rect(self.x + 8 * u / 100, self.y + 5 * u / 100, 2 * u / 100, LH() - 4 * u / 100, C_TEXT)
+            self.dirty = false
+            gui_font(16, 0)
+            return
         if self.focus
             // 选区高亮（码点对齐的字节区间 → 像素区间）
             let i32 lo = self.sel_lo()
@@ -580,6 +598,7 @@ pub struct App
             let InputBox w = InputBox(x=e.x, y=e.y, w=e.w)
             w.text = e.text
             w.cx = length(e.text)
+            w.ph = e.ph
             w.visible = e.visible
             w.enable = e.enable
             e.idx = self.add_input(w)
@@ -693,6 +712,15 @@ pub struct App
             self.layout_menus()
         if e.which == 8
             self.texts[ix].set_text(s)
+        self.uis[k] = e
+
+    // 输入框 placeholder（运行期改）：k = add 返回的元素下标
+    fn void set_placeholder(let i32 k, let string s)
+        let UI e = copy(self.uis[k])
+        e.ph = s
+        if e.which == 2
+            self.inputs[e.idx].ph = s
+            self.inputs[e.idx].dirty = true
         self.uis[k] = e
 
     fn void set_pos(let i32 k, let i32 px, let i32 py)
@@ -1750,6 +1778,7 @@ pub struct UI
     i32 rows = 0         // list 可见行数（0=默认 4）
     string[] items       // list 条目 / menu 条目
     bool checked = false // check 初值
+    string ph = ""       // input placeholder（text 为空时显示的灰色提示）
     // ---- 输出标签（app.step() 后自动刷新） ----
     i32 clicks = 0       // button/check/menu：点击计数；list：双击计数
     i32 sel = -1         // list/menu 选中下标
@@ -1781,6 +1810,9 @@ pub struct UI
 
     fn void text(let string s)
         self.text = s
+
+    fn void placeholder(let string s)
+        self.ph = s
 
     fn void color(let u32 c)
         self.color = c
