@@ -1027,6 +1027,14 @@ pub struct App
                 if self.inputs[di].dirty
                     self.any_dirty = true
             di++
+        // TextArea 拖选：聚焦且按住左键时移动即扩展选区
+        let i32 ti = 0
+        while ti < length(self.texts)
+            if self.texts[ti].focus and self.texts[ti].enable and self.texts[ti].dragging and self.ldown
+                self.texts[ti].on_drag(self.mx, self.my)
+                if self.texts[ti].dirty
+                    self.any_dirty = true
+            ti++
         let i32 i = 0
         while i < length(self.buttons)
             let bool h = self.buttons[i].hit(self.mx, self.my) and not self.ldown
@@ -1106,7 +1114,9 @@ pub struct App
             if press
                 self.texts[i].set_focus(self.texts[i].enable and self.texts[i].hit(self.mx, self.my))
                 if self.texts[i].focus
-                    self.texts[i].place_cursor(self.mx, self.my)
+                    self.texts[i].on_press(self.mx, self.my)
+            if not press
+                self.texts[i].on_release()
             if self.texts[i].dirty
                 self.any_dirty = true
             i++
@@ -1453,6 +1463,10 @@ pub struct TextArea
     string[] lines
     i32 cx = 0            // 光标字节列
     i32 cy = 0            // 光标行
+    i32 sax = 0           // 选区锚点（字节列）
+    i32 say = 0           // 选区锚点（行）
+    bool sel_on = false   // 选区激活（仅鼠标拖选置位——防业务直改 cx 产生幽灵选区）
+    bool dragging = false
     i32 top = 0           // 首可见行
     bool focus = false
     bool visible = true
@@ -1499,6 +1513,8 @@ pub struct TextArea
         self.cx = 0
         self.cy = 0
         self.top = 0
+        self.collapse()
+        self.dragging = false
         self.dirty = true
 
     fn string text()
@@ -1517,6 +1533,9 @@ pub struct TextArea
     fn void set_focus(let bool f)
         if self.focus != f
             self.focus = f
+            if not f
+                self.collapse()
+                self.dragging = false
             self.dirty = true
 
     // 鼠标点击定位光标（空 lines 时自动初始化为单空行，v3.5 DX 防越界）
@@ -1548,6 +1567,69 @@ pub struct TextArea
             self.cx = best
         self.clamp_scroll()
 
+    // 鼠标按下：定位光标 + 记录选区锚点，开始拖选
+    fn void on_press(let i32 mx, let i32 my)
+        self.place_cursor(mx, my)
+        self.sax = self.cx
+        self.say = self.cy
+        self.dragging = true
+        self.sel_on = false          // 单击无拖动 = 无选区，拖动后 on_drag 置位
+
+    // 鼠标拖动：光标跟随（锚点不动 → 形成选区）
+    fn void on_drag(let i32 mx, let i32 my)
+        if self.dragging
+            self.place_cursor(mx, my)
+            self.sel_on = true
+
+    fn void on_release()
+        self.dragging = false
+
+    fn bool has_sel()
+        return self.sel_on and (self.say != self.cy or self.sax != self.cx)
+
+    // 光标移动后收起选区（锚点吸到光标）
+    fn void collapse()
+        self.sax = self.cx
+        self.say = self.cy
+        self.sel_on = false
+
+    // 删除当前选区（跨行）；光标落选区起点；返回是否删了东西
+    fn bool del_selection()
+        if not self.has_sel()
+            return false
+        let i32 by = self.say
+        let i32 bx = self.sax
+        let i32 ey = self.cy
+        let i32 ex = self.cx
+        if by > ey or (by == ey and bx > ex)
+            let i32 t1 = by
+            by = ey
+            ey = t1
+            let i32 t2 = bx
+            bx = ex
+            ex = t2
+        if by == ey
+            self.lines[by] = prefix(self.lines[by], bx) + suffix(self.lines[by], ex)
+        else
+            let string head = prefix(self.lines[by], bx)
+            let string tail = suffix(self.lines[ey], ex)
+            let string[] out = self.lines[0, 0]
+            let i32 i = 0
+            while i < by
+                out = push(out, self.lines[i])
+                i++
+            out = push(out, head + tail)
+            i = ey + 1
+            while i < length(self.lines)
+                out = push(out, self.lines[i])
+                i++
+            self.lines = out[1, length(out) - 1]
+        self.cy = by
+        self.cx = bx
+        self.collapse()
+        self.clamp_scroll()
+        return true
+
     // 替换第 cy 行并重建数组的通用入口都不需要——直接改 self.lines[cy]
     // 光标处插入多行文本（\n 拆行；空串无操作），供 Ctrl+V 与业务侧复用
     fn void insert_at_cursor(let string clip)
@@ -1562,8 +1644,9 @@ pub struct TextArea
             while i < ns
                 segs[i] = trim(segs[i], "\r")
                 i++
-            segs[0] = prefix(ln, self.cx) + segs[0]
-            segs[ns - 1] = segs[ns - 1] + suffix(ln, self.cx)
+            let i32 cut = self.cx
+            segs[0] = prefix(ln, cut) + segs[0]
+            segs[ns - 1] = segs[ns - 1] + suffix(ln, cut)
             // lines[0..cy-1] + segs + lines[cy+1..]（占位首元素后裁掉）
             let string[] out = self.lines[0, 0]
             i = 0
@@ -1580,7 +1663,8 @@ pub struct TextArea
                 i++
             self.lines = out[1, length(out) - 1]
             self.cy = self.cy + ns - 1
-            self.cx = length(segs[ns - 1]) - length(suffix(ln, self.cx))
+            self.cx = cut + length(segs[ns - 1]) - length(suffix(ln, cut))
+        self.collapse()
         self.clamp_scroll()
 
     fn bool handle_key(let i64 k)
@@ -1590,7 +1674,9 @@ pub struct TextArea
         let string ln = self.lines[self.cy]
         let i32 n = length(ln)
         if k == 8
-            // Backspace：删光标前一码点；行首则与上一行合并
+            // Backspace：有选区先删选区；否则删光标前一码点；行首则与上一行合并
+            if self.del_selection()
+                return true
             if self.cx > 0
                 let i32 s2 = align_back(ln, self.cx - 1)
                 self.lines[self.cy] = prefix(ln, s2) + suffix(ln, self.cx)
@@ -1608,10 +1694,13 @@ pub struct TextArea
                     self.lines = out[1, length(out) - 1]
                     self.cy--
                     self.cx = pn
+            self.collapse()
             self.clamp_scroll()
             return true
         if k == KEY_EXT + 0x2E
-            // Delete：删光标处码点；行尾则吞并下一行
+            // Delete：有选区先删选区；否则删光标处码点；行尾则吞并下一行
+            if self.del_selection()
+                return true
             if self.cx < n
                 let i32 e2 = align_fwd(ln, self.cx + 1)
                 self.lines[self.cy] = prefix(ln, self.cx) + suffix(ln, e2)
@@ -1625,6 +1714,7 @@ pub struct TextArea
                             out = push(out, self.lines[i])
                         i++
                     self.lines = out[1, length(out) - 1]
+            self.collapse()
             self.clamp_scroll()
             return true
         if k == KEY_EXT + 0x25
@@ -1635,6 +1725,7 @@ pub struct TextArea
                 if self.cy > 0
                     self.cy--
                     self.cx = length(self.lines[self.cy])
+            self.collapse()
             self.clamp_scroll()
             return true
         if k == KEY_EXT + 0x27
@@ -1645,6 +1736,7 @@ pub struct TextArea
                 if self.cy < nl - 1
                     self.cy++
                     self.cx = 0
+            self.collapse()
             self.clamp_scroll()
             return true
         if k == KEY_EXT + 0x26
@@ -1653,6 +1745,7 @@ pub struct TextArea
                 self.cy--
                 if self.cx > length(self.lines[self.cy])
                     self.cx = length(self.lines[self.cy])
+                self.collapse()
                 self.clamp_scroll()
             return true
         if k == KEY_EXT + 0x28
@@ -1661,22 +1754,31 @@ pub struct TextArea
                 self.cy++
                 if self.cx > length(self.lines[self.cy])
                     self.cx = length(self.lines[self.cy])
+                self.collapse()
                 self.clamp_scroll()
             return true
         if k == KEY_EXT + 0x24
             self.cx = 0
+            self.collapse()
             self.dirty = true
             return true
         if k == KEY_EXT + 0x23
             self.cx = n
+            self.collapse()
             self.dirty = true
             return true
         if k == KEY_CTRL + 86 or k == 22
-            // Ctrl+V 粘贴（86='V'；22=0x16 为 WM_CHAR 控制码兜底）
+            // Ctrl+V 粘贴（86='V'；22=0x16 为 WM_CHAR 控制码兜底）；有选区先删
+            if self.del_selection()
+                self.insert_at_cursor(gui_clip_get())
+                return true
             self.insert_at_cursor(gui_clip_get())
             return true
         if k == 13 or k == 10
-            // Enter：光标处拆行
+            // Enter：有选区先删（光标落选区起点），再拆行
+            if self.del_selection()
+                self.insert_at_cursor("\n")
+                return true
             let string head = prefix(ln, self.cx)
             let string tail = suffix(ln, self.cx)
             let string[] out = self.lines[0, 0]
@@ -1693,12 +1795,17 @@ pub struct TextArea
             self.lines = out[1, length(out) - 1]
             self.cy++
             self.cx = 0
+            self.collapse()
             self.clamp_scroll()
             return true
         if k >= 32 and k < KEY_EXT
-            // 可打印（含中文，WM_CHAR UTF-16 码元）：光标处插入
+            // 可打印（含中文，WM_CHAR UTF-16 码元）：有选区先删选区再插入
+            if self.del_selection()
+                self.insert_at_cursor("" + cast(k, char))
+                return true
             self.lines[self.cy] = prefix(ln, self.cx) + cast(k, char) + suffix(ln, self.cx)
             self.cx = self.cx + length("" + cast(k, char))
+            self.collapse()
             self.clamp_scroll()
             return true
         return false
@@ -1716,6 +1823,46 @@ pub struct TextArea
         if last > nl
             last = nl
         let i32 avail = self.w - 2 * pad
+        // 选区高亮（say/sax ↔ cy/cx 规范化为行主序 [起,止]）
+        if self.focus and self.has_sel()
+            let i32 by = self.say
+            let i32 bx = self.sax
+            let i32 ey = self.cy
+            let i32 ex = self.cx
+            if by > ey or (by == ey and bx > ex)
+                let i32 t1 = by
+                by = ey
+                ey = t1
+                let i32 t2 = bx
+                bx = ex
+                ex = t2
+            let i32 li = self.top
+            while li < last
+                let i32 ry2 = self.y + pad + (li - self.top) * LH()
+                let string lnh = self.lines[li]
+                let i32 ll = length(lnh)
+                let i32 xs = -1
+                let i32 xe = -1
+                if li > by and li < ey
+                    xs = 0
+                    xe = ll
+                else
+                    if li == by and li == ey and bx < ex and bx <= ll and ex <= ll
+                        xs = bx
+                        xe = ex
+                    else
+                        if li == by and li < ey and bx <= ll
+                            xs = bx
+                            xe = ll
+                        else
+                            if li == ey and li > by and ex <= ll
+                                xs = 0
+                                xe = ex
+                if xs >= 0 and xe > xs
+                    let i32 x1 = self.x + pad + gui_text_w(prefix(lnh, xs))
+                    let i32 x2 = self.x + pad + gui_text_w(prefix(lnh, xe))
+                    gui_fill_rect(x1, ry2, x2 - x1, LH(), C_ACCENTD)
+                li++
         let i32 i = self.top
         while i < last
             let i32 ry = self.y + pad + (i - self.top) * LH()

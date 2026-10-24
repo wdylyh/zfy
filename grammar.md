@@ -834,7 +834,7 @@ App 只重绘脏组件——文本/状态变化后**必须置 dirty = true**）�
 |---|---|---|
 | `Label` | text、color、bg_w | 静态文本；bg_w=清屏宽度防残影 |
 | `Button` | **clicks**（累计点击数） | 悬停/按下高亮 |
-| `InputBox` | text、focus | 单行输入，点击获焦，键盘输入 |
+| `InputBox` | text、focus | 单行输入，点击获焦，键盘输入；**鼠标拖选**（按下定位光标并开始拖选，移动扩选，松开结束），有选区时输入/退格/Delete 先删选区 |
 | `Slider` | **value**（0..100） | 拖拽滑块 |
 | `ProgressBar` | value | 只展示，set_value 驱动 |
 | `ListBox` | **sel**（-1 未选）、top | 点击选中行，滚轮滚动 |
@@ -867,8 +867,14 @@ ta.insert_at_cursor(s)                 // 光标处插入（Ctrl+V 内部走它�
 ta.handle_key(k) -> bool               // 手动喂键（App.add_text 已自动）
 ```
 
-内置编辑能力：点击/方向键/Home/End 移动光标、回车拆行、退格删字
-（行首回退合行）、Delete、滚轮上下滚动。**UTF-8 码点对齐**：cx 是
+内置编辑能力：**鼠标拖选**（按下定位光标并记录锚点，按住移动扩选，
+松开结束；高亮跟随；拖选跨行按行主序规范化）+ 点击/方向键/Home/End
+移动光标（移动即收起选区）、回车拆行、退格删字
+（行首回退合行）、Delete、滚轮上下滚动。
+**选区联动**：有选区时输入字符 / 回车 / Ctrl+V / 退格 / Delete 均先删除
+选区再作用于光标处（输入即替换选区）。选中状态可读：`ta.has_sel() ->
+bool`，`ta.del_selection() -> bool`（删选区，光标落选区起点，业务可手动
+调用）；锚点字段 `sax/say`，拖选进行中 `dragging`。**UTF-8 码点对齐**：cx 是
 字节列，退格/Delete 自动按前导字节回退整个多字节字符，中文不会被
 切坏。判断按键来源：`k >= KEY_EXT` 为扩展键（k-KEY_EXT=VK），
 `k >= KEY_CTRL` 为 Ctrl 组合键。

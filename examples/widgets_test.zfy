@@ -2,8 +2,8 @@
 // 断言：组件状态机（悬停/点击/聚焦/输入/拖动/滚动/选中）+ 渲染冒烟 + damage 计数
 mod gui;
 mod widgets;
-use widgets::{App, Label, Button, InputBox, Slider, ProgressBar, ListBox, C_BG, C_OK}
-use gui::{KEY_CTRL}
+use widgets::{App, Label, Button, InputBox, TextArea, Slider, ProgressBar, ListBox, C_BG, C_OK}
+use gui::{KEY_CTRL, KEY_EXT}
 use gui::{gui_frame_sleep}
 
 fn main()
@@ -51,6 +51,60 @@ fn main()
     if ib0.handle_key(bs)
         output("FAIL backspace on empty should be noop")
         fails++
+
+    // ===== 1c) TextArea 鼠标拖选（w-053） =====
+    let TextArea ta = TextArea(x=0, y=0, w=200, h=100)
+    ta.set_text("abcd\nefgh\nijkl")
+    // 模拟按下 (row1 中段) 再拖到 (row2 中段)
+    ta.on_press(0, 0)
+    ta.on_drag(0, 0)
+    ta.cx = 3
+    ta.cy = 1
+    if not ta.has_sel()
+        output("FAIL ta has_sel after drag")
+        fails++
+    if not ta.del_selection()
+        output("FAIL ta del_selection")
+        fails++
+    if ta.text() != "h\nijkl"
+        output("FAIL ta del cross-line: " + ta.text())
+        fails++
+    if ta.has_sel()
+        output("FAIL ta sel cleared")
+        fails++
+    // 反向选区（锚点在光标后）
+    ta.set_text("abcd\nefgh")
+    ta.cx = 2
+    ta.cy = 1
+    ta.sax = 1
+    ta.say = 0
+    ta.sel_on = true
+    ta.say = 0
+    if not ta.del_selection() or ta.text() != "agh"
+        output("FAIL ta reverse selection: " + ta.text())
+        fails++
+    // 输入替换选区
+    ta.set_text("hello")
+    ta.cx = 1
+    ta.sel_on = true
+    ta.cy = 0
+    ta.sax = 3
+    ta.say = 0
+    if not ta.handle_key(88) or ta.text() != "hXlo"      // X=88
+        output("FAIL ta type replaces selection: " + ta.text())
+        fails++
+    // 导航键收起选区
+    ta.set_text("abc")
+    ta.cx = 0
+    ta.cy = 0
+    ta.sax = 3
+    ta.say = 0
+    if not ta.handle_key(KEY_EXT + 39)                 // Right
+        fails++
+    if ta.has_sel() or ta.cx != 1
+        output("FAIL ta collapse on nav")
+        fails++
+    output("ta selection ok")
 
     // ===== 1b) 全选覆盖 / 多字节选区 / placeholder / 点击定位（w-052） =====
     let i64 ctrl_a = KEY_CTRL + 65
