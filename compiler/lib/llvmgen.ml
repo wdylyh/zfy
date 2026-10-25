@@ -73,7 +73,6 @@ type gctx = {
   globals : (string, unit) Hashtbl.t;  (* 顶层变量槽（'@' 前缀）去重表 *)
   srcfiles : (string, string) Hashtbl.t; (* panic 行号（v3.5 DX）：文件名 → 常量全局名 *)
   structs : sdef list;             (* struct 定义表（布局与辅助函数生成用） *)
-  clo_envs : (string, string) Hashtbl.t; (* P0-1c：闭包签名 mangle -> clenv 布局名 *)
   clofrees : (string, string) Hashtbl.t; (* P0-1c：clenv 名 -> env 析构器符号（缓存） *)
   gres_pending : (string * string * string) list ref;
     (* v3.27 审计修复：zfy_global_reg 待发射调用（槽名, gfree wrapper, 诊断名）。
@@ -277,6 +276,9 @@ type fctx = {
   mutable nr : int;
   allocas : (string, string * zty) Hashtbl.t;  (* 变量名 -> (地址寄存器, 类型) *)
   regs : (string, string) Hashtbl.t;           (* 纯临时名 -> LLVM 寄存器 *)
+  boxed : (string, string) Hashtbl.t;          (* t-049/C：& 捕获堆箱槽（槽名 -> zbox
+                                                  struct 名）——val_of/ptr_of 对这些槽
+                                                  自动穿透一层指针（读载荷/取载荷地址） *)
   fret : zty;
   mutable nl : int;                            (* 内联边界检查的局部标签计数 *)
   fname : string;                              (* 当前函数名（zfy.globals 判定用） *)
@@ -364,6 +366,16 @@ let rec val_of fc (o : operand) : string * string =
   | OStr s -> (str_value fc s, t)
   | OLocal n ->
     if Hashtbl.mem fc.regs n then (Hashtbl.find fc.regs n, t)
+    else if Hashtbl.mem fc.boxed n then begin
+      (* & 捕获堆箱（t-049/C）：槽存箱指针（rc 载荷起点 = zbox 单字段 v
+         地址，偏移 0）——读 = load 箱指针得载荷地址，再按类型 load 值 *)
+      let (addr, _) = Hashtbl.find fc.allocas n in
+      let bp = fresh_r fc in
+      emitf fc "  %s = load ptr, ptr %s" bp addr;
+      let r = fresh_r fc in
+      emitf fc "  %s = load %s, ptr %s" r t bp;
+      (r, t)
+    end
     else if Hashtbl.mem fc.allocas n then begin
       if is_agg o.oty then lerr None "aggregate value %s must be used as a pointer" n;
       let (addr, _) = Hashtbl.find fc.allocas n in
@@ -371,7 +383,7 @@ let rec val_of fc (o : operand) : string * string =
       emitf fc "  %s = load %s, ptr %s" r t addr;
       (r, t)
     end
-    else lerr None "undefined local variable %s" n
+    else lerr None "undefined local variable %s (in fn %s)" n fc.fname
 
 (* 标量值 -> i128 位模式（数组/列表元素统一按位模式存储，宽度由 elemsz 决定） *)
 let bits_of fc (o : operand) : string =
@@ -428,6 +440,7 @@ let bits_of fc (o : operand) : string =
 let ptr_of fc (o : operand) : string * string =
   let dbg = function
     | OInt n -> Printf.sprintf "OInt %Ld" n
+    | OBig d -> Printf.sprintf "OBig %s" d
     | OFloat f -> Printf.sprintf "OFloat %g" f
     | OStr s -> Printf.sprintf "OStr \"%s\"" (String.escaped s)
     | OBool b -> Printf.sprintf "OBool %b" b
@@ -436,7 +449,16 @@ let ptr_of fc (o : operand) : string * string =
   in
   match o.o with
   | OLocal n ->
-    if Hashtbl.mem fc.allocas n then
+    if Hashtbl.mem fc.boxed n then begin
+      (* & 捕获堆箱（t-049/C）：变量地址 = 载荷地址 = 箱指针（zbox 单字段
+         v 偏移 0，槽内存箱指针 load 即得）——MStoreK/MCopy/MFieldGet 根等
+         全部写路径与聚合读路径自动适配 *)
+      let (addr, _) = Hashtbl.find fc.allocas n in
+      let bp = fresh_r fc in
+      emitf fc "  %s = load ptr, ptr %s" bp addr;
+      (bp, ll_ty o.oty)
+    end
+    else if Hashtbl.mem fc.allocas n then
       let (addr, ty) = Hashtbl.find fc.allocas n in
       (addr, ll_ty ty)
     else lerr None "undefined variable %s" n
@@ -985,6 +1007,14 @@ let gen_input fc name (ty : zty) delim =
   match Hashtbl.find_opt fc.allocas name with
   | None -> lerr None "undefined variable %s" name
   | Some (addr, _) ->
+    let addr =
+      (* t-049/C：& 捕获堆箱槽——写目标穿透为箱载荷地址（zbox 单字段偏移 0） *)
+      if Hashtbl.mem fc.boxed name then begin
+        let bp = fresh_r fc in
+        emitf fc "  %s = load ptr, ptr %s" bp addr;
+        bp
+      end else addr
+    in
     let (dp, _) = val_of fc delim in
     let (fname, extra) =
       match ty with
@@ -1080,47 +1110,38 @@ let bool_i32_rts =
     "zfy_contains_u32"; "zfy_contains_u64"; "zfy_contains_f32";
     "zfy_contains_f64"; "zfy_contains_str" ]
 
-(* P0-1c：惰性生成 clenv 析构器 @zfy.clofree$<clenv>（rc release：归零才
-   级联释放捕获副本 + free env 块）；clofrees 缓存去重。spawn 移交与闭包
-   变量 RAII 共用。env 块带 rc 头（zfy_env_new），浅拷共享（闭包赋值/
-   容器存闭包）由 assign 侧 retain 配平 *)
+(* P0-1c：惰性生成 clenv 析构器 @zfy.clofree$<clenv>（t-049/C 改为纯
+   字段级联释放，直接调 zfy_struct_free_<clenv>——rc 递减与 free 整块由
+   zfy_env_free 负责，dtor 只做捕获副本级联）。析构器不再由句柄方传入：
+   MClNew 构造后经 zfy_env_set_dtor 写进 env 块头（自描述），同签名多
+   lambda 的 clenv 布局差异不再依赖 clo_envs 映射（旧映射在多 lambda
+   混合值/& 捕获时会错配崩溃）。clofrees 缓存去重 *)
 let ensure_clofree (g : gctx) (clenv : string) : string =
   let sym = Printf.sprintf "@zfy.clofree$%s" clenv in
   if not (Hashtbl.mem g.clofrees clenv) then begin
     Hashtbl.replace g.clofrees clenv sym;
-    (* null 安全：move 后槽/零值槽 field0 = null——跳过释放防段错误 *)
     Buffer.add_string g.mbuf
       (Printf.sprintf
-         "define internal void @zfy.clofree$%s(ptr %%env) {\n  %%z = icmp eq ptr %%env, null\n  br i1 %%z, label %%skip, label %%do\nskip:\n  ret void\ndo:\n  call void @zfy_rc_release(ptr %%env, ptr @zfy_struct_free_%s)\n  ret void\n}\n"
+         "define internal void @zfy.clofree$%s(ptr %%env) {\n  call void @zfy_struct_free_%s(ptr %%env)\n  ret void\n}\n"
          clenv clenv)
   end;
   sym
 
 let gen_call fc dst name (args : operand list) (ret_ty : zty) =
   if name = "zfy_thread_spawn" then begin
-    (* spawn（P0-1c 类别 2）：env 所有权移交线程。改调 zfy_thread_spawn_d
-       附带 env 析构器（线程体结束：级联释放捕获副本 + free env 块）；
-       闭包签名 → clenv 映射缺失（跨函数返回的闭包）时退回旧接口 *)
+    (* spawn（P0-1c 类别 2）：env 所有权移交线程。统一调 zfy_thread_spawn_d
+       附带 @zfy_env_free（线程体结束：env 自描述析构——块内 dtor 级联释放
+       捕获副本 + rc 递减 + free 整块，t-049/C；不再依赖 clo_envs 映射，
+       跨函数返回的闭包同样正确） *)
     (match dst, args with
      | Some d, [ clo ] ->
        let (op, _) = ptr_of fc clo in
-       let dtor =
-         match clo.oty with
-         | TStruct mangle ->
-           (match Hashtbl.find_opt fc.g.clo_envs mangle with
-            | Some clenv -> Some (ensure_clofree fc.g clenv)
-            | None -> None)
-         | _ -> None
+       let (dp, _) =
+         match Hashtbl.find_opt fc.allocas d with
+         | Some (a, _) -> (a, "ptr")
+         | None -> (d, "ptr")
        in
-       (match dtor with
-        | Some sym ->
-          let (dp, _) =
-            match Hashtbl.find_opt fc.allocas d with
-            | Some (a, _) -> (a, "ptr")
-            | None -> (d, "ptr")
-          in
-          emitf fc "  call void @zfy_thread_spawn_d(ptr %s, ptr %s, ptr %s)" dp op sym
-        | None -> emitf fc "  call void @zfy_thread_spawn(ptr %s, ptr %s)" d op)
+       emitf fc "  call void @zfy_thread_spawn_d(ptr %s, ptr %s, ptr @zfy_env_free)" dp op
      | _ -> lerr None "zfy_thread_spawn call shape error")
   end
   else if name = "zfy_stoi_wide" then begin
@@ -1251,8 +1272,10 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
              沉入入口块——循环内多次构造复用同一堆块，rc 份额错乱：第 2 次
              构造覆盖 payload、第 1 份"份额"实为同块，后续覆盖路径 release
              提前归零 → 悬垂/堆损坏，d1 审计用例实证）。与 MClNew 同款
-             当前位置发射，每次求值独立分配 *)
-          emitf fc "  %s = call ptr @zfy_env_new(i64 %d)" blk sz;
+             当前位置发射，每次求值独立分配。
+             t-049/C：iface 装箱为 8 字节 rc 头（zfy_rc_alloc + 调用方按
+             vtable release fn 释放），不再共用 16 字节自描述头的 zfy_env_new *)
+          emitf fc "  %s = call ptr @zfy_rc_alloc(i64 %d)" blk sz;
           (* P0-1b：深拷贝替代 memcpy（src 内含 string/seq 字段时浅拷
              会共享——release 时双释放）；zeroinit 后逐字段 assign *)
           emitf fc "  call void @llvm.memset.p0.i64(ptr %s, i8 0, i64 %d, i1 false)"
@@ -1593,6 +1616,11 @@ let gen_field_store ~(free_old : bool) fc (fp : string) (v : operand) : unit =
     emitf fc "  call void @zfy_struct_assign_%s(ptr %s, ptr %s)" s fp sp
   | TErr _ ->
     (* T! 字段写入：memcpy 覆盖（旧 msg 按 strdup 泄漏约定不释放） *)
+    let (sp, _) = ptr_of fc v in
+    gen_memcpy fc fp sp (size_of fc.g v.oty)
+  | TFrac _ ->
+    (* frac 字段写入（t-049/B 捕获构造）：聚合 memcpy（frac 无堆资源，
+       旧值无需释放；值捕获声明点深拷贝副本即此） *)
     let (sp, _) = ptr_of fc v in
     gen_memcpy fc fp sp (size_of fc.g v.oty)
   | _ ->
@@ -2096,14 +2124,47 @@ let gen_instr fc (i : instr) : unit =
         if String.length name > 0 && name.[0] = '%' then name
         else Printf.sprintf "%%v.%s" name
       in
-      emitf_entry fc "  %s = alloca %s" addr (ll_ty ty);
-      Hashtbl.replace fc.allocas name (addr, ty);
-      (* 值槽清零（零值即各类型默认值；随后声明初值语句会覆盖） *)
-      (match ty with
-       | TString | TArray _ | TList _ ->
-         emitf fc "  store ptr null, ptr %s" addr
-       | _ -> emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr)
+      (match Hashtbl.find_opt fc.boxed name with
+       | Some boxname ->
+         (* & 捕获堆箱（t-049/C）：槽仍为 alloca（存箱指针）。本指令只在
+            入口块执行一次——只负责开槽（存 null），rc 堆箱由声明点的
+            MBoxAlloc 分配（循环体内声明逐次分配，与作用域退出 MFreeVar
+            的 release 逐次配平）。allocas 登记 TPtr (TStruct zbox) 使
+            val_of/ptr_of 按箱语义穿透。箱为 8 字节 rc 头（zfy_rc_alloc +
+            zfy_rc_release 释放，dtor = zfy_struct_free_<zbox> 由调用方按
+            类型传）——与 16 字节自描述头的闭包 env（zfy_env_new）区分 *)
+         let zty = TStruct boxname in
+         emitf_entry fc "  %s = alloca ptr" addr;
+         emitf_entry fc "  store ptr null, ptr %s" addr;
+         Hashtbl.replace fc.allocas name (addr, TPtr zty)
+       | None ->
+         emitf_entry fc "  %s = alloca %s" addr (ll_ty ty);
+         Hashtbl.replace fc.allocas name (addr, ty);
+         (* 值槽清零（零值即各类型默认值；随后声明初值语句会覆盖） *)
+         (match ty with
+          | TString | TArray _ | TList _ ->
+            emitf fc "  store ptr null, ptr %s" addr
+          | _ -> emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr))
     end
+  | MBoxAlloc (name, ty) ->
+    (* t-049/C：& 捕获堆箱槽的 rc 堆箱分配——声明点发射（循环体内声明
+       逐次分配，与作用域退出 MFreeVar 的 release 逐次配平）。
+       rc_alloc + 箱指针入槽 + 载荷零初始化（载荷类型 = 声明类型，
+       ll_ty 下的 zeroinitializer 对标量/指针均合法） *)
+    let boxname =
+      match Hashtbl.find_opt fc.boxed name with
+      | Some b -> b
+      | None -> lerr None "boxed alloc for non-boxed slot %s" name
+    in
+    let (addr, _) =
+      match Hashtbl.find_opt fc.allocas name with
+      | Some a -> a
+      | None -> lerr None "undefined variable %s" name
+    in
+    let blk = fresh_r fc in
+    emitf fc "  %s = call ptr @zfy_rc_alloc(i64 %d)" blk (size_of fc.g (TStruct boxname));
+    emitf fc "  store ptr %s, ptr %s" blk addr;
+    emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) blk
   | MFracNew (d, ty, num, den) ->
     let addr = fresh_r fc in
     let fty = ll_ty ty in
@@ -2238,41 +2299,55 @@ let gen_instr fc (i : instr) : unit =
   | MInput (name, ty, delim) -> gen_input fc name ty delim
   | MFreeVar (name, ty) ->
     (* RAII 释放：string 释放堆串；数组/列表释放 seq（string 元素一并释放） *)
-    (match Hashtbl.find_opt fc.allocas name with
-     | Some (addr, _) ->
-       (match ty with
-        | TString ->
-          let sp = fresh_r fc in
-          emitf fc "  %s = load ptr, ptr %s" sp addr;
-          emitf fc "  call void @zfy_free_str(ptr %s)" sp;
+    (match Hashtbl.find_opt fc.boxed name with
+     | Some boxname ->
+       (* & 捕获堆箱（t-049/C）：release 箱（归零后按 zbox 布局析构载荷
+          资源——string/seq/嵌套 struct——再 free 整块）；槽置 null 防重复 *)
+       (match Hashtbl.find_opt fc.allocas name with
+        | Some (addr, _) ->
+          let bp = fresh_r fc in
+          emitf fc "  %s = load ptr, ptr %s" bp addr;
+          emitf fc "  call void @zfy_rc_release(ptr %s, ptr @zfy_struct_free_%s)"
+            bp boxname;
           emitf fc "  store ptr null, ptr %s" addr
-        | TArray _ | TList _ ->
-          (* 元素资源按 seq 头部 kind/ops 释放（w-014 #2/#4） *)
-          let sp = fresh_r fc in
-          emitf fc "  %s = load ptr, ptr %s" sp addr;
-          emitf fc "  call void @zfy_seq_free(ptr %s)" sp;
-          emitf fc "  store ptr null, ptr %s" addr
-        | TStruct s ->
-          (* struct：释放内含堆资源后清零槽（防重复释放） *)
-          emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s addr;
-          emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr
-        | TFile ->
-          (* File：作用域退出自动 close（幂等；null=已 move，跳过；
-             close 失败 panic——design_fileio.md 规则 3/4） *)
-          let sp = fresh_r fc in
-          emitf fc "  %s = load ptr, ptr %s" sp addr;
-          emitf fc "  call void @zfy_file_autoclose(ptr %s)" sp;
-          emitf fc "  store ptr null, ptr %s" addr
-        | _ -> ())
-     | None -> lerr None "undefined variable %s" name)
-  | MFreeClo (name, clenv) ->
+        | None -> lerr None "undefined variable %s" name)
+     | None ->
+     (match Hashtbl.find_opt fc.allocas name with
+      | Some (addr, _) ->
+        (match ty with
+         | TString ->
+           let sp = fresh_r fc in
+           emitf fc "  %s = load ptr, ptr %s" sp addr;
+           emitf fc "  call void @zfy_free_str(ptr %s)" sp;
+           emitf fc "  store ptr null, ptr %s" addr
+         | TArray _ | TList _ ->
+           (* 元素资源按 seq 头部 kind/ops 释放（w-014 #2/#4） *)
+           let sp = fresh_r fc in
+           emitf fc "  %s = load ptr, ptr %s" sp addr;
+           emitf fc "  call void @zfy_seq_free(ptr %s)" sp;
+           emitf fc "  store ptr null, ptr %s" addr
+         | TStruct s ->
+           (* struct：释放内含堆资源后清零槽（防重复释放） *)
+           emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s addr;
+           emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr
+         | TFile ->
+           (* File：作用域退出自动 close（幂等；null=已 move，跳过；
+              close 失败 panic——design_fileio.md 规则 3/4） *)
+           let sp = fresh_r fc in
+           emitf fc "  %s = load ptr, ptr %s" sp addr;
+           emitf fc "  call void @zfy_file_autoclose(ptr %s)" sp;
+           emitf fc "  store ptr null, ptr %s" addr
+         | _ -> ())
+       | None -> lerr None "undefined variable %s" name))
+  | MFreeClo (name, _) ->
     (* RAII（P0-1c）：闭包槽 field0 = env 块地址（块头即 code）——
-       rc release（归零才级联释放捕获副本 + free 块，P0-1a 引用计数） *)
+       env 自描述析构（t-049/C）：zfy_env_free 从块头取 dtor（@zfy.clofree$<clenv>，
+       rc 归零才级联释放捕获副本 + free 整块，P0-1a 引用计数） *)
     (match Hashtbl.find_opt fc.allocas name with
      | Some (addr, _) ->
        let h = fresh_r fc in
        emitf fc "  %s = load ptr, ptr %s" h addr;
-       emitf fc "  call void @zfy_rc_release(ptr %s, ptr @zfy_struct_free_%s)" h clenv;
+       emitf fc "  call void @zfy_env_free(ptr %s)" h;
        emitf fc "  store ptr null, ptr %s" addr
      | None -> lerr None "undefined variable %s" name)
   | MFreeTemp name ->
@@ -2480,6 +2555,14 @@ let gen_instr fc (i : instr) : unit =
        let r = fresh_r fc in
        emitf fc "  %s = load ptr, ptr %s" r fp;
        Hashtbl.replace fc.regs d r
+     | TFrac _ ->
+       (* frac 字段（t-049/B 捕获读）：聚合产临时槽（MCall frac_rt 的 agg
+          参数与 MFieldStore 值写入均按 ptr_of 取槽地址；寄存器无 alloca
+          不可作聚合槽） *)
+       let addr = fresh_r fc in
+       emitf_entry fc "  %s = alloca %s" addr (ll_ty fty);
+       gen_memcpy fc addr fp (size_of fc.g fty);
+       Hashtbl.replace fc.allocas d (addr, fty)
      | _ ->
        let r = fresh_r fc in
        emitf fc "  %s = load %s, ptr %s" r (ll_ty fty) fp;
@@ -2516,9 +2599,16 @@ let gen_instr fc (i : instr) : unit =
     gen_seq_rows fc r elem len;
     Hashtbl.replace fc.regs d r
   | MAddrOf (d, slot) ->
-    (* 取地址：dst = 变量槽地址（全局 @g.x 与局部 %v.x 都登记在 allocas） *)
+    (* 取地址：dst = 变量槽地址（全局 @g.x 与局部 %v.x 都登记在 allocas）。
+       & 捕获堆箱（t-049/C）：地址 = 箱指针（rc 载荷起点，逃逸安全） *)
     (match Hashtbl.find_opt fc.allocas slot with
-     | Some (addr, _) -> Hashtbl.replace fc.regs d addr
+     | Some (addr, _) ->
+       if Hashtbl.mem fc.boxed slot then begin
+         let bp = fresh_r fc in
+         emitf fc "  %s = load ptr, ptr %s" bp addr;
+         Hashtbl.replace fc.regs d bp
+       end
+       else Hashtbl.replace fc.regs d addr
      | None -> lerr None "address-of target is undefined: %s" slot)
   | MLoadK (d, src, ty) ->
     (* 解引用读：src 求值为指针，load 目标类型 *)
@@ -2612,9 +2702,9 @@ let gen_instr fc (i : instr) : unit =
     (* 函数入口地址：寄存器表直接持有 LLVM 符号文本（@名） *)
     Hashtbl.replace fc.regs d ("@" ^ name)
   | MClNew (d, mangle, clenv, items, _ret) ->
-    (* 闭包堆块（v3.7）：按 clenv$N 布局分配（zfy_env_new = 带 rc 头的
-       堆分配，引用计数回收），逐字段写入（gen_field_store 完成
-       string/seq/struct 捕获的深拷贝）；dst = 句柄 struct 槽 { ptr h }，
+    (* 闭包堆块（v3.7）：按 clenv$N 布局分配（zfy_env_new = 带 {dtor, rc}
+       自描述头的堆分配，引用计数回收，t-049/C），逐字段写入（gen_field_store
+       完成 string/seq/struct 捕获的深拷贝）；dst = 句柄 struct 槽 { ptr h }，
        堆块地址存入槽字段（后续传参/赋值按 struct 槽统一处理） *)
     (match find_struct fc.g clenv with
      | Some sd ->
@@ -2622,14 +2712,27 @@ let gen_instr fc (i : instr) : unit =
        let addr = fresh_r fc in
        emitf_entry fc "  %s = alloca %s" addr (ll_ty (TStruct mangle));
        Hashtbl.replace fc.allocas d (addr, TStruct mangle);
-       Hashtbl.replace fc.g.clo_envs mangle clenv;   (* P0-1c：析构器解析用 *)
        emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty (TStruct mangle)) addr;
        let blk = fresh_r fc in
        emitf fc "  %s = call ptr @zfy_env_new(i64 %d)" blk sz;
+       (* env 块自描述析构（t-049/C）：dtor 写进块头（@zfy.clofree$<clenv>，
+          纯字段级联）——释放侧（MFreeClo/assign/free fn/spawn）统一
+          zfy_env_free 从块内分派，同签名多 lambda 布局互不干扰 *)
+       emitf fc "  call void @zfy_env_set_dtor(ptr %s, ptr %s)" blk
+         (ensure_clofree fc.g clenv);
        List.iteri
          (fun i v ->
            let fp = gen_gep fc blk (ll_ty (TStruct clenv)) i in
-           gen_field_store ~free_old:false fc fp v)
+           gen_field_store ~free_old:false fc fp v;
+           (* & 捕获字段（t-049/C）：字段 = zbox 堆箱指针，clenv 取得
+              引用份额（env 释放时字段 release 配平） *)
+           (match v.oty with
+            | TPtr (TStruct s2)
+              when String.length s2 > 5 && String.sub s2 0 5 = "zbox$" ->
+              let bp = fresh_r fc in
+              emitf fc "  %s = load ptr, ptr %s" bp fp;
+              emitf fc "  call void @zfy_rc_retain(ptr %s)" bp
+            | _ -> ()))
          items;
        let hslot = gen_gep fc addr (ll_ty (TStruct mangle)) 0 in
        emitf fc "  store ptr %s, ptr %s" blk hslot
@@ -2762,6 +2865,8 @@ let gen_fn g (f : mfn) : string =
   let body = Buffer.create 512 in
   let fc =
     { g; buf = body; ebuf; nr = 0; allocas = Hashtbl.create 16; regs = Hashtbl.create 16;
+      boxed = (match Hashtbl.find_opt Typeck.boxed_fns f.mname with
+               | Some t -> t | None -> Hashtbl.create 0);
       fret = f.mret; nl = 0; fname = f.mname }
   in
   let ret_ll = if is_agg f.mret then "void" else ll_ty f.mret in
@@ -2782,8 +2887,21 @@ let gen_fn g (f : mfn) : string =
   List.iter
     (fun (n, t) ->
       let addr = Printf.sprintf "%%v.%s" n in
-      emitf fc "  %s = alloca %s" addr (ll_ty t);
-      Hashtbl.replace fc.allocas n (addr, t);
+      (* t-049/C：& 捕获参数堆箱——槽存箱指针（alloca ptr），入口 rc_alloc
+         装箱、载荷接管传入值，函数退出 MFreeVar release 配平。
+         is_agg（struct/frac/err）载荷 ref_cap_ty_ok 拒绝 & 捕获，不会装箱 *)
+      let boxed =
+        match Hashtbl.find_opt fc.boxed n with
+        | Some b when not (is_agg t) -> Some b
+        | _ -> None
+      in
+      (match boxed with
+       | Some boxname ->
+         emitf fc "  %s = alloca ptr" addr;
+         Hashtbl.replace fc.allocas n (addr, TPtr (TStruct boxname))
+       | None ->
+         emitf fc "  %s = alloca %s" addr (ll_ty t);
+         Hashtbl.replace fc.allocas n (addr, t));
       if is_agg t then begin
         match t with
         | TStruct s when is_move_only_sname_ll s ->
@@ -2806,16 +2924,29 @@ let gen_fn g (f : mfn) : string =
           emitf fc "  %s = load %s, ptr %%%s" r (ll_ty t) n;
           emitf fc "  store %s %s, ptr %s" (ll_ty t) r addr
       end
-      else if t = TString then
-        (* 所有权接管：直接持有调用方移交的堆串 *)
-        emitf fc "  store ptr %%%s, ptr %s" n addr
-      else
-        match t with
-        | TArray _ | TList _ ->
-          (* 所有权接管：直接持有调用方移交的 seq *)
-          emitf fc "  store ptr %%%s, ptr %s" n addr
-        | _ ->
-          emitf fc "  store %s %%%s, ptr %s" (ll_ty t) n addr)
+      else begin
+        let take_slot v = emitf fc "  store ptr %s, ptr %s" v addr in
+        (match boxed with
+         | Some boxname ->
+           (* 装箱：载荷接管传入值（string/seq 为所有权指针，标量为值拷贝） *)
+           let blk = fresh_r fc in
+           emitf fc "  %s = call ptr @zfy_rc_alloc(i64 %d)" blk (size_of fc.g (TStruct boxname));
+           (match t with
+            | TString | TArray _ | TList _ -> emitf fc "  store ptr %%%s, ptr %s" n blk
+            | _ -> emitf fc "  store %s %%%s, ptr %s" (ll_ty t) n blk);
+           take_slot blk
+         | None ->
+           if t = TString then
+             (* 所有权接管：直接持有调用方移交的堆串 *)
+             take_slot (Printf.sprintf "%%%s" n)
+           else
+             match t with
+             | TArray _ | TList _ ->
+               (* 所有权接管：直接持有调用方移交的 seq *)
+               take_slot (Printf.sprintf "%%%s" n)
+             | _ ->
+               emitf fc "  store %s %%%s, ptr %s" (ll_ty t) n addr)
+      end)
     f.mparams;
   (* 基本块（入口块不写标签：参数落槽即入口块前奏） *)
   List.iteri
@@ -2870,9 +3001,8 @@ let gen_struct_type_def (_ : gctx) (sd : sdef) : string =
    v3.27 P0-1 专属释放：
    - mutex$/thread$/chan$<tag>：单 ptr 字段 → runtime 句柄释放；
    - iface$X：{ data, vt } → vtable 末槽 release 间接调用（深释放 data）；
-   - closure$<sig>：field0 = env 块地址 → @zfy.clofree$<clenv>（级联释放
-     捕获副本 + free 块）。clenv 映射来自 g.clo_envs（MClNew 时登记，
-     故本函数必须在 gen_fn 全部完成后生成——调用点已挪至 gen_program 末尾）。
+   - closure$<sig>：field0 = env 块地址 → @zfy_env_free（t-049/C：env 自
+     描述析构——块内 dtor 级联释放捕获副本 + rc 递减 + free 块）。
    字段级 move-only 类型（嵌套句柄/接口/闭包借拷）跳过——级联会双释放 *)
 let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
   let sn = struct_ty_name sd.sname in
@@ -2903,19 +3033,14 @@ let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
     Printf.sprintf
       "define void @zfy_struct_free_%s(ptr %%p) {\n  %%d = load ptr, ptr %%p\n  %%z = icmp eq ptr %%d, null\n  br i1 %%z, label %%skip, label %%do\nskip:\n  ret void\ndo:\n  %%vtp = getelementptr inbounds %s, ptr %%p, i32 0, i32 1\n  %%vt = load ptr, ptr %%vtp\n  %%fp = getelementptr [ %d x ptr ], ptr %%vt, i64 0, i32 %d\n  %%rel = load ptr, ptr %%fp\n  call void %%rel(ptr %%d)\n  ret void\n}\n"
       sd.sname sn (nslots + 1) nslots
-  (* 闭包句柄：field0 = env 块地址（块头即 code）→ clofree 析构器 *)
+  (* 闭包句柄：field0 = env 块地址（块头即 code）→ zfy_env_free
+     （t-049/C：env 自描述析构——块内 dtor（@zfy.clofree$<clenv>，纯字段
+     级联）+ rc 递减 + free 整块。同签名多个 clenv 布局各自正确，
+     不再按 clo_envs 映射硬编码单一布局析构器） *)
   else if String.length sd.sname > 8 && String.sub sd.sname 0 8 = "closure$" then
-    (match Hashtbl.find_opt g.clo_envs sd.sname with
-     | Some clenv ->
-       let sym = ensure_clofree g clenv in
-       Printf.sprintf
-         "define void @zfy_struct_free_%s(ptr %%p) {\n  %%h = load ptr, ptr %%p\n  call void %s(ptr %%h)\n  ret void\n}\n"
-         sd.sname sym
-     | None ->
-       (* 映射缺失（该签名从未在本程序 MClNew——不可达；防御性 no-op） *)
-       Printf.sprintf
-         "define void @zfy_struct_free_%s(ptr %%p) {\n  ret void\n}\n"
-         sd.sname)
+    Printf.sprintf
+      "define void @zfy_struct_free_%s(ptr %%p) {\n  %%h = load ptr, ptr %%p\n  call void @zfy_env_free(ptr %%h)\n  ret void\n}\n"
+      sd.sname
   else begin
   let b = Buffer.create 128 in
   let emit : 'a. ('a, unit, string, unit) format4 -> 'a =
@@ -2937,6 +3062,13 @@ let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
         (* clenv 捕获副本：递归 rc release *)
         emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
         emit "  call void @zfy_struct_free_%s(ptr %s)" s2 fp
+      | TPtr (TStruct s2)
+        when String.length s2 > 5 && String.sub s2 0 5 = "zbox$" ->
+        (* & 捕获字段（t-049/C）：zbox 堆箱指针（MClNew 写入时 retain 过），
+           release 箱（归零析构载荷 + free） *)
+        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+        emit "  %s = load ptr, ptr %s" v fp;
+        emit "  call void @zfy_rc_release(ptr %s, ptr @zfy_struct_free_%s)" v s2
       | TString ->
         emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
         emit "  %s = load ptr, ptr %s" v fp;
@@ -3032,7 +3164,7 @@ let gen_program (m : mir) : string =
   let g =
     { mbuf = Buffer.create 512; nstr = 0; globals = Hashtbl.create 16;
       srcfiles = Hashtbl.create 4; structs = m.mstructs;
-      clo_envs = Hashtbl.create 8; clofrees = Hashtbl.create 8;
+      clofrees = Hashtbl.create 8;
       gres_pending = ref [] }
   in
   (* 显式声明模块 triple：与 clang --target=x86_64-w64-mingw32 的推断一致，
@@ -3065,8 +3197,8 @@ let gen_program (m : mir) : string =
       Buffer.add_string g.mbuf
         (Printf.sprintf "%%err.%s = type { i32, ptr, %s }\n" suf vll))
     err_defs;
-  (* struct 类型定义（布局；辅助函数生成挪至 gen_fn 之后——closure$ 的
-     free fn 依赖 gen 期间登记的 clo_envs 映射，见 gen_struct_free_fn 注释） *)
+  (* struct 类型定义（布局；辅助函数生成挪至 gen_fn 之后——clofree$ 析构器
+     在 MClNew 处惰性生成，见 ensure_clofree 注释） *)
   List.iter
     (fun sd -> Buffer.add_string g.mbuf (gen_struct_type_def g sd))
     m.mstructs;
@@ -3384,8 +3516,13 @@ let gen_program (m : mir) : string =
     "declare ptr @zfy_file_read_lines(ptr)\n";
   Buffer.add_string g.mbuf
     "declare void @zfy_file_write_file_err(ptr sret(%err.i64), ptr, ptr)\n";
-  (* 闭包（v3.7）：env 堆块分配（带 rc 头，引用计数回收——v3.27 P0-1a） *)
+  (* 闭包（v3.7）：env 堆块分配（t-049/C：16 字节自描述头 {dtor, rc}——
+     构造后 zfy_env_set_dtor 写入块内析构器，释放统一 zfy_env_free）；
+     zfy_rc_alloc = 8 字节 rc 头通用分配（iface 装箱 / zbox 堆箱） *)
   Buffer.add_string g.mbuf "declare ptr @zfy_env_new(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_env_set_dtor(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_env_free(ptr)\n";
+  Buffer.add_string g.mbuf "declare ptr @zfy_rc_alloc(i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_rc_retain(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_rc_release(ptr, ptr)\n";
   (* 并发（v3.8）：线程/互斥/原子/sleep/channel。
@@ -3651,8 +3788,8 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf (Buffer.contents thunk_buf);
   Hashtbl.reset thunk_cache;
   Buffer.reset thunk_buf;
-  (* struct 深拷贝/释放辅助函数（P0-1c：挪至 gen_fn 之后——closure$ free fn
-     依赖 clo_envs 与 clofree$ 析构器；LLVM 同模块前向引用合法，顺序无关） *)
+  (* struct 深拷贝/释放辅助函数（P0-1c：挪至 gen_fn 之后——clofree$ 析构器
+     在 MClNew 处惰性生成；LLVM 同模块前向引用合法，顺序无关） *)
   List.iter
     (fun sd ->
       Buffer.add_string g.mbuf (gen_struct_free_fn g sd);

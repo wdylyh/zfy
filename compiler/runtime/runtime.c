@@ -2657,12 +2657,45 @@ static void zfy_rc_report(void) {
                 zfy_rc_alloced - zfy_rc_freed, zfy_rc_alloced, zfy_rc_freed);
 }
 
-/* env 堆块分配（v3.27 P0-1 引用计数）：头 8 字节 = 原子 rc（初始 1），
- * 返回 payload 指针（字段偏移不受影响）。闭包 env / iface 装箱共用——
- * assign 浅拷共享时 LLVM 侧调 zfy_rc_retain，释放统一走 zfy_rc_release
- * （归零才级联释放 + free），杜绝浅拷共享场景的双释放/悬垂 */
+/* env 堆块分配（v3.27 P0-1 引用计数；t-049/C 改自描述 dtor）：
+ * 头 16 字节 = { dtor, rc }（dtor 在 rc 前 8 字节，rc 仍保持"载荷指针
+ * 前 8 字节"约定），返回 payload 指针（字段偏移不受影响）。
+ * dtor 由 LLVM 侧构造后经 zfy_env_set_dtor 写入（@zfy.clofree$<clenv>，
+ * 级联释放捕获副本）；释放统一走 zfy_env_free——rc 归零时从块内取 dtor
+ * 执行 + free 整块。此前释放侧由句柄方传 clenv 布局析构器，同签名多
+ * lambda 布局不同时会错配（值捕获字段被当箱指针 rc_release → 崩溃）。
+ * 注意：iface 装箱 / zbox 堆箱仍是 8 字节 rc 头（zfy_rc_alloc 分配 +
+ * zfy_rc_release 释放，dtor 由调用方按类型传），不走本组接口 */
 void *zfy_env_new(long long n) {
-    return zfy_rc_alloc((size_t)(n > 0 ? n : 1));
+    size_t payload = (size_t)(n > 0 ? n : 1);
+    long long *raw = (long long *)malloc(payload + 16);
+    if (!raw) zfy_die("rc: 内存分配失败");
+    raw[0] = 0;   /* dtor 槽（构造后由 zfy_env_set_dtor 写入） */
+    raw[1] = 1;   /* rc = 1（new 约定） */
+    zfy_rc_alloced++;
+    return (void *)(raw + 2);
+}
+
+/* 写入 env 块自描述析构器（载荷指针, dtor） */
+void zfy_env_set_dtor(void *p, void (*d)(void *)) {
+    if (p) ((void (**)(void *))p)[-2] = d;
+}
+
+/* env 块释放（t-049/C）：rc 归零才执行块内 dtor（级联释放捕获副本）+
+ * free 整块（malloc 起点在 dtor 槽）。null 安全（move 后槽/零值槽） */
+void zfy_env_free(void *p) {
+    if (!p) return;
+    long long *rcp = ((long long *)p) - 1;        /* rc 槽 */
+    void (**dp)(void *) = (void (**)(void *))rcp - 1;  /* dtor 槽 = 块起点 */
+#ifdef _WIN32
+    if (InterlockedDecrement64(rcp) == 0) {
+#else
+    if (--*rcp == 0) {
+#endif
+        zfy_rc_freed++;
+        if (*dp) (*dp)(p);
+        free(dp);
+    }
 }
 
 /* 从闭包槽解出调用入口 */
@@ -4389,7 +4422,7 @@ int32_t zfy_gui_text_w(char *s) { (void)s; return 0; }
 /* ---- 线程 ---- */
 typedef struct {
     void *env;
-    void (*dtor)(void *);                /* env 析构器（级联释放捕获副本 + free 块） */
+    void (*dtor)(void *);                /* env 析构器（zfy_env_free：块内 dtor + rc + free） */
 } zfy_thr_pack;
 
 static unsigned __stdcall zfy_thr_proc_d(void *p) {
@@ -4399,8 +4432,8 @@ static unsigned __stdcall zfy_thr_proc_d(void *p) {
     free(pk);
     void *code = *(void **)env;
     ((void (*)(void *))code)(env);
-    if (dtor) dtor(env);                 /* P0-1c：dtor（clofree）内部自带 rc release */
-    else zfy_rc_release(env, NULL);      /* 无 dtor：直接释放（rc 归零语义） */
+    if (dtor) dtor(env);                 /* P0-1c：dtor（zfy_env_free）自带块内 dtor 分派 */
+    else zfy_env_free(env);              /* 无 dtor：env 自描述析构（rc 归零语义） */
     return 0;
 }
 
@@ -4408,7 +4441,7 @@ static unsigned __stdcall zfy_thr_proc(void *p) {
     void *env = p;                       /* env 块：首字段 = code */
     void *code = *(void **)env;
     ((void (*)(void *))code)(env);
-    zfy_rc_release(env, NULL);           /* P0-1c：env 所有权随 spawn 移交，线程侧释放 */
+    zfy_env_free(env);                   /* P0-1c：env 所有权随 spawn 移交，线程侧释放 */
     return 0;
 }
 void zfy_thread_spawn(void **out, void *clo_slot) {

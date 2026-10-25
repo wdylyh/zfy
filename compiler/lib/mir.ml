@@ -57,7 +57,11 @@ type instr =
     (* panic 行号追踪（v3.5 DX）：每条语句入口写全局 @zfy_cur_line/@zfy_cur_file，
        zfy_panic（含 runtime 内部越界/除零等）打印 "  at file:line" *)
   | MAlloca of string * zty                      (* 变量槽（入口块统一分配�?*)
-  | MFracNew of string * zty * operand * operand (* 分数字面量：�? frac 类型, 分子, 分母 *)
+  | MFracNew of string * zty * operand * operand (* 分数字面量：… frac 类型, 分子, 分母 *)
+  | MBoxAlloc of string * zty
+    (* t-049/C：& 捕获堆箱槽的 rc 堆箱分配（槽名, 载荷类型=声明类型）。
+       必须在声明点发射：循环体内声明逐轮分配，与作用域退出 MFreeVar 的
+       rc release 逐次配平（MAlloca 在入口块仅执行一次，无法逐轮分配） *)
   | MNorm of string * zty                        (* frac 槽约分：调用 zfy_frac_norm_<suf> *)
   | MTempAlloca of string * zty                  (* 归一用临时聚合槽（llvmgen 入口块 alloca） *)
   | MSeqRemove of string * operand * operand * zty * bool
@@ -166,6 +170,10 @@ type lctx = {
   mutable clo_envs : (string * string) list;  (* P0-1c：闭包变量槽 -> clenv 布局名
                                                 （EClNewK 临时移入变量时登记，MFreeVar 级联释放用） *)
   unreds : (string, bool) Hashtbl.t;  (* unred frac 数组/列表槽名集合：元素存入不归一 *)
+  boxed : (string, string) Hashtbl.t;  (* t-049/C：& 捕获堆箱槽（槽名 -> zbox 布局名）。
+                                          这些槽存的是 rc 堆箱指针，llvmgen 在作用域退出
+                                          发 zfy_rc_release——mir 侧据此强制登记 RAII，
+                                          否则标量槽不满足 owned_ty 而漏发 MFreeVar（泄漏） *)
 }
 
 let new_block l =
@@ -229,9 +237,11 @@ let move_only_ty (t : zty) =
   | TStruct s -> is_move_only_sname s
   | _ -> false
 
-(* 在当前作用域登记需 RAII 释放的变量（后声明先释放） *)
+(* 在当前作用域登记需 RAII 释放的变量（后声明先释放）。
+   t-049/C：& 捕获堆箱槽（boxed 表内）强制登记——无论槽类型是否 owned_ty，
+   作用域退出都要对箱做 rc release（llvmgen 的 MFreeVar boxed 分支接管） *)
 let declare_owned l name ty =
-  if owned_ty name ty then
+  if owned_ty name ty || Hashtbl.mem l.boxed name then
     match l.scopes with
     | top :: _ -> top := (name, ty) :: !top
     | [] -> ()
@@ -430,6 +440,23 @@ let same_seq_root (a : texpr) (b : texpr) : bool =
   match seq_root_key_opt a, seq_root_key_opt b with
   | Some ka, Some kb -> ka = kb
   | _ -> false
+
+(* 字段链根展平（t-049/B）：EFieldK 链 → (根操作数, 前置序号链, 根类型)。
+   EVarK → 变量槽；EDerefK (EVarK n)（TPtr）→ 指针槽（MFieldGet/Store
+   按 TPtr 根自动解引用）；EFieldK（捕获字段形态 deref($env).p）→ 递归
+   展平，序号并入前置链——GEP 一次直达最终字段。供 SFieldSetK /
+   SAugFieldK 的捕获根分派使用（lexpr EFieldK 读路径另有自己的
+   flatten + lexpr base fallback，语义不同不共用） *)
+let flatten_field_root (l : lctx) (root : texpr) : operand * int list * zty =
+  let rec go acc b =
+    match b.e with
+    | EFieldK (b', i) -> go (i :: acc) b'
+    | EVarK n -> (op (OLocal n) b.ety, acc, b.ety)
+    | EDerefK ({ e = EVarK n; ety = TPtr t; _ }) ->
+      (op (OLocal n) (TPtr t), acc, TPtr t)
+    | _ -> merr b.epos "unsupported field chain root"
+  in
+  go [] root
 
 let rec lexpr l (e : texpr) : operand =
   match e.e with
@@ -1060,6 +1087,9 @@ and seq_slot_addr l (root : texpr) (elem : zty) : operand =
       match b.e with
       | EFieldK (b', i) -> flatten (i :: acc) b'
       | EVarK n -> Some (n, acc, b.ety)
+      (* deref(env).f（t-049 捕获下标写/push）：根槽持有指针，rootty 标
+         TPtr 由 llvmgen MFieldAddr load 后 GEP（自动解引用字段定位） *)
+      | EDerefK ({ e = EVarK n; ety = TPtr t; _ }) -> Some (n, acc, TPtr t)
       | _ -> None
     in
     (match flatten [] root with
@@ -1099,6 +1129,8 @@ and lstmt_inner l (s : tstmt) : unit =
        直接 move 所有权免克隆。File/句柄/接口/闭包（move-only，P0-1）：
        初值为局部变量槽时为所有权转移（清空源槽，运行期失效兜底） *)
     declare_owned l name ty;
+    (* t-049/C：& 捕获堆箱槽在声明点分配 rc 堆箱（逐轮配平释放，见 MBoxAlloc 注释） *)
+    if Hashtbl.mem l.boxed name then emit l (MBoxAlloc (name, ty));
     let v = lexpr l init in
     let moved =
       match ty, v.o with
@@ -1122,9 +1154,10 @@ and lstmt_inner l (s : tstmt) : unit =
   | SSeqDeclK (_, name, elem, len, is_list, inits, enn) ->
     (* 数组/列表：先分配（未初始化槽位为全零位模式），再逐个写入初始元素。
        frac 元素（enn）：初值与后续存入均自动约分；unred 数组不归一 *)
-    declare_owned l name
-      (if is_list then TList elem
-       else TArray (elem, Int64.to_int len));
+    let ty = if is_list then TList elem else TArray (elem, Int64.to_int len) in
+    declare_owned l name ty;
+    (* t-049/C：& 捕获堆箱槽在声明点分配 rc 堆箱（逐轮配平释放） *)
+    if Hashtbl.mem l.boxed name then emit l (MBoxAlloc (name, ty));
     (match elem with
      | TFrac _ when not enn -> Hashtbl.replace l.unreds name true
      | _ -> ());
@@ -1142,6 +1175,8 @@ and lstmt_inner l (s : tstmt) : unit =
        则直接 move 所有权，免去克隆 *)
     let tgt = if is_list then TList elem else TArray (elem, Int64.to_int len) in
     declare_owned l name tgt;
+    (* t-049/C：& 捕获堆箱槽在声明点分配 rc 堆箱（逐轮配平释放） *)
+    if Hashtbl.mem l.boxed name then emit l (MBoxAlloc (name, tgt));
     let v = lexpr l src in
     if not (move_owned_temp l name v tgt) then
       emit l (MCopy (name, v, tgt))
@@ -1203,11 +1238,24 @@ and lstmt_inner l (s : tstmt) : unit =
          match b.e with
          | EFieldK (b', i) -> flatten (i :: acc) b'
          | EVarK n -> Some (n, acc, b.ety)
+         (* deref(env).f（t-049 捕获赋值）：根槽 = "$env" 指针槽，
+            rootty 标 TPtr 由 MFieldStore 自动解引用定位字段 *)
+         | EDerefK ({ e = EVarK n; ety = TPtr t; _ }) -> Some (n, acc, TPtr t)
          | _ -> None
        in
        (match flatten [] lhs with
         | Some (rootn, idxs, rootty) ->
-          emit l (MFieldStore (op (OLocal rootn) rootty, rootty, idxs, v))
+          emit l (MFieldStore (op (OLocal rootn) rootty, rootty, idxs, v));
+          (* 非 unred frac 捕获字段赋值后自动约分（t-049/B）：MNorm 限变量
+             槽，这里 GEP 字段地址后直接调用 zfy_frac_norm_<suf> *)
+          (match lhs.ety with
+           | TFrac e when nn ->
+             let ap = fresh l in
+             emit l (MFieldAddr (ap, op (OLocal rootn) rootty, rootty, idxs,
+                                 lhs.ety));
+             emit l (MCall (None, "zfy_frac_norm_" ^ Hir.suffix_of e,
+                           [ op (OLocal ap) (TPtr lhs.ety) ], TVoid))
+           | _ -> ())
         | None -> merr lhs.epos "unsupported field assignment target")
      | _ -> merr lhs.epos "unsupported assignment target"))
   | SAugIndexK (root, (TErr _ as elem), idx, bop, v, grow) ->
@@ -1368,8 +1416,8 @@ and lstmt_inner l (s : tstmt) : unit =
     emit l (MAugSlice (name, elem, lexpr l a, lexpr l b, lexpr l st, bop,
                        lexpr l v))
   | SFieldSetK (root, idxs, rootty, v) ->
-    (* 字段写入：根地址（变量槽/元素槽地址/解引用）定位一次 + GEP 链，
-       深拷贝新值 + 释放旧值（llvmgen 按字段类型分派）。
+    (* 字段写入：根地址（变量槽/元素槽地址/解引用/捕获字段链）定位一次 +
+       GEP 链，深拷贝新值 + 释放旧值（llvmgen 按字段类型分派）。
        v3 2026-10-11：bag.items = push(bag.items, x) 同槽特判——push 本就
        原地写该字段，跳过整体深拷贝（MFieldStore 先释放旧值会让 push
        写入的 seq 变悬垂） *)
@@ -1383,30 +1431,51 @@ and lstmt_inner l (s : tstmt) : unit =
     in
     if same_field_root then
       ignore (lexpr l v)
-    else begin
-      let rp =
-        match root.e with
-        | EVarK n -> op (OLocal n) root.ety
-        | EAddrOfK { e = ESeqGetK (b, i); _ } ->
-          let d = fresh l in
-          let ety = (match root.ety with TPtr t -> t | _ -> assert false) in
-          emit l (MElemAddr (d, lexpr l b, lexpr l i, ety, true));
-          op (OLocal d) ety
-        | EDerefK p -> lexpr l p
-        | _ -> merr root.epos "unsupported field-set root"
-      in
-      emit l (MFieldStore (rp, root.ety, idxs, lexpr l v))
-    end
+    else
+      begin match root.e with
+      | EFieldK _ ->
+        (* 捕获字段链根（t-049/B）：根 = env 块字段（deref($env).p），
+           展平出根指针与前置序号链，并入 idxs 一次 GEP 直达最终字段
+           （值捕获副本 = env 块内独立存储，字段写只改副本，外层不变） *)
+        let (rr, pre, rrootty) = flatten_field_root l root in
+        emit l (MFieldStore (rr, rrootty, pre @ idxs, lexpr l v))
+      | _ ->
+        let rp =
+          match root.e with
+          | EVarK n -> op (OLocal n) root.ety
+          | EAddrOfK { e = ESeqGetK (b, i); _ } ->
+            let d = fresh l in
+            let ety = (match root.ety with TPtr t -> t | _ -> assert false) in
+            emit l (MElemAddr (d, lexpr l b, lexpr l i, ety, true));
+            op (OLocal d) ety
+          | EDerefK p -> lexpr l p
+          | _ -> merr root.epos "unsupported field-set root"
+        in
+        emit l (MFieldStore (rp, root.ety, idxs, lexpr l v))
+      end
   | SAugFieldK (root, idxs, rootty, bop, v) ->
-    (* 字段增广：load 字段 + op + 写回（字段只求值一次；字段类型 = 右值类型） *)
+    (* 字段增广：load 字段 + op + 写回（字段只求值一次；字段类型 = 右值类型）。
+       根 = 变量槽（EVarK，lslot 名）或捕获字段链（EFieldK，t-049/B——
+       展平出 env 根指针与前置序号链，读写链均穿透 env 解引用） *)
     let fty = v.ety in
+    let (rp, base_ty, pre) =
+      match root.e with
+      | EVarK n -> (op (OLocal n) rootty, rootty, [])
+      | EFieldK _ ->
+        let (rr, pre, rrootty) = flatten_field_root l root in
+        (rr, rrootty, pre)
+      | EDerefK p ->
+        let pv = lexpr l p in
+        (pv, (match p.ety with TPtr t -> t | _ -> p.ety), [])
+      | _ -> merr (match root with { epos = ep; _ } -> ep)
+               "unsupported augmented-field root"
+    in
     let old = fresh l in
-    emit l (MFieldGet (old, op (OLocal root) rootty, rootty, idxs, fty));
+    emit l (MFieldGet (old, rp, base_ty, pre @ idxs, fty));
     let ov = lexpr l v in
     let r = fresh l in
     emit l (MBinop (r, bop, op (OLocal old) fty, ov));
-    emit l (MFieldStore (op (OLocal root) rootty, rootty, idxs,
-                         op (OLocal r) fty))
+    emit l (MFieldStore (rp, base_ty, pre @ idxs, op (OLocal r) fty))
   | SDerefSetK (p, v) ->
     (* 指针解引用写入 p* = v：地址先求值。
        标量/指针目标：直接 store 值。
@@ -1738,7 +1807,12 @@ let lower_fn (h : hir) (f : tfn) : mfn =
   let l =
     { blocks = Hashtbl.create 8; nb = 0; nt = 0; cur = Obj.magic 0;
       loops = []; scopes = []; stmt_temps = []; unchecked = false;
-      frunred = f.frunred; locks = []; clo_envs = []; unreds = Hashtbl.create 8 }
+      frunred = f.frunred; locks = []; clo_envs = []; unreds = Hashtbl.create 8;
+      (* t-049/C：& 捕获堆箱槽表（槽名 -> zbox 布局名），按函数名从 typeck
+         读取（与 llvmgen 同源——mname 即 f.fname）；declare_owned 据此把
+         堆箱槽强制纳入 RAII，作用域退出配平 rc release *)
+      boxed = (match Hashtbl.find_opt Typeck.boxed_fns f.fname with
+               | Some t -> t | None -> Hashtbl.create 0) }
   in
   let entry = new_block l in
   l.cur <- entry;
@@ -1874,6 +1948,7 @@ let uses_of (i : instr) : string list =
      | None -> operand_names m)
   | MSetLoc _ -> []
   | MAlloca _ -> []
+  | MBoxAlloc _ -> []
   | MFracNew (_, _, a, b) -> operand_names a @ operand_names b
   | MNorm _ -> []
   | MTempAlloca _ -> []

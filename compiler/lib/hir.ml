@@ -159,8 +159,9 @@ and tstmt_kind =
        根地址为 TStruct/TPtr(TStruct) 形态：变量槽 EVarK / 元素槽地址
        EAddrOfK (ESeqGetK _)（ps[1].x = v，w-014 #8）/ 解引用 EDerefK；
        根只定位一次，链逐级 GEP；聚合字段写入为深拷贝（值语义） *)
-  | SAugFieldK of string * int list * zty * binop * texpr
-    (* struct 字段链复合赋值：(根槽名, 链, 根类型, 运算, 右值)——
+  | SAugFieldK of texpr * int list * zty * binop * texpr
+    (* struct 字段链复合赋值：(根, 链, 根类型, 运算, 右值)——根为变量槽
+       EVarK（lslot 名）或捕获字段链 EFieldK（t-049/B）；
        仅数值标量字段（load + op + store 同一字段） *)
   | SDerefSetK of texpr * texpr
     (* 指针解引用写入：p* = v（p 表达式, 值——目标类型 = v.ety，仅标量/指针；

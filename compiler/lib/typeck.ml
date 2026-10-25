@@ -223,9 +223,9 @@ type local = { lconst : bool; lty : zty; lslot : string; lunred : bool;
                lshared : bool }         (* v3.26 P0-3：shared 共享全局（锁外裸读写报错） *)
 
 (* lambda 捕获上下文（v3.7）：caps = 名字 -> (clenv 字段序号, 是否引用捕获,
-   类型, 使用位置)；clenv = env 块 struct 名；base = lambda 检查起点的
-   scopes 深度（EVar 外层查找跳过 lambda 自身作用域） *)
-type capctxk = { caps : (string, int * bool * zty * pos) Hashtbl.t;
+   类型, 使用位置, 外层变量是否 unred frac)；clenv = env 块 struct 名；
+   base = lambda 检查起点的 scopes 深度（EVar 外层查找跳过 lambda 自身作用域） *)
+type capctxk = { caps : (string, int * bool * zty * pos * bool) Hashtbl.t;
                  clenv : string; base : int }
 type env = {
   g : genv;
@@ -261,6 +261,12 @@ type env = {
        shared 全局的裸读写须命中本集合或豁免上下文（atomic 内建实参） *)
   mutable atomic_exempt : bool;
     (* atomic_load/store/add/inc 实参检查期间置位：&x 取址绕过锁外访问检查 *)
+  mutable fnstack : string list;
+    (* 当前函数名栈（顶层 fn / lambda 各占一层，③ 堆箱归因用）：
+       declare 时把"槽 -> 声明所在函数"记入 decl_of，& 捕获标记堆箱时
+       据此把槽记到声明函数名下（mir 按 fn 读取 boxed_fns） *)
+  mutable decl_of : (string, string) Hashtbl.t;
+    (* 变量槽 -> 声明所在函数名（③ 堆箱化归因表） *)
 }
 
 (* 内建函数表（与 hir.ml builtin_fns 同步） *)
@@ -322,6 +328,29 @@ let lookup_var env name =
        | None -> go rest)
   in
   go env.scopes
+
+(* lambda 体内变量查找（t-049）：capctx 激活时搜内部作用域（cc.base
+   之上被 push 的 skip 层）+ 全局（'@' 槽——全局不属于任何函数帧，
+   lambda 内直接读写是既有语义，try_capture 也拒绝捕获全局）；
+   外层函数局部不在本函数槽空间，写路径（赋值/复合赋值/序列字面量）
+   与读路径（check_expr EVar direct）同规则，miss 后交 try_capture
+   捕获改写；否则全量查找会命中外层槽产 EVarK 外层槽名，mir/llvmgen
+   在 lambda 内找不到该槽而崩 E4019 *)
+let lookup_var_local env name =
+  match env.capctx with
+  | None -> lookup_var env name
+  | Some cc ->
+    let is_global l =
+      String.length l.lslot > 0 && l.lslot.[0] = '@' in
+    let skip = List.length env.scopes - cc.base in
+    let rec go k = function
+      | [] -> None
+      | sc :: rest ->
+        (match Hashtbl.find_opt sc name with
+         | Some l when k < skip || is_global l -> Some l
+         | _ -> go (k + 1) rest)
+    in
+    go 0 env.scopes
 
 (* 从 borrowed 表摘除一条借用登记（容错：不存在则忽略——lambda/函数
    边界整体换表后，旧登记的摘除自然成为空操作） *)
@@ -472,6 +501,12 @@ let declare env name l =
     end
     else fresh ()
   in
+  (* ③ 堆箱归因：槽 -> 声明所在函数（fnstack 头；& 捕获标记堆箱时
+     据此把槽记到声明函数名下，mir/llvmgen 按 fn 名读取 boxed_fns） *)
+  if slot.[0] <> '@' && String.length slot > 0 then
+    (match env.fnstack with
+     | f :: _ -> Hashtbl.replace env.decl_of slot f
+     | [] -> ());
   match env.scopes with
   | sc :: _ -> Hashtbl.replace sc name { l with lslot = slot }
   | [] -> assert false
@@ -488,12 +523,11 @@ let rec tag_of_zty (z : zty) : string =
   | TFloat n -> "f" ^ string_of_int n
   | TBool -> "bool" | TChar -> "char" | TString -> "string" | TVoid -> "void"
   | TStruct s -> s
+  | TFile -> "file"
   | TPtr t -> "p" ^ tag_of_zty t
   | TList e -> "list$" ^ tag_of_zty e
   | TArray (e, n) -> "arr$" ^ tag_of_zty e ^ "$" ^ string_of_int n
   | TFrac e -> "frac" ^ tag_of_zty e
-  | TArray (t, n) -> "a" ^ string_of_int n ^ "$" ^ tag_of_zty t
-  | TList t -> "l$" ^ tag_of_zty t
   | TErr e ->
     (* T! 可作泛型实参（new.md 第1条）：tag 前缀 err$ 保证与源码标识符
        及其他形态标签无碰撞（Box$i32err$i64 等） *)
@@ -556,16 +590,79 @@ let ensure_handle_struct (g : genv) (mangle : string) : string =
   end;
   mangle
 
-(* zty 是否可作捕获字段（v1 限标量/string/bool/char/指针/闭包句柄；
-   seq/struct/frac 捕获不支持——struct 捕获的深拷贝所有权链待后续） *)
-let rec cap_ty_ok (z : zty) : bool =
+(* zty 是否可作捕获字段（值捕获：标量/string/bool/char/指针/句柄 + 容器/
+   struct/frac（声明点深拷贝进 env 块）；T!/含 T! 字段的 struct 不可捕获——
+   TErr 聚合尺寸未参与 env 块布局计算） *)
+let rec struct_cap_ok (g : genv) (s : string) : bool =
+  match Hashtbl.find_opt g.structs s with
+  | None -> false
+  | Some sd ->
+    List.for_all
+      (fun (_, ft, _) ->
+        match resolve ft with
+        | TErr _ -> false
+        | TStruct s2 -> struct_cap_ok g s2
+        | _ -> true)
+      sd.sfields
+
+let rec cap_ty_ok (g : genv) (z : zty) : bool =
   match resolve z with
   | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString -> true
   | TPtr _ -> true
+  | TList _ | TArray _ | TFrac _ -> true
   | TStruct s ->
     is_clo_struct s || is_map_struct s || cont_kind s <> None
     || is_thr_struct s || is_mtx_struct s || is_chan_struct s
+    || struct_cap_ok g s
   | _ -> false
+
+(* & 捕获（引用捕获）可装箱的载荷类型：载荷须为"单字段可 load"形态
+   （标量/string/bool/char/指针/列表/数组）——deref 读 = 从箱指针 load；
+   struct/frac 载荷内联多标量，deref 读需展开多字段，v3.29 暂不支持 *)
+let ref_cap_ty_ok (z : zty) : bool =
+  match resolve z with
+  | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString -> true
+  | TPtr _ -> true
+  | TList _ | TArray _ -> true
+  | _ -> false
+
+(* ③ 引用捕获堆箱表：函数名 -> (变量槽 -> 堆箱布局 struct 名)。
+   typeck 期间填充（check_lambda 显式捕获预登记时），llvmgen 按 mfn 名
+   读取：堆箱变量的槽存储改为 rc 堆箱（zfy_env_new），声明点分配、
+   作用域退出 rc release，闭包 env 持箱指针 + retain——逃逸安全 *)
+let boxed_fns : (string, (string, string) Hashtbl.t) Hashtbl.t = Hashtbl.create 8
+
+(* ③ 堆箱布局 struct（幂等）：zbox$<tag> 单字段（载荷类型 = 变量类型）——
+   复用 gen_struct_free_fn 生成载荷堆资源析构（string/seq/嵌套句柄递归），
+   释放统一走 zfy_rc_release(载荷, @zfy_struct_free_zbox$<tag>) 配平 *)
+let ensure_box_struct (g : genv) (ty : zty) : string =
+  let name = "zbox$" ^ tag_of_zty ty in
+  if not (Hashtbl.mem g.structs name) then
+    Hashtbl.replace g.structs name
+      { spacked = false; sfields = [ ("v", ty, None) ] };
+  name
+
+(* ③ & 捕获落堆箱登记：把槽记到声明函数名下（跨 lambda 归因经 decl_of） *)
+let mark_boxed (env : env) (slot : string) (ty : zty) : unit =
+  let dfn =
+    match Hashtbl.find_opt env.decl_of slot with
+    | Some f -> f
+    | None -> (match env.fnstack with f :: _ -> f | [] -> "main")
+  in
+  let boxname = ensure_box_struct env.g ty in
+  let tbl =
+    match Hashtbl.find_opt boxed_fns dfn with
+    | Some t -> t
+    | None ->
+      let t = Hashtbl.create 4 in
+      Hashtbl.replace boxed_fns dfn t; t
+  in
+  Hashtbl.replace tbl slot boxname
+
+(* 闭包签名 mangle -> clenv 布局 struct 名（check_lambda 登记时记录）。
+   spawn 白名单检查据此刻举捕获字段类型（closure$ 句柄本身单 ptr 字段，
+   捕获在 clenv 上）——单文件单进程，check_program 防御性重置 *)
+let clo_clenvs : (string, string) Hashtbl.t = Hashtbl.create 8
 
 (* struct 名 -> 闭包签名 *)
 let clo_sig (g : genv) (s : string) (p : pos) : zty list * zty =
@@ -833,7 +930,7 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
      | _ -> terr pp "closure return type must be a scalar, string or void");
     List.iter
       (fun z ->
-        if not (cap_ty_ok z) then
+        if not (cap_ty_ok g z) then
           terr pp "closure parameter type %s is not supported (v1: scalar/string/pointer/closure)"
             (pp_zty z))
       ptys';
@@ -1507,18 +1604,25 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
         | TStruct s ->
           is_clo_struct s || is_thr_struct s || is_mtx_struct s
           || is_chan_struct s
+        (* TPtr（含 & 捕获的 zbox$ 堆箱指针）跨线程共享宿主内存不安全，
+           与容器同拒 *)
         | _ -> false
       in
       let check_spawn_caps cs =
-        match Hashtbl.find_opt env.g.structs cs with
-        | Some sd ->
-          List.iter
-            (fun (fn', ft, _) ->
-              if fn' <> "h" && not (spawn_cap_ok ft) then
-                terr p
-                  "spawn: captured variable of type %s cannot cross threads (capture scalars/string/handles, or pass via chan)"
-                  (pp_zty ft))
-            (List.tl sd.sfields)
+        (* 捕获字段在 clenv 块上（首字段 code 是函数指针）——经 clo_clenvs
+           映射查布局 struct 刻举捕获类型；closure$ 句柄本身无捕获信息 *)
+        match Hashtbl.find_opt clo_clenvs cs with
+        | Some clenv ->
+          (match Hashtbl.find_opt env.g.structs clenv with
+           | Some sd ->
+             List.iter
+               (fun (fn', ft, _) ->
+                 if fn' <> "code" && not (spawn_cap_ok ft) then
+                   terr p
+                     "spawn: captured variable of type %s cannot cross threads (capture scalars/string/handles, or pass via chan)"
+                     (pp_zty ft))
+               sd.sfields
+           | None -> ())
         | None -> ()
       in
       let cs =
@@ -1763,16 +1867,17 @@ and try_capture env name p' =
       | Some l
         when not (String.length l.lslot > 0 && l.lslot.[0] = '@')
              && not l.lconst ->
-        (* v3.26 P0-3：不可捕获类型（数组/列表/struct 等内联值）编译期报错，
-           不再静默落回外层槽引用（那会在 codegen 期崩 E4019） *)
-        if not (cap_ty_ok l.lty) then
-          terr p' "captured variable '%s' has unsupported type %s (arrays/lists/structs cannot be captured; use a global, pass elements, or send via chan)"
+        (* v3.26 P0-3 → v3.29：不可捕获类型（T!/含 T! 字段的 struct 等）
+           编译期报错，不再静默落回外层槽引用（那会在 codegen 期崩 E4019）。
+           容器/struct/frac 自 v3.29 起为声明点深拷贝值捕获 *)
+        if not (cap_ty_ok env.g l.lty) then
+          terr p' "captured variable '%s' has unsupported type %s (T! and structs containing T! cannot be captured; pass the value via chan instead)"
             name (pp_zty l.lty);
         (match Hashtbl.find_opt cc.caps name with
-         | Some (idx, is_ref, ty, _) -> Some (cap_ref env idx is_ref ty p')
+         | Some (idx, is_ref, ty, _, _) -> Some (cap_ref env idx is_ref ty p')
          | None ->
            let idx = Hashtbl.length cc.caps + 1 in
-           Hashtbl.replace cc.caps name (idx, false, l.lty, p');
+           Hashtbl.replace cc.caps name (idx, false, l.lty, p', l.lunred);
            Some (cap_ref env idx false l.lty p'))
       | _ -> None
     end
@@ -1797,7 +1902,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
   in
   List.iter
     (fun z ->
-      if not (cap_ty_ok z) then
+      if not (cap_ty_ok env.g z) then
         terr lp "lambda parameter type %s is not supported (v1: scalar/string/pointer)"
           (pp_zty z))
     ptys;
@@ -1831,6 +1936,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
   let saved_cap = env.capctx in
   let saved_ldepth = env.ldepth in
   let saved_slotn = env.slotn in
+  let saved_fnstack = env.fnstack in
   let r =
     try
       env.fnvars <- Hashtbl.create 8;
@@ -1839,6 +1945,9 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
       env.uses <- [];
       env.ldepth <- 0;
       env.capctx <- Some cc;
+      (* ③ 堆箱归因：lambda 检查期压栈（lambda 内声明的变量被更内层
+         lambda & 捕获时，decl_of 记到本 lambda 名下） *)
+      env.fnstack <- fname :: env.fnstack;
       (* 显式引用捕获预登记（名字须为外层局部变量；字段序随登记序） *)
       List.iter
         (fun (is_ref, cn, cp) ->
@@ -1859,10 +1968,18 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
             terr cp "cannot capture global '%s' by reference (globals are always accessible directly)" cn;
           if l.lconst then
             terr cp "cannot capture const '%s'" cn;
-          if not (cap_ty_ok l.lty) then
+          if not (cap_ty_ok env.g l.lty) then
             terr cp "captured variable '%s' has unsupported type %s" cn (pp_zty l.lty);
+          (* ③ 引用捕获堆箱化：&x 的外层变量槽改为 rc 堆箱存储——闭包 env
+             字段存箱指针（retained），逃逸出作用域后读写仍有效。
+             载荷限"单字段可 load"类型（struct/frac 载荷暂不支持 & 捕获） *)
+          if is_ref then begin
+            if not (ref_cap_ty_ok l.lty) then
+              terr cp "captured variable '%s' of type %s cannot be captured by reference (struct/frac payloads are value-capture only)" cn (pp_zty l.lty);
+            mark_boxed env l.lslot l.lty
+          end;
           let idx = Hashtbl.length cc.caps + 1 in
-          Hashtbl.replace cc.caps cn (idx, is_ref, l.lty, cp))
+          Hashtbl.replace cc.caps cn (idx, is_ref, l.lty, cp, l.lunred))
         lam.lcaps;
       push_scope env;
       declare env "$env"
@@ -1957,19 +2074,23 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
       env.borrowed <- saved_borrowed;
       env.ldepth <- saved_ldepth;
       env.slotn <- saved_slotn;
+      env.fnstack <- saved_fnstack;
       while List.length env.scopes > cc.base do pop_scope env done;
       (* 冻结捕获表 → 注册 clenv$N struct（字段 0 = code 头） *)
       let caps_list =
         List.sort
           (fun a b ->
             compare (let (i, _, _, _, _) = a in i) (let (i, _, _, _, _) = b in i))
-          (Hashtbl.fold (fun cn (idx, is_ref, ty, cpos) acc ->
+          (Hashtbl.fold (fun cn (idx, is_ref, ty, cpos, _) acc ->
              (idx, cn, is_ref, ty, cpos) :: acc) cc.caps [])
       in
       let env_fields =
         [ ("code", TPtr (TUint 8)) ] @
         List.map (fun (_, cn, is_ref, ty, _) ->
-            (cn, if is_ref then TPtr ty else ty)) caps_list
+            (* & 捕获字段 = 箱指针（zbox$<tag>*，rc 头负偏移）；值捕获字段
+               = 变量值本身（容器/struct/frac 为声明点深拷贝副本） *)
+            (cn, if is_ref then TPtr (TStruct (ensure_box_struct env.g ty))
+                 else ty)) caps_list
       in
       if not (Hashtbl.mem env.g.structs clenv_name) then
         Hashtbl.replace env.g.structs clenv_name
@@ -1995,20 +2116,27 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
       env.borrowed <- saved_borrowed;
       env.ldepth <- saved_ldepth;
       env.slotn <- saved_slotn;
+      env.fnstack <- saved_fnstack;
       while List.length env.scopes > cc.base do pop_scope env done;
       raise (TypeError (p2, m2))
   in
   let (tret, ptys, code_name, caps_list) = r in
   let mangle = ensure_clo_struct env.g tret ptys in
+  (* 登记 闭包 mangle -> clenv 布局名：spawn 跨线程白名单检查据此刻举
+     捕获字段类型（closure$ 句柄本身单 ptr 字段，捕获在 clenv 上） *)
+  Hashtbl.replace clo_clenvs mangle clenv_name;
   (* 堆块内容：首元素 code（函数名），其后捕获值——值捕获读槽，
      引用捕获取地址；深拷贝由 llvmgen MClNew 按类型完成 *)
   let code_op = mk (EFunPtrK code_name) (TPtr (TUint 8)) in
   let cap_ops =
     List.map
-      (fun (_, cn, is_ref, _, cpos) ->
+      (fun (_, cn, is_ref, ty, cpos) ->
         let v = check_expr env (EVar (cn, cpos)) in
         if is_ref then
-          { e = EAddrOfK v; ety = TPtr v.ety; epos = cpos }
+          (* & 捕获：取箱指针（llvmgen MAddrOf 对堆箱槽 load 槽值）。
+             ety 标 TPtr (TStruct zbox$tag)——MClNew 写字段后据此 retain *)
+          { e = EAddrOfK v;
+            ety = TPtr (TStruct (ensure_box_struct env.g ty)); epos = cpos }
         else v)
       caps_list
   in
@@ -2045,6 +2173,8 @@ and wrap_fn_as_clo env p fname (ptys : zty list) (ret : zty) =
                             spos = p }) ] } in
   lambda_out_acc := !lambda_out_acc @ [ tf ];
   let mangle = ensure_clo_struct env.g ret ptys in
+  (* 空捕获 wrapper 同样登记（clenv 仅 code 字段，spawn 检查遍历为空） *)
+  Hashtbl.replace clo_clenvs mangle clenv_name;
   { e = EClNewK (mangle, clenv_name,
                  [ { e = EFunPtrK wname; ety = TPtr (TUint 8); epos = p } ]);
     ety = TStruct mangle; epos = p }
@@ -2268,13 +2398,19 @@ and check_expr env (e : expr) : texpr =
           （parser 把 a.b.c 合并成 EVar "a.b.c"） *)
        (match split_field_path name with
         | Some (first, segs) ->
-          (match lookup_var env first with
+          (match lookup_var_local env first with
            | Some l ->
              if Hashtbl.mem env.moved l.lslot then
                terr p' "variable %s has been moved and cannot be used (reassign to revive it)" first;
              let root = { e = EVarK l.lslot; ety = l.lty; epos = p' } in
              field_chain env p' root segs
            | None ->
+             (match try_capture env first p' with
+              | Some root ->
+                (* 捕获根字段链读（t-049/B）：根 = 捕获字段（env 块内副本），
+                   链逐级 GEP 穿透 env 解引用（读副本，外层不变） *)
+                field_chain env p' root segs
+              | None ->
              (* ErrCode.<名>：标准错误码编译期常量（i32） *)
              (match first, segs with
               | "ErrCode", [ seg ] ->
@@ -2285,7 +2421,7 @@ and check_expr env (e : expr) : texpr =
                 (* 枚举变体裸名（v3.9）：零载荷变体 Shape.Empty *)
                 (match check_enum_ctor env name p' None with
                  | Some te -> te
-                 | None -> terr p' "%s" (undef_fix env p' name "variable"))))
+                 | None -> terr p' "%s" (undef_fix env p' name "variable")))))
         | None ->
           (* 名字是函数（本文件/extern 声明）：引用为函数指针值 *)
           (match Hashtbl.find_opt env.g.fns name with
@@ -3980,7 +4116,7 @@ and chain_fields env p (ty0 : zty) (segs : string list) : int list * zty =
 and seq_slot_root env (base : expr) (what : string) : texpr =
   match base with
   | EVar (name, p') ->
-    (match lookup_var env name with
+    (match lookup_var_local env name with
      | Some l ->
        if l.lconst then
          terr p' "cannot modify %s of constant %s (const is deeply immutable)" what name;
@@ -3988,20 +4124,35 @@ and seq_slot_root env (base : expr) (what : string) : texpr =
          terr p' "%s has been moved and cannot be written" name;
        { e = EVarK l.lslot; ety = l.lty; epos = p' }
      | None ->
-       (* dotted 字段链（bag.xs）：const 根不可变检查后走读路径求值 *)
-       (match split_field_path name with
-        | Some (first, _) ->
-          (match lookup_var env first with
-           | Some l when l.lconst ->
-             terr p' "cannot modify %s of constant %s (const is deeply immutable)" what first
-           | _ -> ())
-        | None -> ());
-       let tb = check_expr env base in
-       (match tb.e with
-        | EFieldK _ | EDerefK _ -> tb
-        | _ ->
-          terr (pos_of_expr base) "%s must be a list variable or field" what;
-          tb))
+       (* t-049/B：捕获上下文下引用外层列表变量 → 捕获改写（值捕获 = env
+          字段链、& 捕获 = 解引用堆箱字段，均为合法可写槽根形态）。不改写
+          会保留外层槽名，lambda 内按 OLocal 求值崩 E4019。
+          dotted 名（bag.xs）与 const 由后续检查处理（try_capture 对
+          dotted 名返回 None） *)
+       (match try_capture env name p' with
+        | Some tb -> tb
+        | None ->
+          begin
+            (* dotted 字段链（bag.xs）：const 根不可变检查；非 dotted 且非
+               const 的 miss = 真未定义 *)
+            (match split_field_path name with
+             | Some (first, _) ->
+               (match lookup_var env first with
+                | Some l when l.lconst ->
+                  terr p' "cannot modify %s of constant %s (const is deeply immutable)" what first
+                | _ -> ())
+             | None ->
+               (match lookup_var env name with
+                | Some l when l.lconst ->
+                  terr p' "cannot modify %s of constant %s (const is deeply immutable)" what name
+                | _ -> terr p' "undefined variable '%s'" name));
+            let tb = check_expr env base in
+            (match tb.e with
+             | EFieldK _ | EDerefK _ -> tb
+             | _ ->
+               terr (pos_of_expr base) "%s must be a list variable or field" what;
+               tb)
+          end))
   | _ ->
     (match base with
      | EIndex (EVar (arr, ap), _, _) ->
@@ -5296,7 +5447,7 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
         | t -> terr ap "augmented assignment target does not support slicing: %s" (pp_zty t))
      | None -> terr ap "%s" (undef_fix env ap arr "variable"))
   | EVar (name, p') ->
-    (match lookup_var env name with
+    (match lookup_var_local env name with
      | Some l ->
        if l.lconst then
          terr p' "cannot assign to constant %s (declared const)" name;
@@ -5337,11 +5488,58 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           in
           SAugVarK (slot, lty, bop, trhs, needs_norm))
      | None ->
+       (* 捕获变量复合赋值/自增自减（t-049）：降为 读字段 → 运算 → 写回。
+          值捕获走 SAssignK（MFieldStore）；& 捕获字段值 = 箱指针 = 载荷
+          地址，走 SDerefSetK（标量 MStore / string 释放旧值整体替换）。
+          string += 不走 SStrAppendK 原地优化（其限变量槽），语义同
+          s = s + v（concat 新串写回） *)
+       (match try_capture env name p' with
+        | Some lhste ->
+          let lty = lhste.ety in
+          if (match resolve lty with TPtr _ -> true | _ -> false) then
+            terr p' "pointers do not support augmented assignment/inc/dec (arithmetic only as p = p + n inside unsafe)";
+          let trhs =
+            (match resolve lty with
+             | TFrac e when is_frac_arith rhs ->
+               frac_bare_guard rhs;
+               check_frac_expr env rhs e
+             | TString when bop = BAdd ->
+               let trhs = check_expr env rhs in
+               (match resolve trhs.ety with
+                | TChar -> to_string_of trhs
+                | TString -> trhs
+                | t -> terr p' "string concatenation requires string or char, got %s" (pp_zty t))
+             | _ -> check_expr env rhs)
+          in
+          let trhs = coerce p' trhs lty in
+          let nv =
+            (match resolve lty, bop with
+             | TString, BAdd ->
+               { e = ECallK ("zfy_str_concat", [ lhste; trhs ], []);
+                 ety = TString; epos = p' }
+             | _ -> { e = EBinK (bop, lhste, trhs); ety = lty; epos = p' })
+          in
+          (* 非 unred frac 捕获复合赋值后自动约分（同 SAssign 捕获分支） *)
+          let needs_norm =
+            (match resolve lty with
+             | TFrac _ ->
+               (match env.capctx with
+                | Some cc ->
+                  (match Hashtbl.find_opt cc.caps name with
+                   | Some (_, _, _, _, unred) -> not unred
+                   | None -> false)
+                | None -> false)
+             | _ -> false)
+          in
+          (match lhste.e with
+           | EDerefK fld -> SDerefSetK (fld, nv)
+           | _ -> SAssignK (lhste, nv, needs_norm, false))
+        | None ->
        (* 整体 lookup 失败且名字含 '.'：struct 字段链复合赋值
           （p.x += v / p.hp++ 等；const 根在此报错） *)
        (match split_field_path name with
         | Some (first, segs) ->
-          (match lookup_var env first with
+          (match lookup_var_local env first with
            | Some l ->
              (match resolve l.lty with
               | TStruct _ | TPtr (TStruct _) ->
@@ -5352,13 +5550,31 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
                  | TInt _ | TUint _ | TFloat _ ->
                    let trhs = check_expr env rhs in
                    let trhs = coerce p' trhs fty in
-                   SAugFieldK (l.lslot, idxs, l.lty, bop, trhs)
+                   SAugFieldK ({ e = EVarK l.lslot; ety = l.lty; epos = p' },
+                               idxs, l.lty, bop, trhs)
                  | t ->
                    terr p' "struct field augmented assignment supports only numeric scalar fields, got %s"
                      (pp_zty t))
               | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
-           | None -> terr p' "%s" (undef_fix env p' name "variable"))
-        | None -> terr p' "%s" (undef_fix env p' name "variable")))
+           | None ->
+             (match try_capture env first p' with
+              | Some root ->
+                (* 捕获根字段链复合赋值（t-049/B）：根 = 捕获字段（env 块
+                   副本），mir 侧展平链读写穿透 env 解引用（改副本不回写） *)
+                (match resolve root.ety with
+                 | TStruct _ | TPtr (TStruct _) ->
+                   let (idxs, fty) = chain_fields env p' root.ety segs in
+                   (match resolve fty with
+                    | TInt _ | TUint _ | TFloat _ ->
+                      let trhs = check_expr env rhs in
+                      let trhs = coerce p' trhs fty in
+                      SAugFieldK (root, idxs, root.ety, bop, trhs)
+                    | t ->
+                      terr p' "struct field augmented assignment supports only numeric scalar fields, got %s"
+                        (pp_zty t))
+                 | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
+              | None -> terr p' "%s" (undef_fix env p' name "variable")))
+        | None -> terr p' "%s" (undef_fix env p' name "variable"))))
   | EDeref (pe, dp) ->
     (* p* op= v / p*++ / p*--：解引用复合赋值（仅数值标量/指针目标；
        string 例外：p^ += v 走 concat + 引用槽整体替换，w-020） *)
@@ -5807,7 +6023,7 @@ and check_stmt env (st : stmt) : tstmt =
              terr dp "dereference assignment supports only scalar/pointer/aggregate types, got %s" (pp_zty t'))
         | t -> terr dp "assignment target must be a pointer dereference, got %s" (pp_zty t))
      | EVar (name, p'), rhs' ->
-       (match lookup_var env name with
+       (match lookup_var_local env name with
         | Some l ->
           if l.lconst then
             terr p' "cannot assign to constant %s (declared const)" name;
@@ -5893,10 +6109,44 @@ and check_stmt env (st : stmt) : tstmt =
                  | _ ->
                    mk (SAssignK ({ e = EVarK slot; ety = trhs.ety; epos = p' }, trhs, needs_norm, false)))))
         | None ->
+          (* 捕获变量赋值（t-049）：lambda 体内外层局部变量——lhs 改写为
+             clenv 字段（cap_ref），走 MFieldStore 字段路径（深拷贝新值 +
+             释放旧字段资源；值捕获副本 = env 块内独立存储，外层不变） *)
+          (match try_capture env name p' with
+           | Some lhste ->
+             let lty = lhste.ety in
+             let trhs =
+               (match resolve lty with
+                | TFrac e when is_frac_arith rhs' ->
+                  frac_bare_guard rhs';
+                  check_frac_expr env rhs' e
+                | _ -> check_expr env rhs')
+             in
+             let trhs = coerce p' trhs lty in
+             (* 捕获目标不参与 move 语义（env 字段路径一律深拷贝/句柄 retain）；
+                非 unred frac 捕获赋值后自动约分（needs_norm 随 SAssignK 下传，
+                mir 对字段链目标补 zfy_frac_norm 调用）。
+                & 捕获降 SDerefSetK：字段值 = 箱指针 = 载荷地址（标量 MStore /
+                聚合释放旧值整体替换）；值捕获走 SAssignK（MFieldStore） *)
+             let needs_norm =
+               (match resolve lty with
+                | TFrac _ ->
+                  (match env.capctx with
+                   | Some cc ->
+                     (match Hashtbl.find_opt cc.caps name with
+                      | Some (_, _, _, _, unred) -> not unred
+                      | None -> false)
+                   | None -> false)
+                | _ -> false)
+             in
+             (match lhste.e with
+              | EDerefK fld -> mk (SDerefSetK (fld, trhs))
+              | _ -> mk (SAssignK (lhste, trhs, needs_norm, false)))
+           | None ->
           (* 名字含 '.'：struct 字段链写入（p.x = v / p.pos.x = v / r.x = v 指针自动解引用） *)
           (match split_field_path name with
            | Some (first, segs) ->
-             (match lookup_var env first with
+             (match lookup_var_local env first with
               | Some l ->
                 (match resolve l.lty with
                  | TStruct _ | TPtr (TStruct _) ->
@@ -5912,8 +6162,23 @@ and check_stmt env (st : stmt) : tstmt =
                    mk (SFieldSetK ({ e = EVarK l.lslot; ety = l.lty; epos = p' },
                                    idxs, l.lty, trhs))
                  | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
-              | None -> terr p' "%s" (undef_fix env p' name "variable"))
-           | None -> terr p' "%s" (undef_fix env p' name "variable")))
+              | None ->
+                (match try_capture env first p' with
+                 | Some root ->
+                   (* 捕获根字段链写入（t-049/B）：根 = 捕获字段（env 块副本），
+                      mir SFieldSetK 展平链一次 GEP 直达副本字段（改副本不回写） *)
+                   (match resolve root.ety with
+                    | TStruct _ | TPtr (TStruct _) ->
+                      let (idxs, fty) = chain_fields env p' root.ety segs in
+                      if (match resolve fty with TStruct _ -> true | _ -> false)
+                         && bare_struct_ref env rhs' then
+                        terr p' "struct field assignment requires explicit copy(...) or move ... (no implicit deep copy)";
+                      let trhs = check_expr env rhs' in
+                      let trhs = coerce p' trhs fty in
+                      mk (SFieldSetK (root, idxs, root.ety, trhs))
+                    | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
+                 | None -> terr p' "%s" (undef_fix env p' name "variable")))
+           | None -> terr p' "%s" (undef_fix env p' name "variable"))))
      | _ -> terr p "unsupported assignment target")
   | SAssignList (lhs, exprs, p) ->
     (* 序列字面量整体赋值（w-014 #3）：a = 1, 2, 3 / bag.xs = 1, 2 /
@@ -5922,7 +6187,7 @@ and check_stmt env (st : stmt) : tstmt =
       { e = ESeqLitK (elem, elems); ety = TList elem; epos = p } in
     (match lhs with
      | EVar (name, p') ->
-       (match lookup_var env name with
+       (match lookup_var_local env name with
         | Some l ->
           if l.lconst then
             terr p' "cannot assign to constant %s (declared const)" name;
@@ -5946,10 +6211,33 @@ and check_stmt env (st : stmt) : tstmt =
                                  mk_lit e elems, false, false))))
            | t -> terr p' "sequence literal assignment requires an array/list target, got %s" (pp_zty t))
         | None ->
+          (* 捕获目标序列字面量整体赋值（t-049/B）：值捕获走 SAssignK 字段
+             路径（MFieldStore 释放旧字段 seq + 深拷贝新值）；& 捕获降
+             SDerefSetK（聚合：释放旧值 + 接管新值）。定长数组长度校验同本地 *)
+          (match try_capture env name p' with
+           | Some lhste ->
+             let assign_cap lit =
+               (match lhste.e with
+                | EDerefK fld -> mk (SDerefSetK (fld, lit))
+                | _ -> mk (SAssignK (lhste, lit, false, false))) in
+             (match resolve lhste.ety with
+              | TList e ->
+                let elems =
+                  List.map (fun ie -> coerce p (check_expr env ie) e) exprs in
+                assign_cap (mk_lit e elems)
+              | TArray (e, n) ->
+                if List.length exprs <> n then
+                  terr p "array literal has %d elements but target length is %d"
+                    (List.length exprs) n;
+                let elems =
+                  List.map (fun ie -> coerce p (check_expr env ie) e) exprs in
+                assign_cap (mk_lit e elems)
+              | t -> terr p' "sequence literal assignment requires an array/list target, got %s" (pp_zty t))
+           | None ->
           (* dotted 字段链目标：bag.xs = 1, 2 *)
           (match split_field_path name with
            | Some (first, segs) ->
-             (match lookup_var env first with
+             (match lookup_var_local env first with
               | Some l ->
                 (match resolve l.lty with
                  | TStruct _ | TPtr (TStruct _) ->
@@ -5973,8 +6261,30 @@ and check_stmt env (st : stmt) : tstmt =
                                       idxs, l.lty, mk_lit e elems))
                     | t -> terr p' "sequence literal assignment requires an array/list field, got %s" (pp_zty t))
                  | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
-              | None -> terr p' "%s" (undef_fix env p' name "variable"))
-           | None -> terr p' "%s" (undef_fix env p' name "variable")))
+              | None ->
+                (match try_capture env first p' with
+                 | Some root ->
+                   (* 捕获根字段链整体赋值（t-049/B）：env 块副本字段替换，
+                      列表深拷贝接管、定长数组长度校验同本地 *)
+                   (match resolve root.ety with
+                    | TStruct _ | TPtr (TStruct _) ->
+                      let (idxs, fty) = chain_fields env p' root.ety segs in
+                      (match resolve fty with
+                       | TList e ->
+                         let elems =
+                           List.map (fun ie -> coerce p (check_expr env ie) e) exprs in
+                         mk (SFieldSetK (root, idxs, root.ety, mk_lit e elems))
+                       | TArray (e, n) ->
+                         if List.length exprs <> n then
+                           terr p "array literal has %d elements but field length is %d"
+                             (List.length exprs) n;
+                         let elems =
+                           List.map (fun ie -> coerce p (check_expr env ie) e) exprs in
+                         mk (SFieldSetK (root, idxs, root.ety, mk_lit e elems))
+                       | t -> terr p' "sequence literal assignment requires an array/list field, got %s" (pp_zty t))
+                    | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
+                 | None -> terr p' "%s" (undef_fix env p' name "variable")))
+           | None -> terr p' "%s" (undef_fix env p' name "variable"))))
      | EDeref (pe, dp) ->
        (* ref 参数整体赋值：xs = 1, 2 / xs = 新表 *)
        check_constp env pe dp;
@@ -6876,8 +7186,11 @@ let check_program (prog : program) : hir =
       in_unsafe = false; in_unwrap = false; moved = Hashtbl.create 8;
       borrowed = Hashtbl.create 8; scope_borrows = []; borrow_temps = []; uses = [];
       ldepth = 0; capctx = None;
-      locks = []; atomic_exempt = false }
+      locks = []; atomic_exempt = false;
+      fnstack = []; decl_of = Hashtbl.create 16 }
   in
+  Hashtbl.reset boxed_fns;   (* ③ 堆箱表：单文件单进程，防御性重置 *)
+  Hashtbl.reset clo_clenvs;  (* ③ 闭包 mangle -> clenv 映射：同上 *)
   (* 全局作用域：顶层声明（const 内联；非 const 为全局可变变量） *)
   push_scope env;
   (* 顶层作用域中把变量槽改写为全局槽名 @g.<名字>（LLVM 全局变量） *)
@@ -6986,6 +7299,7 @@ let check_program (prog : program) : hir =
     let saved_moved = env.moved in
     let saved_borrowed = env.borrowed in
     let saved_ret = env.fncur_ret in
+    let saved_fnstack = env.fnstack in
           let r =
             try
               let sig_ = Hashtbl.find g.fns name in
@@ -6993,6 +7307,8 @@ let check_program (prog : program) : hir =
               env.fnvars <- Hashtbl.create 8;   (* 槽名按函数隔离 *)
               env.moved <- Hashtbl.create 8;    (* move 跟踪按函数隔离 *)
               env.borrowed <- Hashtbl.create 8; (* 借用跟踪按函数隔离 *)
+              (* ③ 堆箱归因：函数检查期压栈——declare 据此把槽记到本函数名下 *)
+              env.fnstack <- name :: env.fnstack;
               push_scope env;
               let tparams =
                 List.map2
@@ -7081,6 +7397,7 @@ let check_program (prog : program) : hir =
     env.moved <- saved_moved;
     env.borrowed <- saved_borrowed;
     env.fncur_ret <- saved_ret;
+    env.fnstack <- saved_fnstack;
     while List.length env.scopes > depth do pop_scope env done;
     r
   in
@@ -7525,7 +7842,7 @@ let check_program (prog : program) : hir =
       | SFieldSetK (r, idxs, rt, v) ->
         SFieldSetK (fix_texpr r, idxs, subst_ty rt, fix_texpr v)
       | SAugFieldK (n, idxs, rt, op, v) ->
-        SAugFieldK (n, idxs, subst_ty rt, op, fix_texpr v)
+        SAugFieldK (fix_texpr n, idxs, subst_ty rt, op, fix_texpr v)
       | SDerefSetK (p, v) -> SDerefSetK (fix_texpr p, fix_texpr v)
       | SAugDerefK (p, op, v) -> SAugDerefK (fix_texpr p, op, fix_texpr v)
       | SUnsafeK b -> SUnsafeK (List.map fix_stmt b)

@@ -1,0 +1,113 @@
+// 闭包捕获系统专项（t-049 + 任务 B/C，v3.29）：
+//   A) lambda 内对外层捕获变量的直接赋值 / 复合赋值 / 自增改写 clenv 字段
+//      （值捕获副本独立，外层变量不变）
+//   B) 容器 / struct / frac 值捕获：声明点深拷贝进 env 块，读/整体赋值可用
+//   C) & 引用捕获堆箱化：逃逸出宿主作用域后读写安全，循环多次创建各自独立
+// 预期输出：
+// 5 0          （值捕获赋值：lambda 内 n=5 改副本，外层仍 0）
+// 5 10 0       （复合赋值 += 持久于副本）
+// 1 0          （自增同上）
+// 3 2 1        （列表整体赋值 length=3；外层 length=2、xs[0]=1 不变）
+// 3 2          （列表捕获 push：副本原地追加尾元素 3；外层 length 仍 2）
+// 1            （struct 捕获读字段）
+// 3/2 0 3/4    （frac 捕获：副本乘 2 后自动约分 3/2；外层 3/4 不变）
+// 1 2 2        （& 捕获：宿主与 lambda 共享堆箱，双写可见）
+// 1 1 11 11 21 21 （循环内 & 捕获：每轮新箱，读写一致）
+// 11 12 13     （& 捕获逃逸：宿主槽出界后堆箱读写安全）
+// ok
+struct Pnt
+    i32 x
+    i32 y
+
+fn main()
+    // A1) 值捕获直接赋值
+    let i32 n = 0
+    let fn() -> i32 setn = fn() -> i32
+        n = 5
+        return n
+    output(setn())      // 5
+    output(n)           // 0
+
+    // A2) 复合赋值 +=
+    let i32 acc = 0
+    let fn() -> i32 add5 = fn() -> i32
+        acc += 5
+        return acc
+    output(add5())      // 5
+    output(add5())      // 10
+    output(acc)         // 0
+
+    // A3) 自增
+    let i32 c = 0
+    let fn() -> i32 inc = fn() -> i32
+        c++
+        return c
+    output(inc())       // 1
+    output(c)           // 0
+
+    // B1) 列表值捕获：整体赋值 / length / 读
+    let i32[] xs = 1, 2
+    let fn() -> i32 lst = fn() -> i32
+        xs = 7, 8, 9
+        return length(xs)
+    output(lst())       // 3
+    output(length(xs))  // 2（外层不变）
+    output(xs[0])       // 1
+
+    // B1b) 列表捕获 push：副本上原地追加（t-049/B seq_slot_root 捕获改写）
+    let fn() -> i32 pushb = fn() -> i32
+        xs = push(xs, 3)
+        return xs[length(xs) - 1]
+    output(pushb())     // 3
+    output(length(xs))  // 2（外层不变）
+
+    // B2) struct 值捕获：读字段
+    let Pnt p = Pnt(x=1, y=2)
+    let fn() -> i32 getx = fn() => p.x
+    output(getx())      // 1
+
+    // B3) frac 值捕获：副本运算 + 自动约分
+    let frac f = (3/4)
+    let fn() -> i32 fop = fn() -> i32
+        f = f * 2
+        output(f)       // 3/2
+        return 0
+    let i32 r6 = fop()
+    output(r6)          // 0
+    output(f)           // 3/4（外层不变）
+
+    // C1) & 捕获：宿主读写穿透（堆箱共享）
+    let i32 counter = 0
+    let fn() -> i32 bump = fn [&counter]() -> i32
+        counter++
+        return counter
+    output(bump())      // 1
+    output(bump())      // 2
+    output(counter)     // 2
+
+    // C2) 循环多次创建各自独立（每轮新箱，轮末配平释放）
+    let i32 k = 0
+    while k < 3
+        let i32 x = 10 * k
+        let fn() -> i32 g = fn [&x]() -> i32
+            x++
+            return x
+        output(g())     // 1 / 11 / 21
+        output(x)       // 1 / 11 / 21
+        k = k + 1
+
+    // C3) & 捕获逃逸：宿主槽出界后堆箱读写安全
+    let fn() -> i32 esc = fn() -> i32
+        return 0
+    let i32 once = 1
+    if once == 1
+        let i32 x = 10
+        esc = fn [&x]() -> i32
+            x++
+            return x
+    output(esc())       // 11
+    let i32 t9 = esc()
+    output(t9)          // 12
+    output(esc())       // 13
+
+    output("ok")
