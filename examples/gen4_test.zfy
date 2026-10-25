@@ -1,0 +1,45 @@
+// 泛型 v3 收尾用例：无默认值 T 字段按实例零值填充、
+// 字面量构造按上下文落型（声明/赋值/实参/push 元素/struct 字段）（本轮）。
+struct Box2<T>
+    T v
+
+struct Pair2<A, B>
+    A x
+    B y
+
+struct Pct<T: num>
+    T v = 0
+
+struct Q
+    Pct<i32> p
+
+fn i32 take(let Pct<i32> p)
+    return p.v
+
+fn i32 takeBox(let Box2<i32> b)
+    return b.v
+
+fn main()
+    // 4) 泛型 struct 的 T 字段无默认值：实例化时按实参类型取零值
+    let Box2<i32> a = Box2()
+    assert_eq(a.v, 0)
+    let Box2<string> s = Box2()
+    assert_eq(s.v, "")
+    let Pair2<i32, string> pr = Pair2()
+    assert_eq(pr.x, 0)
+    assert_eq(pr.y, "")
+    assert_eq(takeBox(Box2()), 0)
+    // 5) 字面量构造按上下文落型
+    let Pct<i32> p = Pct(7)        // 声明初值
+    assert_eq(p.v, 7)
+    p = Pct(8)                    // 赋值
+    assert_eq(p.v, 8)
+    let Pct<i32>[] ps
+    ps = push(ps, Pct(9))         // push 元素
+    assert_eq(ps[0].v, 9)
+    assert_eq(take(Pct(10)), 10)  // 实参
+    let Box2<Pct<i32>> bb = Box2(Pct(11))
+    assert_eq(bb.v.v, 11)
+    let Q q = Q(Pct(12))          // struct 字段
+    assert_eq(q.p.v, 12)
+    return

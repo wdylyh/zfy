@@ -1149,20 +1149,24 @@ and parse_match_arms p tp =
 
 (* let x = match ...（v3.11）：match 初始化表达式，脱糖为透明块——
    目标变量零值声明 + 每个 arm 体转为对目标的赋值。
-   目标类型由 let 头给出；限标量/struct/string 形状（零初始化）；
-   arm 体须为单表达式语句（绑定变量在 arm 内仍可用） *)
+   目标类型由 let 头给出或由 typeck 按 arm 体公共类型推断（省略类型）；
+   限标量/struct/string 形状（零初始化）；arm 体须为单表达式语句，
+   缩进块体（多语句）时末表达式作为 arm 值（其余语句照常执行） *)
 and parse_match_decl p tp name ty_opt is_const is_frac is_unred =
   if is_const then
     err tp "const does not support a match initializer";
   let (scrut, arms) = parse_match_arms p tp in
+  (* arm 体末语句改写为对目标的赋值；块体保留前序语句（作用域同 arm） *)
   let arms2 =
     List.map
       (fun (a : marm) ->
-        match a.mbody with
-        | [ SExpr e ] ->
-          { a with mbody = [ SAssign (EVar (name, tp), e, a.mpos) ] }
-        | _ ->
-          err a.mpos "match initializer arms must be a single expression statement")
+        let rec go acc = function
+          | [] -> err a.mpos "match initializer arm must end with an expression"
+          | [ SExpr e ] ->
+            List.rev (SAssign (EVar (name, tp), e, a.mpos) :: acc)
+          | st :: rest -> go (st :: acc) rest
+        in
+        { a with mbody = go [] a.mbody })
       arms
   in
   SBlock ([ SDecl (false, is_frac, is_unred, false, name, ty_opt, None, tp);
@@ -1357,6 +1361,21 @@ and parse_stmt p =
      | (Newline, _) | (Dedent, _) | (Eof, _) ->
        end_of_stmt p;
        SReturn (None, tp)
+     | (Keyword KMatch, _) ->
+       (* return match（v3.30 表达式位置 match，最常见形态）：
+          脱糖 = 语句位置 SMatch，arm 体为单表达式时改写为 `return expr`。
+          arm 体为缩进块时保留原块（须在块内显式 return）；
+          穷尽性检查与语句位置一致（enum scrutinee 须覆盖全部变体或 `_`） *)
+       let (scrut, arms) = parse_match_arms p tp in
+       let arms2 =
+         List.map
+           (fun (a : marm) ->
+             match a.mbody with
+             | [ SExpr e ] -> { a with mbody = [ SReturn (Some e, a.mpos) ] }
+             | _ -> a)
+           arms
+       in
+       SMatch (scrut, arms2, tp)
      | _ ->
        let e = parse_expr p in
        end_of_stmt p;
@@ -1524,6 +1543,8 @@ and parse_nested_fn p tp =
        | (Ident _, _) -> Some (parse_ty p)
        | (LBracket, _) | (Star, _) | (Bang, _) | (Lt, _) -> Some (parse_ty p)
        | _ -> None)
+    (* v3.30：嵌套函数返回闭包类型 *)
+    | (Keyword KFn, _) -> Some (parse_ty p)
     | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty p)
     | _ -> None
   in
@@ -2352,6 +2373,9 @@ and parse_item p =
          | (Ident _, _) -> Some (parse_ty p)
          | (LBracket, _) | (Star, _) | (Bang, _) | (Lt, _) -> Some (parse_ty p)
          | _ -> None)
+      (* v3.30：返回类型为闭包 fn(T...) -> R（前置 fn 已消费，此处 KFn
+         只可能是返回类型，无歧义） *)
+      | (Keyword KFn, _) -> Some (parse_ty p)
       | _ when is_qpath_start p.toks && looks_like_ty_path p -> Some (parse_ty p)
       | _ -> None
     in

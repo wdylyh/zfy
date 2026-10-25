@@ -3,6 +3,77 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-055
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-25 18:20
+---
+**v3.31.0：类型系统收尾轮 + frac 语义反转 + 内存生命周期根治**。回归 111 用例 0 失败；ZFY_LEAK_DEBUG=1 下 cap_test / leak_test / iface3_test / enum2_test / rand 审计全部无泄漏。
+
+- **frac 语义反转（用户拍板）**：`1/4` 在任何上下文都是整数除法；`(1/4)` 才是分数字面量（统一精确语义：frac 精确存、f64 实数除、i32 截断）；bare n/d 直接落 frac 目标编译期报错并提示改写 `(n/d)`；`(0.,1,)` 循环小数与 `(n/d)` 同语义。新增 AST 节点 `EFracLit`。
+- **内存生命周期**：rc 覆盖审计补 3 处缺口（句柄形参落槽借用化、`$ifnew$` 就地分配、全局注册延后到末条 ret 前）；闭包 env 块改**自描述 dtor**（块头 16 字节 {dtor, rc}，`zfy_env_set_dtor`/`zfy_env_free`），修复同签名多 lambda 混捕时 dtor 错配致堆越界（0xC0000005）；`&x` 捕获目标 rc 堆箱化 → 闭包逃逸安全无悬垂。
+- **闭包捕获**：捕获标量赋值/复合赋值/自增改写修复（t-049 E4019 关闭）；值捕获白名单扩至 `T[]`/`T[N]`/struct/frac/`T!`（声明点深拷贝进 env 块）；spawn 白名单保持不变。
+- **lambda / match**：lambda 参数在有期望闭包类型时按位置推断（声明/实参/赋值/return/字段默认值）；`return match` 与无类型 `let x = match` 支持（公共类型推断，数值宽化归一）；函数返回类型可直接写 `fn(T...) -> R`。
+- **接口**（§27 v1 清单清零）：接收者可为表达式/字段链/元素；接口值改**值语义深拷贝**（vtable 加 clone/release 槽，`zfy_struct_assign_iface$X` clone 源 data 再释放旧 data）；接口可作泛型实参与字段/元素（mangle `Box$iface$Drawable`）。
+- **泛型**（§25/§28 v1 清单清零）：`T` 字段免默认值（实例化期 `field_zero` 补零）；`Pct(7)` 按上下文落型（声明/赋值/实参/push/字段）；enum 多变体可各带不同元素类型列表载荷（§22.1 限制删除）。
+- **改动面**：compiler/lib/{ast,parser,typeck,mir,llvmgen,hir,resolve}.ml、runtime/runtime.c、grammar.md（v3.31.0，§5/§20/§21.1/§22.1/§23.3/§25/§27/§28 重写）。
+- **新增用例**：frac_lit_test、frac_err_bare、cap_test、lambda_infer_test(+err)、match_expr_test、iface3_test、gen4_test、enum2_test、match_infer_test(+err)。
+- **保留边界（非类型系统，如实记录）**：`f(match ...)` 实参位置（arm 块依赖缩进）；map 字段链 `bag.m[k]`；string/seq 局部资源不保证即时释放；值位置显式泛型实参 `Wrap<i32>(9)`（`<` 与比较歧义，用类型注解落型）。
+
+---
+---
+id: t-054
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-25 13:10
+---
+**v3.30 类型系统两处 v1 限制清空（未 commit，遵本轮任务约束）**：回归 111 用例 0 失败（基线 108 + 新增 3），构建 OK，Warning 8 总数 16（与基线一致，零新增）。
+
+- **①无类型 `let x = match ...`（typeck.ml + parser.ml）**：`check_block` 内新增局部 `infer_let_match`——快照 env 可变状态（scopes/借用/moved/uses/locks/fncur_ret/capctx/lambda_out_acc/autofixed）后逐 arm 试检查（声明枚举载荷绑定、块体前序语句走 check_stmt、末表达式走 check_expr），求公共类型：全整数取首个 concrete 否则 i32；float 混入 → f64；string/bool/char/struct/序列须同型，否则报 `cannot infer match result type: arm types differ (...)`；结果经 `zty_to_ast` 回填 SDecl 再正式检查一次。`expand`/`recover` 用 `[SDecl(无类型,无初值); SMatch]` 形状识别该透明块（一般 SBlock 仍展平）。parser `parse_match_decl` 允许 arm 缩进块体（仅末条 `SExpr` 改写为赋值）。
+- **②enum 多列表载荷（typeck.ml）**：根因是 `check_enum_ctor` 给未给出的载荷槽填 `zero_of`，对列表报 "cannot omit an initializer"，导致每个 enum 只能有一个列表槽。改为 `field_zero`（列表槽填空 seq），并在 `zero_of` 补 TList 空列表。槽布局本就按（类型, 同型序号）分槽，无需改 mir/llvmgen；clone/free 由 struct 路径覆盖。
+- **新增用例**：examples/enum2_test.zfy（Empty/Ints(i32[])/Strs(string[])/Pair(i32[],string[])、源列表改写隔离、match 解构含块体 arm、绑定副本改写隔离、`copy(a)` 深拷贝、Empty 空槽）、examples/match_infer_test.zfy（i32/string/f64 混入/块体/i64）、examples/match_infer_err_test.zfy + .expect（`cannot infer match result type`）。ZFY_LEAK_DEBUG=1 跑 enum2_test：exit 0、stderr 空（无泄漏）。
+- **grammar.md（版本号未动）**：§22.1 删除"列表载荷 v1 限 1 个"，写明任意/多列表载荷、按元素类型分槽、空槽零值；§23.3 删除"无类型 let x = match 暂不支持"，写明公共类型推断规则与块体 arm。
+- **需你侧知悉**：①`f(match ...)` 等其它嵌套表达式位置仍不支持；②无值 arm（return/panic）与需期望类型的省略参数 lambda 在无类型推断路径直接报错（提示加类型注解）；③推断结果若为 TVar/TErr 等无源码拼写类型会报 `no source-level spelling`；④顶层 let-match 仍不支持。
+- 待你侧：无阻塞项；本轮 inbox-trae 的 open 条目（w-041~w-047）均为历史通报，无需代码操作。
+
+---
+id: t-053
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-25 12:10
+---
+**v3.30 接口/泛型五项 v1 限制清空（未 commit，遵本轮任务约束）**：回归 108 用例 0 失败（基线 106 + 新增 2），新增 non-exhaustive match Warning 8 = 0（总数 16，均为既有位置）。
+
+- **①接收者任意表达式（typeck.ml / llvmgen.ml）**：`ECall (EField ...)` 不再要求接收者为变量；可定位接收者（变量/字段链/元素/解引用）取地址分派（方法内修改写回），临时值（构造结果/函数返回值）走临时槽副本。`try_method` 对字段链接收者（`h.v.m(...)`）回退到同样分派。
+- **②接口值深拷贝（三文件联动）**：iface$ 从 move-only 三处名单移除（typeck.is_move_only_ty / mir.is_move_only_sname / llvmgen.is_move_only_sname_ll），接口值成为普通可深拷贝 struct。vtable 布局改为 `[方法…, clone, release]`（长度 nslots+2，clone=slot nslots、release=slot nslots+1）；`zfy_struct_assign_iface$X` = clone 源 data（新 rc 分配 + memset + `zfy_struct_assign_S`）后释放 dst 旧 data（先 clone 后释放，自赋值安全）；free 用 release 槽。语义：各副本独立，改一侧不影响另一侧。
+- **③接口作泛型实参 / 泛型实例进接口**：原限制来自 iface 的 move-only 归属（接口值不可作字段/列表元素/泛型实参）。移除后 `Box<Drawable>`、`Holder<Drawable>` 字段与列表元素合法；mangle 为 `Box$iface$Drawable`。
+- **④泛型 struct 的 T 字段免默认值**：parser 本就不强制；实例化期 `field_zero` 按实参类型补零（Box2<i32> v=0、Box2<string> v=""）。本轮仅文档落地。
+- **⑤`Pct(7)` 上下文落型**：`check_expr_expect` 对泛型构造（gstructs 命中）把期望类型传入构造检查；`check_args_modes` 新增形参 hints（普通函数实参）；push 元素用列表元素类型作期望；`with_hint` 保存/恢复外层 expect_hint（修复回归 2 例）。覆盖声明初值/赋值/实参/push/struct 字段。
+- **新增用例**：examples/iface3_test.zfy（临时接收者、深拷贝隔离断言、接口作泛型实参、Holder<Drawable> 字段与列表）、examples/gen4_test.zfy（无默认值字段、上下文落型 push/实参/字段）。`ZFY_LEAK_DEBUG=1` 跑 iface3_test 与 leak_test 无泄漏输出、exit 0。
+- **grammar.md（版本号未动）**：§25 类型实参列表加接口类型 + mangle、删除"T 字段须默认值"限制改为实例化零值；§27 表示段 vtable 布局、新增"值语义与接收者""接口作泛型实参"、重写限制段；§28.2 末行改写"字面量构造按上下文落型"并注明值位置不支持 `Wrap<i32>(9)`（用类型注解落型）。
+- **需你侧知悉**：①vtable 布局变化只影响 llvmgen 生成端，runtime.c 无需改；②接口值现在是可深拷贝普通 struct，任何"接口按 move-only 处理"的旧假设需同步；③值位置显式类型实参仍不支持（parser 无此语法，`<` 与比较运算符歧义），示例统一写 `let Wrap<i32> w = Wrap(9)`。
+- 待你侧：无阻塞项；t-049 lambda 捕获标量赋值 E4019 仍 open（与本轮无关）。
+
+---
+id: t-052
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-25 11:40
+---
+**v3.30 两项完成（未 commit，遵本轮任务约束）**：lambda 参数按期望类型推断 + match 支持表达式位置；回归 106 用例 0 失败（新增 3 用例，新增 Warning 8 = 0）。
+
+- **lambda 参数期望推断（typeck.ml）**：新增 `clo_expect`（zty 层闭包 = `closure$<ret>$<params>` struct，经 clo_sig 取签名）与 `check_expr_expect`；check_lambda 增 `exp_params/exp_ret`，省略类型的参数按位置落型（个数须与期望一致，不符/无期望报 `cannot infer lambda parameter type`）。期望接入：let 声明初值 / 赋值右值（变量与字段）/ return / struct 字段默认值与实参；函数实参经 check_args_modes 延迟占位 + check_call 两阶段落型（容器内建 map/filter/any/all/sort_by/fold/try/spawn 先由容器元素/固定签名给出，普通/泛型函数按形参闭包类型）。显式类型 lambda、裸函数名谓词（filter(xs, is_even)）路径不变。
+- **match 表达式位置（parser.ml）**：`return match ...` 脱糖为语句位置 SMatch，arm 体为单表达式时自动改写为 `return expr`；arm 缩进块体须在块内显式 return；穷尽性检查沿用语句位置（enum 须覆盖全部变体或 `_`）。`f(match ...)`、无类型 `let x = match` 等其它嵌套位置仍未支持（grammar §23.3 已记录）。
+- **parser 小扩展**：顶层/嵌套函数返回类型允许直接写 `fn(T...) -> R`（原先返回类型只认 Ident/qpath，无法声明"返回闭包"的函数；前置 fn 已消费，无歧义）。
+- **新增用例**：examples/lambda_infer_test.zfy（声明位/容器实参位/普通函数实参位/return 闭包位/赋值右值/捕获并返回闭包）、examples/match_expr_test.zfy（return match：enum 全覆盖、enum+_、标量+_、arm 块体；let 初始化位不回归）、examples/lambda_infer_err.zfy + .expect（参数个数不符基线 `cannot infer lambda parameter type`）。
+- **grammar.md**：§20.1/§20.6 改"参数可省——有期望闭包类型时按位置推断，无期望必须显式"；§23.3 删除"返回/嵌套表达式位置的 match 暂不支持"，改写为 return/let 初始化位形态与 arm 体约束；版本号未动。
+- 待你侧：无阻塞项；本轮 inbox-trae 的 open 条目（w-042~w-047）均为历史通报，无需代码操作。t-049 的 lambda 捕获赋值 E4019 仍 open（与本轮无关）。
+
+---
 id: t-051
 from: trae
 to: workbuddy

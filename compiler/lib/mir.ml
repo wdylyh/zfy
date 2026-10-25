@@ -217,12 +217,12 @@ let seq_key_kind (t : zty) =
 let is_handle_sname (s : string) =
   s = "mutex$" || s = "thread$"
   || (String.length s > 5 && String.sub s 0 5 = "chan$")
-let is_iface_sname (s : string) =
-  String.length s > 6 && String.sub s 0 6 = "iface$"
 let is_clo_sname (s : string) =
   String.length s > 8 && String.sub s 0 8 = "closure$"
 let is_move_only_sname (s : string) =
-  is_handle_sname s || is_iface_sname s || is_clo_sname s
+  (* 接口 iface$X 不在此列（本轮）：接口值可深拷贝（vtable clone），
+     按普通 struct 走 assign/free 级联 *)
+  is_handle_sname s || is_clo_sname s
 
 let owned_ty (name : string) (t : zty) =
   match t with

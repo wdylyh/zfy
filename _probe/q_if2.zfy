@@ -1,0 +1,18 @@
+interface Drawable
+    fn i32 getv()
+    fn void setv(let i32 x)
+
+struct Circle
+    i32 v = 0
+    fn i32 getv()
+        return self.v
+    fn void setv(let i32 x)
+        self.v = x
+
+fn main()
+    let Drawable a = Drawable(Circle(1))
+    a.setv(5)
+    let Drawable b = copy(a)
+    b.setv(9)
+    output(a.getv(), ",", b.getv(), "\n")
+    return

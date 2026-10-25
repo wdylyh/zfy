@@ -1,0 +1,66 @@
+// v3.30 lambda 参数期望推断测试
+// 覆盖：声明位 / 容器算法实参位 / 函数实参位 / return 位 / 赋值右值；
+// 显式类型 lambda 与裸函数名谓词照旧（不回归）。
+
+fn bool is_even(let i32 v)
+    return v % 2 == 0
+
+fn i32 apply_twice(let fn(i32) -> i32 f, let i32 v)
+    return f(f(v))
+
+fn fn(i32) -> i32 make_inc(let i32 base)
+    return fn(x) => x + base
+
+fn fn(i32) -> i32 choose(let bool left)
+    if left
+        return fn(x) => x + 1
+    return fn(x) => x * 10
+
+fn main()
+    // 1) 声明位：按声明闭包类型推断参数
+    let fn(i32) -> i32 dbl = fn(x) => x * 2
+    assert_eq(dbl(21), 42)
+    let fn(i32, i32) -> i32 add = fn(a, b) => a + b
+    assert_eq(add(20, 22), 42)
+
+    // 2) 容器算法实参位（元素类型 → 参数；返回由体/语义定）
+    let i32[] xs = 3, 1, 4, 1, 5
+    let i32[] dd = map(xs, fn(v) => v * 2)
+    assert_eq(dd[2], 8)
+    let i32[] big = filter(xs, fn(v) => v > 2)
+    assert_eq(count(big, 3), 1)
+    // assert_eq 只支持标量/string（bool 走 output 验证）
+    output(any(xs, fn(v) => v > 4))
+    output(all(xs, fn(v) => v > 0))
+    let i32[] desc = sort_by(xs, fn(a, b) => b - a)
+    assert_eq(desc[0], 5)
+    let i32 total = fold(xs, fn(acc, v) => acc + v, 0)
+    assert_eq(total, 14)
+
+    // 3) 普通函数实参位（形参类型 = fn(i32) -> i32）
+    assert_eq(apply_twice(fn(v) => v + 1, 40), 42)
+
+    // 4) return 位（函数返回类型 = 闭包类型）
+    let fn(i32) -> i32 inc = choose(true)
+    let fn(i32) -> i32 ten = choose(false)
+    assert_eq(inc(41), 42)
+    assert_eq(ten(41), 410)
+
+    // 5) 捕获 + 返回闭包的函数（返回值按声明落型）
+    let fn(i32) -> i32 addb = make_inc(100)
+    assert_eq(addb(5), 105)
+
+    // 6) 赋值右值（目标变量类型已知）
+    let fn(i32) -> i32 sq = fn(i32 x) => 0
+    sq = fn(x) => x * x
+    assert_eq(sq(6), 36)
+
+    // 7) 显式类型 lambda 照旧
+    let fn(i32) -> i32 dbl2 = fn(i32 x) => x * 2
+    assert_eq(dbl2(21), 42)
+
+    // 8) 裸函数名谓词照旧
+    let i32[] ev = filter(xs, is_even)
+    assert_eq(count(ev, 4), 1)
+
+    output("lambda_infer ok")

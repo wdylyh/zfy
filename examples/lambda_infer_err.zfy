@@ -1,0 +1,4 @@
+// v3.30 lambda 参数推断失败基线：期望闭包类型与 lambda 参数个数不符
+fn main()
+    let fn(i32) -> i32 f = fn(a, b) => a + b
+    output(f(1, 2))

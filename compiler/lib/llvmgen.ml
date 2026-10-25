@@ -1306,7 +1306,13 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
       in go 0 imethods
     in
     let (_, _ptys, ret) = List.nth imethods slot in
-    let (ifp, _) = ptr_of fc ifc in
+    let (ifp, _) =
+      match ifc.oty with
+      | TPtr (TStruct _) ->
+        (* 位置接收者（变量/字段/元素地址）：指针值即接口槽地址 *)
+        let (v, _) = val_of fc ifc in (v, ll_ty ifc.oty)
+      | _ -> ptr_of fc ifc
+    in
     let data = fresh_r fc in
     emitf fc "  %s = load ptr, ptr %s" data ifp;
     let ifty = ll_ty (TStruct ("iface$" ^ iname)) in
@@ -2825,11 +2831,11 @@ let gen_term fc (t : term) =
 (* ---------- 函数生成 ---------- *)
 
 (* move-only struct 名判定（llvmgen 侧，与 mir.move_only_ty 对应）：
-   句柄 mutex$/thread$/chan$<tag>、接口 iface$X、闭包 closure$<sig> *)
+   句柄 mutex$/thread$/chan$<tag>、闭包 closure$<sig>。
+   接口 iface$X 不在此列（本轮）：接口值按普通 struct 深拷贝/级联释放 *)
 let is_move_only_sname_ll (s : string) : bool =
   s = "mutex$" || s = "thread$"
   || (String.length s > 5 && String.sub s 0 5 = "chan$")
-  || (String.length s > 6 && String.sub s 0 6 = "iface$")
   || (String.length s > 8 && String.sub s 0 8 = "closure$")
 
 (* v3.27 审计修复：把 ins（待发射的调用文本）插到函数体最后一条 ret
@@ -3022,7 +3028,9 @@ let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
     Printf.sprintf
       "define void @zfy_struct_free_%s(ptr %%p) {\n  call void @zfy_chan_free(ptr %%p)\n  ret void\n}\n"
       sd.sname
-  (* 接口值：{ data, vt } → vtable 末槽 release(data) *)
+  (* 接口值：{ data, vt } → vtable 末槽 release(data)。
+     vtable 布局 = [方法…, clone, release]：release 在 nslots+1，
+     clone 在 nslots（拷贝时按动态类型深拷贝 data，值语义）。 *)
   else if String.length sd.sname > 6 && String.sub sd.sname 0 6 = "iface$" then
     let iname = String.sub sd.sname 6 (String.length sd.sname - 6) in
     let nslots =
@@ -3032,7 +3040,7 @@ let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
     in
     Printf.sprintf
       "define void @zfy_struct_free_%s(ptr %%p) {\n  %%d = load ptr, ptr %%p\n  %%z = icmp eq ptr %%d, null\n  br i1 %%z, label %%skip, label %%do\nskip:\n  ret void\ndo:\n  %%vtp = getelementptr inbounds %s, ptr %%p, i32 0, i32 1\n  %%vt = load ptr, ptr %%vtp\n  %%fp = getelementptr [ %d x ptr ], ptr %%vt, i64 0, i32 %d\n  %%rel = load ptr, ptr %%fp\n  call void %%rel(ptr %%d)\n  ret void\n}\n"
-      sd.sname sn (nslots + 1) nslots
+      sd.sname sn (nslots + 2) (nslots + 1)
   (* 闭包句柄：field0 = env 块地址（块头即 code）→ zfy_env_free
      （t-049/C：env 自描述析构——块内 dtor（@zfy.clofree$<clenv>，纯字段
      级联）+ rc 递减 + free 整块。同签名多个 clenv 布局各自正确，
@@ -3105,10 +3113,52 @@ let gen_struct_assign_fn (sd : sdef) : string =
       "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n  %%v = load ptr, ptr %%src\n  call void @zfy_rc_retain(ptr %%v)\n  store ptr %%v, ptr %%dst\n  ret void\n}\n"
       sd.sname
   else if String.length sd.sname > 6 && String.sub sd.sname 0 6 = "iface$" then
+    (* 本轮 值语义：接口值拷贝 = 按动态类型 clone data 堆块（vtable clone
+       槽）+ 新 rc 份额；再释放 dst 旧 data（先 clone 后释放，自赋值安全）。
+       源 data 为 null（未初始化）时目标同样置空。 *)
+    let iname = String.sub sd.sname 6 (String.length sd.sname - 6) in
+    let nslots =
+      match Hashtbl.find_opt Typeck.iface_tbl iname with
+      | Some ms -> List.length ms
+      | None -> lerr None "undefined interface %s" iname
+    in
     let sn = struct_ty_name sd.sname in
     Printf.sprintf
-      "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n  %%d = getelementptr inbounds %s, ptr %%dst, i32 0, i32 0\n  %%s0 = getelementptr inbounds %s, ptr %%src, i32 0, i32 0\n  %%v = load ptr, ptr %%s0\n  call void @zfy_rc_retain(ptr %%v)\n  store ptr %%v, ptr %%d\n  %%d1 = getelementptr inbounds %s, ptr %%dst, i32 0, i32 1\n  %%s1 = getelementptr inbounds %s, ptr %%src, i32 0, i32 1\n  %%t = load ptr, ptr %%s1\n  store ptr %%t, ptr %%d1\n  ret void\n}\n"
-      sd.sname sn sn sn sn
+      "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n\
+       \  %%s0 = getelementptr inbounds %s, ptr %%src, i32 0, i32 0\n\
+       \  %%v = load ptr, ptr %%s0\n\
+       \  %%s1 = getelementptr inbounds %s, ptr %%src, i32 0, i32 1\n\
+       \  %%t = load ptr, ptr %%s1\n\
+       \  %%z = icmp eq ptr %%v, null\n\
+       \  br i1 %%z, label %%nul, label %%clone\n\
+       clone:\n\
+       \  %%cfp = getelementptr [ %d x ptr ], ptr %%t, i64 0, i32 %d\n\
+       \  %%cf = load ptr, ptr %%cfp\n\
+       \  %%nd = call ptr %%cf(ptr %%v)\n\
+       \  br label %%merge\n\
+       nul:\n\
+       \  br label %%merge\n\
+       merge:\n\
+       \  %%nd2 = phi ptr [ %%nd, %%clone ], [ null, %%nul ]\n\
+       \  %%t2 = phi ptr [ %%t, %%clone ], [ null, %%nul ]\n\
+       \  %%d0 = getelementptr inbounds %s, ptr %%dst, i32 0, i32 0\n\
+       \  %%old = load ptr, ptr %%d0\n\
+       \  %%oz = icmp eq ptr %%old, null\n\
+       \  br i1 %%oz, label %%set, label %%rel\n\
+       rel:\n\
+       \  %%d1 = getelementptr inbounds %s, ptr %%dst, i32 0, i32 1\n\
+       \  %%ovt = load ptr, ptr %%d1\n\
+       \  %%rfp = getelementptr [ %d x ptr ], ptr %%ovt, i64 0, i32 %d\n\
+       \  %%rf = load ptr, ptr %%rfp\n\
+       \  call void %%rf(ptr %%old)\n\
+       \  br label %%set\n\
+       set:\n\
+       \  store ptr %%nd2, ptr %%d0\n\
+       \  %%de = getelementptr inbounds %s, ptr %%dst, i32 0, i32 1\n\
+       \  store ptr %%t2, ptr %%de\n\
+       \  ret void\n\
+       }\n"
+      sd.sname sn sn (nslots + 2) nslots sn sn (nslots + 2) (nslots + 1) sn
   else begin
   let b = Buffer.create 256 in
   let emit : 'a. ('a, unit, string, unit) format4 -> 'a =
@@ -3219,6 +3269,17 @@ let gen_program (m : mir) : string =
           (Printf.sprintf
              "define internal void @zfy_ifrel$%s$%s(ptr %%data) {\n  call void @zfy_rc_release(ptr %%data, ptr @zfy_struct_free_%s)\n  ret void\n}\n"
              iname sname sname);
+        (* 本轮：clone fn（vtable 倒数第二槽）——接口值拷贝的深拷贝源：
+           按实现 struct 的 assign 语义新分配 rc 块（string/seq/嵌套字段
+           深拷贝，句柄字段 retain 配平），返回独立份额。 *)
+        (match find_struct g sname with
+         | Some sd ->
+           let (sz, _) = Hir.struct_size_align g.structs sd in
+           Buffer.add_string g.mbuf
+             (Printf.sprintf
+                "define internal ptr @zfy_ifclone$%s$%s(ptr %%data) {\n  %%z = icmp eq ptr %%data, null\n  br i1 %%z, label %%skip, label %%do\nskip:\n  ret ptr null\ndo:\n  %%blk = call ptr @zfy_rc_alloc(i64 %d)\n  call void @llvm.memset.p0.i64(ptr %%blk, i8 0, i64 %d, i1 false)\n  call void @zfy_struct_assign_%s(ptr %%blk, ptr %%data)\n  ret ptr %%blk\n}\n"
+                iname sname sz sz sname)
+         | None -> lerr None "undefined struct %s" sname);
         let thunks =
           List.map
             (fun (mn, ptys, ret) ->
@@ -3255,9 +3316,9 @@ let gen_program (m : mir) : string =
             imethods
         in
         Buffer.add_string g.mbuf
-          (Printf.sprintf "@vt$%s$%s = constant [ %d x ptr ] [ %s, ptr @zfy_ifrel$%s$%s ]\n"
-             iname sname (nslots + 1)
-             (String.concat ", " thunks) iname sname))
+          (Printf.sprintf "@vt$%s$%s = constant [ %d x ptr ] [ %s, ptr @zfy_ifclone$%s$%s, ptr @zfy_ifrel$%s$%s ]\n"
+             iname sname (nslots + 2)
+             (String.concat ", " thunks) iname sname iname sname))
     Typeck.iface_impls;
   (* 每个 struct 的元素操作对（w-014 #2）：struct 作 seq 元素时
      zfy_seq_set_agg/get_agg/free 按头部 ops 深拷贝/释放 *)

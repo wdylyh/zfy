@@ -1,0 +1,35 @@
+// probe：接口临时接收者 + 深拷贝 + 泛型实参
+interface Drawable
+    fn f64 area()
+    fn i32 getv()
+
+struct Circle
+    f64 r = 0.0
+    i32 v = 0
+    fn f64 area()
+        return 3.14 * self.r * self.r
+    fn i32 getv()
+        return self.v
+    fn void setv(let i32 x)
+        self.v = x
+
+fn Drawable getShape()
+    return Drawable(Circle(2.0))
+
+struct Wrap<T>
+    T x = 0
+    fn i32 getv()
+        return 7
+
+fn main()
+    // 1) 临时接收者
+    output(Drawable(Circle(2.0)).area(), "\n")
+    output(getShape().area(), "\n")
+    // 2) 深拷贝隔离
+    let Drawable a = Drawable(Circle(1.0))
+    let Drawable b = a
+    let Wrap<i32> w = Wrap(9)
+    // 3) 泛型实例进接口
+    let Drawable d = Drawable(w)
+    output(d.getv(), "\n")
+    return

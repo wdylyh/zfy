@@ -140,15 +140,15 @@ let widen_target (a : zty) (b : zty) : zty =
     if ws >= 2 * wu then (if sa then a else b) else TUint (max ws wu)
 
 (* move-only 类型（P0-1，v3.27）：File、句柄（mutex$/thread$/chan$<tag>）、
-   接口（iface$X）、闭包（closure$<sig>）——变量间转移 = 所有权转移
-   （源槽清空），值语义拷贝废止 *)
+   闭包（closure$<sig>）——变量间转移 = 所有权转移（源槽清空），
+   值语义拷贝废止。接口 iface$X 不在此列（本轮）：接口值按底层动态
+   类型深拷贝（vtable clone 槽），拷贝/传参/入列表/返回均为独立副本 *)
 let is_move_only_ty (t : zty) : bool =
   match t with
   | TFile -> true
   | TStruct s ->
     s = "mutex$" || s = "thread$"
     || (String.length s > 5 && String.sub s 0 5 = "chan$")
-    || is_iface_name s
     || (String.length s > 8 && String.sub s 0 8 = "closure$")
   | _ -> false
 
@@ -1186,6 +1186,10 @@ let rec zero_of (env : env) (p : pos) (t : zty) : texpr =
        非零 default，如 Outer 裸声明丢 Inner.msg="im"） *)
     check_struct_new env p s []
   | TPtr _ -> mk ENullK
+  | TList et ->
+    (* 空列表零值（v1 限制清理）：仅 let x = match ... 推断出列表类型时
+       走到这里——parser 不接受裸 `let T[] x`（SSeqDecl 要求初值） *)
+    { e = EEmptySeqK; ety = TList et; epos = p }
   | TErr et ->
     (* T! 裸声明：成功包元素零值（code=0 误读安全）；
        ety 须为外层 TErr（模式变量 et 避免遮蔽外层 t） *)
@@ -1885,19 +1889,28 @@ and try_capture env name p' =
 (* lambda 检查（v3.7）：ELambda 表达式与 SFn 嵌套函数共用。
    nmopt = Some 名（嵌套函数，实例名用其名）；产 EClNewK（h 句柄）。
    实例 tfn（env 参数 + 捕获改写后的 body）进 lambda_out_acc。
-   v1 约定：lambda 参数必须显式类型；捕获字段限标量/string/bool/char/
-   指针/句柄（seq/struct 捕获不支持）；env 堆块生命周期 = 进程。 *)
-and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
+   v3.30 期望推断：exp_params = 上下文给出的参数类型列表（如声明类型
+   fn(i32) -> i32 的 i32 列表 / map 的元素类型），exp_ret = 上下文给出的
+   返回类型。省略类型的参数严格按位置落型——个数须与 exp_params 一致；
+   任何参数既无显式类型又无可用期望 → cannot infer lambda parameter type。
+   显式写类型的参数优先级高于期望（照旧）。捕获字段限标量/string/bool/
+   char/指针/句柄（seq/struct 捕获不支持）；env 堆块生命周期 = 进程。 *)
+and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option)
+    (exp_params : zty list option) (exp_ret : zty option) =
   let mk k ty = { e = k; ety = ty; epos = lp } in
+  let nparams = List.length lam.lparams in
   let ptys =
-    List.map
-      (fun (prm : lparam) ->
+    List.mapi
+      (fun i (prm : lparam) ->
         match prm.lpty with
         | Some t -> resolve (conv_ty env.g prm.lppos t)
         | None ->
-          terr prm.lppos
-            "lambda parameter '%s' needs an explicit type, e.g. fn(i32 x) => x * 2 (context inference is not supported yet)"
-            prm.lpname)
+          (match exp_params with
+           | Some ps when List.length ps = nparams -> resolve (List.nth ps i)
+           | _ ->
+             terr prm.lppos
+               "cannot infer lambda parameter type: '%s' has no declared type and the context provides no matching closure type (write fn(i32 %s) => ... or give the lambda a fn(T...) -> R type)"
+               prm.lpname prm.lpname))
       lam.lparams
   in
   List.iter
@@ -1910,7 +1923,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
     match lam.lbody with
     | LBlock (_, Some rt) -> Some (resolve (conv_ty env.g lp rt))
     | LBlock (_, None) -> assert false
-    | LExpr _ -> None   (* 由体表达式类型决定 *)
+    | LExpr _ -> Option.map resolve exp_ret   (* 由体表达式类型决定（有期望则按期望） *)
   in
   (match ret0 with
    | Some r ->
@@ -2004,22 +2017,33 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
       let (tret, tbody) =
         match lam.lbody with
         | LExpr e ->
-          let te = check_expr env e in
-          let rt0 = resolve te.ety in
-          (* 未求解 TVar（无期望上下文，如 fn(x) => x）：立即默认化，
-             与收尾 subst_ty 同规则（含浮点字面量子树落 f64）——
-             闭包 mangle 按此型生成，必须先于收尾定型 *)
-          let rt =
-            match rt0 with
-            | TVar _ -> if floaty_texpr te then TFloat 64 else TInt 64
-            | _ -> rt0
-          in
-          (* 尾表达式 → SReturnK（普通函数体同约定：SExprK 不产返回值）；
-             void 尾表达式保留 SExprK（epilogue 产 ret void，避免
-             TRet (Some void) 发射非法 IR `ret void 0`） *)
-          (rt,
-           if resolve rt = TVoid then [ { s = SExprK te; spos = lp } ]
-           else [ { s = SReturnK (Some te); spos = lp } ])
+          (match ret0 with
+           | Some r ->
+             (* 期望返回类型存在（v3.30）：体按期望检查并 coerce——
+                字面量算术树落期望型（fn(x) => x * 2 落 i32 返回）；
+                体本身是 lambda（返回闭包）时同样按期望落型 *)
+             let te = coerce lp (check_expr_expect env e (Some r)) r in
+             if resolve r = TVoid then
+               (r, [ { s = SExprK te; spos = lp } ])
+             else
+               (r, [ { s = SReturnK (Some te); spos = lp } ])
+           | None ->
+             let te = check_expr env e in
+             let rt0 = resolve te.ety in
+             (* 未求解 TVar（无期望上下文，如 fn(x) => x）：立即默认化，
+                与收尾 subst_ty 同规则（含浮点字面量子树落 f64）——
+                闭包 mangle 按此型生成，必须先于收尾定型 *)
+             let rt =
+               match rt0 with
+               | TVar _ -> if floaty_texpr te then TFloat 64 else TInt 64
+               | _ -> rt0
+             in
+             (* 尾表达式 → SReturnK（普通函数体同约定：SExprK 不产返回值）；
+                void 尾表达式保留 SExprK（epilogue 产 ret void，避免
+                TRet (Some void) 发射非法 IR `ret void 0`） *)
+             (rt,
+              if resolve rt = TVoid then [ { s = SExprK te; spos = lp } ]
+              else [ { s = SReturnK (Some te); spos = lp } ]))
         | LBlock (blk, Some _) ->
           env.fncur_ret <- (match ret0 with Some r -> r | None -> assert false);
           let tb = check_block env blk in
@@ -2032,6 +2056,7 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
             | _ -> tb
           in
           ((match ret0 with Some r -> r | None -> assert false), tb)
+        | LBlock (_, None) -> assert false
       in
       pop_scope env;
       (* 缺 return 检查（非 void） *)
@@ -2142,6 +2167,35 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option) =
   in
   mk (EClNewK (mangle, clenv_name, code_op :: cap_ops)) (TStruct mangle)
 
+(* 期望类型 → 闭包签名（v3.30）：源码写的 fn(T...) -> R 经 conv_ty 已落成
+   closure$<ret>$<params> struct 名（函数签名/内建形参同样是 struct 名），
+   故在 zty 层只需识别 closure$ struct；非闭包类型 → None *)
+and clo_expect env (et : zty) (p : pos) : (zty list * zty) option =
+  match resolve et with
+  | TStruct s when is_clo_struct s -> Some (clo_sig env.g s p)
+  | _ -> None
+
+(* 期望类型检查入口（v3.30）：只在上下文能给出明确类型的位置调用——
+   let 声明初值（声明类型）/ 函数实参（形参类型）/ 赋值右值（目标类型）/
+   return（函数返回类型）/ struct 字段默认值（字段类型）。
+   非 lambda 表达式一律照旧 check_expr（期望不参与一般表达式推断）；
+   lambda 且期望为闭包类型时按期望落参数与返回类型。 *)
+and check_expr_expect env (e : expr) (exp : zty option) : texpr =
+  match e, exp with
+  | ELambda (lam, lp), Some et ->
+    (match clo_expect env et lp with
+     | Some (ps, r) -> check_lambda env lam lp None (Some ps) (Some r)
+     | None -> check_expr env e)
+  | ECall (EVar (n, _), _, _), Some et
+    when Hashtbl.mem env.g.gstructs n ->
+    (* 泛型构造字面量构造落型（本轮）：上下文期望类型 → 构造检查的
+       类型实参期望（Pct(7) 在 Pct<i32> 目标下取 i32 实例） *)
+    expect_hint := Some et;
+    let te = check_expr env e in
+    expect_hint := None;
+    te
+  | _ -> check_expr env e
+
 (* 函数名 → 闭包句柄包装（v3.7）：wrapper（首参 env 丢弃，实参透传）进
    lambda_out_acc；产空捕获 EClNewK。槽名 $a0.. 与 fparams 手工一致 *)
 and wrap_fn_as_clo env p fname (ptys : zty list) (ret : zty) =
@@ -2244,8 +2298,11 @@ and check_enum_ctor env (name : string) (p' : pos) (args_opt : call_arg list opt
                    match v with
                    | Some tv -> tv
                    | None ->
+                     (* 未给出的载荷槽填零：列表/数组槽填空 seq（field_zero）——
+                        此前走 zero_of 对列表报"cannot omit an initializer"，
+                        导致 enum 只能有一个列表载荷槽（v1 限制） *)
                      let (_, t, _) = List.nth sd.sfields i in
-                     zero_of env p' t)
+                     field_zero env p' t)
                  vals)
           in
           Some { e = EStructNewK (mangle, fvals); ety = TStruct mangle; epos = p' }
@@ -2968,11 +3025,15 @@ and check_expr env (e : expr) : texpr =
              目标槽根泛化（w-014 #3）：变量/字段链（bag.xs）/ref 参数
              解引用/嵌套元素槽（push(a[i], v)——内层列表为真实槽） *)
           (match args with
-           | [ CPos b; CPos v ] ->
+           | [ CPos b; (CPos _ as v) ] | [ CPos b; (CCopy _ as v) ] ->
+             (* 本轮：值实参也接受显式 copy（copy(a) 与 a 同义——列表元素
+                写入本就按元素类型深拷贝，接口值走 clone 语义） *)
+             let vexpr = (match v with CPos e | CCopy e -> e | _ -> assert false) in
              let root = seq_slot_root env b "push target" in
              (match resolve root.ety with
               | TList e | TPtr (TList e) ->
-                let tv0 = coerce p' (check_expr env v) e in
+                (* 本轮：元素类型已知 → 作期望（Pct(7) 按列表元素实例落型） *)
+                let tv0 = coerce p' (check_expr_expect env vexpr (Some e)) e in
                 (* 返回列表本身（指针根解引用：push(a[i], v) 返回 a[i] 的列表值） *)
                 mk (EPushK (root, { tv0 with ety = resolve e }))
                   (match resolve root.ety with
@@ -3088,15 +3149,15 @@ and check_expr env (e : expr) : texpr =
                            mk (EIndirectCallK (tcallee, targs)) ret
                          | _ ->
                            (* 普通/未知函数调用：走统一实参分派（自动 move/copy/ref） *)
-                           let (targs, origs, modes) = check_args_modes env args in
-                           check_call env p' np name targs origs modes)
+                           let (targs, origs, modes, dlam) = check_args_modes env args in
+                           check_call env p' np name targs origs modes dlam)
                       | None ->
                         (* 枚举变体构造（v3.9）：Shape.Circle(x, y) *)
                         (match check_enum_ctor env name p' (Some args) with
                          | Some te -> te
                          | None ->
-                           let (targs, origs, modes) = check_args_modes env args in
-                           check_call env p' np name targs origs modes))
+                           let (targs, origs, modes, dlam) = check_args_modes env args in
+                           check_call env p' np name targs origs modes dlam))
                    | None ->
                      (* 普通函数调用：走统一实参分派（自动 move/copy/ref）。
                         P0-3：atomic 四内建的实参在分派期检查——豁免须包住
@@ -3105,22 +3166,38 @@ and check_expr env (e : expr) : texpr =
                        List.mem name
                          ["atomic_load"; "atomic_store"; "atomic_add"; "atomic_inc"] in
                      if exempt then env.atomic_exempt <- true;
-                     let (targs, origs, modes) = check_args_modes env args in
+                     (* 本轮：普通函数形参类型已知 → 作为泛型构造实参的落型
+                        期望（f(Pct(7)) 的 7 按 Pct<i32> 实例定 i32） *)
+                     let hints =
+                       match Hashtbl.find_opt env.g.fns name with
+                       | Some sn when List.length sn.params = List.length args ->
+                         Some sn.params
+                       | _ -> None
+                     in
+                     let (targs, origs, modes, dlam) =
+                       check_args_modes ~hints env args in
                      if exempt then env.atomic_exempt <- false;
-                     check_call env p' np name targs origs modes)))))
+                     check_call env p' np name targs origs modes dlam)))))
      | EField (b, seg, pp) ->
        (* 元素/表达式接收者的方法调用（v3.3.8）：arr[i].m(...) / a.b[i].m(...)。
           基为 struct（或 struct 指针）且 seg 命中方法表 → 脱糖为
           <S>__m(ref recv, args)（接收者按引用传：值 struct 走 CRef 取
           元素地址，指针接收者直接传指针值）；否则维持 unsupported callee *)
+       let rec locatable (x : expr) =
+         match x with
+         | EVar _ -> true
+         | EField (bx, _, _) | EIndex (bx, _, _) | EDeref (bx, _) -> locatable bx
+         | _ -> false
+       in
        let tb = check_expr env b in
        (match resolve tb.ety with
         | TStruct s when is_iface_name s ->
-          (* 接口方法分派（v3.13）：接收者须为变量（槽引用） *)
-          (match tb.e with
-           | EVarK _ -> check_iface_call env pp (iface_of_struct s) seg tb args
-           | _ ->
-             terr pp "interface method call on a non-variable expression is not supported yet (assign to a variable first)")
+          (* 接口方法分派（v3.13）：接收者可为任意接口值表达式。
+             位置接收者（变量/字段/元素）取地址分派——方法内的修改写回
+             原处；临时值（构造/函数返回值）用副本，槽在语句末前有效。 *)
+          let recv =
+            if locatable b then check_expr env (EAddrOf (b, pp)) else tb in
+          check_iface_call env pp (iface_of_struct s) seg recv args
         | TStruct s ->
           (match Hashtbl.find_opt method_tbl (s, seg) with
            | Some gname ->
@@ -3133,8 +3210,9 @@ and check_expr env (e : expr) : texpr =
            | None -> terr pp "unsupported callee expression")
         | _ -> terr pp "unsupported callee expression")
      | ELambda (lam, lp) ->
-       (* lambda 立即调用（v3.7）：fn(x) => e(args) = (闭包)(args) *)
-       let tcl = check_lambda env lam lp None in
+       (* lambda 立即调用（v3.7）：fn(x) => e(args) = (闭包)(args)
+          v3.30：无期望上下文——省略参数类型报 cannot infer（显式类型照旧） *)
+       let tcl = check_lambda env lam lp None None None in
        (match resolve tcl.ety with
         | TStruct s when is_clo_struct s ->
           let (ptys, ret) = clo_sig env.g s p' in
@@ -3396,8 +3474,11 @@ and check_expr env (e : expr) : texpr =
        mk (ERemoveK (root, ti, isl)) e
      | t -> terr p' "remove only works on arrays/lists, got %s" (pp_zty t))
   | ELambda (lam, lp) ->
-    (* lambda（v3.7）：检查体 + 实例函数收集 + 产闭包句柄构造 *)
-    check_lambda env lam lp None
+    (* lambda（v3.7）：检查体 + 实例函数收集 + 产闭包句柄构造。
+       v3.30：普通表达式位置无期望类型（省略参数类型报 cannot infer）；
+       有期望的入口（声明/实参/赋值/return/字段默认值）经
+       check_expr_expect / check_call 传期望后再检查 *)
+    check_lambda env lam lp None None None
 
 (* 方法调用尝试（v3.2 随机数模块）：dotted 名 a.b.m(...)，末端 m 命中
    接收者 struct 的方法表 → 改写为脱糖函数调用 <S>__m(ref recv, args)。
@@ -3429,7 +3510,18 @@ and try_method env name p' args =
              Some (check_expr env (ECall (EVar (gname, p'), rarg :: args, p')))
            | None -> None)
         | _ -> None)
-     | None -> None)
+     | None ->
+       (* 本轮：接收者为字段链（h.v.m(...)，front 非变量名）。按表达式
+          分派——字段链本身可定位（h.v 是真实存储），取地址分派使方法内
+          修改写回字段；其它类型维持原路径（返回 None） *)
+       (match split_field_path front with
+        | Some (f0, _) when lookup_var_local env f0 <> None ->
+          let recv = check_expr env (EAddrOf (EVar (front, p'), p')) in
+          (match resolve recv.ety with
+           | TPtr (TStruct s) when is_iface_name s ->
+             Some (check_iface_call env p' (iface_of_struct s) mname recv args)
+           | _ -> None)
+        | _ -> None))
   | _ -> None
 
 (* 接口构造（v3.13）：IfaceName(structValue)——核对 struct 方法集与签名
@@ -3506,8 +3598,46 @@ and check_iface_call env p iname mname recv args =
   { e = ECallK ("$ifcall$" ^ iname ^ "$" ^ mname, recv :: targs, []);
     ety = ret; epos = p }
 
-and check_call env p np name0 targs origs modes =
+and check_call env p np name0 targs origs modes dlam =
   let name = ref name0 in
+  (* v3.30 ①：容器算法/并发内建的 lambda 实参——此处签名由容器实参决定，
+     container_call 之前即可给出参数期望：容器元素类型（filter/any/all
+     返回 bool，sort_by 返回 i32，fold 返回元素类型，map 返回类型由体推断）。
+     容器首实参不是 list 时保持延迟，让 container_call 报原有错误。 *)
+  let container_expect i =
+    match name0, targs with
+    | ("map" | "filter" | "any" | "all"), xs :: _ ->
+      (match resolve xs.ety with
+       | TList e ->
+         if i = 1 then
+           (Some [ e ], if name0 = "map" then None else Some TBool)
+         else (None, None)
+       | _ -> (None, None))
+    | "sort_by", xs :: _ ->
+      (match resolve xs.ety with
+       | TList e -> if i = 1 then (Some [ e; e ], Some (TInt 32)) else (None, None)
+       | _ -> (None, None))
+    | "fold", xs :: _ ->
+      (match resolve xs.ety with
+       | TList e -> if i = 1 then (Some [ e; e ], Some e) else (None, None)
+       | _ -> (None, None))
+    | "try", _ -> if i = 0 then (Some [], None) else (None, None)
+    (* spawn 的闭包实参固定零参（返回类型由体推断，与原先一致） *)
+    | "spawn", _ -> if i = 0 then (Some [], None) else (None, None)
+    | _ -> (None, None)
+  in
+  let targs, dlam =
+    List.fold_left
+      (fun (ts, dl) (i, lam, lp) ->
+        let (eps, ert) = container_expect i in
+        match eps with
+        | Some _ ->
+          (List.mapi
+             (fun j x -> if j = i then check_lambda env lam lp None eps ert else x) ts,
+           List.filter (fun (j, _, _) -> j <> i) dl)
+        | None -> (ts, dl))
+      (targs, dlam) dlam
+  in
   let sig_ =
     match container_call env p name0 targs with
     | Some (n2, s2) -> name := n2; s2
@@ -3582,6 +3712,25 @@ and check_call env p np name0 targs origs modes =
   in  if List.length sig_.params <> List.length targs then
     terr p "function %s expects %d arguments, got %d"
       !name (List.length sig_.params) (List.length targs);
+  (* v3.30 ②：剩余延迟 lambda（普通函数/内置闭包形参）：期望 = 形参闭包
+     类型（conv_ty 后为 closure$ struct，亦兼容源码 TClo）。形参不是闭包
+     类型 → cannot infer（要求显式）。 *)
+  let targs =
+    List.mapi
+      (fun i ta ->
+        match List.find_opt (fun (j, _, _) -> j = i) dlam with
+        | None -> ta
+        | Some (_, lam, lp) ->
+          (match try List.nth sig_.params i with _ -> TVoid with
+           | pt ->
+             (match clo_expect env pt p with
+              | Some (ps, r) -> check_lambda env lam lp None (Some ps) (Some r)
+              | None ->
+                terr lp
+                  "cannot infer lambda parameter type: parameter %d of %s is not a closure type (annotate the lambda parameters explicitly)"
+                  (i + 1) !name)))
+      targs
+  in
   (* ref 参数/实参匹配（new2.md #1）：ref 参数必须 f(ref x)，反之亦然。
      例外（v3.2 struct 方法）：实参本身已是同型指针（方法内 self 转发）时
      CPos 值传等价于传地址，放行 *)
@@ -3914,27 +4063,53 @@ and check_ref_arg env (e : expr) : texpr =
         "ref can only apply to a variable/field/element (pass-by-reference needs an addressable location)";
     check_expr env (EAddrOf (e, pos_of_expr e))
 
-(* 实参列表 → (类型化实参, 模式列表)：0=值 1=move（含自动 move） 2=ref 3=copy *)
-and check_args_modes env (args : call_arg list) : texpr list * expr option list * int list =
-  let triples =
-    List.map
-    (function
-      | CPos e ->
-        (match e with
-         | EVar (n, p) when auto_moveable env n p ->
-           (* 自动 move（new2.md #1：最后使用即 move）——免拷贝移交 *)
-           (check_move_arg env e, None, 1)
-         | _ -> (check_expr env e, Some e, 0))
-      | CMove e -> (check_move_arg env e, None, 1)
-      | CCopy e -> (check_copy_arg env e, None, 3)
-      | CRef e -> (check_ref_arg env e, None, 2)
-      | CNamed (n, e) ->
-        terr (pos_of_expr e) "function calls do not support named argument %s=" n)
-    args
+(* 实参列表 → (类型化实参, 模式列表, 延迟 lambda 表)：
+   模式 0=值 1=move（含自动 move） 2=ref 3=copy；
+   延迟 lambda 表 = (实参下标, lambda, pos)——参数类型省略的 lambda 在此
+   不检查（v3.30：此阶段尚无形参期望类型），由 check_call 按期望闭包
+   类型构造；全显式类型的 lambda 照旧当场检查 *)
+and check_args_modes ?(hints : zty list option = None) env (args : call_arg list)
+  : texpr list * expr option list * int list * (int * lambda * pos) list =
+  let untyped lam =
+    List.exists (fun (p : lparam) -> p.lpty = None) lam.lparams
   in
-  (List.map (fun (a, _, _) -> a) triples,
-   List.map (fun (_, b, _) -> b) triples,
-   List.map (fun (_, _, c) -> c) triples)
+  (* 本轮：按形参类型给泛型构造字面量实参下期望（f(Pct(7)) 落 Pct<i32>）。
+     expect_hint 只被泛型构造检查读取，其余表达式无感。 *)
+  let hint_i i = match hints with Some ps -> List.nth_opt ps i | None -> None in
+  let with_hint i f =
+    (* 保存/恢复外层期望提示：实参检查内部可能消费或改写 expect_hint
+       （如嵌套泛型调用），不能无条件清空——否则外层声明/形参期望丢失 *)
+    let prev = !expect_hint in
+    (match hint_i i with Some et -> expect_hint := Some et | None -> ());
+    let r = f () in
+    expect_hint := prev;
+    r
+  in
+  let triples =
+    List.mapi
+      (fun i (ca : call_arg) ->
+        match ca with
+        | CPos e ->
+          (match e with
+           | ELambda (lam, lp) when untyped lam ->
+             (* 占位 texpr：ety 用未定 TVar（容器算法按首实参决策，不受影响） *)
+             ({ e = EIntK 0L; ety = fresh_var (); epos = lp }, Some e, 0,
+              Some (i, lam, lp))
+           | EVar (n, p) when auto_moveable env n p ->
+             (* 自动 move（new2.md #1：最后使用即 move）——免拷贝移交 *)
+             (check_move_arg env e, None, 1, None)
+           | _ -> (with_hint i (fun () -> check_expr env e), Some e, 0, None))
+        | CMove e -> (check_move_arg env e, None, 1, None)
+        | CCopy e -> (with_hint i (fun () -> check_copy_arg env e), None, 3, None)
+        | CRef e -> (check_ref_arg env e, None, 2, None)
+        | CNamed (n, e) ->
+          terr (pos_of_expr e) "function calls do not support named argument %s=" n)
+      args
+  in
+  (List.map (fun (a, _, _, _) -> a) triples,
+   List.map (fun (_, b, _, _) -> b) triples,
+   List.map (fun (_, _, c, _) -> c) triples,
+   List.filter_map (fun (_, _, _, d) -> d) triples)
 
 (* ref 参数体内改写（new2.md #1）：ref 参数在体内自动解引用——
    读 x → (x)^、写 x = v → (x)^ = v、x op= / x++ 同理；
@@ -4226,17 +4401,16 @@ and check_struct_new env p name (args : call_arg list) : texpr =
           | Some a ->
             (* 字段实参为泛型构造/泛型函数调用时传期望（嵌套
                Box<Box<i32>> n = Box(Box(4)) 的内层 Box(4) 需要） *)
-            let ta =
-              (match a with
-               | ECall (EVar _, _, _) -> expect_hint := Some ft
-               | _ -> ())
-            in
-            let ta2 = check_expr env a in
+            (match a with
+             | ECall (EVar _, _, _) -> expect_hint := Some ft
+             | _ -> ());
+            let ta2 = check_expr_expect env a (Some ft) in
             expect_hint := None;
             coerce p ta2 ft
           | None ->
             (match fdef with
-             | Some de -> coerce p (check_expr env de) ft
+             (* v3.30：字段类型已知 → 作期望（lambda 字段默认值按此落型） *)
+             | Some de -> coerce p (check_expr_expect env de (Some ft)) ft
              | None -> field_zero env p ft))
         sd.sfields
     in
@@ -4364,7 +4538,8 @@ and check_struct_new_generic env p name (args : call_arg list) : texpr =
         | Some ta -> coerce p ta ft
         | None ->
           (match fdef with
-           | Some de -> coerce p (check_expr env de) ft
+           (* v3.30：字段类型已知 → 作期望 *)
+           | Some de -> coerce p (check_expr_expect env de (Some ft)) ft
            | None -> field_zero env p ft))
       sd.sfields
   in
@@ -5279,7 +5454,8 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
     | _, _ ->
       (match checked with
        | Some t -> t
-       | None -> check_expr env init))
+       (* v3.30：声明类型已知 → 作为期望传入（省略参数类型的 lambda 按期望落型） *)
+       | None -> check_expr_expect env init (Some want)))
   in
   let tinit = coerce p tinit want in
   (* borrow 初始化：默认落 const 槽（只读借用）；用户显式写 `let T* p`（非 const
@@ -5693,11 +5869,182 @@ and check_unwrap_decl env p isconst name ty init =
    （多错误收集）；恢复作用域栈深度（异常会跳过配对的 pop_scope）。
    moved 表/fnvars 的残留可能引起级联报错，可接受（不掩盖首个错误） *)
 and check_block env (stmts : stmt list) : tblock =
+  (* let x = match ...（省略类型，§23.3）：parser 脱糖形状 =
+     SBlock [SDecl(无类型/无初值); SMatch(arm 体末表达式改写为对目标赋值)]。
+     推断 = 试检查各 arm 体（含枚举变体绑定、块体前序语句）取得末表达式
+     类型，再求公共类型（数值按宽化规则归一）；正式检查随后只做一次。
+     试检查在快照环境上进行：作用域/move/借用/uses/lambda 累积/自动修复
+     记录全部还原，避免重复标记 move、重复注册 lambda 或重复报告 autofix。
+     （collected 不还原：试检查中泛型实例体等内部检查产生的真实错误保留。） *)
+  let infer_let_match tp (scrut : expr) (arms : marm list) (name : string) : ty =
+    let saved_scopes = env.scopes in
+    let saved_scope_borrows = env.scope_borrows in
+    let saved_borrow_temps = env.borrow_temps in
+    let saved_moved = Hashtbl.copy env.moved in
+    let saved_borrowed = Hashtbl.copy env.borrowed in
+    let saved_uses = env.uses in
+    let saved_ldepth = env.ldepth in
+    let saved_locks = env.locks in
+    let saved_ret = env.fncur_ret in
+    let saved_cap = env.capctx in
+    let saved_lambda = !lambda_out_acc in
+    let saved_autofixed = !autofixed in
+    let probe_err : (pos * string) option ref = ref None in
+    let restore () =
+      env.scopes <- saved_scopes;
+      env.scope_borrows <- saved_scope_borrows;
+      env.borrow_temps <- saved_borrow_temps;
+      env.moved <- saved_moved;
+      env.borrowed <- saved_borrowed;
+      env.uses <- saved_uses;
+      env.ldepth <- saved_ldepth;
+      env.locks <- saved_locks;
+      env.fncur_ret <- saved_ret;
+      env.capctx <- saved_cap;
+      lambda_out_acc := saved_lambda;   (* 丢弃试检查注册的 lambda 函数 *)
+      autofixed := saved_autofixed      (* 自动修复记录由正式检查重新产生 *)
+    in
+    let run () =
+      let tscr = check_expr env scrut in
+      let (is_enum, ename, mangle, variants) =
+        match resolve tscr.ety with
+        | TStruct s when String.length s > 5 && String.sub s 0 5 = "enum$" ->
+          let en = String.sub s 5 (String.length s - 5) in
+          (match Hashtbl.find_opt env.g.enums en with
+           | Some (vs, mg) -> (true, en, mg, vs)
+           | None -> (false, "", "", []))
+        | _ -> (false, "", "", [])
+      in
+      List.map
+        (fun (arm : marm) ->
+          push_scope env;
+          let r =
+            try
+              (* 枚举变体载荷绑定（与正式 SMatch 降码同规则声明） *)
+              (match arm.mpat with
+               | PVar (vname, binds, vp) when is_enum && binds <> [] ->
+                 let vn =
+                   if String.contains vname '.' then begin
+                     let en' = String.sub vname 0 (String.index vname '.') in
+                     if en' <> ename then
+                       terr vp "pattern %s does not belong to enum %s" vname ename;
+                     let i = String.index vname '.' in
+                     String.sub vname (i + 1) (String.length vname - i - 1)
+                   end
+                   else vname
+                 in
+                 let rec find_v = function
+                   | (v, _, sm) :: rest -> if v = vn then Some sm else find_v rest
+                   | [] -> None
+                 in
+                 (match find_v variants with
+                  | Some slotmap ->
+                    let sd : sdefk = Hashtbl.find env.g.structs mangle in
+                    List.iteri
+                      (fun j bn ->
+                        if j < List.length slotmap then begin
+                          let slot = List.nth slotmap j + 1 in
+                          let (_, ft, _) = List.nth sd.sfields slot in
+                          declare env bn
+                            { lconst = false; lty = ft; lslot = ""; lunred = false;
+                              lconstp = false; lshared = false }
+                        end)
+                      binds
+                  | None -> ())
+               | _ -> ());
+              (* arm 体：末条赋值取出右值作表达式，其余语句照常检查 *)
+              let rec split acc = function
+                | [] -> None
+                | [ SAssign (EVar (n2, _), e, _) ] when n2 = name ->
+                  Some (List.rev acc, e)
+                | st :: rest -> split (st :: acc) rest
+              in
+              (match split [] arm.mbody with
+               | None -> None
+               | Some (pre, tail) ->
+                 List.iter (fun st -> ignore (check_stmt env st)) pre;
+                 Some (check_expr env tail))
+            with TypeError (pe, me) ->
+              (* 试检查失败：记首个错误（最终作为本条语句的错误上报），
+                 交给公共类型判定决定是否还有类型不一致需要报告 *)
+              if !probe_err = None then probe_err := Some (pe, me);
+              None
+          in
+          pop_scope env;
+          r)
+        arms
+    in
+    let probed = try run () with e -> restore (); raise e in
+    restore ();
+    (* 公共类型：全同型直接用；全数值按宽化归一（float 混入 → f64，
+       否则首个 concrete 整型、没有则 i32）；其余组合报 cannot infer *)
+    let cls_of (t : texpr) =
+      match resolve t.ety with
+      | (TInt _ | TUint _) as z -> (`Int z, z)
+      | TFloat _ as z -> (`Float, z)
+      | TVar _ when is_frac_lit_t t -> (`Frac, resolve t.ety)
+      | TVar _ when floaty_texpr t -> (`Float, resolve t.ety)
+      | TVar _ -> (`IntLit, resolve t.ety)
+      | TFrac _ as z -> (`Frac, z)
+      | z -> (`Other, z)
+    in
+    let typed =
+      List.filter_map
+        (fun r -> match r with Some t -> Some (cls_of t) | None -> None) probed in
+    if List.length typed <> List.length probed then begin
+      match !probe_err with
+      | Some (pe, me) -> raise (TypeError (pe, me))   (* 报试检查的真实错误 *)
+      | None ->
+        terr tp "cannot infer match result type: every arm body must end with a value expression (write an explicit type on the let)"
+    end
+    else begin
+      let zs = List.map snd typed in
+      let all_same =
+        match zs with
+        | [] -> false
+        | z0 :: rest -> List.for_all (fun z -> resolve z = resolve z0) rest
+      in
+      let is_num = function
+        | `Int _ | `IntLit | `Float -> true
+        | `Frac | `Other -> false in
+      let zty =
+        if all_same then List.hd zs
+        else if List.for_all (fun (c, _) -> is_num c) typed then
+          if List.exists (fun (c, _) -> c = `Float) typed then TFloat 64
+          else
+            (match List.filter_map
+                     (fun (c, _) -> match c with `Int z -> Some z | _ -> None) typed with
+             | z :: _ -> z          (* 首个 concrete 整型 *)
+             | [] -> TInt 32)       (* 全为整数字面量：i32 *)
+        else begin
+          let z0 = resolve (snd (List.hd typed)) in
+          let z1 =
+            (match List.find_opt (fun (_, z) -> resolve z <> z0) typed with
+             | Some (_, z) -> resolve z
+             | None -> z0) in
+          terr tp
+            "cannot infer match result type: arm types differ (%s vs %s); annotate the let with an explicit type"
+            (pp_zty z0) (pp_zty z1)
+        end
+      in
+      match (try Some (zty_to_ast tp zty) with ZtyToAstFail -> None) with
+      | Some aty -> aty
+      | None ->
+        terr tp "cannot infer match result type: %s has no source-level spelling; annotate the let with an explicit type"
+          (pp_zty zty)
+    end
+  in
+  let is_let_match_block = function
+    | [ SDecl (_, _, _, _, _, None, None, _); SMatch _ ] -> true
+    | _ -> false
+  in
   (* 一行多声明器（SDeclList）展开为逐条语句（w-012），共享同一作用域：
      声明按序生效，同行后续声明器与语句可见前面的名字 *)
   let rec expand (st : stmt) : stmt list =
     match st with
     | SDeclList ss -> List.concat_map expand ss
+    (* let x = match 的无类型形状保留到 recover（推断需按语句级错误恢复） *)
+    | SBlock (bs, _) when is_let_match_block bs -> [ st ]
     | SBlock (bs, _) -> List.concat_map expand bs
     | s -> [ s ]
   in
@@ -5705,7 +6052,16 @@ and check_block env (stmts : stmt list) : tblock =
     let depth = List.length env.scopes in
     let lkd = List.length env.locks in
     let r =
-      try Some (check_stmt env s)
+      try
+        (match s with
+         | SBlock ([ SDecl (c, f, u, sh, n, None, None, tp); SMatch (scr, arms, mp) ], bp) ->
+           (* 无类型 let x = match：先推断公共类型，再按既有脱糖检查
+              （零值声明 + 各 arm 赋值），整体作为透明块下传 *)
+           let aty = infer_let_match tp scr arms n in
+           let d = check_stmt env (SDecl (c, f, u, sh, n, Some aty, None, tp)) in
+           let m = check_stmt env (SMatch (scr, arms, mp)) in
+           Some { s = SBlockK [ d; m ]; spos = bp }
+         | _ -> Some (check_stmt env s))
       with TypeError (p, m) ->
         collected := (p, m) :: !collected;
         None
@@ -6061,7 +6417,9 @@ and check_stmt env (st : stmt) : tstmt =
                      （v3.29：顶层 bare n/d 报错提示写 (n/d)） *)
                   frac_bare_guard rhs';
                   check_frac_expr env rhs' e
-                | _ -> check_expr env rhs')
+                | _ ->
+                  (* v3.30：目标类型已知 → 作期望（lambda 参数按此落型） *)
+                  check_expr_expect env rhs' (Some lty))
              in
              let needs_norm =
                (match resolve lty with TFrac _ -> not l.lunred | _ -> false) in
@@ -6120,7 +6478,9 @@ and check_stmt env (st : stmt) : tstmt =
                 | TFrac e when is_frac_arith rhs' ->
                   frac_bare_guard rhs';
                   check_frac_expr env rhs' e
-                | _ -> check_expr env rhs')
+                | _ ->
+                  (* v3.30：捕获槽类型已知 → 作期望 *)
+                  check_expr_expect env rhs' (Some lty))
              in
              let trhs = coerce p' trhs lty in
              (* 捕获目标不参与 move 语义（env 字段路径一律深拷贝/句柄 retain）；
@@ -6157,7 +6517,8 @@ and check_stmt env (st : stmt) : tstmt =
                    if (match resolve fty with TStruct _ -> true | _ -> false)
                       && bare_struct_ref env rhs' then
                      terr p' "struct field assignment requires explicit copy(...) or move ... (no implicit deep copy)";
-                   let trhs = check_expr env rhs' in
+                   (* v3.30：字段类型已知 → 作期望 *)
+                   let trhs = check_expr_expect env rhs' (Some fty) in
                    let trhs = coerce p' trhs fty in
                    mk (SFieldSetK ({ e = EVarK l.lslot; ety = l.lty; epos = p' },
                                    idxs, l.lty, trhs))
@@ -6173,7 +6534,8 @@ and check_stmt env (st : stmt) : tstmt =
                       if (match resolve fty with TStruct _ -> true | _ -> false)
                          && bare_struct_ref env rhs' then
                         terr p' "struct field assignment requires explicit copy(...) or move ... (no implicit deep copy)";
-                      let trhs = check_expr env rhs' in
+                      (* v3.30：捕获字段类型已知 → 作期望 *)
+                      let trhs = check_expr_expect env rhs' (Some fty) in
                       let trhs = coerce p' trhs fty in
                       mk (SFieldSetK (root, idxs, root.ety, trhs))
                     | t -> terr p' "type %s does not support field assignment %s" (pp_zty t) name)
@@ -6351,7 +6713,8 @@ and check_stmt env (st : stmt) : tstmt =
                （v3.29：顶层 bare n/d 报错提示写 (n/d)） *)
             frac_bare_guard e';
             check_frac_expr env e' e
-          | _ -> check_expr env e')
+          (* v3.30：函数返回类型已知 → 作期望（return lambda 参数按此落型） *)
+          | _ -> check_expr_expect env e' (Some env.fncur_ret))
        in
        let te = coerce p te env.fncur_ret in
        mk (SReturnK (Some te)))
@@ -6754,7 +7117,7 @@ and check_stmt env (st : stmt) : tstmt =
         lbody = LBlock (body, ret) }
     in
     if is_frac then terr p' "nested functions do not support frac";
-    let tcl = check_lambda env lam p' (Some nm) in
+    let tcl = check_lambda env lam p' (Some nm) None None in
     (* 名字绑定为局部变量（闭包句柄）：声明即初始化 *)
     declare env nm
       { lconst = false; lty = tcl.ety; lslot = ""; lunred = false; lconstp = false; lshared = false };

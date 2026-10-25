@@ -1,0 +1,12 @@
+// 无类型 let x = match 的报错边界：arm 体公共类型不一致
+struct A
+    i32 x
+struct B
+    i32 y
+
+fn main()
+  let i32 c = 1
+  let v = match c
+      1 => A(1)
+      _ => B(2)
+  output(v.x)

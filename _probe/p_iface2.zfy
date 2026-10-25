@@ -1,0 +1,57 @@
+interface Drawable
+    fn i32 getv()
+    fn void setv(let i32 x)
+    fn string name()
+
+struct Circle
+    i32 v = 0
+    fn i32 getv()
+        return self.v
+    fn void setv(let i32 x)
+        self.v = x
+    fn string name()
+        return "circle"
+
+struct Wrap<T: num>
+    T x = 0
+    fn i32 getv()
+        return 7
+    fn void setv(let i32 x)
+        self.x = x
+    fn string name()
+        return "wrap"
+
+struct Holder<T>
+    T v
+
+fn Drawable getShape()
+    return Drawable(Circle(2))
+
+fn main()
+    // 1) 临时接口值直接调用
+    let Drawable tmp = Drawable(Circle(2))
+    output(tmp.getv(), "\n")
+    output(Drawable(Circle(3)).getv(), "\n")
+    output(getShape().getv(), "\n")
+    // 2) 深拷贝隔离
+    let Drawable a = Drawable(Circle(1))
+    a.setv(5)
+    let Drawable b = copy(a)
+    b.setv(9)
+    output(a.getv(), ",", b.getv(), "\n")
+    // 入列表：元素深拷贝隔离
+    let Drawable[] ds
+    ds = push(ds, copy(a))
+    ds[0].setv(11)
+    output(a.getv(), ",", ds[0].getv(), "\n")
+    // 3) 泛型实例进接口
+    let Wrap<i32> w = Wrap(9)
+    let Drawable d = Drawable(w)
+    output(d.getv(), "\n")
+    // 接口作泛型实参：字段 + 列表元素
+    let Holder<Drawable> h = Holder(copy(a))
+    output(h.v.getv(), "\n")
+    let Holder<Drawable>[] hs
+    hs = push(hs, Holder(copy(a)))
+    output(hs[0].v.getv(), "\n")
+    return

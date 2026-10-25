@@ -1,0 +1,41 @@
+// 无类型 let x = match 推断（§23.3）：arm 体公共类型
+enum Color
+    Red
+    Green
+    Blue
+
+fn main()
+  let Color c = Color.Green
+
+  // 1. 数值：全整数字面量 → i32
+  let n = match c
+      Color.Red => 1
+      _ => 0
+  output(n)   // 0
+
+  // 2. 字符串：全同型 string
+  let s = match c
+      Color.Green => "green"
+      _ => "other"
+  output(s)   // green
+
+  // 3. float 混入 → f64（字面量 2 按 f64 落型）
+  let f = match c
+      Color.Green => 1.5
+      _ => 2
+  output(f)   // 1.500000
+
+  // 4. block 体 arm：按末表达式类型
+  let k = match c
+      Color.Green =>
+          let i32 base = 4
+          base + 1
+      _ => 0
+  output(k)   // 5
+
+  // 5. 首个具体整型：i64 变量参与时落 i64
+  let i64 big = 7
+  let m = match c
+      Color.Red => big
+      _ => 2
+  output(m)   // 2（值同为 i64）

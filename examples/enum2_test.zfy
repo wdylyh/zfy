@@ -1,0 +1,69 @@
+// enum 多列表载荷测试（v1 限制清理：任意变体可带列表载荷，多个变体
+// 可各带不同元素类型的列表；槽布局按类型分槽，列表字段按 struct 值
+// 语义深拷贝/释放）
+enum Boxed
+    Empty
+    Ints(i32[])
+    Strs(string[])
+    Pair(i32[], string[])
+
+fn main()
+  // 1. 多列表载荷构造（源列表被克隆进枚举载荷，互不影响）
+  let i32[] xs = 1, 2, 3
+  let string[] ss = "alpha", "beta"
+  let Boxed a = Boxed.Ints(xs)
+  let Boxed b = Boxed.Strs(ss)
+  let Boxed p = Boxed.Pair(xs, ss)
+
+  xs[0] = 99
+  ss[0] = "zzz"
+
+  // 2. match 解构 i32[] 载荷：绑定是独立深拷贝
+  let i32[] got = 0, 0, 0
+  match a
+    Boxed.Ints(v) => got = v
+    _ => got = 0, 0, 0
+  output(got[0])   // 1（未被 xs 的改写影响）
+  output(got[2])   // 3
+
+  // 3. match 解构 string[] 载荷（块体 arm：多语句 + 末表达式）
+  let string[] names = "", "", ""
+  match b
+    Boxed.Strs(v) =>
+        names = v
+        output(names[0])   // alpha
+        output(names[1])   // beta
+    _ => output("none")
+
+  // 4. 双列表载荷变体（同一变体带 i32[] + string[] 两个槽）
+  let i32[] nums = 0, 0, 0
+  let string[] strs = "", ""
+  match p
+    Boxed.Pair(n, s) =>
+        nums = n
+        strs = s
+    _ => output("none")
+  output(nums[2])   // 3
+  output(strs[1])   // beta
+
+  // 5. 解构绑定改写后原枚举不受影响（绑定副本与载荷隔离）
+  match a
+    Boxed.Ints(v) =>
+        v[0] = 7
+        output(v[0])   // 7
+    _ => output(-1)
+  match a
+    Boxed.Ints(v) => output(v[0])   // 1
+    _ => output(-1)
+
+  // 6. 枚举值整体拷贝（struct 深拷贝：列表槽独立克隆、旧值正确释放）
+  let Boxed a2 = copy(a)
+  match a2
+    Boxed.Ints(v) => output(v[1])   // 2
+    _ => output(-1)
+
+  // 7. 零载荷变体：未被使用的列表槽填空列表，不泄漏
+  let Boxed e = Boxed.Empty
+  match e
+    Boxed.Empty => output("empty")
+    _ => output("not empty")

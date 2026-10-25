@@ -1,0 +1,66 @@
+// 接口 v3 收尾用例：临时/任意表达式接收者、接口值深拷贝、泛型实参进接口
+// 与接口作泛型实参（本轮）。
+interface Drawable
+    fn i32 getv()
+    fn void setv(let i32 x)
+    fn string name()
+
+struct Circle
+    i32 v = 0
+    fn i32 getv()
+        return self.v
+    fn void setv(let i32 x)
+        self.v = x
+    fn string name()
+        return "circle"
+
+// 泛型实例隐式实现接口（方法集按实例核对）
+struct Wrap<T: num>
+    T x = 0
+    fn i32 getv()
+        return 7
+    fn void setv(let i32 x)
+        self.x = x
+    fn string name()
+        return "wrap"
+
+// 接口作泛型实参：T = Drawable
+struct Holder<T>
+    T v
+
+fn Drawable getShape()
+    return Drawable(Circle(2))
+
+fn main()
+    // 1) 接收者可为任意表达式：临时构造值、函数返回值、字段/元素
+    let Drawable tmp = Drawable(Circle(2))
+    assert_eq(tmp.getv(), 2)
+    assert_eq(Drawable(Circle(3)).getv(), 3)
+    assert_eq(getShape().getv(), 2)
+    // 2) 接口值深拷贝：拷贝后各自独立，改一侧不影响另一侧
+    let Drawable a = Drawable(Circle(1))
+    a.setv(5)
+    let Drawable b = copy(a)
+    b.setv(9)
+    assert_eq(a.getv(), 5)
+    assert_eq(b.getv(), 9)
+    // 入列表：元素为独立深拷贝副本
+    let Drawable[] ds
+    ds = push(ds, copy(a))
+    ds[0].setv(11)
+    assert_eq(a.getv(), 5)
+    assert_eq(ds[0].getv(), 11)
+    // 3) 泛型实例进接口
+    let Wrap<i32> w = Wrap(9)
+    let Drawable d = Drawable(w)
+    assert_eq(d.getv(), 7)
+    assert_eq(d.name(), "wrap")
+    // 接口作泛型实参：字段 + 列表元素；字段上的方法按地址分派（写回）
+    let Holder<Drawable> h = Holder(copy(a))
+    assert_eq(h.v.getv(), 5)
+    h.v.setv(3)
+    assert_eq(h.v.getv(), 3)
+    let Holder<Drawable>[] hs
+    hs = push(hs, Holder(copy(a)))
+    assert_eq(hs[0].v.getv(), 5)
+    return

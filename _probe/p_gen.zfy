@@ -1,0 +1,19 @@
+struct Box2<T>
+    T v
+
+struct Pct<T: num>
+    T v = 0
+
+fn i32 take(let Pct<i32> p)
+    return p.v
+
+fn main()
+    let Box2<i32> a = Box2()
+    output(a.v)
+    let Pct<i32> p = Pct(7)
+    output(p.v)
+    let Pct<i32>[] ps
+    ps = push(ps, Pct(7))
+    output(ps[0].v)
+    output(take(Pct(7)))
+    return

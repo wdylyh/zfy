@@ -1,0 +1,13 @@
+interface Drawable
+    fn i32 getv()
+
+struct Circle
+    i32 v = 0
+    fn i32 getv()
+        return self.v
+
+fn main()
+    let Drawable tmp = Drawable(Circle(2))
+    output(tmp.getv(), "\n")
+    output(Drawable(Circle(3)).getv(), "\n")
+    return
