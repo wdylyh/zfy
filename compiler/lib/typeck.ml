@@ -38,6 +38,16 @@ let int_fits (v : int64) (t : zty) : bool =
   | TUint 128 -> true
   | _ -> false
 
+(* ---------- (n/d) 分数字面量（v3.29 语义反转）----------
+   check_expr 把 EFracLit 预产为「截断整除值 EIntK (n/d) + 未定 TVar」，
+   精确分子分母登记在 frac_lits（key = TVar id）：
+   - 整数期望：EIntK 已带截断值，直接走既有字面量范围检查/coerce（零特判）
+   - 浮点期望：查表换 EFloatK 实数除（(1/4) → 0.25）
+   - frac 期望：查表按分数精确构造 EFracNewK（不除法；unred 保留原分子分母）
+   - 无期望（output 实参等）：fix_texpr 兜底查表落 i32 frac（与 let x = (n/d)
+     推断一致）。不带括号的 1/4 是普通除法，不经此路径 *)
+let frac_lits : (int, int64 * int64) Hashtbl.t = Hashtbl.create 16
+
 (* 9d：extern "C" 函数名名单（i128 参数按引用传、返回值按 <2 x i64> 接收，
    与 clang win32 的 __int128 ABI 一致） *)
 let extern_fns : (string, unit) Hashtbl.t = Hashtbl.create 8
@@ -615,7 +625,7 @@ let rec subst_ty_ast (map : (string * zty) list) (t : ty) : ty =
    按类型实参映射替换，随后按普通函数检查 *)
 let rec subst_expr map (e : expr) : expr =
   match e with
-  | EInt _ | EBigInt _ | EFloat _ | EStr _ | EChar _ | EBool _ | EVar _ | ENull _ -> e
+  | EInt _ | EBigInt _ | EFracLit _ | EFloat _ | EStr _ | EChar _ | EBool _ | EVar _ | ENull _ -> e
   | EBin (o, a, b, p) -> EBin (o, subst_expr map a, subst_expr map b, p)
   | EUn (o, a, p) -> EUn (o, subst_expr map a, p)
   | ECall (f, args, p) ->
@@ -987,7 +997,7 @@ let match_param (g : genv) (tparams : string list) (p : pos)
     (match z with TArray (z2, _) -> match_gty g tparams p pd.pty z2 mref | _ -> false)
 
 let pos_of_expr = function
-  | EInt (_, p) | EBigInt (_, p) | EFloat (_, p) | EStr (_, p) | EChar (_, p) | EBool (_, p)
+  | EInt (_, p) | EBigInt (_, p) | EFracLit (_, _, p) | EFloat (_, p) | EStr (_, p) | EChar (_, p) | EBool (_, p)
   | EVar (_, p) | EBin (_, _, _, p) | EUn (_, _, p) | ECall (_, _, p)
   | EIndex (_, _, p) | ESlice (_, _, _, _, p)
   | ECast (_, _, p)
@@ -1177,6 +1187,49 @@ and const_eval (env : env) (e : texpr) : int64 option =
      | _ -> None)
   | _ -> None
 
+(* ---------- (n/d) 分数字面量的 typeck 侧 helper（v3.29） ---------- *)
+
+(* texpr 是否为 (n/d) 分数字面量的延迟形态（EIntK + 登记表命中） *)
+and is_frac_lit_t (t : texpr) : bool =
+  match t.e, resolve t.ety with
+  | EIntK _, TVar n -> Hashtbl.mem frac_lits n
+  | _ -> false
+
+(* 取回 (n/d) 分数字面量的精确分子分母（须先 is_frac_lit_t） *)
+and frac_lit_get (t : texpr) : int64 * int64 =
+  match t.ety with
+  | TVar n -> Hashtbl.find frac_lits n
+  | _ -> assert false
+
+(* (n/d) 按元素类型构造 EFracNewK（v3.29：精确分数，不除法不约分；
+   unred 声明由外层保留原分子分母；构造路径与原 n/d 字面量分支同构） *)
+and frac_lit_k (a : int64) (b : int64) (e : zty) (p : pos) : texpr =
+  let fv v = { e = EIntK v; ety = fresh_var (); epos = p } in
+  let cv t =
+    if resolve t.ety = e then t
+    else { e = ECastK (t, e); ety = e; epos = t.epos }
+  in
+  { e = EFracNewK (cv (fv a), cv (fv b)); ety = TFrac e; epos = p }
+
+(* 标量提升为分数的 (n/d) 感知版：延迟分数字面量按精确分数构造（x + (1/4)
+   中 x 为 frac 时左侧是 1/4 而非 0/1），其余走原标量提升（x → x/1） *)
+and frac_lift (t : texpr) (e : zty) (p : pos) : texpr =
+  match t.e, resolve t.ety with
+  | EIntK _, TVar n when Hashtbl.mem frac_lits n ->
+    let (a, b) = Hashtbl.find frac_lits n in
+    frac_lit_k a b e p
+  | _ -> mk_frac_from t e p
+
+(* v3.29：bare n/d（两个整数字面量）直接落在 frac 目标（声明初值/赋值/
+   复合赋值/实参/return/序列元素的顶层）→ 编译期报错；嵌在更大 frac 算术
+   树内的 bare n/d 不经过此守卫（frac 除法语义天然给出正确结果）。
+   浮点字面量除式（1.2/4.8）无括号新写法，语义保持不变（不拦截） *)
+and frac_bare_guard (e : expr) : unit =
+  match e with
+  | EBin (Ast.Div, EInt _, EInt _, p') ->
+    terr p' "n/d without parentheses is integer division, not a fraction literal; write (n/d)"
+  | _ -> ()
+
 (* 标量提升为分数：EFracNewK (x cast e, 1) *)
 and mk_frac_from (x : texpr) (e : zty) (p : pos) : texpr =
   let xc =
@@ -1254,10 +1307,13 @@ and is_frac_arith (e : expr) : bool =
   | EUn (Ast.Neg, _, _) -> true
   | _ -> false
 
-(* frac 期望表达式（new.md 2026-10-11 用户拍板：frac 上下文里只要是有
-   / 号都直接用分数）：整棵算术表达式按分数计算——
-   - n/d 字面量形式仍按分数构造（不执行除法，unred 声明保留原分子分母）
-   - 其余除法两侧转 frac 走运行时分数除法（结果自动约分）
+(* frac 期望表达式（new.md 2026-10-11 + v3.29 语义反转）：
+   整棵算术表达式按分数计算——
+   - (n/d) 分数字面量（EFracLit）按分数精确构造（不除法，unred 声明保留
+     原分子分母）
+   - 不带括号的 n/d 是普通除法：两侧转 frac 走运行时分数除法（1/4 =
+     1/1 ÷ 4/1 = 1/4，嵌在 frac 算术树内天然正确）；bare n/d 直接落在
+     frac 目标顶层时由调用方的 frac_bare_guard 报错
    - 整数字面量/标量表达式自动提升为分数（x → x/1）
    - float 字面量在整数 frac 中精确转二进制分数（0.5 → 1/2）
    非 frac 目标路径完全不经过此函数（i32 目标整数除法、f64 目标实数除法
@@ -1265,20 +1321,10 @@ and is_frac_arith (e : expr) : bool =
 and check_frac_expr env (e : expr) (elem : zty) : texpr =
   let p = pos_of_expr e in
   match e with
-  | EBin (Ast.Div, a, b, p')
-    when (match a, b with
-          | (EInt _ | EFloat _), (EInt _ | EFloat _) -> true
-          | _ -> false) ->
-    (* n/d 字面量：按分数构造，不执行除法（与既有声明/实参语义一致） *)
-    let ta = check_expr env a and tb = check_expr env b in
-    let conv (x : expr) (t : texpr) =
-      match x, elem with
-      | EFloat (v, _), (TInt _ | TUint _) -> frac_of_float_lit v elem p'
-      | _ ->
-        if resolve t.ety = elem then t
-        else { e = ECastK (t, elem); ety = elem; epos = t.epos }
-    in
-    { e = EFracNewK (conv a ta, conv b tb); ety = TFrac elem; epos = p' }
+  | EFracLit (a, b, p') ->
+    (* (n/d) 分数字面量：按分数精确构造，不执行除法（与原 n/d 字面量
+       分支同构：整数字面量按 elem cast） *)
+    frac_lit_k a b elem p'
   | EBin ((Ast.Add | Ast.Sub | Ast.Mul | Ast.Div) as op, a, b, p') ->
     let ta = check_frac_expr env a elem in
     let tb = check_frac_expr env b elem in
@@ -2082,6 +2128,15 @@ and check_expr env (e : expr) : texpr =
   let mk k ty = { e = k; ety = ty; epos = p } in
   match e with
   | EInt (n, _) -> mk (EIntK n) (fresh_var ())
+  | EFracLit (a, b, p') ->
+    (* (n/d) 分数字面量（v3.29 语义反转）：预产截断整除值 + 未定 TVar，
+       精确分子分母登记 frac_lits 表——落型由期望上下文决定（见表注释）：
+       int → 截断值（含范围检查）、float → 实数除、frac → 精确构造、
+       无期望 → fix_texpr 兜底 i32 frac *)
+    incr var_counter;
+    let nid = !var_counter in
+    Hashtbl.replace frac_lits nid (a, b);
+    { e = EIntK (Int64.div a b); ety = TVar nid; epos = p' }
   | EBigInt (digits, _) ->
     (* 超出 i64 的大字面量（w-014 #6）：ety 未定（TVar），由期望上下文
        反绑到 i128/u128（coerce 校验范围）；其余上下文报错 *)
@@ -2295,15 +2350,15 @@ and check_expr env (e : expr) : texpr =
           | TFrac e, _ ->
             (match e, rr with
              | (TInt _ | TUint _), (TInt _ | TUint _ | TVar _) ->
-               (e, tl, mk_frac_from tr e p')
-             | TFloat _, (TFloat _ | TVar _) -> (e, tl, mk_frac_from tr e p')
+               (e, tl, frac_lift tr e p')
+             | TFloat _, (TFloat _ | TVar _) -> (e, tl, frac_lift tr e p')
              | _ ->
                terr p' "%s cannot be mixed with %s in this operation" (pp_zty (TFrac e)) (pp_zty rr))
           | _, TFrac e ->
             (match e, rl with
              | (TInt _ | TUint _), (TInt _ | TUint _ | TVar _) ->
-               (e, mk_frac_from tl e p', tr)
-             | TFloat _, (TFloat _ | TVar _) -> (e, mk_frac_from tl e p', tr)
+               (e, frac_lift tl e p', tr)
+             | TFloat _, (TFloat _ | TVar _) -> (e, frac_lift tl e p', tr)
              | _ ->
                terr p' "%s cannot be mixed with %s in this operation" (pp_zty rl) (pp_zty (TFrac e)))
           | _ -> assert false
@@ -2490,6 +2545,18 @@ and check_expr env (e : expr) : texpr =
           | TVar _ -> floaty_texpr x
           | _ -> false
         in
+        (* v3.29：(n/d) 分数字面量（未定 TVar）与浮点（具体 float 或含浮点
+           字面量的未定子树）混算 → 报错。分数语义与浮点无法统一
+           （frac 不与 float 混算、整数语义下 float 非法），避免落成
+           frac/float 混算坏 IR *)
+        let frac_lit_side t x =
+          match resolve t with
+          | TVar _ -> is_frac_lit_t x
+          | _ -> false
+        in
+        if (frac_lit_side rl tl && floaty_side rr tr)
+        || (frac_lit_side rr tr && floaty_side rl tl) then
+          terr p' "a fraction literal (n/d) cannot be mixed with floats (assign it to a typed variable first)";
         let other_int t =
           match t with TInt _ | TUint _ | TChar -> true | _ -> false in
         (if (floaty_side rl tl && other_int rr)
@@ -2565,6 +2632,15 @@ and check_expr env (e : expr) : texpr =
           (* -x 生成 0 - x *)
           let zero = mk_frac_from { e = EIntK 0L; ety = e; epos = p' } e p' in
           mk (EBinK (BSub, zero, t1)) (TFrac e)
+        | TVar _ when is_frac_lit_t t1 ->
+          (* -(n/d)（v3.29）：负号折进分子保持精确分数（表项同步取负），
+             截断值同步重算（OCaml 整除向零，-(7/2) 与 (-7)/2 均为 -3）；
+             直接消掉 EUn 包装，落型交给查表的各期望分支 *)
+          let (a, b) = frac_lit_get t1 in
+          (match t1.ety with
+           | TVar n -> Hashtbl.replace frac_lits n (Int64.neg a, b)
+           | _ -> ());
+          mk (EIntK (Int64.div (Int64.neg a) b)) t1.ety
         | t1' ->
           if not (is_numeric t1') then
             terr p' "unary minus requires a numeric type, got %s" (pp_zty t1');
@@ -3073,7 +3149,25 @@ and check_expr env (e : expr) : texpr =
     in
     (* cast(e, frac)（v3 2026-10-11）：整数/bool/char → 分数 n/1（不失败，
        不产错误值）；float 字面量按二进制精确值转分数（0.5→1/2）；运行期
-       float 值与 frac 跨宽不支持 *)
+       float 值与 frac 跨宽不支持。
+       v3.29：cast((n/d), T)——分数字面量直接按目标类型产常量值
+       （整数=截断整除、float=实数除、frac=精确构造），不走 ECastK 包装
+       （避免内层延迟分数字面量被二次转换） *)
+    if is_frac_lit_t t1 then begin
+      let (fa, fb) = frac_lit_get t1 in
+      match b with
+      | TFrac elem -> frac_lit_k fa fb elem p'
+      | (TInt _ | TUint _) as tgt ->
+        let q = Int64.div fa fb in
+        if not (int_fits q tgt) then
+          terr p' "fraction literal (%Ld/%Ld) = %Ld overflows %s" fa fb q (pp_zty tgt);
+        { e = EIntK q; ety = tgt; epos = p' }
+      | TFloat _ as tgt ->
+        { e = EFloatK (Int64.to_float fa /. Int64.to_float fb); ety = tgt; epos = p' }
+      | _ ->
+        terr p' "unsupported cast: fraction literal -> %s" (pp_zty t')
+    end
+    else
     (match b with
      | TFrac elem ->
        let tv =
@@ -3393,7 +3487,8 @@ and check_call env p np name0 targs origs modes =
         match resolve pt, orig with
         | TFrac w, Some rhs when is_frac_arith rhs ->
           (* frac 参数位置含 / 的算术实参（new.md 2026-10-11）：整棵按分数算
-             （n/d 字面量形式仍按分数构造，与既有语义一致） *)
+             （v3.29：顶层 bare n/d 报错提示写 (n/d)，(n/d) 精确构造） *)
+          frac_bare_guard rhs;
           check_frac_expr env rhs w
         | TStruct ps, Some (EVar (fn, fp))
           when is_clo_struct ps && (match ta.e with EFunPtrK _ -> true | _ -> false) ->
@@ -3492,7 +3587,7 @@ and pos_after (a : pos) (b : pos) =
 and uses_of_expr (acc : (string * pos) list) (e : expr) : (string * pos) list =
   match e with
   | EVar (n, p) -> (n, p) :: acc
-  | EInt _ | EBigInt _ | EFloat _ | EStr _ | EChar _ | EBool _ | ENull _ -> acc
+  | EInt _ | EBigInt _ | EFracLit _ | EFloat _ | EStr _ | EChar _ | EBool _ | ENull _ -> acc
   | EBin (_, a, b, _) -> uses_of_expr (uses_of_expr acc a) b
   | EUn (_, a, _) -> uses_of_expr acc a
   | EBorrow (a, _) -> uses_of_expr acc a
@@ -3715,7 +3810,7 @@ and deref_refs (refs : string list) (body : block) : block =
     match e with
     | EVar (n, p) when in_refs n -> EDeref (EVar (n, p), p)
     | EVar _ -> e
-    | EInt _ | EFloat _ | EStr _ | EChar _ | EBool _ | ENull _ -> e
+    | EInt _ | EFracLit _ | EFloat _ | EStr _ | EChar _ | EBool _ | ENull _ -> e
     | EBin (o, a, b, p) -> EBin (o, re a, re b, p)
     | EUn (o, a, p) -> EUn (o, re a, p)
     | ECall (callee, args, p) ->
@@ -4043,8 +4138,10 @@ and check_struct_new_generic env p name (args : call_arg list) : texpr =
       name nfields (List.length pos_args);
   let checked : texpr option array = Array.make nfields None in
   let arg_zty (ta : texpr) =
-    (* 字面量实参 ety 为未求解 TVar：推断时落默认类型（int→i64、float→f64） *)
+    (* 字面量实参 ety 为未求解 TVar：推断时落默认类型（int→i64、float→f64）；
+       v3.29：(n/d) 分数字面量落 i32 frac（不支持时由 match_field 报推断错误） *)
     match ta.e, resolve ta.ety with
+    | EIntK _, TVar n when Hashtbl.mem frac_lits n -> TFrac (TInt 32)
     | EIntK _, TVar _ -> TInt 64
     | EFloatK _, TVar _ -> TFloat 64
     | _, z -> z
@@ -4160,10 +4257,15 @@ and coerce p (te : texpr) (want : zty) : texpr =
       { e = EErrOkK te2; ety = want; epos = te.epos }
     | TVar _, TFrac e ->
       (* 未求解字面量表达式 → frac（return/赋值/实参上下文）：
-         值侧同步改写——n/d 字面量除式按分数构造（分子/分母不除法），
-         其他整数字面量表达式整体标量提升为分数。此前走 unify 仅改类型
-         不改值，OInt 直接落 frac 聚合槽致 E4021 内部错误（w-021） *)
+         值侧同步改写——v3.29：(n/d) 分数字面量查表精确构造（分子/分母
+         不除法，unred 声明保留原分子分母）；n/d 字面量除式按分数构造
+         （分子/分母不除法），其他整数字面量表达式整体标量提升为分数。
+         此前走 unify 仅改类型不改值，OInt 直接落 frac 聚合槽致 E4021
+         内部错误（w-021） *)
       (match te.e with
+       | _ when is_frac_lit_t te ->
+         let (fa, fb) = frac_lit_get te in
+         frac_lit_k fa fb e te.epos
        | EBinK (BDiv, ta, tb) ->
          let is_num = function EIntK _ | EFloatK _ -> true | _ -> false in
          if is_num ta.e && is_num tb.e then begin
@@ -4187,10 +4289,12 @@ and coerce p (te : texpr) (want : zty) : texpr =
         (pp_zty tgt)
     | TVar _, (TBool | TChar)
       when (match te.e with
-            | EBinK _ | EUnK _ | ECallK _ -> true | _ -> false) ->
+            | EBinK _ | EUnK _ | ECallK _ -> true
+            | _ -> is_frac_lit_t te) ->
       (* v3.3.2：延迟定型的算术/调用树（2**0、|3| 等，ety=TVar）不可落
          bool/char 目标——此前 unify 静默把共享 TVar 绑成 TBool/TChar，
-         codegen 无对应分发报 E4025 内部错误（if 2**0） *)
+         codegen 无对应分发报 E4025 内部错误（if 2**0）。
+         v3.29：(n/d) 分数字面量同样不可落 bool/char *)
       terr p "arithmetic result cannot be used as %s (explicit comparison or conversion required)"
         (pp_zty b)
     | TVar _, ((TInt _ | TUint _) as tgt) ->
@@ -4208,6 +4312,11 @@ and coerce p (te : texpr) (want : zty) : texpr =
                (pp_zty tgt), pp_zty tgt)];
          { e = ECastK (te, want); ety = want; epos = te.epos }
        | _ -> unify p te.ety want; te)
+    | TVar _, TFloat _ when is_frac_lit_t te ->
+      (* v3.29：(n/d) 分数字面量落浮点期望 → 实数除常量（(1/4) → 0.25）。
+         f32 期望同值产 f64 常量，后端按目标槽宽发射 *)
+      let (fa, fb) = frac_lit_get te in
+      { e = EFloatK (Int64.to_float fa /. Int64.to_float fb); ety = want; epos = te.epos }
     | TVar _, _ | _, TVar _ -> unify p te.ety want; te
     | _, TFrac e when (match te.e with EIntK _ | EFloatK _ -> true | _ -> false) ->
       (* 数值字面量提升为分数（实参/返回等表达式上下文，与声明初值一致；
@@ -4658,6 +4767,17 @@ and check_rand_timer env p name (args : call_arg list) =
   | "rand", [ a; b ] ->
     no_named ();
     let ta = check_expr env a and tb = check_expr env b in
+    (* v3.29：(n/d) 分数字面量实参（EIntK + frac_lits 命中）→ 精确 i32 frac，
+       使 rand((1/2), (3/2)) 走 frac 区间随机；裸 1/2 是整数除法（落整数
+       区间），不经此转换 *)
+    let frac_lit_or (t : texpr) =
+      match t.e, resolve t.ety with
+      | EIntK _, TVar n when Hashtbl.mem frac_lits n ->
+        let (fa, fb) = Hashtbl.find frac_lits n in
+        frac_lit_k fa fb (TInt 32) t.epos
+      | _ -> t
+    in
+    let ta = frac_lit_or ta and tb = frac_lit_or tb in
     let rt0 = resolve ta.ety and rt1 = resolve tb.ety in
     let is_f64ish (t : texpr) =
       match resolve t.ety with
@@ -4881,12 +5001,17 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
       let rec lit_ty = function
         | EInt _ -> Some ("i32", false)
         | EBigInt _ -> Some ("i128", false)
+        | EFracLit _ -> Some ("i32", true)
         | EFloat _ -> Some ("f64", false)
         | EStr _ -> Some ("string", false)
         | EChar _ -> Some ("char", false)
         | EBool _ -> Some ("bool", false)
         | EUn (Ast.Neg, e1, _) -> lit_ty e1
-        | EBin (Ast.Div, (EInt _ | EFloat _), (EInt _ | EFloat _), _) -> Some ("i32", true)
+        (* v3.29：(n/d) 分数字面量 → i32 frac；bare n/d 是普通除法
+           （整数字面量除式 → i32；浮点字面量参与 → f64 实数除） *)
+        | EBin (Ast.Div, EInt _, EInt _, _) -> Some ("i32", false)
+        | EBin (Ast.Div, (EFloat _ | EInt _), (EFloat _ | EInt _), _) ->
+          Some ("f64", false)
         | _ -> None
       in
       (match init with
@@ -4952,21 +5077,15 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
       if resolve t.ety <> TBool then
         terr p "bool can only be initialized with true/false, 0/1, or a boolean expression";
       t
-    | TFrac e, EBin (Div, a, b, _)
-      when (match a, b with
-            | (EInt _ | EFloat _), (EInt _ | EFloat _) -> true
-            | _ -> false) ->
-      (* frac 字面量：分子 / 分母（不执行除法、不自动约分） *)
-      let ta = check_expr env a and tb = check_expr env b in
-      let ac =
-        if resolve ta.ety = e then ta
-        else { e = ECastK (ta, e); ety = e; epos = ta.epos }
-      in
-      let bc =
-        if resolve tb.ety = e then tb
-        else { e = ECastK (tb, e); ety = e; epos = tb.epos }
-      in
-      { e = EFracNewK (ac, bc); ety = TFrac e; epos = p }
+    | TFrac _, EBin (Ast.Div, EInt _, EInt _, lp) ->
+      (* v3.29：bare n/d（整数对）直接落 frac 声明初值 → 编译期报错（顶层
+         形态必为 bare：括号形式已被 parser 升级为 EFracLit）。浮点字面量
+         除式（1.2/4.8）无括号新写法，语义保持不变（走下方含 / 分支） *)
+      terr lp "n/d without parentheses is integer division, not a fraction literal; write (n/d)"
+    | TFrac e, EFracLit (a, b, lp) ->
+      (* (n/d) 分数字面量（v3.29）：按分数精确构造（不执行除法、不自动
+         约分；unred 声明保留原分子分母） *)
+      frac_lit_k a b e lp
     | TFrac e, EBin (Ast.Div, a, b, _)
       when is_frac_arith a || is_frac_arith b ->
       (* 非 n/d 形式的除式（new.md 2026-10-11）：两侧按 frac 期望检查——
@@ -5203,7 +5322,9 @@ and check_aug env p (lhs : expr) (bop : Ast.binop) (rhs : expr) =
           let trhs =
             (match resolve lty with
              | TFrac e when is_frac_arith rhs ->
-               (* frac 变量复合赋值含 / 的算术（new.md 2026-10-11）：按分数算 *)
+               (* frac 变量复合赋值含 / 的算术（new.md 2026-10-11）：按分数算
+                  （v3.29：顶层 bare n/d 报错提示写 (n/d)） *)
+               frac_bare_guard rhs;
                check_frac_expr env rhs e
              | _ -> check_expr env rhs)
           in
@@ -5409,8 +5530,10 @@ and check_seq_decl env p isconst is_frac is_unred name e len is_list inits =
   let check_elem (ie : expr) : texpr =
     match resolve e, ie with
     | TFrac w, _ when is_frac_arith ie ->
-      (* frac 元素初值含 / 的算术（new.md 2026-10-11）：整棵按分数算
-         （n/d 字面量形式仍按分数构造不除法，存入时按 enn 归一） *)
+      (* frac 元素初值含 / 的算术（new.md 2026-10-11）：整棵按分数算；
+         v3.29：顶层 bare n/d 报错提示写 (n/d)，(n/d) 精确构造不除法，
+         存入时按 enn 归一 *)
+      frac_bare_guard ie;
       check_frac_expr env ie w
     | _ ->
       let ti2 = check_expr env ie in
@@ -5718,7 +5841,9 @@ and check_stmt env (st : stmt) : tstmt =
              let trhs =
                (match resolve lty with
                 | TFrac e when is_frac_arith rhs' ->
-                  (* frac 变量赋值含 / 的算术（new.md 2026-10-11）：整棵按分数算 *)
+                  (* frac 变量赋值含 / 的算术（new.md 2026-10-11）：整棵按分数算
+                     （v3.29：顶层 bare n/d 报错提示写 (n/d)） *)
+                  frac_bare_guard rhs';
                   check_frac_expr env rhs' e
                 | _ -> check_expr env rhs')
              in
@@ -5912,7 +6037,9 @@ and check_stmt env (st : stmt) : tstmt =
        let te =
          (match resolve env.fncur_ret with
           | TFrac e when is_frac_arith e' ->
-            (* frac 函数 return 含 / 的算术（new.md 2026-10-11）：按分数算 *)
+            (* frac 函数 return 含 / 的算术（new.md 2026-10-11）：按分数算
+               （v3.29：顶层 bare n/d 报错提示写 (n/d)） *)
+            frac_bare_guard e';
             check_frac_expr env e' e
           | _ -> check_expr env e')
        in
@@ -6972,6 +7099,7 @@ let check_program (prog : program) : hir =
         List.map
           (fun (t : texpr) ->
             match t.e, resolve t.ety with
+            | EIntK _, TVar n when Hashtbl.mem frac_lits n -> TFrac (TInt 32)
             | EIntK _, TVar _ -> TInt 64
             | EFloatK _, TVar _ -> TFloat 64
             | _, z -> z)
@@ -7249,6 +7377,16 @@ let check_program (prog : program) : hir =
     { x with e = x'; ety }
   in
   let rec fix_texpr (e : texpr) : texpr =
+    (* v3.29：(n/d) 分数字面量兜底判定必须先于 subst_ty——subst_ty 会把
+       未解 TVar 就地默认成 i64，兜底将永远失配。仅当 TVar 仍未被任何
+       期望绑定（resolve 后仍是 TVar）且命中 frac_lits 时兜底转 frac；
+       已绑整数/浮点期望的节点走正常路径（节点已被 coerce 换型） *)
+    let frac_fallback =
+      match e.e, resolve e.ety with
+      | EIntK _, TVar n when Hashtbl.mem frac_lits n ->
+        Some (Hashtbl.find frac_lits n)
+      | _ -> None
+    in
     let ety0 = subst_ty e.ety in
     (* 浮点字面量未被上下文约束时，默认应为 f64 而非 i64 *)
     let ety =
@@ -7258,6 +7396,18 @@ let check_program (prog : program) : hir =
     in
     let e', ety =
       match e.e with
+      | EIntK _ ->
+        (* v3.29：(n/d) 分数字面量兜底落型（ety 未被任何期望约束，如 output
+           实参/裸形态）→ 默认 i32 frac 精确构造（与 let x = (n/d) 推断
+           一致）；普通整数字面量不变 *)
+        (match frac_fallback with
+         | Some (fa, fb) ->
+           let cv v =
+             { e = ECastK ({ e = EIntK v; ety = TInt 64; epos = e.epos }, TInt 32);
+               ety = TInt 32; epos = e.epos }
+           in
+           (EFracNewK (cv fa, cv fb), TFrac (TInt 32))
+         | None -> (e.e, ety))
       | EBigK d ->
         (* 大字面量（w-014 #6）：期望上下文未落到 i128/u128（如裸表达式
            语句/算术操作数）即报错；合法时保留由后端按 i128 字面量发射 *)

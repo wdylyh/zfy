@@ -581,7 +581,7 @@ let resolve (main : program) (main_dir : string)
                             | LExpr x -> LExpr (rw_expr m x)
                             | LBlock (bl, rt) -> LBlock (rw_block m bl, rt)) },
                   p)
-      | EInt _ | EFloat _ | EStr _ | EChar _ | EBool _ -> e
+      | EInt _ | EFracLit _ | EFloat _ | EStr _ | EChar _ | EBool _ -> e
     and rw_block m bl = List.map (rw_stmt m) bl
     and rw_stmt m (s : stmt) : stmt =
       match s with

@@ -1,0 +1,46 @@
+// v3.29 分数字面量语义反转：(n/d) 才是分数字面量，裸 n/d 永远是整数除法
+fn main()
+    // ① frac 期望：(n/d) 精确构造，不执行除法（(1/4)*4 == 1）
+    let i32 frac f = (1/4)
+    if f * 4 != 1
+        panic("frac (1/4)*4 != 1")
+    // ② unred 声明：(6/48) 保留原分子分母（不约分）
+    let i32 frac unred ur = (6/48)
+    if ur != (6/48)
+        panic("unred (6/48) lost original num/den")
+    // ③ 整数期望：(n/d) 截断整除
+    let i32 k = (7/2)
+    if k != 3
+        panic("i32 (7/2) != 3")
+    let i32 z = (1/4)
+    if z != 0
+        panic("i32 (1/4) != 0")
+    // ④ 浮点期望：(n/d) 实数除
+    let f64 x = (1/4)
+    if x != 0.25
+        panic("f64 (1/4) != 0.25")
+    // ⑤ 无期望推断：output((1/4)) 兜底落 i32 frac，打印 1/4（非截断 0）
+    output((1/4), end=' ')
+    // ⑥ 循环小数字面量 (前缀,循节,) 与 (n/d) 同语义：0.111... = 1/9
+    let i32 frac r9 = (0.,1,)
+    if r9 != (1/9)
+        panic("rdec (0.,1,) != 1/9")
+    let f64 y = (0.,1,)
+    if y < 0.11111 or y > 0.11112
+        panic("f64 (0.,1,) not ~0.1111")
+    // ⑦ 裸 n/d：永远整数除法
+    let i32 q = 7/2
+    if q != 3
+        panic("bare 7/2 != 3")
+    let i32 z2 = 1/4
+    if z2 != 0
+        panic("bare 1/4 != 0")
+    // ⑧ frac 算术树内嵌裸 1/4：frac 除法语义（1/1 ÷ 4/1 = 1/4），
+    //    1/4 + (1/4) = 1/2（若按整数除法则得 0/1 + 1/4 = 1/4）
+    let i32 frac h = 1/4 + f
+    if h != (1/2)
+        panic("frac tree 1/4 + (1/4) != 1/2")
+    output(ur, end=' ')                       // 期望 6/48
+    output(k, end=' ')                        // 期望 3
+    output(x, end=' ')                        // 期望 0.25
+    output("")

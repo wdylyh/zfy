@@ -1,17 +1,18 @@
 // frac 分数类型与 reduce 验证
 // 规则：字面量/初值不自动约分；运算结果（如 a*b）自动约分到最简
+// v3.29 语义反转：(n/d) 才是分数字面量（括号必须）；裸 n/d 是整数除法
 fn main()
-    let i32 frac j = 23/34
+    let i32 frac j = (23/34)
     output(j)
-    let i64 frac x = 6/216
+    let i64 frac x = (6/216)
     reduce(x, 1, 2)
     output(x)
-    let i64 frac y = 6/216
+    let i64 frac y = (6/216)
     reduce(y, 2, 2)
     output(y)
     // 分数四则：运算结果自动约分到最简
-    let i32 frac a = 1/2
-    let i32 frac b = 1/3
+    let i32 frac a = (1/2)
+    let i32 frac b = (1/3)
     let i32 frac c = a + b
     output(c)
     let i32 frac m = a * b
@@ -29,5 +30,5 @@ fn main()
     // 比较
     if a < b
         output(1)
-    let i32 frac const pi2 = 22/7
+    let i32 frac const pi2 = (22/7)
     output(pi2)

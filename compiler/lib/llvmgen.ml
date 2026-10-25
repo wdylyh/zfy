@@ -75,6 +75,11 @@ type gctx = {
   structs : sdef list;             (* struct 定义表（布局与辅助函数生成用） *)
   clo_envs : (string, string) Hashtbl.t; (* P0-1c：闭包签名 mangle -> clenv 布局名 *)
   clofrees : (string, string) Hashtbl.t; (* P0-1c：clenv 名 -> env 析构器符号（缓存） *)
+  gres_pending : (string * string * string) list ref;
+    (* v3.27 审计修复：zfy_global_reg 待发射调用（槽名, gfree wrapper, 诊断名）。
+       须在 zfy.globals 末尾（全部全局构造的 rc 分配之后）统一发射——reg 注册
+       晚于 rc 报告挂钩注册，atexit LIFO 保证兜底回收先于 ZFY_LEAK_DEBUG
+       报告执行，否则全局存活份额被 rc 报告误报为泄漏（g_global 审计实证） *)
 }
 
 let struct_ty_name (s : string) : string = Printf.sprintf "%%struct.%s" s
@@ -1228,8 +1233,8 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
          emitf fc "  %s = icmp ne i32 %s, 0" d r)
   | name, [ src ] when String.length name > 7 && String.sub name 0 7 = "$ifnew$" ->
     (* 接口值构造（v3.13）：堆拷贝 struct 值 + vtable 指针 → { data, vt }。
-       dst = 接口值槽（16 字节聚合，sret 约定）；生命周期 = 进程（不回收，
-       与闭包 env 同策略） *)
+       dst = 接口值槽（16 字节聚合，sret 约定）；data 堆块带引用计数，
+       最后一个引用释放时归还（v3.27 P0-1a，与闭包 env 同策略） *)
     (match dst with
      | None -> lerr None "$ifnew must be captured"
      | Some d ->
@@ -1242,7 +1247,12 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
           let (sz, _) = Hir.struct_size_align fc.g.structs sd in
           let (srcp, _) = ptr_of fc src in
           let blk = fresh_r fc in
-          emitf_entry fc "  %s = call ptr @zfy_env_new(i64 %d)" blk sz;
+          (* v3.27 审计修复：装箱分配必须随求值位置发射（原 emitf_entry
+             沉入入口块——循环内多次构造复用同一堆块，rc 份额错乱：第 2 次
+             构造覆盖 payload、第 1 份"份额"实为同块，后续覆盖路径 release
+             提前归零 → 悬垂/堆损坏，d1 审计用例实证）。与 MClNew 同款
+             当前位置发射，每次求值独立分配 *)
+          emitf fc "  %s = call ptr @zfy_env_new(i64 %d)" blk sz;
           (* P0-1b：深拷贝替代 memcpy（src 内含 string/seq 字段时浅拷
              会共享——release 时双释放）；zeroinit 后逐字段 assign *)
           emitf fc "  call void @llvm.memset.p0.i64(ptr %s, i8 0, i64 %d, i1 false)"
@@ -2076,8 +2086,8 @@ let gen_instr fc (i : instr) : unit =
           | _ -> ""
         in
         if wrap <> "" && fc.fname = "zfy.globals" then
-          emitf fc "  call void @zfy_global_reg(ptr %s, ptr %s, ptr %s)"
-            gname wrap (intern_string fc.g name)
+          fc.g.gres_pending := (gname, wrap, name) :: !(fc.g.gres_pending)
+          (* 发射推迟至 zfy.globals 末尾（见 gctx.gres_pending 注释） *)
       end;
       Hashtbl.replace fc.allocas name (gname, ty)
     end
@@ -2602,8 +2612,8 @@ let gen_instr fc (i : instr) : unit =
     (* 函数入口地址：寄存器表直接持有 LLVM 符号文本（@名） *)
     Hashtbl.replace fc.regs d ("@" ^ name)
   | MClNew (d, mangle, clenv, items, _ret) ->
-    (* 闭包堆块（v3.7）：按 clenv$N 布局分配（zfy_env_new = 不回收的
-       malloc，env 生命周期 = 进程），逐字段写入（gen_field_store 完成
+    (* 闭包堆块（v3.7）：按 clenv$N 布局分配（zfy_env_new = 带 rc 头的
+       堆分配，引用计数回收），逐字段写入（gen_field_store 完成
        string/seq/struct 捕获的深拷贝）；dst = 句柄 struct 槽 { ptr h }，
        堆块地址存入槽字段（后续传参/赋值按 struct 槽统一处理） *)
     (match find_struct fc.g clenv with
@@ -2711,6 +2721,39 @@ let gen_term fc (t : term) =
 
 (* ---------- 函数生成 ---------- *)
 
+(* move-only struct 名判定（llvmgen 侧，与 mir.move_only_ty 对应）：
+   句柄 mutex$/thread$/chan$<tag>、接口 iface$X、闭包 closure$<sig> *)
+let is_move_only_sname_ll (s : string) : bool =
+  s = "mutex$" || s = "thread$"
+  || (String.length s > 5 && String.sub s 0 5 = "chan$")
+  || (String.length s > 6 && String.sub s 0 6 = "iface$")
+  || (String.length s > 8 && String.sub s 0 8 = "closure$")
+
+(* v3.27 审计修复：把 ins（待发射的调用文本）插到函数体最后一条 ret
+   指令行之前——LLVM 不允许 ret 之后还发普通指令 *)
+let insert_before_last_ret (body : string) (ins : string) : string =
+  let arr = Array.of_list (String.split_on_char '\n' body) in
+  let n = Array.length arr in
+  let last = ref (-1) in
+  (for i = n - 1 downto 0 do
+     let l = arr.(i) in
+     if !last < 0 && String.length l >= 5 && String.sub l 0 5 = "  ret" then
+       last := i
+   done);
+  if !last < 0 then body ^ "\n" ^ ins
+  else begin
+    let b = Buffer.create (String.length body + String.length ins + 2) in
+    for i = 0 to n - 1 do
+      if i = !last then begin
+        Buffer.add_string b ins;
+        Buffer.add_char b '\n'
+      end;
+      Buffer.add_string b arr.(i);
+      if i < n - 1 then Buffer.add_char b '\n'
+    done;
+    Buffer.contents b
+  end
+
 let gen_fn g (f : mfn) : string =
   if Sys.getenv_opt "ZFY_DEBUG" = Some "1" then
     Printf.eprintf "[llvmgen] %s\n" f.mname;
@@ -2743,6 +2786,13 @@ let gen_fn g (f : mfn) : string =
       Hashtbl.replace fc.allocas n (addr, t);
       if is_agg t then begin
         match t with
+        | TStruct s when is_move_only_sname_ll s ->
+          (* 句柄/接口/闭包形参（v3.27 P0-1a 审计修复）：借用语义——
+             mir 侧不登记 owned（被调方退出不释放），槽位只做 memcpy
+             位拷贝接管指针值，不 retain。若走 struct_assign（retain）
+             则调用方份额照旧、被调方多出的份额无释放点 → 泄漏
+             （f1 审计用例实证：apply(inner) 每次 retain 无配平） *)
+          gen_memcpy fc addr (Printf.sprintf "%%%s" n) (size_of fc.g t)
         | TStruct s ->
           (* struct：借传槽地址，深拷贝接管（值语义；先清零防释放未初始化垃圾） *)
           emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty t) addr;
@@ -2776,6 +2826,23 @@ let gen_fn g (f : mfn) : string =
        | Some t -> gen_term fc t
        | None -> emitf fc "  unreachable"))
     f.mblocks;
+  (* v3.27 审计修复：zfy.globals 中推迟发射的全局资源注册调用，统一插到
+     函数体最后一条 ret 之前——注册时机晚于全部全局构造的 rc 分配，
+     atexit LIFO 保证 gres 兜底回收先于 ZFY_LEAK_DEBUG 报告执行
+     （否则全局存活份额被误报为泄漏，见 gctx.gres_pending 注释）。 *)
+  if f.mname = "zfy.globals" && !(g.gres_pending) <> [] then begin
+    let ins =
+      List.rev !(g.gres_pending)
+      |> List.map (fun (gname, wrap, name) ->
+             Printf.sprintf "  call void @zfy_global_reg(ptr %s, ptr %s, ptr %s)"
+               gname wrap (intern_string g name))
+      |> String.concat "\n"
+    in
+    let old = Buffer.contents body in
+    Buffer.clear body;
+    Buffer.add_string body (insert_before_last_ret old ins);
+    g.gres_pending := []
+  end;
   (* 组装：函数头 + 入口块 alloca 区 + 参数落槽/基本块 *)
   Buffer.add_buffer buf ebuf;
   Buffer.add_buffer buf body;
@@ -2797,14 +2864,6 @@ let gen_struct_type_def (_ : gctx) (sd : sdef) : string =
     Printf.sprintf "%s = type <{ %s }>\n" (struct_ty_name sd.sname) body
   else
     Printf.sprintf "%s = type { %s }\n" (struct_ty_name sd.sname) body
-
-(* move-only struct 名判定（llvmgen 侧，与 mir.move_only_ty 对应）：
-   句柄 mutex$/thread$/chan$<tag>、接口 iface$X、闭包 closure$<sig> *)
-let is_move_only_sname_ll (s : string) : bool =
-  s = "mutex$" || s = "thread$"
-  || (String.length s > 5 && String.sub s 0 5 = "chan$")
-  || (String.length s > 6 && String.sub s 0 6 = "iface$")
-  || (String.length s > 8 && String.sub s 0 8 = "closure$")
 
 (* 生成 @zfy_struct_free_<名>(ptr)：逐字段释放堆资源
    （string/seq/嵌套 struct 递归；运行时 free 函数均 NULL 安全）。
@@ -2973,7 +3032,8 @@ let gen_program (m : mir) : string =
   let g =
     { mbuf = Buffer.create 512; nstr = 0; globals = Hashtbl.create 16;
       srcfiles = Hashtbl.create 4; structs = m.mstructs;
-      clo_envs = Hashtbl.create 8; clofrees = Hashtbl.create 8 }
+      clo_envs = Hashtbl.create 8; clofrees = Hashtbl.create 8;
+      gres_pending = ref [] }
   in
   (* 显式声明模块 triple：与 clang --target=x86_64-w64-mingw32 的推断一致，
      消除链接阶段 "overriding the module target triple" 警告（w-015 #8） *)
@@ -3324,7 +3384,7 @@ let gen_program (m : mir) : string =
     "declare ptr @zfy_file_read_lines(ptr)\n";
   Buffer.add_string g.mbuf
     "declare void @zfy_file_write_file_err(ptr sret(%err.i64), ptr, ptr)\n";
-  (* 闭包（v3.7）：env 堆块分配（不回收——生命周期 = 进程） *)
+  (* 闭包（v3.7）：env 堆块分配（带 rc 头，引用计数回收——v3.27 P0-1a） *)
   Buffer.add_string g.mbuf "declare ptr @zfy_env_new(i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_rc_retain(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_rc_release(ptr, ptr)\n";

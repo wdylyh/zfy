@@ -670,11 +670,11 @@ and parse_primary p =
   | IntLit n -> ignore (next p); EInt (n, tp)
   | BigIntLit s -> ignore (next p); EBigInt (s, tp)
   | RDecLit (num, den) ->
-    (* 循环小数字面量 (前缀,循节,)：词法已折算为分数 num/den，
-       降为 n/d 除式——frac 上下文按分数构造（EFracNewK）、float 上下文
-       实数除、int 上下文整数除（截断，即"按目标宽度截取不四舍五入"） *)
+    (* 循环小数字面量 (前缀,循节,)：词法已折算为分数 num/den——
+       与 (n/d) 分数字面量同语义（v3.29）：frac 期望精确构造、float 期望
+       实数除、int 期望常量截断（"按目标宽度截取不四舍五入"） *)
     ignore (next p);
-    EBin (Ast.Div, EInt (num, tp), EInt (den, tp), tp)
+    EFracLit (num, den, tp)
   | FloatLit f -> ignore (next p); EFloat (f, tp)
   | StrLit s -> ignore (next p); EStr (s, tp)
   | CharLit c -> ignore (next p); EChar (c, tp)
@@ -741,7 +741,14 @@ and parse_primary p =
     ignore (next p);
     let e = parse_expr p in
     expect p RParen ")";
-    e
+    (* (n/d) 分数字面量（v3.29 语义反转）：括号包住的两个整数字面量除式
+       升级为分数字面量 EFracLit——不带括号的 1/4 永远是普通除法。
+       仅匹配裸整数字面量两侧：(-1/4)（一元负号）与 (1/-4) 不匹配
+       （保持除法语义）；分母为 0 同样保持除法（由 typeck 报除零） *)
+    (match e with
+     | EBin (Ast.Div, EInt (a, _), EInt (b, ep), _) when b <> 0L ->
+       EFracLit (a, b, ep)
+     | _ -> e)
   | _ -> err tp (Printf.sprintf "expected an expression, got %s" (pp_token tk))
 
 (* ---------- 块与语句 ---------- *)

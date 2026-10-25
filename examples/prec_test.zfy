@@ -36,5 +36,5 @@ fn main()
     let bool b3 = cast(es, bool) ?? false
     output(b1, b2, b3)                       // true false false
     // prec 与 frac
-    let i32 frac f = 6/48
+    let i32 frac f = (6/48)
     output(prec(f, 3), end="|\n")            // 1/8 截 3 -> 1/8（恰4字符截3 -> "1/8"？1/8 是3字符）

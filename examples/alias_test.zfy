@@ -61,7 +61,7 @@ fn main()
     output(k == k2, l == l2, m == m2, n == n2, sep=',')
 
     // ④ frac + 别名组合（约分/不约分；quad 与 f128 等价且都合法）
-    let i32 frac r = 6/48
+    let i32 frac r = (6/48)
     output(r, end=' ')                       // 期望 1/8（自动约分）
     output("")
     let f64 frac const unred ur = 1.2/4.8

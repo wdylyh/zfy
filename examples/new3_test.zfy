@@ -1,15 +1,15 @@
 // 第三轮改造（new.md）冒烟测试
 fn main()
-    let i32 frac unred ur = 6/48
+    let i32 frac unred ur = (6/48)
     output(ur, end=' ')                       // 期望 6/48（不约分）
     output("")
 
-    let i32 frac a = 6/48
+    let i32 frac a = (6/48)
     output(a, end=' ')                        // 期望 1/8（自动约分）
     output("")
 
     // unred 运算 → 赋给普通 frac 约分（6/48 * 2/4 = 12/192 = 1/16）
-    let i32 frac ur2 = 2/4
+    let i32 frac ur2 = (2/4)
     let i32 frac c = ur * ur2
     output(c, end=' ')                        // 期望 1/16
     output("")

@@ -38,6 +38,12 @@ and expr =
   | EInt of int64 * pos
   | EBigInt of string * pos       (* 超出 i64 的十进制大字面量（w-014 #6）：
                                      仅在 i128/u128 期望上下文合法 *)
+  | EFracLit of int64 * int64 * pos
+    (* (n/d) 分数字面量（v3.29 语义反转）：括号包住的两个整数字面量除式
+       （或循环小数字面量折算结果）。语义由期望上下文决定——
+       frac 期望 → 精确分数构造（EFracNewK，不除法）；整数期望 → 常量
+       截断整除；浮点期望 → 实数除；无期望推断 → i32 frac。
+       不带括号的 1/4 永远是普通除法（EBin Div），落 frac 目标编译期报错 *)
   | EFloat of float * pos
   | EStr of string * pos
   | EChar of char * pos

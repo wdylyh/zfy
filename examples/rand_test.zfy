@@ -64,11 +64,12 @@ fn main()
             bad++
         i++
     // ---- frac 区间：在 [1/2, 3/2] 内（自动约分）----
+    // v3.29：(n/d) 才是分数字面量；裸 1/2 是整数除法（rand(0, 1) 整数区间）
     rand.seed(11)
     i = 0
     while i < 50
-        let i64 frac f = rand(1/2, 3/2)
-        if f < 1/2 or f > 3/2
+        let i32 frac f = rand((1/2), (3/2))
+        if f < (1/2) or f > (3/2)
             bad++
         i++
     // ---- choice 列表形态（可重复，源不动）----

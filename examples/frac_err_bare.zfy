@@ -1,0 +1,4 @@
+// v3.29：裸 n/d 直接落在 frac 目标 → 编译期报错（提示写 (n/d)）
+fn main()
+    let i32 frac a = 1/4
+    output(a)

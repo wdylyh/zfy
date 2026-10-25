@@ -38,8 +38,8 @@ fn main()
     output(gnums[0], gnums[1], end="\n")
 
     // frac 参数
-    let i32 frac x = 1/2
-    let i32 frac y = 1/3
+    let i32 frac x = (1/2)
+    let i32 frac y = (1/3)
     let i32 frac s = fr_sum(x, y)
     output(s, end="\n")
 
