@@ -92,8 +92,38 @@ let dispatch argv =
    继续走 dispatch *)
 let extract_flags (argv : string array) : string array =
   let rest = ref [] in
+  (* 前缀匹配（--target=<t> / --linker-script=<p> 两种写法都支持） *)
+  let pref s p =
+    String.length s >= String.length p && String.sub s 0 (String.length p) = p in
+  let strip s p = String.sub s (String.length p) (String.length s - String.length p) in
   let rec go i =
     if i >= Array.length argv then ()
+    (* freestanding 裸机模式（§31）：入口/panic_handler/运行时裁剪 + 编译期禁用表 *)
+    else if argv.(i) = "--freestanding" then begin
+      Driver.set_freestanding true; go (i + 1)
+    end
+    else if argv.(i) = "--no-link" then begin
+      (* 只产 .ll，不做最终链接（裸机 ELF 目标在 Windows 宿主无法链接） *)
+      Driver.set_no_link true; go (i + 1)
+    end
+    else if argv.(i) = "--emit-ll" then
+      (* 默认已写出 .ll；保留显式开关便于脚本自描述 *)
+      go (i + 1)
+    else if pref argv.(i) "--target=" then begin
+      Driver.set_target_triple (strip argv.(i) "--target="); go (i + 1)
+    end
+    else if argv.(i) = "--target" && i + 1 < Array.length argv then begin
+      Driver.set_target_triple argv.(i + 1); go (i + 2)
+    end
+    else if pref argv.(i) "--linker-script=" || pref argv.(i) "--link-script=" then begin
+      let p = if pref argv.(i) "--linker-script="
+        then strip argv.(i) "--linker-script=" else strip argv.(i) "--link-script=" in
+      Driver.set_linker_script p; go (i + 1)
+    end
+    else if (argv.(i) = "--linker-script" || argv.(i) = "--link-script")
+            && i + 1 < Array.length argv then begin
+      Driver.set_linker_script argv.(i + 1); go (i + 2)
+    end
     else if argv.(i) = "--panic-mode" && i + 1 < Array.length argv then begin
       let m = argv.(i + 1) in
       if m <> "exit" && m <> "abort" then begin

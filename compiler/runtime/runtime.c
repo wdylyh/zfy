@@ -18,11 +18,60 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
-#include <malloc.h>
+#ifndef ZFY_FREESTANDING
+#include <malloc.h>                  /* 宿主堆扩展（裸机无此头） */
+#endif
 #include <time.h>                    /* 时间内建（v3.3.6）：time/mktime/localtime */
+
+/* ---------- 裸机内存层（§31 --freestanding）----------
+   裸机无宿主堆：本文件所有 malloc/free/realloc/calloc 经宏重定向到
+   zfy_malloc/zfy_free（弱符号，用户可提供自己的实现覆盖）。
+   默认实现是 16MB 静态缓冲的 bump 分配器：不回收（free 空操作），
+   每块带 16 字节头记录长度，故 realloc 可“新分配 + 拷贝”。
+   注意：整段仅在 ZFY_FREESTANDING 下生效，宿主构建行为一字不变。 */
+#ifdef ZFY_FREESTANDING
+#define ZFY_FS_POOL_SIZE (16u * 1024u * 1024u)
+static unsigned char zfy_fs_pool[ZFY_FS_POOL_SIZE] __attribute__((aligned(16)));
+static size_t zfy_fs_off = 0;
+typedef struct { size_t size; } zfy_fs_hdr;
+
+__attribute__((weak)) void *zfy_malloc(size_t n) {
+    /* 头部 16 字节 + 数据按 16 字节对齐 */
+    size_t need = sizeof(zfy_fs_hdr) + ((n + 15u) & ~(size_t)15);
+    if (zfy_fs_off + need > sizeof(zfy_fs_pool)) return NULL;
+    zfy_fs_hdr *h = (zfy_fs_hdr *)(void *)(zfy_fs_pool + zfy_fs_off);
+    h->size = n;
+    zfy_fs_off += need;
+    return (void *)(h + 1);
+}
+
+__attribute__((weak)) void zfy_free(void *p) { (void)p; /* bump：不回收 */ }
+
+__attribute__((weak)) void *zfy_realloc(void *p, size_t n) {
+    if (!p) return zfy_malloc(n);
+    zfy_fs_hdr *h = ((zfy_fs_hdr *)p) - 1;
+    void *q = zfy_malloc(n);
+    if (q) memcpy(q, p, h->size < n ? h->size : n);
+    return q;
+}
+
+__attribute__((weak)) void *zfy_calloc(size_t cnt, size_t sz) {
+    size_t n = cnt * sz;
+    void *q = zfy_malloc(n);
+    if (q) memset(q, 0, n);
+    return q;
+}
+
+#define malloc(n) zfy_malloc(n)
+#define free(p) zfy_free(p)
+#define realloc(p, n) zfy_realloc(p, n)
+#define calloc(n, s) zfy_calloc(n, s)
+#endif /* ZFY_FREESTANDING */
 #ifdef _WIN32
 #include <io.h>                      /* _isatty（交互控制台探测） */
+#ifndef ZFY_FREESTANDING
 #include <windows.h>                 /* OS 熵源（SystemFunction036 动态加载） */
+#endif
 #else
 #include <unistd.h>                  /* isatty / getentropy */
 #endif
@@ -96,6 +145,7 @@ char *zfy_msg_strdup(const char *s); /* 前向声明：受跟踪的错误消息�
  *   - zfy_panic_abort：非 0 时 abort()（调试器断点场景，--panic-mode abort）。
  * 编译器生成侧在 MPanic 调用前补 RAII 释放（emit_frees + unlock 回卷），
  * 覆盖 panic 语句所在函数的局部资源与锁。 */
+#ifndef ZFY_FREESTANDING
 #include <setjmp.h>
 typedef struct zfy_try_frame {
     struct zfy_try_frame *prev;
@@ -148,6 +198,21 @@ void zfy_panic(int32_t code, char *msg) {
     if (zfy_panic_abort) abort();
     exit(zfy_panic_exit);
 }
+
+#else /* ZFY_FREESTANDING：裸机 panic 骨架 */
+/* 无 setjmp/longjmp、无 exit/abort、无 stderr。
+   panic 直接调用用户 panic_handler(code=0, msg)；handler 约定不返回
+   （loop 或 asm("hlt")）。若用户 handler 意外返回，在此挂起（不引入 OS 退出）。 */
+void zfy_set_panic_exit(int code) { (void)code; }
+void zfy_set_panic_abort(int on) { (void)on; }
+const char *zfy_panic_msg(void) { return ""; }
+
+void zfy_panic(int32_t code, char *msg) {
+    if (zfy_panic_handler) zfy_panic_handler(code, msg ? msg : "");
+    for (;;) { /* 用户 handler 应已停止执行；返回则死循环挂起 */ }
+}
+#endif /* ZFY_FREESTANDING */
+
 
 /* 错误值快捷填充 */
 static void err_set(zfy_err *out, int32_t code, const char *msg) {
@@ -310,6 +375,9 @@ void zfy_err_find_str(zfy_err *out, const char *s, const char *sub, long long k)
     else
         err_ok_i(out, r);
 }
+
+/* freestanding（--freestanding）：文件 I/O 依赖 OS，整段裁剪。 */
+#ifndef ZFY_FREESTANDING
 
 /* ---------- 文件 I/O（design_fileio.md） ----------
  * File = move-only 句柄：变量槽值是堆上句柄对象指针 { FILE* fp; int closed }。
@@ -534,6 +602,8 @@ __attribute__((constructor)) static void zfy_io_init(void) {
     setvbuf(stdout, out_buf, _IOFBF, sizeof out_buf);
 }
 
+#endif /* !ZFY_FREESTANDING：文件 I/O 段结束 */
+
 /* ---------- 串辅助（深拷贝语义 + 安全释放） ---------- */
 
 /* 释放堆串：free(NULL) 安全（零值槽位） */
@@ -564,11 +634,13 @@ static zfy_msg_node *zfy_msg_list = NULL;
 static void zfy_msg_atexit(void); /* 前向声明 */
 
 char *zfy_msg_strdup(const char *s) {
+#ifndef ZFY_FREESTANDING
     static int hooked = 0;
     if (!hooked) {
         hooked = 1;
         atexit(zfy_msg_atexit);
     }
+#endif
     char *r = zfy_strdup(s);
     if (r) {
         zfy_msg_node *n = (zfy_msg_node *)malloc(sizeof(zfy_msg_node));
@@ -1011,6 +1083,10 @@ DEF_FRAC_INT(u128, unsigned __int128, unsigned __int128, unsigned __int128)
 DEF_FRAC_FLT(f32, float)
 DEF_FRAC_FLT(f64, double)
 DEF_FRAC_FLT(f128, long double)
+
+/* ---------- output / input 运行时支持 ----------
+   freestanding：无控制台（output/input 在编译期已被 typeck 拒绝），整段裁剪。 */
+#ifndef ZFY_FREESTANDING
 
 /* ---------- output 运行时支持 ---------- */
 
@@ -1536,6 +1612,8 @@ void zfy_input_err_char(zfy_err *out, const char *delim) {
     err_ok_i(out, (long long)c);
 }
 
+#endif /* !ZFY_FREESTANDING：output/input 段结束 */
+
 /* ---------- 数组/列表运行时支持（按元素宽度存储） ---------- */
 
 /* 前置声明：元素级操作按头部 kind 递归释放/复制嵌套 seq（w-014 #2/#4） */
@@ -1643,6 +1721,7 @@ static void elem_assign(void *dst, const void *src, int kind, zfy_ops *ops,
     if (buf != tmpbuf) free(buf);
 }
 
+#ifndef ZFY_FREESTANDING
 /* output(数组/列表)（w-013）：按元素类型码打印序列，元素间以 sep 分隔。
    类型码：0 i8 1 i16 2 i32 3 i64 4 u8 5 u16 6 u32 7 u64 8 i128 9 u128
    10 f32 11 f64 12 char 13 bool 14 string（与 mir elem_kind 对应） */
@@ -1709,6 +1788,7 @@ static void zfy_print_seq_nest_rec(zfy_seq *s, int depth, int leafkind, const ch
 void zfy_print_seq_nest(zfy_seq *s, int depth, int leafkind, const char *sep) {
     zfy_print_seq_nest_rec(s, depth, leafkind, sep);
 }
+#endif /* !ZFY_FREESTANDING：output(序列) 打印段结束（output 语句不可用） */
 
 /* 列表扩长到 need 个元素：容量按需加倍 realloc，新增槽位填零值 */
 static void seq_grow(zfy_seq *s, long long need) {
@@ -2491,6 +2571,7 @@ DEF_COUNT(str, STRCMP(x, v) == 0, char *)
 
 /* ---------- 标准库最小版（v3.12）：os_args / os_env / assert_eq ---------- */
 
+#ifndef ZFY_FREESTANDING
 /* os_args() -> list<string>：Windows CRT argv 规则解析 GetCommandLineA
  * （空格分隔，"..." 段内空格保留，"..." 内 "" 转义引号，反斜杠按 CRT 规则） */
 zfy_seq *zfy_os_args(void) {
@@ -2563,6 +2644,7 @@ void zfy_os_env_err(zfy_err *out, const char *name) {
     out->msg = NULL;
     out->value.p = zfy_strdup(tmp);
 }
+#endif /* !ZFY_FREESTANDING：os_args/os_env 段结束（assert_eq 纯计算，保留） */
 
 /* assert_eq(a, b)（v3.12 测试内建）：不等 panic（打印两侧值）。 */
 #define DEF_ASSERT(TAG, FMT, ELEM_T, FREAD)                                \
@@ -2602,13 +2684,15 @@ void zfy_assert_eq_str(const char *a, const char *b) {
  * 约定：new = rc(1)；LLVM 侧 assign 浅拷后调 zfy_rc_retain；
  * 释放侧一律 zfy_rc_release(p, dtor)——rc 归零才执行 dtor + free。
  * spawn 移交 = 宿主槽 rc 份额移交线程（spawn 后宿主槽裸置空不再释放） */
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(ZFY_FREESTANDING)
 static long long *zfy_rc_of(void *p) { return ((long long *)p) - 1; }
 static long long zfy_rc_alloced = 0, zfy_rc_freed = 0;   /* 泄漏统计（ZFY_LEAK_DEBUG） */
 static void zfy_rc_report(void);
 void *zfy_rc_alloc(size_t payload) {
+#ifndef ZFY_FREESTANDING
     static int rep_hooked = 0;
     if (!rep_hooked) { rep_hooked = 1; atexit(zfy_rc_report); }
+#endif
     long long *raw = (long long *)malloc(payload + 8);
     if (!raw) zfy_die("rc: 内存分配失败");
     *raw = 1;
@@ -2631,8 +2715,10 @@ static long long *zfy_rc_of(void *p) { return ((long long *)p) - 1; }
 static long long zfy_rc_alloced = 0, zfy_rc_freed = 0;
 static void zfy_rc_report(void);
 void *zfy_rc_alloc(size_t payload) {
+#ifndef ZFY_FREESTANDING
     static int rep_hooked = 0;
     if (!rep_hooked) { rep_hooked = 1; atexit(zfy_rc_report); }
+#endif
     long long *raw = (long long *)malloc(payload + 8);
     if (!raw) zfy_die("rc: 内存分配失败");
     *raw = 1;
@@ -2649,6 +2735,7 @@ void zfy_rc_release(void *p, void (*dtor)(void *)) {
     }
 }
 #endif
+#ifndef ZFY_FREESTANDING
 /* 泄漏报告（P0-1a 验证）：ZFY_LEAK_DEBUG=1 时 atexit 打印 rc 对象
  * 分配/回收差值（>0 = 泄漏的闭包 env/chan/mutex/iface 装箱数） */
 static void zfy_rc_report(void) {
@@ -2656,6 +2743,7 @@ static void zfy_rc_report(void) {
         fprintf(stderr, "[zfy-leak] rc 对象泄漏: %lld (alloc %lld / freed %lld)\n",
                 zfy_rc_alloced - zfy_rc_freed, zfy_rc_alloced, zfy_rc_freed);
 }
+#endif /* !ZFY_FREESTANDING：泄漏报告依赖 atexit/getenv/stderr */
 
 /* env 堆块分配（v3.27 P0-1 引用计数；t-049/C 改自描述 dtor）：
  * 头 16 字节 = { dtor, rc }（dtor 在 rc 前 8 字节，rc 仍保持"载荷指针
@@ -2687,7 +2775,7 @@ void zfy_env_free(void *p) {
     if (!p) return;
     long long *rcp = ((long long *)p) - 1;        /* rc 槽 */
     void (**dp)(void *) = (void (**)(void *))rcp - 1;  /* dtor 槽 = 块起点 */
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(ZFY_FREESTANDING)
     if (InterlockedDecrement64(rcp) == 0) {
 #else
     if (--*rcp == 0) {
@@ -3357,6 +3445,7 @@ zfy_seq *zfy_str_split_str(const char *s, const char *delim) {
    POSIX: getentropy()。
    熵源不可用属不可恢复错误，fail-fast die。 */
 
+#ifndef ZFY_FREESTANDING
 /* ---- 控制台 UTF-8 统一（编码策略：进程内所有 string 均为 UTF-8 字节） ----
  * Windows 控制台默认代码页（如 936/GBK）会导致 UTF-8 中文经 printf/fwrite
  * 输出乱码、input() 键入字节为 GBK。进程加载时强制代码页 65001：
@@ -3385,6 +3474,7 @@ void zfy_os_random_u64(unsigned long long *out) {
     if (getentropy(out, 8) != 0) zfy_die("os_random: getentropy failed");
 #endif
 }
+#endif /* !ZFY_FREESTANDING：OS 熵源 / 控制台代码页段结束 */
 
 /* ---------- 整数溢出 panic（任务一：默认检查）----------
    LLVM 侧用 llvm.*.with.overflow 内建/前置比较判定溢出，命中时调用本函数。
@@ -3580,6 +3670,7 @@ void zfy_pow_i128_ov(long long out[2],
  * datetime 布局与 LLVM %struct.datetime 一致：8 个 int32_t（32 字节），
  * zfy_time_local 以 sret 首参写入（调用方分配槽位）。
  * weekday: 0=周日..6=周六（tm_wday 语义）；yday: 年内第几天，0 起（tm_yday）。 */
+#ifndef ZFY_FREESTANDING
 typedef struct {
     int32_t year, month, day, hour, minute, second, weekday, yday;
 } zfy_datetime;
@@ -3654,6 +3745,7 @@ int64_t zfy_time_mktime(int64_t y, int64_t mo, int64_t d,
     time_t t = mktime(&tmv);
     return (t == (time_t)-1) ? -1 : (int64_t)t;
 }
+#endif /* !ZFY_FREESTANDING：时间内建段结束（依赖 time/localtime/mktime/sleep） */
 
 /* ---------- 内建随机 + 计时器（v3.28 new.md 第1、2条）----------
  * rand 系：xoshiro256** 引擎 + SplitMix64 播种（全局单序列；未 seed 先用
@@ -3877,6 +3969,7 @@ DEF_RANDFRAC(u64, uint64_t)
 
 /* ---------- 计时器（timer 系，new.md 第2条） ---------- */
 
+#ifndef ZFY_FREESTANDING
 #define ZFY_TIMER_SLOTS 4096
 static struct {
     int active;      /* 槽已登记 */
@@ -3962,6 +4055,7 @@ void zfy_time_sleep_f(double sec) {
     while (nanosleep(&req, &req) == -1 && errno == EINTR) { /* 重试剩余部分 */ }
 #endif
 }
+#endif /* !ZFY_FREESTANDING：计时器段结束（依赖 QPC/单调钟/sleep） */
 
 /* ==================== GUI 核心层（v3.3.7 design_gui.md L0） ====================
  * 架构（速度保障）：
@@ -3975,7 +4069,7 @@ void zfy_time_sleep_f(double sec) {
  *  - DPI 感知：Per-Monitor V2（旧系统退回 SetProcessDPIAware），
  *    open 的 w/h 按 dpi 缩放为物理像素，无 DWM 拉伸模糊；gui_dpi() 供布局缩放
  *  - 可调窗口：WM_SIZE 时重建 DIB 并推 EV_SIZE 事件（x=新宽, y=新高） */
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(ZFY_FREESTANDING)
 #include <wchar.h>                     /* wcslen（GUI 文本转换） */
 
 typedef struct { int64_t t, x, y, k; } gui_ev;
@@ -4542,7 +4636,7 @@ int32_t zfy_gui_text_w(char *s) { (void)s; return 0; }
  *   - join 后句柄置 null（重复 join 报错）；map/列表等容器
  *     非线程安全，跨线程共享须用 mutex 外部保护。
  * ================================================================== */
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(ZFY_FREESTANDING)
 #include <process.h>
 
 /* ---- 线程 ---- */
@@ -4876,12 +4970,25 @@ void zfy_mutex_new(void **o) { (void)o; zfy_die("mutex: 仅支持 Windows"); }
 void zfy_mutex_lock(void **s) { (void)s; }
 void zfy_mutex_unlock(void **s) { (void)s; }
 void zfy_mutex_free(void **s) { (void)s; }
+#if defined(ZFY_FREESTANDING)
+/* 裸机：原子操作走 clang __atomic 内建（无需 OS 互斥原语；atomic 内建在
+   freestanding 下仍可用，保持与 Windows Interlocked 相同的旧值语义） */
+int32_t zfy_atomic_load_32(void *p) { return __atomic_load_n((int32_t *)p, __ATOMIC_SEQ_CST); }
+void zfy_atomic_store_32(void *p, int32_t v) { __atomic_store_n((int32_t *)p, v, __ATOMIC_SEQ_CST); }
+int32_t zfy_atomic_add_32(void *p, int32_t v) { return __atomic_fetch_add((int32_t *)p, v, __ATOMIC_SEQ_CST); }
+int64_t zfy_atomic_load_64(void *p) { return __atomic_load_n((int64_t *)p, __ATOMIC_SEQ_CST); }
+void zfy_atomic_store_64(void *p, int64_t v) { __atomic_store_n((int64_t *)p, v, __ATOMIC_SEQ_CST); }
+int64_t zfy_atomic_add_64(void *p, int64_t v) { return __atomic_fetch_add((int64_t *)p, v, __ATOMIC_SEQ_CST); }
+void zfy_atomic_inc_32(void *p) { (void)__atomic_fetch_add((int32_t *)p, 1, __ATOMIC_SEQ_CST); }
+void zfy_atomic_inc_64(void *p) { (void)__atomic_fetch_add((int64_t *)p, 1, __ATOMIC_SEQ_CST); }
+#else
 int32_t zfy_atomic_load_32(void *p) { (void)p; return 0; }
 void zfy_atomic_store_32(void *p, int32_t v) { (void)p; (void)v; }
 int32_t zfy_atomic_add_32(void *p, int32_t v) { (void)p; (void)v; return 0; }
 int64_t zfy_atomic_load_64(void *p) { (void)p; return 0; }
 void zfy_atomic_store_64(void *p, int64_t v) { (void)p; (void)v; }
 int64_t zfy_atomic_add_64(void *p, int64_t v) { (void)p; (void)v; return 0; }
+#endif
 void zfy_sleep_ms(long long ms) { (void)ms; }
 void zfy_chan_new(void **o) { (void)o; zfy_die("chan: 仅支持 Windows"); }
 void zfy_chan_send_i64(void **s, long long v) { (void)s; (void)v; }

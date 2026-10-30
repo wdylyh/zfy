@@ -2564,6 +2564,9 @@ and parse_item p =
       match ty_opt with
       | Some ty -> Some ty
       | None when name = "main" -> Some (TNamed ("i32", tp))   (* main 隐含 i32 *)
+      (* freestanding 入口与 panic 钩子允许省略返回类型，缺省 void *)
+      | None when name = "_start" || name = "panic_handler" ->
+        Some (TNamed ("void", tp))
       | None -> err tp "function declaration requires a return type (or use void)"
     in
     IFn { name; params; ret; rfrac = is_frac; runred = is_unred;

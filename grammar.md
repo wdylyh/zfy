@@ -1,4 +1,4 @@
-# zfy 语言规范（v3.31.0，2026-10-25）
+# zfy 语言规范（v3.32.0，2026-10-30）
 
 > 本规范只描述当前语法。旧语法一律删除、不再保留历史版本描述。
 > 适用编译器：`compiler/_build/zfyc.exe` 当前构建。
@@ -258,27 +258,46 @@ union Value
   union 内不存 string 之外的所有权资源；string 字段请自行管理）。
 - 只能声明字段，不能有方法。
 
-### 7.2 位域（struct packed 内，v3.32）
+### 7.2 位域（v3.32；布局与 C（MSVC x64）一致）
 
 ```
-struct packed Flags
+struct Flags
     u8 lo: 3
     u8 mid: 4
     i8 sgn: 4
+
+struct packed P
+    u8 a: 3
+    u32 b: 5
 ```
 
-- 语法 `TYPE 名字: N`，须在 `struct packed` 内（普通 struct 内报错）；
-  `TYPE` 必须是整数类型，`N` 是编译期整数字面量且 `1 ≤ N ≤ 位宽`。
-- 存储：每个位域字段**独占一个其声明类型的存储单元**（v1 简化，不做
-  相邻位域合并），位从 LSB 起。
+- 语法 `TYPE 名字: N`：普通 struct 与 `struct packed` 内都允许（union 内
+  报错）；`TYPE` 必须是整数类型，`N` 为编译期整数字面量且
+  `1 ≤ N ≤ 位宽`。
+- **存储单元分配（Microsoft C 位域规则）**：按字段声明序逐字段处理，
+  维护"当前存储单元"（起点偏移、单元宽 = 声明类型宽度、已用位数）：
+  - 位域紧邻塞入当前单元：声明类型与当前单元相同、且剩余位放得下 `N`
+    位时共享单元；否则换新单元（新起点 = 当前偏移按单元对齐后取整）。
+  - 声明类型宽度不同（如 `u8` 位域后接 `u32` 位域）即换新单元。
+  - 普通字段**结束**当前位域单元，按自身对齐另起位置（可与位域交错，
+    例如 `u8 a:3; i32 b; u8 c:5` 中 b 对齐到 4、c 另起单元）。
+  - 对齐：非 packed 时新单元按声明类型自然对齐（结构对齐 = 各单元/普通
+    字段对齐的最大值）；packed 时单元按 **1 字节**对齐（等价
+    `#pragma pack(1)`，结构对齐 = 1），单元内部宽度不变。
+  - 零宽位域（C 的 `u8 : 0` 强制换下一单元）**本语法不支持**：字段必须
+    有名字、宽度 ≥ 1。
 - 读写一律生成**显式掩码代码**（读：无符号按 `& (2^N-1)`、有符号先左移
   再算术右移做符号扩展；写：read-modify-write 清位后置入低 N 位）。
   普通代码即可使用，**不必包 `unsafe`**（与 C 位域不同，没有指针访问）。
 - 取位域地址（`&f.lo`）报错；位域字段不能有默认值，也不能用于
   `sizeof` 字段偏移。
-- C ABI 兼容性：本实现的布局**不与 C 编译器**的位域打包规则一致
-  （C 会把相邻窄位域塞进同一单元）；与 C 交互请改用普通整数字段 +
-  显式掩码，或按本实现约定对齐结构体大小。
+- `sizeof`/`alignof` 返回与 C 一致的值。实测对照（clang 18.1.8
+  `-mms-bitfields`，packed 用 `#pragma pack(1)`）：
+  `{u8 a:3}` = 1/1；`{u8 a:5, u8 b:4}` = 2/1；`{u16 a:4, u32 b:5, u8 c:3}`
+  = 12/4；`{u8 a:3, i32 b, u8 c:5}` = 12/4；`{u32 a:20, u32 b:12}` = 4/4；
+  `{u32 a:32, u8 b:1}` = 8/4；packed `{u8 a:3, u32 b:5, u16 c:4}` = 7/1、
+  `{u8 a:3, u32 b, u8 c:5}` = 6/1。内存映像（字段/未用位/填充字节全零）
+  与 C 逐字节一致。
 
 ### 7.3 符号属性（export / section / internal，v3.32）
 
@@ -1811,3 +1830,115 @@ fn main()
   （正常/panic/handler 自定义退出）atexit 统一回收——零泄漏承诺。
   `ZFY_LEAK_DEBUG=1` 运行时 stderr 打印回收清单与 rc 差值报告
   （`[zfy-leak] rc 对象泄漏: N`，N=0 为平衡）。
+
+## 31. 裸机模式（freestanding，v3.31）
+
+`--freestanding` 生成不依赖操作系统 / CRT 的裸机产物：入口由用户提供、
+panic 走用户钩子、OS 依赖的内建在**编译期**拒绝、运行时只链接纯计算
+核心层。普通模式（不带该开关）行为完全不变。
+
+### 31.1 编译开关
+
+```
+zfyc build 程序.zfy --freestanding [--no-link] [--target <triple>] [--link-script <path>]
+```
+
+- `--freestanding`：进入裸机模式。可与 `--wrap-overflow`、`--panic-mode`
+  等既有开关任意组合（开关解析在 CLI，先于编译管线生效）。
+- `--no-link`：只产出 `.ll`（及用户自行转出的 `.o`），不做最终链接。
+  宿主（Windows）通常无法链接裸机 ELF 目标，交叉场景用它交接给
+  `clang`/`ld` 与链接脚本。
+- `--target <triple>`：LLVM 目标三元组（如 `x86_64-unknown-elf`、
+  `riscv32-unknown-elf`）；缺省沿用宿主三元组。
+- `--link-script <path>`（等价写法 `--linker-script`）：传给链接器
+  `-Wl,-T,<path>`。仅 ELF 目标可用；Windows/MSVC 目标报错。
+  `--no-link` 时只记录不传给链接器。
+
+### 31.2 入口点：`fn _start()`
+
+- 裸机入口是用户写的 `fn _start()`：**无返回值、无参数**
+  （`void` 返回可省略返回类型）。生成 `define void @_start()`，
+  不再生成 `main`。
+- 函数体先由编译器合成的入口包装调用 `zfy.globals` 完成全局变量
+  初始化，再注册 panic 钩子，最后调用户 `_start` 本体。
+- 同时存在 `fn main()` 是允许的（自行链接 CRT 时可用），但入口仍取
+  `_start`。缺少 `_start` 且缺少 `main` 时报
+  `freestanding requires fn _start()`。
+- 普通模式（无 `--freestanding`）仍必须提供 `fn main()`。
+
+### 31.3 panic_handler：必需钩子
+
+裸机必须提供：
+
+```
+fn panic_handler(let string msg)
+    return
+```
+
+- 签名固定为 `(string) -> void`，无返回类型（`void`）。缺失或签名不符
+  在**编译期**报 `freestanding requires a panic handler`。
+- 运行时把所有 panic 路径（panic 内建、整数溢出检查、除零、断言失败、
+  frac 错误、越界）统一改调用户 handler；handler 返回后进入死循环
+  （`for(;;)`），保证不返回宿主。
+- 代码生成会生成稳定的适配器 `define void @zfy.fs.panic_adapter`
+  （把 runtime 的 `(i32, string)` 回调适配到用户 `(string)` handler）
+  并在入口处 `zfy_set_panic_handler` 注册。
+
+### 31.4 不可用能力（编译期拒绝）
+
+裸机没有 OS 层，以下能力在类型检查阶段直接报错（位置指向使用处），
+消息统一为 `<名称> is not available in freestanding mode`：
+
+| 类别 | 名称 |
+| --- | --- |
+| 文件 I/O | `File` 类型、`open`/`read_all`/`read_line`/`read_lines`/`write`/`writeln`/`close`/`exists`/`read_file`/`write_file` |
+| 控制台 I/O | `output` 语句、`input` 语句 |
+| 并发 | `spawn`/`join`/`detach`、`mutex_new`/`lock`/`unlock`、`chan_send`/`chan_recv`/`chan_close`/`chan_len` |
+| 时间 | `now`/`tick_ms`/`sleep`/`sleep_ms`/`localtime`/`mktime`、`timer`/`timer.add`/`timer.remove`/`timer.now`/`time.sleep` |
+| 环境 | `os_args`/`os_env`、`try`（依赖 setjmp/longjmp） |
+| GUI | `ui` 关键字及全部窗口/组件内建（依赖 Win32/GDI） |
+
+保留可用：纯计算、字符串/数组/列表/map/set、struct、frac、整数溢出
+检查、`assert_eq`、`rand`（纯算法）、原子/volatile 内建。
+
+### 31.5 运行时裁剪与内存
+
+`--freestanding` 链接时 runtime.c 以 `-DZFY_FREESTANDING` 编译：
+去掉 `windows.h` / 线程 / 文件 / GUI / QPC 计时 / output / input /
+时间 / 环境变量等 OS 段，只保留内存、panic 适配器、字符串与容器
+rc/free、frac 运算、溢出检查、断言、rand、math 基础。
+
+裸机内存优先弱符号：
+
+```
+void *zfy_malloc(size_t n);   /* __attribute__((weak)) */
+void  zfy_free(void *p);      /* __attribute__((weak)) */
+```
+
+用户可实现同名强符号覆盖；未提供时默认使用 16MB 静态缓冲的 bump
+分配器（`zfy_free` 空操作，`zfy_realloc` 新分配 + 拷贝）。本文件内
+`malloc/free/realloc/calloc` 经宏重定向到该层。
+
+### 31.6 全局初始化顺序
+
+`_start` 入口 → `zfy.globals`（顶层变量初始化，按声明顺序）→
+注册 panic 钩子 → 用户 `_start` 本体。裸机下不做资源登记表 /
+atexit 兜底回收（无进程退出路径）。
+
+### 31.7 示例
+
+```
+fn panic_handler(let string msg)
+    return
+
+let i64 total = 0
+
+fn _start()
+    let i64 i = 1
+    while i <= 100
+        total = total + i
+        i = i + 1
+    assert_eq(total, cast(5050, i64))
+```
+
+编译：`zfyc build demo.zfy --freestanding --no-link` → 产出 `demo.ll`。

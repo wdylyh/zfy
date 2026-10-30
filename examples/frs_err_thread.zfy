@@ -1,0 +1,6 @@
+// 报错用例：freestanding 下线程（spawn/join/detach）不可用（无 OS 线程栈）
+fn panic_handler(let string msg)
+    return
+
+fn _start()
+    let t = spawn(fn() => 0)

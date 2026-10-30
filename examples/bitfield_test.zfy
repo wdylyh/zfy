@@ -1,0 +1,184 @@
+// 位域 C（MSVC x64 / clang -mms-bitfields）布局一致性回归：
+// 每组形态与 _tmp/bfield.c 的 sizeof/alignof/原始字节 dump 逐一对照。
+// sizeof/alignof 失败 exit 1。
+struct S1
+    u8 a: 3
+
+struct S2
+    u8 a: 5
+    u8 b: 4
+
+struct S3
+    u16 a: 4
+    u32 b: 5
+    u8 c: 3
+
+struct S4
+    u8 a: 3
+    i32 b
+    u8 c: 5
+
+struct S5
+    u32 a: 20
+    u32 b: 12
+
+struct S6
+    u32 a: 32
+    u8 b: 1
+
+struct packed P1
+    u8 a: 3
+    u32 b: 5
+    u16 c: 4
+
+struct packed P2
+    u8 a: 3
+    u32 b
+    u8 c: 5
+
+struct packed P3
+    u8 a: 5
+    u8 b: 4
+
+struct packed P4
+    u16 a: 4
+    u32 b: 5
+
+struct SB
+    i8 sgn: 4
+
+fn i32 check_bytes(let u8* p, let i32 n, let u8[] want)
+    if length(want) != n
+        return 0
+    let i32 ok = 1
+    unsafe
+        for let i32 i = 0, i < n, i++
+            if p[i] != want[i]
+                ok = 0
+    return ok
+
+fn main()
+    let i32 bad = 0
+
+    // 1) 单字段：u8 a:3
+    let S1 s1 = S1(7)
+    if s1.a != 7 or sizeof(S1) != 1 or alignof(S1) != 1
+        bad++
+    let u8[] w1 = 7
+    unsafe
+        if check_bytes(cast(&s1, u8*), 1, w1) != 1
+            bad++
+
+    // 2) 多字段跨单元：u8 a:5 + u8 b:4（放不下 → b 另起单元）
+    let S2 s2 = S2(a=31, b=15)
+    if s2.a != 31 or s2.b != 15 or sizeof(S2) != 2 or alignof(S2) != 1
+        bad++
+    let u8[] w2 = 31, 15
+    unsafe
+        if check_bytes(cast(&s2, u8*), 2, w2) != 1
+            bad++
+    s2.a = 63                        // 写宽于 5 位 → 掩码回 31
+    if s2.a != 31 or s2.b != 15
+        bad++
+
+    // 3) 声明类型不同（u16/u32/u8）：a@0(u16 单元)、b@4、c@8，总大小 12/对齐 4
+    let S3 s3 = S3(a=15, b=31, c=7)
+    if s3.a != 15 or s3.b != 31 or s3.c != 7
+        bad++
+    if sizeof(S3) != 12 or alignof(S3) != 4
+        bad++
+    let u8[] w3 = 15, 0, 0, 0, 31, 0, 0, 0, 7, 0, 0, 0
+    unsafe
+        if check_bytes(cast(&s3, u8*), 12, w3) != 1
+            bad++
+
+    // 4) 混合普通字段（非 packed）：a@0，b 对齐到 4，c@8；大小 12/对齐 4
+    let S4 s4 = S4(a=7, b=287454020, c=31)      // 0x11223344
+    if s4.a != 7 or s4.b != 287454020 or s4.c != 31
+        bad++
+    if sizeof(S4) != 12 or alignof(S4) != 4
+        bad++
+    let u8[] w4 = 7, 0, 0, 0, 68, 51, 34, 17, 31, 0, 0, 0
+    unsafe
+        if check_bytes(cast(&s4, u8*), 12, w4) != 1
+            bad++
+
+    // 5) 满单元：u32 a:20 + b:12（同一 u32 单元），大小 4/对齐 4
+    let S5 s5 = S5(a=1048575, b=4095)
+    if s5.a != 1048575 or s5.b != 4095
+        bad++
+    if sizeof(S5) != 4 or alignof(S5) != 4
+        bad++
+    let u8[] w5 = 255, 255, 255, 255
+    unsafe
+        if check_bytes(cast(&s5, u8*), 4, w5) != 1
+            bad++
+
+    // 6) 满宽位域 + 后续位域换单元：u32 a:32 @0，u8 b:1 @4，大小 8/对齐 4
+    let S6 s6 = S6(a=4294967295, b=1)
+    if s6.a != 4294967295 or s6.b != 1
+        bad++
+    if sizeof(S6) != 8 or alignof(S6) != 4
+        bad++
+    let u8[] w6 = 255, 255, 255, 255, 1, 0, 0, 0
+    unsafe
+        if check_bytes(cast(&s6, u8*), 8, w6) != 1
+            bad++
+
+    // 7) packed：u8 a:3、u32 b:5、u16 c:4（单元按 1 字节对齐）
+    let P1 p1 = P1(a=7, b=31, c=15)
+    if p1.a != 7 or p1.b != 31 or p1.c != 15
+        bad++
+    if sizeof(P1) != 7 or alignof(P1) != 1
+        bad++
+    let u8[] wp1 = 7, 31, 0, 0, 0, 15, 0
+    unsafe
+        if check_bytes(cast(&p1, u8*), 7, wp1) != 1
+            bad++
+
+    // 8) packed 混合普通字段：a@0，b@1..5，c@5..6
+    let P2 p2 = P2(a=7, b=287454020, c=31)
+    if p2.a != 7 or p2.b != 287454020 or p2.c != 31
+        bad++
+    if sizeof(P2) != 6 or alignof(P2) != 1
+        bad++
+    let u8[] wp2 = 7, 68, 51, 34, 17, 31
+    unsafe
+        if check_bytes(cast(&p2, u8*), 6, wp2) != 1
+            bad++
+
+    // 9) packed 多字段跨单元：u8 a:5 + u8 b:4 → b 另起字节单元
+    let P3 p3 = P3(a=31, b=15)
+    if p3.a != 31 or p3.b != 15
+        bad++
+    if sizeof(P3) != 2 or alignof(P3) != 1
+        bad++
+    let u8[] wp3 = 31, 15
+    unsafe
+        if check_bytes(cast(&p3, u8*), 2, wp3) != 1
+            bad++
+
+    // 10) packed 声明类型不同：u16 a:4 @0、u32 b:5 @2，大小 6/对齐 1
+    let P4 p4 = P4(a=15, b=31)
+    if p4.a != 15 or p4.b != 31
+        bad++
+    if sizeof(P4) != 6 or alignof(P4) != 1
+        bad++
+    let u8[] wp4 = 15, 0, 31, 0, 0, 0
+    unsafe
+        if check_bytes(cast(&p4, u8*), 6, wp4) != 1
+            bad++
+
+    // 11) 有符号位域：i8 sgn:4 符号扩展
+    let SB sb = SB(sgn=-3)
+    if sb.sgn != -3 or sizeof(SB) != 1 or alignof(SB) != 1
+        bad++
+    sb.sgn = 8                       // 4 位有符号 → -8
+    if sb.sgn != -8
+        bad++
+
+    if bad > 0
+        output("bitfield_test FAILED: ", bad, "\n")
+        return 1
+    output("bitfield_test OK\n")
+    return 0

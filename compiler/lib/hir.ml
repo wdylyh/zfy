@@ -28,8 +28,8 @@ type zty =
 type sdef = { sname : string; spacked : bool; sfields : (string * zty) list;
               sunion : bool;  (* union：全部字段共享偏移 0（大小=最大字段） *)
               sbits : int list }
-  (* sbits：与 sfields 等长的位域宽度（0 = 普通字段）。位域字段在布局上
-     独占其声明类型的存储单元（v1 简化，见 grammar §7.1） *)
+  (* sbits：与 sfields 等长的位域宽度（0 = 普通字段）。位域按 Microsoft C
+     规则塞入同宽声明类型的存储单元（见 grammar §7.2、struct_layout） *)
 
 type binop =
   BAdd | BSub | BMul | BDiv | BMod | BEq | BNe | BLt | BGt | BLe | BGe | BAnd | BOr
@@ -268,6 +268,15 @@ let pp_unop = function UNeg -> "-" | UNot -> "!" | UBitNot -> "~"
 
 (* ---------- x86-64 C 布局（sizeof/alignof 与 struct 字段偏移） ---------- *)
 
+(* 单个字段的布局信息（位域合并规则见 struct_layout） *)
+type field_layout = {
+  fl_off : int;      (* 普通字段字节偏移；位域 = 存储单元起始字节偏移 *)
+  fl_bit : int;      (* 位域在存储单元内的位偏移（LSB 起）；普通字段 0 *)
+  fl_w : int;        (* 位域宽度；0 = 普通字段 *)
+  fl_unit : int;     (* 存储单元字节数（位域 = 声明类型大小） *)
+  fl_member : int;   (* 对应 LLVM struct 成员序号（同单元位域共享） *)
+}
+
 let align_up n a = if a <= 1 then n else (n + a - 1) / a * a
 
 (* 标量（含 string/数组/列表槽=ptr）的 (大小, 对齐)；
@@ -296,8 +305,13 @@ let rec ty_size_align (structs : sdef list) (t : zty) : int * int =
 
 (* struct (大小, 对齐)：
    - 非 packed：C 布局（字段偏移按各自对齐取整，总大小对齐到最大字段对齐）
-   - packed：字段紧凑排列（无填充），整体对齐 1 *)
-and struct_size_align (structs : sdef list) (sd : sdef) : int * int =
+   - packed：字段紧凑排列（无填充），整体对齐 1
+   - 位域按 Microsoft C（MSVC x64 / clang -mms-bitfields）规则分配：
+     相邻同宽声明类型的位域塞进同一存储单元（单元宽 = 声明类型大小），
+     放不下则换新单元；声明类型宽度不同也换新单元；普通字段另起对齐位置。
+     packed 时存储单元按 1 字节对齐（可跨字节边界、不额外填充）。 *)
+and struct_layout (structs : sdef list) (sd : sdef)
+    : field_layout list * int * int =
   if sd.sunion then begin
     (* union：大小 = 最大字段大小（构建期已校验字段非聚合/非引用类型），
        对齐 = 最大字段对齐；至少 1 字节 *)
@@ -307,60 +321,77 @@ and struct_size_align (structs : sdef list) (sd : sdef) : int * int =
         let (s, a) = ty_size_align structs ft in
         if s > 0 then begin size := max !size s; al := max !al a end)
       sd.sfields;
-    (align_up !size !al, !al)
-  end
-  else if sd.spacked then begin
-    let size =
-      List.fold_left
-        (fun acc (_, ft) ->
-          let (s, _) = ty_size_align structs ft in
-          if s < 0 then acc else acc + s)
-        0 sd.sfields
-    in
-    (size, 1)
+    (List.map
+       (fun (_, ft) ->
+         let (s, _) = ty_size_align structs ft in
+         { fl_off = 0; fl_bit = 0; fl_w = 0;
+           fl_unit = (if s < 0 then 0 else s); fl_member = 0 })
+       sd.sfields,
+     align_up !size !al, !al)
   end
   else begin
+    (* sbits 与 sfields 等长；历史构造点若缺位域表则按全普通字段处理 *)
+    let bits =
+      if List.length sd.sbits = List.length sd.sfields then sd.sbits
+      else List.map (fun _ -> 0) sd.sfields
+    in
     let off = ref 0 and mal = ref 1 in
-    List.iter
-      (fun (_, ft) ->
+    (* 当前打开的位域存储单元：起始偏移/单元字节数/已用位数/成员序号 *)
+    let ustart = ref 0 and usize = ref 0 and used = ref 0 in
+    let member = ref (-1) in
+    let out = ref [] in
+    List.iter2
+      (fun (_, ft) w ->
         let (s, a) = ty_size_align structs ft in
         if s >= 0 then begin
-          mal := max !mal a;
-          off := align_up !off a + s
+          let ua = if sd.spacked then 1 else a in
+          if w > 0 then begin
+            let ubits = s * 8 in
+            let same_unit = !usize = s && !used + w <= ubits in
+            if not same_unit then begin
+              (* 换新单元：按声明类型对齐（packed 按 1 字节） *)
+              ustart := align_up !off ua;
+              usize := s;
+              used := 0;
+              incr member;
+              off := !ustart
+            end;
+            out := { fl_off = !ustart; fl_bit = !used; fl_w = w;
+                     fl_unit = !usize; fl_member = !member } :: !out;
+            used := !used + w;
+            let uend = !ustart + !usize in
+            if uend > !off then off := uend;
+            mal := max !mal ua
+          end
+          else begin
+            (* 普通字段：结束当前位域单元，按自身对齐放置 *)
+            usize := 0; used := 0;
+            incr member;
+            let o = align_up !off ua in
+            out := { fl_off = o; fl_bit = 0; fl_w = 0;
+                     fl_unit = s; fl_member = !member } :: !out;
+            off := o + s;
+            mal := max !mal ua
+          end
         end)
-      sd.sfields;
-    (align_up !off !mal, !mal)
+      sd.sfields bits;
+    let al = if sd.spacked then 1 else !mal in
+    (List.rev !out, align_up !off al, al)
   end
+and struct_size_align (structs : sdef list) (sd : sdef) : int * int =
+  let (_, size, al) = struct_layout structs sd in
+  (size, al)
 
-(* struct 各字段偏移（声明序；packed 无填充）与 (总大小, 总对齐) *)
+(* struct 各字段偏移（声明序；位域偏移 = 存储单元起始）与 (总大小, 总对齐) *)
 let struct_field_offsets (structs : sdef list) (sd : sdef)
     : int list * int * int =
-  let (tsize, talign) = struct_size_align structs sd in
-  if sd.sunion then
-    (List.map (fun _ -> 0) sd.sfields, tsize, talign)
-  else if sd.spacked then begin
-    let rec go off = function
-      | [] -> ([], off)
-      | (_, ft) :: rest ->
-        let (s, _) = ty_size_align structs ft in
-        let (offs, endoff) = go (if s < 0 then off else off + s) rest in
-        (off :: offs, endoff)
-    in
-    let (offs, _) = go 0 sd.sfields in
-    (offs, tsize, talign)
-  end
-  else begin
-    let rec go off = function
-      | [] -> ([], off)
-      | (_, ft) :: rest ->
-        let (s, a) = ty_size_align structs ft in
-        if s < 0 then go off rest
-        else begin
-          let o = align_up off a in
-          let (offs, endoff) = go (o + s) rest in
-          (o :: offs, endoff)
-        end
-    in
-    let (offs, _) = go 0 sd.sfields in
-    (offs, tsize, talign)
-  end
+  let (ls, tsize, talign) = struct_layout structs sd in
+  (List.map (fun fl -> fl.fl_off) ls, tsize, talign)
+
+(* 单个字段的布局（越界返回全零）——位域读写需要字节偏移外的位偏移 *)
+let struct_field_layout (structs : sdef list) (sd : sdef) (i : int)
+    : field_layout =
+  let (ls, _, _) = struct_layout structs sd in
+  match List.nth_opt ls i with
+  | Some fl -> fl
+  | None -> { fl_off = 0; fl_bit = 0; fl_w = 0; fl_unit = 0; fl_member = 0 }

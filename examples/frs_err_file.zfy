@@ -1,0 +1,6 @@
+// 报错用例：freestanding 下 File 类型不可用（文件 I/O 依赖 OS）
+fn panic_handler(let string msg)
+    return
+
+fn _start()
+    let File f = open("x.txt", "r")

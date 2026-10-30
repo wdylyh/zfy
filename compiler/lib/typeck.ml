@@ -8,6 +8,41 @@ exception TypeError of pos * string
 let terr p fmt =
   Printf.ksprintf (fun s -> raise (TypeError (p, s))) fmt
 
+(* ---------- freestanding（--freestanding 裸机模式）----------
+   driver 在编译前设置。true 时 runtime 只链接纯计算核心层，OS 依赖的
+   内建/类型/语句在类型检查阶段直接报错（消息含 "freestanding mode"），
+   不留到链接期。 *)
+let freestanding = ref false
+let set_freestanding (b : bool) = freestanding := b
+
+(* freestanding 下禁用的内建名（依赖 OS 或 CRT：文件 I/O、线程/互斥/
+   chan、时间/计时、环境变量、setjmp 帧）。rand 纯引擎与原子/volatile
+   保留（不依赖 OS）。 *)
+let fs_disabled_builtins =
+  [ (* 标准输出/输入语句（§12） *)
+    "output"; "input";
+    (* 文件 I/O（§14） *)
+    "open"; "read_all"; "read_line"; "read_lines"; "write"; "writeln";
+    "close"; "exists"; "read_file"; "write_file";
+    (* 并发（§21）：线程/互斥/channel/sleep *)
+    "spawn"; "join"; "detach"; "mutex_new"; "lock"; "unlock"; "sleep";
+    "chan_send"; "chan_recv"; "chan_close"; "chan_len";
+    (* 时间/计时（§12.2） *)
+    "now"; "tick_ms"; "sleep_ms"; "localtime"; "mktime";
+    "timer"; "timer.add"; "timer.remove"; "timer.now"; "time.sleep";
+    (* 标准库 OS 部分（§26） *)
+    "os_args"; "os_env";
+    (* panic 恢复依赖 setjmp/longjmp（§29） *)
+    "try" ]
+
+(* 内建/语句可用性守卫：freestanding 下命中禁用名单即编译期报错 *)
+let fs_guard p (name : string) =
+  if !freestanding && List.mem name fs_disabled_builtins then
+    terr p "%s is not available in freestanding mode (only the pure-compute runtime is linked)" name
+
+let has_prefix (s : string) (p : string) : bool =
+  String.length s >= String.length p && String.sub s 0 (String.length p) = p
+
 (* 多错误收集（n3）：check_program 期间语句级/函数级恢复时收集的错误。
    driver 在检查结束后统一读取报告；非空时不进入后续阶段 *)
 let collected : (pos * string) list ref = ref []
@@ -864,6 +899,8 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
     TFrac (TInt 32)
   | TNamed (s, pp) ->
     (match prim_type s with
+     | Some TFile when !freestanding ->
+       terr pp "File is not available in freestanding mode (file I/O is OS-dependent)"
      | Some t' -> t'
      | None ->
        (match Hashtbl.find_opt g.aliases s with
@@ -2994,6 +3031,8 @@ and check_expr env (e : expr) : texpr =
        (* 接口构造（v3.13）：Drawable(p) *)
        check_iface_ctor env p' name args
      | EVar (name, np) ->
+       (* freestanding：OS 依赖内建在类型检查期直接报错，不留到链接期 *)
+       if !freestanding && not (Hashtbl.mem env.g.fns name) then fs_guard p' name;
        (* 原子/volatile 内建实参规整（v3.31）：Ordering.X → i32 常量、旧形态
           补默认 SeqCst；用户自定义同名函数优先（不规整） *)
        let args =
@@ -7208,6 +7247,8 @@ and check_stmt env (st : stmt) : tstmt =
     mk (SBlockK ({ s = SDeclK (false, mv.lslot, tscr.ety, tscr, false); spos = p }
                  :: chain))
   | SOutput (args, sep, end_, p) ->
+    (* freestanding：无 OS 控制台，output 禁用（改用 panic_handler / 自行 asm 输出） *)
+    fs_guard p "output";
     let targs = List.map (check_expr env) args in
     List.iter
       (fun (ta : texpr) ->
@@ -7270,6 +7311,8 @@ and check_stmt env (st : stmt) : tstmt =
     in
     mk (SOutputK (targs, ioval "" sep, ioval "\n" end_))
   | SInput (targets, delim, p) ->
+    (* freestanding：stdin 不存在，input 禁用 *)
+    fs_guard p "input";
     (* delim：char/string 表达式（变量亦可，其他类型强转 string）；
        None 默认"换行和空格"字符集 *)
     let tdelim =
@@ -7603,14 +7646,14 @@ let check_program (prog : program) : hir =
             fields
         in
         (* union / 位域校验：union 字段限标量或指针（布局为 [maxsize x i8]，
-           聚合字段需额外 bitcast，v1 不支持）；位域仅限 struct packed 内的
-           整数字段，宽度不得超过类型位宽 *)
+           聚合字段需额外 bitcast，v1 不支持）；位域按 Microsoft C 规则布局，
+           packed/普通 struct 都允许，但只能用于整数字段且宽度不超声明类型 *)
         List.iter2
           (fun (sf : Ast.sfield) (_, ft, _) ->
             (match sf.fbits with
              | Some n ->
-               if not packed then
-                 terr sf.fpos "bit fields are only allowed in struct packed";
+               if is_union then
+                 terr sf.fpos "bit fields are not allowed in union";
                (match resolve ft with
                 | TInt w | TUint w ->
                   if n > w then
@@ -7752,6 +7795,13 @@ let check_program (prog : program) : hir =
         (* extern "C"：登记签名（调用直通 LLVM 符号，与 C 链接一致） *)
         List.iter
           (fun (f : Ast.extern_fn) ->
+            (* freestanding：GUI（Win32/GDI）运行时被裁剪，绑定即报错 *)
+            if !freestanding
+               && (has_prefix f.ename "zfy_gui" || has_prefix f.ename "zfy_win")
+            then
+              terr f.epos
+                "GUI (%s) is not available in freestanding mode (Win32/GDI runtime is not linked)"
+                f.ename;
             if Hashtbl.mem g.fns f.ename then
               terr f.epos "duplicate function definition: %s (extern conflicts with an existing function)" f.ename;
             if List.mem f.ename builtin_names then
@@ -8364,8 +8414,32 @@ let check_program (prog : program) : hir =
         | _ -> None)
       prog
   in
-  (* 必须有 main *)
-  if not (Hashtbl.mem g.fns "main") then
+  (* 入口检查。
+     默认模式：必须有 main。
+     freestanding：优先 fn _start()（void/i32）；也允许只有 fn main()
+     （用户自行链接 CRT 时）；并要求 fn panic_handler(let string msg)。 *)
+  if !freestanding then begin
+    (match Hashtbl.find_opt g.fns "_start" with
+     | Some { params = []; ret = TVoid; _ } | Some { params = []; ret = TInt 32; _ } -> ()
+     | Some { params; ret; _ } ->
+       terr { file = ""; line = 1; col = 1 }
+         "freestanding requires fn _start() (no parameters) to return void or i32, got (%s) -> %s"
+         (String.concat ", " (List.map pp_zty params)) (pp_zty ret)
+     | None ->
+       if not (Hashtbl.mem g.fns "main") then
+         terr { file = ""; line = 1; col = 1 }
+           "freestanding requires fn _start() (no parameters) as the entry point, or fn main() when linking a CRT");
+    (match Hashtbl.find_opt g.fns "panic_handler" with
+     | Some { params = [ TString ]; ret = TVoid; _ } -> ()
+     | Some { params; ret; _ } ->
+       terr { file = ""; line = 1; col = 1 }
+         "freestanding requires fn panic_handler(let string msg) -> void, got (%s) -> %s"
+         (String.concat ", " (List.map pp_zty params)) (pp_zty ret)
+     | None ->
+       terr { file = ""; line = 1; col = 1 }
+         "freestanding requires a panic handler: define fn panic_handler(let string msg)")
+  end
+  else if not (Hashtbl.mem g.fns "main") then
     terr { file = ""; line = 1; col = 1 } "missing main()";
   (* 泛型实例化可能新增 struct（Box<i32> 等）：复检循环嵌套
      （A<i32> 含 B<i32>、B<i32> 含 A<i32> 的跨实例值环） *)

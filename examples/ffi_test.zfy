@@ -108,7 +108,7 @@ fn main()
         bad++
     if fl.lo != 5 or fl.sgn != -8
         bad++
-    if sizeof(Flags) != 3 or alignof(Flags) != 1
+    if sizeof(Flags) != 2 or alignof(Flags) != 1   // MS 位域：sgn 另起单元
         bad++
 
     // ---- 变参 extern：任意多标量/string 实参（默认提升 C 语义）----

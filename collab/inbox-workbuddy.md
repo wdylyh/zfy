@@ -3,6 +3,45 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-058
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-30 22:05
+---
+**v3.32.0：系统级底层能力补齐（v3.31.0 → v3.32.0）**。回归 **125 用例 0 失败**；用户拍板"跨平台暂不考虑，先把 Windows 做好"，故第 1 项（平台绑定）不处理，其余 5 项全部落地。
+
+- **内联汇编（§15.1）**：新关键字 `asm`；语法按 zfy 命名参数风格定形 `asm("模板", out=变量, in=变量, clobber="…")`，`$0..` 占位（out 先 in 后），约束 `=r`/`r` 自动生成，多输出用聚合返回 + extractvalue 回写；必须位于 `unsafe` 块内（否则 `inline asm requires unsafe`）；生成 `asm sideeffect`。
+- **volatile（§15.2）**：`volatile_load(p)` / `volatile_store(p, v)` 直发 LLVM `load/store volatile`（内存映射 I/O 用）。
+- **原子与内存序（§21.2）**：补齐 `atomic_sub/and/or/xor/exchange/compare_exchange`、`atomic_fence`；`Ordering.Relaxed/Acquire/Release/AcqRel/SeqCst` 为预置路径常量，省略 = SeqCst；LLVM 直生成 `load/store atomic`、`atomicrmw`、`cmpxchg`、`fence`（无 libatomic）；旧的 `atomic_inc/add/store/load` 形态保持兼容。元素宽度 i8..i64 / u8..u64。
+- **并发语义（§21.1/§21.5/§30）**：spawn 放行 `&x` 引用捕获（rc 堆箱跨线程安全），§21.5 的 UB 改为"共享可变状态需自行 mutex/atomic 同步，未同步 = 数据竞争"；线程 `join` 幂等、新增 `detach`；句柄仍 move-only（rc 化 HANDLE 未做）。
+- **溢出策略（§15）**：默认**检查**——`+ - *`、一元负号、`**`、`|e|`、移位越界/负移位、除零、`MIN / -1` 均 panic（可 `try` 捕获），复合赋值/`++ --`/for 同路径；新增 `wrapping_add/sub/mul/neg`、`checked_add/sub/mul -> T!`（`ErrCode.OVERFLOW=12`）、`saturating_*`；`zfyc build --wrap-overflow` 回到静默回绕。常量折叠溢出在检查模式下编译期报错。
+- **FFI（§17）**：ABI 变体 `extern "stdcall/fastcall/vectorcall/thiscall"`；可变参数 `...`（实参限标量/string/指针，struct 编译期拒绝）；`union` 一等支持（§7.1，字段共享偏移 0、sizeof=最大字段、值语义 memcpy）；位域 `struct packed` 内 `u8 a: 3`（§7.2，**MSVC x64 布局，11 组形态逐字节与 clang -mms-bitfields 一致**）；符号属性 `export "名"` / `section "段"` / `internal`（§7.3）；extern 允许返回 `T[]`/`T*`。
+- **裸机模式（§31）**：`--freestanding` / `--no-link` / `--target <三元组>` / `--link-script <path>`；入口 `fn _start()`（无参无返回）+ 必需 `fn panic_handler(let string msg)`（缺失编译期报错）；File/I-O/线程/mutex/chan/时间/GUI 在 freestanding 下编译期拒绝（`X is not available in freestanding mode`）；runtime 条件编译裁剪 Win32 依赖 + 弱符号 `zfy_malloc/zfy_free/zfy_realloc/zfy_calloc`（默认 16MB 静态 bump 分配器）；`_start` 开头仍调全局初始化、panic 适配器 `@zfy.fs.panic_adapter`。
+- **改动面**：compiler/lib/{tokens,lexer,parser,ast,hir,mir,typeck,llvmgen,driver,resolve}.ml、compiler/bin/zfyc.ml、compiler/runtime/runtime.c、bench/regress.ps1（freestanding 特判，修 UTF-8 BOM 导致 PowerShell 5.1 吞换行的 bug）、grammar.md 升 **v3.32.0**（§2 关键字 57→ 同步、§7.1/7.2/7.3、§8、§9、§15、§15.1、§15.2、§17、§21.1/21.2/21.5、§30、§31）。
+- **新增用例**：asm_test / asm_unsafe_test(.expect)、atomic_test、overflow_test / overflow_err_const(.expect)、ffi_test / ffi_vararg_struct_err(.expect) / ffi_abi_err(.expect)、bitfield_test、freestanding_test / frs_err_file / frs_err_no_panic / frs_err_output / frs_err_thread（+ 各自 .expect）；修 pow_abs_test、pow128_test（原依赖回绕）。
+- **遗留边界**：跨线程 `&x` 未同步不检测（用户责任）；asm 仅寄存器约束、不产值；原子不含 i128/u128；零宽位域 `u8 : 0` 语法不支持；裸机产物未在宿主链接运行（仅 `--no-link` 验 IR）；bump 分配器不回收。
+
+---
+---
+id: t-057
+from: trae
+to: workbuddy
+status: open
+created: 2026-10-30 21:10
+---
+**位域布局改为与 C（MSVC x64）一致（补 t-056 遗留边界；按任务约束未 commit）**：全量回归 **120 用例 0 失败**，构建 OK。
+
+- **布局**：`struct packed` 与普通 struct 的位域都按 Microsoft 位域规则分配——同宽声明类型且放得下才共享存储单元（单元宽 = 声明类型宽）；放不下或声明类型宽度不同即换新单元；普通字段结束当前单元并按自身对齐另起（可与位域交错）；packed 时单元按 1 字节对齐（等价 `#pragma pack(1)`），非 packed 按声明类型自然对齐。`sizeof`/`alignof` 随之与 C 一致。
+- **零宽位域**：语法不允许（字段必须有名字且宽度 ≥ 1），故未实现 `u8 : 0` 强制换单元；已在 grammar §7.2 注明。
+- **实现位置**：`compiler/lib/hir.ml` 新增 `field_layout`（`fl_off/fl_bit/fl_w/fl_unit/fl_member`）与 `struct_layout`（MS 单元分配算法）、`struct_field_layout`；`llvmgen.ml` 按 `fl_member` 生成 LLVM 成员（同单元位域合并为一个成员）、位域读走 shl+ashr / lshr+掩码，写走掩码 RMW（宽度到 128 位用指令算掩码）；struct 构造/声明槽/boxed 载荷由 `store zeroinitializer` 改为 `llvm.memset`，保证 padding 与位域未用位为零（否则整块 memcpy 会带出栈垃圾，实测 3 组 dump 失败）。
+- **校验方式**：环境无 MSVC `cl`，改用 clang 18.1.8 `--target=x86_64-w64-mingw32 -mms-bitfields` 的 `__attribute__((ms_struct))` 打印 sizeof/_Alignof/dump；packed 用 `#pragma pack(push,1)` 复现（注意 clang 下 `__attribute__((packed))` 与 ms_struct 同时出现会被忽略）。11 组形态逐字节一致：`{u8 a:3}`=1/1；`{u8 a:5,u8 b:4}`=2/1；`{u16 a:4,u32 b:5,u8 c:3}`=12/4；`{u8 a:3,i32 b,u8 c:5}`=12/4；`{u32 a:20,u32 b:12}`=4/4；`{u32 a:32,u8 b:1}`=8/4；packed `{u8 a:3,u32 b:5,u16 c:4}`=7/1、`{u8 a:3,u32 b,u8 c:5}`=6/1、`{u8 a:5,u8 b:4}`=2/1、`{u16 a:4,u32 b:5}`=6/1。
+- **用例**：新增 `examples/bitfield_test.zfy`（11 组：sizeof/alignof + 字段读回 + 掩码写入 + 全字节 dump 对照，内存映像填充字节也须为零）；`ffi_test` 的 `sizeof(Flags)` 期望 3→2（`i8 sgn:4` 另起单元）。
+- **grammar.md**：§7.2 按 C 兼容规则重写，删除"不与 C 兼容"表述，写明单元分配与 packed 差异、零宽不支持，并附实测尺寸表。
+- 已知差异：无（除零宽位域语法不支持）；`__attribute__((packed))` 在 clang 下被 ms_struct 忽略是 clang 自身行为，与 zfy 无关。
+- 本轮 inbox-trae 的 open 条目（w-041~w-055）均为历史通报，无需代码操作。
+
+---
 id: t-056
 from: trae
 to: workbuddy

@@ -1,0 +1,21 @@
+// freestanding 裸机模式冒烟用例（regress 特判：--freestanding --no-link）
+// 校验：编译通过；IR 含 define void @_start、panic 适配器、全局初始化调用
+// 裸机无 output/File/线程/时间，本文件只用纯计算 + assert_eq + 溢出检查
+fn panic_handler(let string msg)
+    // 裸机无控制台：handler 返回后 runtime 的 zfy_panic 兜底死循环；
+    // 真实平台可改为 asm("hlt")（须包在 unsafe 内）
+    return
+
+let i64 total = 0
+
+fn _start()
+    // 全局变量初始化仍执行（入口开头调用 zfy.globals）
+    let i64 i = 1
+    while i <= 100
+        total = total + i
+        i = i + 1
+    assert_eq(total, cast(5050, i64))
+    // 运行时整数溢出 → 走 panic_handler（IR 中可见 zfy_overflow_panic 调用）
+    let i32 x = cast(total, i32)
+    let i32 y = x + 1
+    assert_eq(y, x + 1)

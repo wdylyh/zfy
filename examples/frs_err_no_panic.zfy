@@ -1,0 +1,3 @@
+// 报错用例：freestanding 必须提供 fn panic_handler(let string msg)
+fn _start()
+    let i32 x = 1

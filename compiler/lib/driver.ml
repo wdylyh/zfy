@@ -4,6 +4,17 @@ open Ast
 
 exception CompileError of pos option * string
 
+(* ---------- 构建模式（--freestanding / --target / --linker-script / --no-link）----------
+   由 zfyc.ml 解析 CLI 后设置。默认值 = 原宿主 Windows 行为，完全不变。 *)
+let freestanding = ref false
+let target_triple = ref ""
+let linker_script = ref ""
+let no_link = ref false
+let set_freestanding b = freestanding := b
+let set_target_triple t = target_triple := t
+let set_linker_script p = linker_script := p
+let set_no_link b = no_link := b
+
 (* ---------- 错误报告（n3：多错误收集 + new.md 格式输出） ---------- *)
 
 type fixkind =
@@ -1144,7 +1155,12 @@ let write_manifest (base : string) : unit =
 
 let compile path : string =
   let base0 = Filename.remove_extension path in
-  if Sys.getenv_opt "ZFY_FORCE" <> Some "1" && up_to_date base0 then begin
+  (* 构建模式下发到类型检查/代码生成（须在 run_checked 之前设置） *)
+  Typeck.set_freestanding !freestanding;
+  Llvmgen.set_freestanding !freestanding;
+  Llvmgen.set_target_triple !target_triple;
+  if not !freestanding
+     && Sys.getenv_opt "ZFY_FORCE" <> Some "1" && up_to_date base0 then begin
     Printf.eprintf "zfy: up to date: %s%s (ZFY_FORCE=1 to rebuild)
 "
       base0 (if Sys.win32 then ".exe" else "");
@@ -1201,31 +1217,63 @@ let compile path : string =
   let oc = open_out ll_path in
   output_string oc ll;
   close_out oc;
-  let exe = if Sys.win32 then base ^ ".exe" else base in
+  (* --no-link：只产出 .ll（关键用例：宿主 Windows 无法链接裸机 ELF 目标），
+     交给用户自己的 clang/ld/链接脚本处理 *)
+  if !no_link then ll_path
+  else begin
+  let exe =
+    if !freestanding then base
+    else if Sys.win32 then base ^ ".exe" else base
+  in
   let clang = find_clang () in
   let target =
-    if Sys.win32 then "--target=x86_64-w64-mingw32 -B D:/mingw64/bin "
+    if !target_triple <> "" then
+      Printf.sprintf "--target=%s%s " !target_triple
+        (if Sys.win32 && not !freestanding then " -B D:/mingw64/bin " else "")
+    else if Sys.win32 then "--target=x86_64-w64-mingw32 -B D:/mingw64/bin "
     else ""
   in
   let runtime =
     match find_runtime () with
-    | Some rt -> Printf.sprintf "%s " rt
+    | Some rt ->
+      (* freestanding：核心层按 -DZFY_FREESTANDING 编译，OS 层被条件编译裁掉 *)
+      Printf.sprintf "%s %s " rt (if !freestanding then "-DZFY_FREESTANDING" else "")
     | None -> ""
   in
-  (* GUI 核心层（v3.3.7）依赖 GDI/User32；非 Windows 无 GUI 层无需链接 *)
-  let libs = if Sys.win32 then "-lgdi32 -luser32 " else "" in
+  (* GUI 核心层（v3.3.7）依赖 GDI/User32；freestanding 不链接任何 OS 库 *)
+  let libs = if Sys.win32 && not !freestanding then "-lgdi32 -luser32 " else "" in
+  (* 链接脚本：-Wl,-T,<path>；仅 ELF 目标（MSVC/Windows 目标不支持） *)
+  let ldscript =
+    if !linker_script = "" then ""
+    else begin
+      let low = String.lowercase_ascii
+          (if !target_triple <> "" then !target_triple else "x86_64-w64-mingw32") in
+      if has_sub low "windows" || has_sub low "msvc" then
+        raise (CompileError (None,
+          "--linker-script is only supported for ELF targets (got " ^ low ^ ")"));
+      if String.contains !linker_script ' '
+      then Printf.sprintf "-Wl,-T,\"%s\" " !linker_script
+      else Printf.sprintf "-Wl,-T,%s " !linker_script
+    end
+  in
   let cmd =
     (* cmd.exe 对整串引号处理怪异：路径无空格时不加引号 *)
     if String.contains clang ' ' then
-      Printf.sprintf "\"%s\" %s\"%s\" %s-O2 %s-o \"%s\"" clang target ll_path runtime libs exe
+      Printf.sprintf "\"%s\" %s\"%s\" %s-O2 %s%s-o \"%s\"" clang target ll_path runtime ldscript libs exe
   else
     (* -O2：链接时对 LLVM IR 做 mem2reg/内联等优化（否则 alloca 槽全走内存，性能差数倍） *)
-    Printf.sprintf "%s %s%s %s-O2 %s-o %s" clang target ll_path runtime libs exe
+    Printf.sprintf "%s %s%s %s-O2 %s%s-o %s" clang target ll_path runtime ldscript libs exe
   in
   let code = Sys.command cmd in
   if code <> 0 then begin
-    Printf.eprintf "zfy:error[E5004] in 0 of %s because (link failed (clang exit code %d))\n" path code;
+    if !freestanding then
+      Printf.eprintf
+        "zfy:error[E5004] in 0 of %s because (freestanding link failed (clang exit code %d); cross-linking bare-metal/ELF targets from the Windows host is usually impossible -- use --no-link to emit .ll/.o)\n"
+        path code
+    else
+      Printf.eprintf "zfy:error[E5004] in 0 of %s because (link failed (clang exit code %d))\n" path code;
     exit 1
   end;
   write_manifest base;
   exe
+  end

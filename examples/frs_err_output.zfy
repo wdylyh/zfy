@@ -1,0 +1,6 @@
+// 报错用例：freestanding 下 output 不可用（无控制台/OS 输出层）
+fn panic_handler(let string msg)
+    return
+
+fn _start()
+    output("hello")
