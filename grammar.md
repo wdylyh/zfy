@@ -51,19 +51,21 @@ fn main()
   - 错误传播是 `e?`。
 - **分号**：语句位置非法（写了报错）；仅空语句占位可用。
 
-## 2. 关键字（45 个）
+## 2. 关键字（53 个）
 
 ```
 if else while for return true false pub mod use break continue
-const frac unred reduce and or not output input cast remove import as
-fail panic err sep end delim struct packed move copy borrow ref null unsafe
-extern type let fn array list xor
+const frac unred reduce and or not xor output input cast array list
+remove import as sep end delim fail panic err struct packed move copy
+borrow ref null unsafe extern type enum match interface ui shared let fn in asm
 ```
 
 - `array`/`list`：保留用于报错提示，**不能当标识符**。
 - `sep`/`end`/`delim`：output/input 的命名参数名。
 - `err`：`??` 块内的错误值绑定名。
 - `xor`：二元异或运算符。**`^` 不是异或**——它只作后缀解引用。
+- `asm`：内联汇编语句（v3.31，见 §15.1；须写在 `unsafe` 块内）。
+- `in`：asm 命名实参 `in=` 的关键字写法（§15.1），因此**不能当标识符**。
 
 ## 3. 类型系统
 
@@ -247,6 +249,8 @@ struct Counter
 | 输出 | `output(v1, v2, ..., sep=?, end=?)`（见 §13） |
 | 输入 | `input(目标..., delim=?)`（见 §13） |
 | unsafe | `unsafe 缩进块`（指针算术、p[i]、p^ 必须在其中） |
+| asm | `asm("模板", out=变量, in=变量, clobber="r1,r2,memory")`（内联汇编，**须在 unsafe 内**，见 §15.1） |
+| volatile | `volatile_load(p)` / `volatile_store(p, v)` 内建调用（§15.2） |
 | reduce | `reduce(frac变量, 次数, 起始除数)` |
 | `remove` | `remove(名, 下标)`：**表达式**，返回被删元素副本（见 §12） |
 | match | `match scrut 缩进块`（见 §23） |
@@ -424,6 +428,9 @@ fn main()
 
 **数学内建说明**：直接落到 libm 符号（`@sqrt` `@log` `@fabs` 等）；
 `abs` 与 C 的 32 位 `abs` 无关，i128/u128 正确。
+
+**低层内建指引**：原子操作与内存序见 §21.2；`volatile` 内存访问见 §15.2；
+内联汇编 `asm` 见 §15.1。
 
 **表达式化的序列操作**：
 - `push(列表, 值)`（**恰两参**；目标是列表非定长数组；嵌套列表
@@ -613,6 +620,43 @@ fn main()
   被借用变量同样不参与自动 move。
 - string 槽独占堆串（MCopy strdup 保证）；`s[i] = c` 原地写（越界 panic）。
 - 程序入口前执行 `zfy.globals`（顶层变量初始化）。
+
+### 15.1 内联汇编 asm（unsafe，v3.31）
+
+```zfy
+unsafe
+    asm("cpuid", out=eax, out=ebx, out=ecx, out=edx, in=leaf, clobber="memory")
+    asm("mfence", clobber="memory")
+    asm("syscall", in=nr, in=a1, out=ret, clobber="rcx,r11,memory")
+```
+
+- 语法 `asm("模板"[, 命名实参 ...])`；命名实参为 `out=变量`、`in=变量`、
+  `clobber="寄存器名列表"`——**可重复、顺序任意**，`in` 按关键字识别。
+- 占位符 `$0 $1 ...` **依次对应 out（按书写顺序，先）再 in（按书写顺序，
+  后）**；约束由编译器自动生成：out = `=r`、in = `r`，clobber 逐项追加为
+  `~{名}`（如 `clobber="rcx,r11,memory"` → `~{rcx},~{r11},~{memory}`）。
+- 生成 `call void asm sideeffect "模板", "约束"(实参...)`——**始终带
+  `sideeffect`**（不被优化器删除/提升/复制）。asm 是**语句**，不产生表达式值。
+- out 变量在 asm 执行后写回槽位（可多个；类型限 ≤64 位整数/bool/char/指针）。
+  模板对内存有读写时须声明 `clobber="memory"`。
+- **必须在 `unsafe` 块内**，否则报 `inline asm requires unsafe`。
+- 模板语法错误、无效寄存器名由汇编器/clang 报编译错误（不会产出坏 exe）。
+
+### 15.2 volatile 内存访问（内存映射 I/O）
+
+```zfy
+let i64 mm = 0
+volatile_store(&mm, 11)
+let i64 v = volatile_load(&mm)
+```
+
+- `volatile_load(p)` / `volatile_store(p, v)` 生成 LLVM `load volatile` /
+  `store volatile`：该次访问**不可被优化器删除、合并或重排**（内存映射
+  I/O 的典型用途）。指针元素类型限 i8/i16/i32/i64/u8..u64。
+- 语言**不提供 `volatile` 声明修饰符**（不做"变量级全访问 volatile"）：
+  需要单次强制访问处用这两个内建；需要顺序/原子性语义用 §21.2 原子内建
+  或 `atomic_fence`。
+- 实参 `&var` 取址；与原子内建一样豁免 `shared` 锁外访问检查（§21.6）。
 
 ## 16. 错误报告格式与自动修复
 
@@ -1196,33 +1240,79 @@ fn main()
 > 共享数据 v3.26 起走 `shared` 全局 + lock 块（§21.3/§21.6）或原子内建；
 > 容器（map/set/列表）非线程安全，跨线程共享须外部 mutex 保护。
 
-### 21.1 线程：spawn / join
+### 21.1 线程：spawn / join / detach
 
 ```zfy
 let t = spawn(fn() => output("hi"))   // 收 lambda
 let t2 = spawn(worker)                // 收裸函数名（自动包 wrapper）
-join(t)                               // 阻塞等待；句柄置空，重复 join 报错
+join(t)                               // 阻塞等待；成功后句柄置空
+join(t)                               // 幂等：对已完成的句柄立即返回（空操作）
+detach(t2)                            // 放弃句柄所有权，不等待线程结束
 ```
 
 - 线程体签名须 `fn() -> void`；spawn 返回线程句柄（`let t =` 推断）。
-- **spawn 捕获白名单（v3.26 P0-3）**：spawn 实参闭包捕获的类型限标量/
-  string/bool/char、闭包句柄、thread/mutex/chan 句柄；捕获数组/列表/
-  普通 struct 等内联聚合编译期报错（数据竞争防护——用全局 `shared` 变量
+- **join 幂等**（v3.31）：join 完成后句柄置空；对已 join/已 detach 的句柄
+  再次 join 是**空操作**（立即返回，不报错、不崩溃）。
+- **detach(t)**（v3.31）：关闭句柄、放弃所有权，立即返回、不等待线程；
+  线程继续独立运行到线程体结束。detach 后句柄为空操作（再次 join 亦空操作）。
+- 句柄仍为 move-only（OS HANDLE 不可拷贝，§30），连接语义靠 join/detach。
+- spawn 的闭包环境所有权移交线程：线程体结束时由线程侧释放
+  （`zfy_env_free`，级联捕获副本）；变量实参在 spawn 后清槽（不可再用）。
+- **spawn 捕获白名单（v3.26 P0-3；v3.31 起放行 `&x` 引用捕获）**：spawn
+  实参闭包捕获的类型限标量/string/bool/char、闭包句柄、thread/mutex/chan
+  句柄，以及 **`&x` 引用捕获（捕获字段是原子的 rc 堆箱指针）**；捕获数组/
+  列表/普通 struct/frac、借用/原始指针编译期报错（提示用全局 `shared` 变量
   或 chan 传值）。**非 spawn 场景**的闭包捕获按 §20.3 白名单放行
   （v3.30 起含列表/数组/struct/frac，值捕获深拷贝进环境块）。
+- **跨线程 `&x` = 共享可变状态**：`&x` 引用捕获的目标由编译器堆箱化，箱的
+  生命周期由**原子引用计数**维护——跨线程不会悬垂/双释放（安全）；但箱内
+  数据的并发读写是共享可变状态，**须自行用 mutex（§21.3a）或原子内建
+  （§21.2）同步**。未同步的并发读写 = 数据竞争（结果不确定），**不是
+  内存安全缺陷（非 UB）**。
 
-### 21.2 原子操作（32/64 位整数全局/局部变量）
+### 21.2 原子操作与内存序（v3.31）
 
 ```zfy
-atomic_inc(&counter)                  // 自增（void，语句级）
-let old = atomic_add(&counter, 10)    // fetch_add：返回加前旧值
-atomic_store(&counter, 5)
-output(atomic_load(&counter))
+atomic_inc(&counter)                                      // 旧形态：自增（void，语句级）
+atomic_store(&counter, 5)                                 // 旧形态：原子写（默认 SeqCst）
+let old = atomic_add(&counter, 10)                        // 旧形态：fetch_add -> 旧值
+output(atomic_load(&counter))                             // 旧形态：原子读（默认 SeqCst）
+
+atomic_store(&counter, 5, Ordering.Release)               // 指定内存序
+output(atomic_load(&counter, Ordering.Acquire))
+let old2 = atomic_add(&counter, 1, Ordering.AcqRel)       // fetch-add -> 加前旧值
+let old3 = atomic_exchange(&counter, 9, Ordering.AcqRel)  // 交换 -> 旧值
+let ok = atomic_compare_exchange(&counter, 9, 21, Ordering.AcqRel, Ordering.Acquire)
+atomic_fence(Ordering.SeqCst)                             // 内存屏障（语句级）
 ```
 
-- 实参 `&var` 取址；类型限 i32/u32/i64/u64（统一按位模式操作）。
-- atomic 内建实参（`&x` 取址）豁免 shared 锁外访问检查（§21.6）——
-  原子操作本身即同步原语。
+| 内建 | 语义 | 返回值 |
+|---|---|---|
+| `atomic_load(p[, ord])` | 原子读 | 值 |
+| `atomic_store(p, v[, ord])` | 原子写 | void（语句级） |
+| `atomic_add(p, v[, ord])` | fetch-add（返回运算前旧值） | 旧值 |
+| `atomic_sub(p, v[, ord])` | fetch-sub | 旧值 |
+| `atomic_and(p, v[, ord])` | fetch-and | 旧值 |
+| `atomic_or(p, v[, ord])` | fetch-or | 旧值 |
+| `atomic_xor(p, v[, ord])` | fetch-xor | 旧值 |
+| `atomic_exchange(p, v[, ord])` | 原子交换 | 旧值 |
+| `atomic_compare_exchange(p, expect, new[, 成功序, 失败序])` | CAS：`*p == expect` 时写 new | bool（成功 true） |
+| `atomic_inc(p)` | 原子自增（旧形态） | void（语句级） |
+| `atomic_fence([ord])` | 内存屏障 | void（语句级） |
+| `volatile_load(p)` / `volatile_store(p, v)` | 非原子强制访问（见 §15.2） | 值 / void |
+
+- **元素类型**：i8/i16/i32/i64 与 u8/u16/u32/u64（按位模式操作，8/16/32/64 位）。
+- **内存序 `Ordering`**（预置枚举值，无新关键字）：`Ordering.Relaxed`、
+  `Ordering.Acquire`、`Ordering.Release`、`Ordering.AcqRel`、
+  `Ordering.SeqCst`——编译期识别为常量，运行期不占开销。
+  **省略内存序实参 = `Ordering.SeqCst`**（旧形态因此保持完全兼容）。
+- CAS 的失败序不能是 `Release`/`AcqRel`（硬件/LLVM 限制），编译器自动
+  降为 Relaxed（monotonic）。
+- **生成方式**：编译器直接发 LLVM 原子指令（`load atomic` / `store atomic` /
+  `atomicrmw` / `cmpxchg` / `fence`），不经运行时库——无 libatomic 依赖。
+  `atomic_inc` 仍走 runtime（Interlocked 家族）。
+- 实参 `&var` 取址；atomic/volatile 内建实参豁免 shared 锁外访问检查
+  （§21.6）——原子操作本身即同步原语。
 
 ### 21.3 互斥锁
 
@@ -1271,9 +1361,15 @@ output(chan_len(ch))                  // 当前排队数
 ### 21.5 其他
 
 - `sleep(ms)`：休眠指定毫秒。
-- 已知限制：join 后句柄置空；mutex/chan 按引用计数回收（最后一个引用
+- 已知限制：thread 句柄 move-only（join/detach 成功后置空，再次 join 为空操作）；
+  mutex/chan 按引用计数回收（最后一个引用
   释放时归还内核资源与控制块，close 后归零即释放）；
-  output 多线程交错不保证；无逃逸分析（引用捕获跨线程逃逸 = UB）。
+  output 多线程交错不保证。
+- **跨线程 `&x`（引用捕获）**（v3.31）：编译期放行的**安全共享**——捕获
+  目标是原子 rc 堆箱，生命周期跨线程正确（不悬垂、不双释放）。箱内数据
+  的并发读写是**共享可变状态**：须自行用 mutex（§21.3a）或原子内建
+  （§21.2）同步；**未同步 = 数据竞争**（结果不确定），但**不是 UB/
+  内存安全缺陷**——"引用捕获跨线程逃逸 = UB"的旧真空已消除。
 
 ### 21.6 shared 全局（v3.26 P0-3）
 
@@ -1618,7 +1714,8 @@ fn main()
 - **引用计数**：chan 对象、mutex CS、闭包 env 块、iface 装箱堆块带原子
   rc 头——浅拷共享（闭包捕获 chan、iface 进数组/赋值、闭包赋值）自动
   retain，最后一个持有者释放时才真正回收（杜绝共享双释放/悬垂）。
-  thread 句柄除外（OS HANDLE 不可计数，语义为 move-only）。
+  thread 句柄除外（OS HANDLE 不可计数，语义为 move-only；join 幂等、
+  detach 放弃所有权但线程继续运行，v3.31 §21.1）。
 - **spawn 移交**：spawn 实参闭包的 env 所有权移交线程——线程体结束线程侧
   释放（含捕获副本级联）；宿主槽置空不再释放。
 - **全局资源兜底**：全局句柄/容器登记进程级注册表，任何退出路径

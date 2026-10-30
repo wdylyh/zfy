@@ -4462,10 +4462,20 @@ void zfy_thread_spawn_d(void **out, void *clo_slot, void (*dtor)(void *)) {
     if (th == 0) zfy_die("spawn: 线程创建失败");
     *out = (void *)th;
 }
+/* 幂等 join（v3.31）：句柄已空（已 join/已 detach/已 free）时直接返回，
+ * 第二次 join 为已完成的空操作 */
 void zfy_thread_join(void **slot) {
     void *h = *slot;
-    if (!h) zfy_die("join: 线程句柄为空（重复 join？）");
+    if (!h) return;
     WaitForSingleObject((HANDLE)h, INFINITE);
+    CloseHandle((HANDLE)h);
+    *slot = NULL;
+}
+/* 分离（v3.31）：detach(t) 只放弃句柄所有权、不等待线程结束；
+ * 线程体继续独立执行，结束后由 _endthreadex 回收线程资源 */
+void zfy_thread_detach(void **slot) {
+    void *h = *slot;
+    if (!h) return;
     CloseHandle((HANDLE)h);
     *slot = NULL;
 }
@@ -4734,6 +4744,7 @@ static void zfy_gres_atexit(void) {
 void zfy_thread_spawn(void **o, void *c) { (void)o; (void)c; zfy_die("spawn: 仅支持 Windows"); }
 void zfy_thread_spawn_d(void **o, void *c, void (*d)(void *)) { (void)o; (void)c; (void)d; zfy_die("spawn: 仅支持 Windows"); }
 void zfy_thread_join(void **s) { (void)s; zfy_die("join: 仅支持 Windows"); }
+void zfy_thread_detach(void **s) { (void)s; }
 void zfy_thread_free(void **s) { (void)s; }
 void zfy_mutex_new(void **o) { (void)o; zfy_die("mutex: 仅支持 Windows"); }
 void zfy_mutex_lock(void **s) { (void)s; }

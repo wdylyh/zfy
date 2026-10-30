@@ -809,6 +809,8 @@ and subst_stmt map (s : stmt) : stmt =
     SReduce (subst_expr map a, subst_expr map b, subst_expr map c, p)
   | SBreak _ | SContinue _ as s -> s
   | SUnsafe (b, p) -> SUnsafe (subst_block map b, p)
+  (* 内联汇编：out/in 为变量名（无类型实参需替换），原样透传 *)
+  | SAsm _ as s -> s
   | SFn (n, lps, ret, fr, b, p) ->
     SFn (n,
          List.map
@@ -1158,6 +1160,76 @@ let rec floaty_texpr (x : texpr) : bool =
   | EUnK (_, u) -> floaty_texpr u
   | EBinK (_, a, b) -> floaty_texpr a || floaty_texpr b
   | _ -> false
+
+(* ---------- 原子/volatile 内建实参规整（v3.31）----------
+
+   Ordering 为预置枚举名（不新增关键字）：实参位置的 Ordering.Relaxed/
+   Acquire/Release/AcqRel/SeqCst 按路径名识别，改写为 i32 常量 0..4
+   （llvmgen 映射 LLVM AtomicOrdering）。旧形态（如 atomic_load(p)）缺省的
+   内存序实参由这里补 SeqCst(4)，保持源码兼容；volatile_load/store 无内存序。 *)
+let ord_code_of = function
+  | "Relaxed" -> 0 | "Acquire" -> 1 | "Release" -> 2 | "AcqRel" -> 3
+  | "SeqCst" -> 4
+  | _ -> -1
+
+let norm_ord_expr p (e : expr) : expr =
+  let seg =
+    match e with
+    | EField (EVar ("Ordering", _), seg, _) -> Some seg
+    (* 点路径在 parser 里已扁平为单个名字（Ordering.AcqRel → EVar 点名） *)
+    | EVar (name, _) when String.length name > 9
+                          && String.sub name 0 9 = "Ordering." ->
+      Some (String.sub name 9 (String.length name - 9))
+    | _ -> None
+  in
+  match seg with
+  | None -> e
+  | Some seg ->
+    let c = ord_code_of seg in
+    if c < 0 then
+      terr p
+        "unknown ordering Ordering.%s (use Ordering.Relaxed/Acquire/Release/AcqRel/SeqCst)"
+        seg;
+    EInt (Int64.of_int c, p)
+
+(* 原子内建名（用户自定义同名函数优先，见调用点判断） *)
+let is_atomic_builtin = function
+  | "atomic_load" | "atomic_store" | "atomic_add" | "atomic_sub" | "atomic_and"
+  | "atomic_or" | "atomic_xor" | "atomic_exchange" | "atomic_compare_exchange"
+  | "atomic_inc" | "atomic_fence" | "volatile_load" | "volatile_store" -> true
+  | _ -> false
+
+(* 规整原子/volatile 调用实参：Ordering.X → i32 常量，旧形态补默认 SeqCst *)
+let fix_atomic_call_args p name (args : call_arg list) : call_arg list =
+  let seq_cst () = CPos (EInt (4L, p)) in
+  let norm_at args i =
+    List.mapi
+      (fun j ca ->
+        if j <> i then ca
+        else
+          match ca with
+          | CPos e -> CPos (norm_ord_expr p e)
+          | CCopy e -> CCopy (norm_ord_expr p e)
+          | CMove e -> CMove (norm_ord_expr p e)
+          | CRef e -> CRef (norm_ord_expr p e)
+          | CNamed _ -> ca)
+      args
+  in
+  match name, List.length args with
+  | "atomic_load", 1 -> args @ [ seq_cst () ]
+  | "atomic_load", 2 -> norm_at args 1
+  | "atomic_store", 2 -> args @ [ seq_cst () ]
+  | "atomic_store", 3 -> norm_at args 2
+  | ("atomic_add" | "atomic_sub" | "atomic_and" | "atomic_or" | "atomic_xor"
+    | "atomic_exchange"), 2 -> args @ [ seq_cst () ]
+  | ("atomic_add" | "atomic_sub" | "atomic_and" | "atomic_or" | "atomic_xor"
+    | "atomic_exchange"), 3 -> norm_at args 2
+  | "atomic_compare_exchange", 3 -> args @ [ seq_cst (); seq_cst () ]
+  | "atomic_compare_exchange", 4 -> args @ [ seq_cst () ]
+  | "atomic_compare_exchange", 5 -> norm_at (norm_at args 3) 4
+  | "atomic_fence", 0 -> [ seq_cst () ]
+  | "atomic_fence", 1 -> norm_at args 0
+  | _ -> args
 
 (* 类型零值表达式（声明省略初值时使用；struct 递归为全字段零值/default 构造） *)
 exception ZtyToAstFail
@@ -1602,14 +1674,22 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
          深拷贝快照，与源隔离）；容器（map/set/list）/普通 struct/frac
          拒绝（提示经 chan 传值）。比普通闭包捕获（cap_ty_ok）更严：
          普通调用捕获共享宿主线程内存无跨线程风险 *)
+      (* 堆箱布局名判定（&x 引用捕获的目标箱：zbox$<tag>） *)
+      let is_box_struct s =
+        String.length s >= 5 && String.sub s 0 5 = "zbox$"
+      in
       let spawn_cap_ok (z : zty) =
         match resolve z with
         | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString -> true
         | TStruct s ->
           is_clo_struct s || is_thr_struct s || is_mtx_struct s
           || is_chan_struct s
-        (* TPtr（含 & 捕获的 zbox$ 堆箱指针）跨线程共享宿主内存不安全，
-           与容器同拒 *)
+        (* &x 引用捕获的堆箱指针（zbox$<tag>*）：箱是原子 rc 堆对象
+           （zfy_rc_retain/release 走 Interlocked），跨线程生命周期安全；
+           箱内数据是共享可变状态，需用户用 mutex/atomic 自行同步
+           （未同步 = 数据竞争，不再是"逃逸即 UB"） *)
+        | TPtr (TStruct s) when is_box_struct s -> true
+        (* 其余指针（借用/原始指针）仍拒绝：可能指向宿主线程栈内存 *)
         | _ -> false
       in
       let check_spawn_caps cs =
@@ -1649,9 +1729,15 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
       mkf "zfy_thread_spawn" [ TStruct cs ]
         (TStruct (ensure_handle_struct env.g "thread$"))
     | "join", [ t ] ->
+      (* 幂等：已 join/detach 的句柄再次 join 为空操作（runtime 侧 null 直接返回） *)
       (match resolve t.ety with
        | TStruct s when is_thr_struct s -> mkf "zfy_thread_join" [ TStruct s ] TVoid
        | _ -> terr p "join expects a thread handle (the value returned by spawn)")
+    | "detach", [ t ] ->
+      (* 分离（v3.31）：放弃句柄所有权、不等待线程结束（线程继续独立运行） *)
+      (match resolve t.ety with
+       | TStruct s when is_thr_struct s -> mkf "zfy_thread_detach" [ TStruct s ] TVoid
+       | _ -> terr p "detach expects a thread handle (the value returned by spawn)")
     | "mutex_new", [] ->
       mkf "zfy_mutex_new" [] (TStruct (ensure_handle_struct env.g "mutex$"))
     | ("lock" | "unlock") as kn, [ m ] ->
@@ -1659,54 +1745,68 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
        | TStruct s when is_mtx_struct s ->
          mkf ("zfy_mutex_" ^ kn) [ TStruct s ] TVoid
        | _ -> terr p "%s expects a mutex handle (from mutex_new)" kn)
-    | "atomic_load", [ x ] ->
-      (* 原子读：实参 &var（TPtr），限 32/64 位整数；返回变量类型。
-         P0-3：实参检查期间豁免 shared 锁外访问检查（原子访问即合法同步） *)
-      env.atomic_exempt <- true;
-      let r =
-        (match resolve x.ety with
-         | TPtr ((TInt 32 | TUint 32) as e) -> mkf "zfy_atomic_load_32" [ x.ety ] e
-         | TPtr ((TInt 64 | TUint 64) as e) -> mkf "zfy_atomic_load_64" [ x.ety ] e
-         | _ -> terr p "atomic_load expects &var of a 32/64-bit integer")
+    (* ---------- 原子/volatile 内建（v3.31）：元素限 8/16/32/64 位整数 ----------
+       实参已由 fix_atomic_call_args 规整（内存序为 i32 常量 0..4）。
+       P0-3 豁免（&x 绕过 shared 锁外访问检查）在调用点按前缀置位，
+       此处签名只负责类型与运行时名（名字由 mir 解析并直发 LLVM 原子指令） *)
+    | ("atomic_load" | "atomic_store" | "atomic_add" | "atomic_sub" | "atomic_and"
+      | "atomic_or" | "atomic_xor" | "atomic_exchange" | "atomic_compare_exchange"
+      | "atomic_inc" | "atomic_fence" | "volatile_load" | "volatile_store") as kn, _ ->
+      let elem_w (x : texpr) : zty * int =
+        match resolve x.ety with
+        | TPtr e ->
+          (match resolve e with
+           | TInt 8 | TUint 8 -> (e, 8)
+           | TInt 16 | TUint 16 -> (e, 16)
+           | TInt 32 | TUint 32 -> (e, 32)
+           | TInt 64 | TUint 64 -> (e, 64)
+           | e ->
+             terr p "%s expects &var of an 8/16/32/64-bit integer, got &%s"
+               kn (pp_zty e))
+        | t ->
+          terr p "%s expects &var of an 8/16/32/64-bit integer, got %s"
+            kn (pp_zty t)
       in
-      env.atomic_exempt <- false;
-      r
-    | "atomic_store", [ x; v ] ->
-      env.atomic_exempt <- true;
-      let r =
-        (match resolve x.ety with
-         | TPtr ((TInt 32 | TUint 32) as e) ->
-           mkf "zfy_atomic_store_32" [ x.ety; e ] TVoid
-         | TPtr ((TInt 64 | TUint 64) as e) ->
-           mkf "zfy_atomic_store_64" [ x.ety; e ] TVoid
-         | _ -> terr p "atomic_store expects &var of a 32/64-bit integer")
-      in
-      env.atomic_exempt <- false;
-      r
-    | "atomic_add", [ x; v ] ->
-      (* 原子加：返回加前旧值（fetch_add 语义）。实参豁免 shared 锁检查 *)
-      env.atomic_exempt <- true;
-      let r =
-        (match resolve x.ety with
-         | TPtr ((TInt 32 | TUint 32) as e) ->
-           mkf "zfy_atomic_add_32" [ x.ety; e ] e
-         | TPtr ((TInt 64 | TUint 64) as e) ->
-           mkf "zfy_atomic_add_64" [ x.ety; e ] e
-         | _ -> terr p "atomic_add expects &var of a 32/64-bit integer")
-      in
-      env.atomic_exempt <- false;
-      r
-    | "atomic_inc", [ x ] ->
-      (* 原子自增：void 返回（语句级可用，免值丢弃检查）。实参豁免同上 *)
-      env.atomic_exempt <- true;
-      let r =
-        (match resolve x.ety with
-         | TPtr (TInt 32 | TUint 32) -> mkf "zfy_atomic_inc_32" [ x.ety ] TVoid
-         | TPtr (TInt 64 | TUint 64) -> mkf "zfy_atomic_inc_64" [ x.ety ] TVoid
-         | _ -> terr p "atomic_inc expects &var of a 32/64-bit integer")
-      in
-      env.atomic_exempt <- false;
-      r
+      (match kn, targs with
+       | "atomic_load", [ x; _ord ] ->
+         let (e, w) = elem_w x in
+         mkf (Printf.sprintf "zfy_atomic_load_%d" w) [ x.ety; TInt 32 ] e
+       | "atomic_store", [ x; _v; _ord ] ->
+         let (e, w) = elem_w x in
+         mkf (Printf.sprintf "zfy_atomic_store_%d" w) [ x.ety; e; TInt 32 ] TVoid
+       | ("atomic_add" | "atomic_sub" | "atomic_and" | "atomic_or" | "atomic_xor"
+         | "atomic_exchange"), [ x; _v; _ord ] ->
+         (* 返回运算前旧值（fetch_* 语义） *)
+         let (e, w) = elem_w x in
+         let base =
+           match kn with
+           | "atomic_add" -> "add" | "atomic_sub" -> "sub" | "atomic_and" -> "and"
+           | "atomic_or" -> "or" | "atomic_xor" -> "xor" | _ -> "exchange"
+         in
+         mkf (Printf.sprintf "zfy_atomic_%s_%d" base w) [ x.ety; e; TInt 32 ] e
+       | "atomic_compare_exchange", [ x; _exp; _nw; _os; _of ] ->
+         (* 成功返回 true；失败时 *expected 由 LLVM cmpxchg 写入实际值 *)
+         let (e, w) = elem_w x in
+         mkf (Printf.sprintf "zfy_atomic_cas_%d" w)
+           [ x.ety; e; e; TInt 32; TInt 32 ] TBool
+       | "atomic_fence", [ _ord ] ->
+         mkf "zfy_atomic_fence" [ TInt 32 ] TVoid
+       | "atomic_inc", [ x ] ->
+         (* 旧形态保持：void 返回（语句级可用，免值丢弃检查） *)
+         (match resolve x.ety with
+          | TPtr (TInt 32 | TUint 32) -> mkf "zfy_atomic_inc_32" [ x.ety ] TVoid
+          | TPtr (TInt 64 | TUint 64) -> mkf "zfy_atomic_inc_64" [ x.ety ] TVoid
+          | t ->
+            terr p "atomic_inc expects &var of a 32/64-bit integer, got %s"
+              (pp_zty t))
+       | "volatile_load", [ x ] ->
+         let (e, w) = elem_w x in
+         mkf (Printf.sprintf "zfy_volatile_load_%d" w) [ x.ety ] e
+       | "volatile_store", [ x; _v ] ->
+         let (e, w) = elem_w x in
+         mkf (Printf.sprintf "zfy_volatile_store_%d" w) [ x.ety; e ] TVoid
+       | _ ->
+         terr p "%s: wrong number of arguments (checked after atomics pre-pass)" kn)
     | "sleep", [ ms ] -> mkf "zfy_sleep_ms" [ TInt 64 ] TVoid
     | "chan_send", [ c; v ] ->
       (match resolve c.ety with
@@ -2872,6 +2972,13 @@ and check_expr env (e : expr) : texpr =
        (* 接口构造（v3.13）：Drawable(p) *)
        check_iface_ctor env p' name args
      | EVar (name, np) ->
+       (* 原子/volatile 内建实参规整（v3.31）：Ordering.X → i32 常量、旧形态
+          补默认 SeqCst；用户自定义同名函数优先（不规整） *)
+       let args =
+         if is_atomic_builtin name && not (Hashtbl.mem env.g.fns name)
+         then fix_atomic_call_args p' name args
+         else args
+       in
        (match name with
         | "sort" ->
           (* sort(内容..., max|min)（new.md 第3条）：排序表达式 *)
@@ -3162,9 +3269,11 @@ and check_expr env (e : expr) : texpr =
                      (* 普通函数调用：走统一实参分派（自动 move/copy/ref）。
                         P0-3：atomic 四内建的实参在分派期检查——豁免须包住
                         实参检查本身（内建分派收到的是已检查的 texpr） *)
+                     (* atomic_* / volatile_* 实参：&x 取址豁免锁外访问检查
+                        （原子访问自带同步语义；volatile 为 MMIO 显式访问） *)
                      let exempt =
-                       List.mem name
-                         ["atomic_load"; "atomic_store"; "atomic_add"; "atomic_inc"] in
+                       is_atomic_builtin name
+                       && not (Hashtbl.mem env.g.fns name) in
                      if exempt then env.atomic_exempt <- true;
                      (* 本轮：普通函数形参类型已知 → 作为泛型构造实参的落型
                         期望（f(Pct(7)) 的 7 按 Pct<i32> 实例定 i32） *)
@@ -3982,6 +4091,11 @@ and uses_of_stmt (acc : (string * pos) list) (s : stmt) : (string * pos) list =
   | SReduce (a, b, c, _) -> uses_of_expr (uses_of_expr (uses_of_expr acc a) b) c
   | SBreak _ | SContinue _ -> acc
   | SUnsafe (blk, _) -> List.fold_left uses_of_stmt acc blk
+  (* 内联汇编：out/in 槽读取在 mir 层发生；这里按变量名登记使用（保守） *)
+  | SAsm (_, outs, ins, _, _) ->
+    List.fold_left
+      (fun acc (n, p) -> (n, p) :: acc)
+      acc (outs @ ins)
   (* 嵌套函数体在自身作用域内检查；捕获不触发外层 auto move *)
   | SFn _ -> acc
   | SMatch (sx, arms, _) ->
@@ -4222,6 +4336,8 @@ and deref_refs (refs : string list) (body : block) : block =
       SInput (tgts, (match delim with Some e -> Some (re e) | None -> None), p)
     | SReduce (a, b, c, p) -> SReduce (re a, re b, re c, p)
     | SUnsafe (blk, p) -> SUnsafe (List.map rs blk, p)
+    (* 内联汇编：out/in 为变量名，ref 参数解引用改写不适用（原样透传） *)
+    | SAsm _ as s -> s
     | SLock (mx, blk, p) -> SLock (re mx, List.map rs blk, p)
     | SBreak _ | SContinue _ -> s
     | SForIn (x, i, seqx, b, p) ->
@@ -7103,6 +7219,54 @@ and check_stmt env (st : stmt) : tstmt =
     env.in_unsafe <- saved;
     pop_scope env;
     mk (SUnsafeK tb)
+  | SAsm (tmpl, outs, ins, clob, p) ->
+    (* 内联汇编（v3.31）：必须在 unsafe 块内（否则报错）；
+       out=/in= 仅接受 ≤64 位整数/bool/char/指针的变量槽（寄存器可承载）；
+       out 不得为常量。out 调用后按槽写回（mir/llvmgen 负责） *)
+    if not env.in_unsafe then terr p "inline asm requires unsafe";
+    let asm_ok t =
+      match resolve t with
+      | TInt (8 | 16 | 32 | 64) | TUint (8 | 16 | 32 | 64)
+      | TBool | TChar | TPtr _ -> true
+      | _ -> false
+    in
+    let touts =
+      List.map
+        (fun (n, np) ->
+          match lookup_var env n with
+          | Some l ->
+            if l.lconst then terr np "asm out= cannot target constant %s" n;
+            let t = resolve l.lty in
+            if not (asm_ok t) then
+              terr np
+                "asm out= variable must be an integer/pointer of at most 64 bits, got %s"
+                (pp_zty t);
+            (l.lslot, t)
+          | None -> terr np "%s" (undef_fix env np n "variable"))
+        outs
+    in
+    let tins =
+      List.map
+        (fun (n, np) ->
+          match lookup_var env n with
+          | Some l ->
+            let t = resolve l.lty in
+            if not (asm_ok t) then
+              terr np
+                "asm in= variable must be an integer/pointer of at most 64 bits, got %s"
+                (pp_zty t);
+            ({ e = EVarK l.lslot; ety = t; epos = np }, t)
+          | None -> terr np "%s" (undef_fix env np n "variable"))
+        ins
+    in
+    let clobbers =
+      match clob with
+      | None -> []
+      | Some s ->
+        List.filter (fun x -> String.length x > 0)
+          (List.map String.trim (String.split_on_char ',' s))
+    in
+    mk (SAsmK (tmpl, touts, tins, clobbers))
   | SFn (nm, params, ret, is_frac, body, p') ->
     (* 嵌套函数（v3.7）：按命名 lambda 处理——注册闭包（隐式值捕获所在
        函数局部变量），名字绑定为局部闭包句柄变量。
@@ -7144,6 +7308,7 @@ and pos_of_stmt = function
   | SOutput (_, _, _, p) | SInput (_, _, p)
   | SSeqDecl (_, _, _, _, _, _, _, _, _, p)
   | SUnsafe (_, p)
+  | SAsm (_, _, _, _, p)
   | SLock (_, _, p)
   | SFn (_, _, _, _, _, p)
   | SMatch (_, _, p)
@@ -8209,6 +8374,9 @@ let check_program (prog : program) : hir =
       | SDerefSetK (p, v) -> SDerefSetK (fix_texpr p, fix_texpr v)
       | SAugDerefK (p, op, v) -> SAugDerefK (fix_texpr p, op, fix_texpr v)
       | SUnsafeK b -> SUnsafeK (List.map fix_stmt b)
+      | SAsmK (t, os, ins, cl) ->
+        SAsmK (t, List.map (fun (n, ty) -> (n, subst_ty ty)) os,
+               List.map (fun (e, ty) -> (fix_texpr e, subst_ty ty)) ins, cl)
       | SBlockK b -> SBlockK (List.map fix_stmt b)
       | SLockK (m, b) -> SLockK (fix_texpr m, List.map fix_stmt b)
       | k -> k

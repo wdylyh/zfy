@@ -138,6 +138,10 @@ and stmt =
   | SContinue of pos
   | SUnsafe of block * pos
     (* unsafe 块：允许指针算术（p+n / p-n / p2-p1）；其余语义与普通块一致 *)
+  | SAsm of string * (string * pos) list * (string * pos) list * string option * pos
+    (* 内联汇编（语句）：asm("模板", out=变量, in=变量, clobber="寄存器,...")。
+       模板 $0..$n 依次对应 out（先）再 in（后）；out= 可重复、顺序任意，
+       调用后按槽写回。必须在 unsafe 块内（typeck 门禁）。 *)
   | SFn of string * lparam list * ty option * bool * block * pos
     (* 嵌套函数定义（v3.7 函数式轮）：块内 fn 返回类型? 名(参数) { }——
        按命名 lambda 处理：定义处创建闭包（隐式值捕获所在函数局部变量），

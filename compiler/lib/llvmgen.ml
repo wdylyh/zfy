@@ -65,6 +65,14 @@ let width_of (t : zty) : int =
 let float_width (t : zty) : int =
   match t with TFloat n -> n | _ -> 0
 
+(* 内存序编号（typeck 规整的 Ordering 常量 0..4）→ LLVM AtomicOrdering 文本 *)
+let ord_str = function
+  | 0 -> "monotonic"
+  | 1 -> "acquire"
+  | 2 -> "release"
+  | 3 -> "acq_rel"
+  | _ -> "seq_cst"
+
 (* ---------- 模块上下文 ---------- *)
 
 type gctx = {
@@ -2629,6 +2637,111 @@ let gen_instr fc (i : instr) : unit =
     let tt = ll_ty ty in
     if vt <> tt then lerr None "dereference-assignment type mismatch %s vs %s" tt vt;
     emitf fc "  store %s %s, ptr %s" tt vv pv
+  | MAsm (tmpl, outs, ins, clobs) ->
+    (* 内联汇编（v3.31）：call <ret> asm sideeffect "模板", "约束"(实参)。
+       约束串：out 在前（=r），in 在后（r），clobber 以 ~{名} 追加；
+       LLVM 模板 $0.. 依次对应 out（先）再 in（后）。out 结果写回变量槽
+       （boxed 槽经 ptr_of 取箱地址） *)
+    let (tesc, _) = string_escape tmpl in
+    let arg_str =
+      String.concat ", "
+        (List.map
+           (fun (o : operand) ->
+             let (v, t) = val_of fc o in
+             Printf.sprintf "%s %s" t v)
+           ins)
+    in
+    let cons =
+      String.concat ","
+        (List.map (fun _ -> "=r") outs
+         @ List.map (fun _ -> "r") ins
+         @ List.map (fun c -> "~{" ^ c ^ "}") clobs)
+    in
+    (* 实参列表必须显式写出括号：零实参也是 "()"（LLVM 语法要求） *)
+    let inm = "(" ^ arg_str ^ ")" in
+    (match outs with
+     | [] ->
+       emitf fc "  call void asm sideeffect \"%s\", \"%s\"%s" tesc cons inm
+     | [ (slot, ty) ] ->
+       let r = fresh_r fc in
+       emitf fc "  %s = call %s asm sideeffect \"%s\", \"%s\"%s"
+         r (ll_ty ty) tesc cons inm;
+       let (dstp, _) = ptr_of fc (operand_of_name slot ty) in
+       emitf fc "  store %s %s, ptr %s" (ll_ty ty) r dstp
+     | _ ->
+       (* 多输出：LLVM 聚合返回 + extractvalue 逐个写回 *)
+       let tys = List.map (fun (_, t) -> ll_ty t) outs in
+       let agg = "{" ^ String.concat ", " tys ^ "}" in
+       let r = fresh_r fc in
+       emitf fc "  %s = call %s asm sideeffect \"%s\", \"%s\"%s"
+         r agg tesc cons inm;
+       List.iteri
+         (fun i (slot, ty) ->
+           let v = fresh_r fc in
+           emitf fc "  %s = extractvalue %s %s, %d" v agg r i;
+           let (dstp, _) = ptr_of fc (operand_of_name slot ty) in
+           emitf fc "  store %s %s, ptr %s" (ll_ty ty) v dstp)
+         outs)
+  | MAtomicLoad (d, p, ty, ord) ->
+    let (pv, _) = val_of fc p in
+    let r = fresh_r fc in
+    emitf fc "  %s = load atomic %s, ptr %s %s, align %d"
+      r (ll_ty ty) pv (ord_str ord) (size_of fc.g ty);
+    Hashtbl.replace fc.regs d r
+  | MAtomicStore (p, v, ty, ord) ->
+    let (pv, _) = val_of fc p in
+    let (vv, vt) = val_of fc v in
+    let tt = ll_ty ty in
+    if vt <> tt then
+      lerr None "atomic store type mismatch: %s vs %s" tt vt;
+    emitf fc "  store atomic %s %s, ptr %s %s, align %d"
+      tt vv pv (ord_str ord) (size_of fc.g ty)
+  | MAtomicRMW (d, op, p, v, ty, ord) ->
+    let (pv, _) = val_of fc p in
+    let (vv, vt) = val_of fc v in
+    let tt = ll_ty ty in
+    if vt <> tt then
+      lerr None "atomicrmw type mismatch: %s vs %s" tt vt;
+    let r = fresh_r fc in
+    emitf fc "  %s = atomicrmw %s ptr %s, %s %s %s"
+      r op pv tt vv (ord_str ord);
+    Hashtbl.replace fc.regs d r
+  | MAtomicCAS (d, p, ex, nw, ty, oku, okf) ->
+    (* cmpxchg 返回 { T, i1 }：extractvalue 取成功位。
+       失败序不能为 release/acq_rel（LLVM 限制）→ 降为 monotonic *)
+    let (pv, _) = val_of fc p in
+    let (ev, et) = val_of fc ex in
+    let (nv, nt) = val_of fc nw in
+    let tt = ll_ty ty in
+    if et <> tt || nt <> tt then
+      lerr None "cmpxchg type mismatch: %s vs %s / %s" tt et nt;
+    let fo =
+      if okf = 2 || okf = 3 then "monotonic" else ord_str okf in
+    let pr = fresh_r fc in
+    emitf fc "  %s = cmpxchg ptr %s, %s %s, %s %s %s %s"
+      pr pv tt ev tt nv (ord_str oku) fo;
+    let ok = fresh_r fc in
+    emitf fc "  %s = extractvalue { %s, i1 } %s, 1" ok tt pr;
+    Hashtbl.replace fc.regs d ok
+  | MFence ord ->
+    (* Relaxed 无屏障语义（C11）；其余映射到 fence <序> *)
+    (match ord with
+     | 0 -> ()
+     | n -> emitf fc "  fence %s" (ord_str n))
+  | MVolatileLoad (d, p, ty) ->
+    let (pv, _) = val_of fc p in
+    let r = fresh_r fc in
+    emitf fc "  %s = load volatile %s, ptr %s, align %d"
+      r (ll_ty ty) pv (size_of fc.g ty);
+    Hashtbl.replace fc.regs d r
+  | MVolatileStore (p, v, ty) ->
+    let (pv, _) = val_of fc p in
+    let (vv, vt) = val_of fc v in
+    let tt = ll_ty ty in
+    if vt <> tt then
+      lerr None "volatile store type mismatch: %s vs %s" tt vt;
+    emitf fc "  store volatile %s %s, ptr %s, align %d"
+      tt vv pv (size_of fc.g ty)
   | MFieldAddr (d, root, rootty, idxs, _) ->
     (* 字段地址：根为 struct 槽（基址=槽地址）或指针值（基址=load 出的指针） *)
     let (rp, base_ty) =
@@ -3592,6 +3705,7 @@ let gen_program (m : mir) : string =
     (fun s -> Buffer.add_string g.mbuf s)
     [ "declare void @zfy_thread_spawn(ptr, ptr)\n";
       "declare void @zfy_thread_join(ptr)\n";
+      "declare void @zfy_thread_detach(ptr)\n";
       "declare void @zfy_mutex_new(ptr)\n";
       "declare void @zfy_mutex_lock(ptr)\n";
       "declare void @zfy_mutex_unlock(ptr)\n";

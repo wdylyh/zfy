@@ -657,6 +657,8 @@ let resolve (main : program) (main_dir : string)
                  mpos = a.mpos })
              arms,
            p)
+      (* 内联汇编：模板/out/in 均为名字或字面量，无跨模块改写需求 *)
+      | SAsm _ as s -> s
       | SBreak _ | SContinue _ -> s
     in
     let rw_param m pr = { pr with pty = rw_ty m pr.pty } in

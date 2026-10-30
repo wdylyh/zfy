@@ -1426,6 +1426,54 @@ and parse_stmt p =
     ignore (next p);
     let b = parse_block p in
     SUnsafe (b, tp)
+  | Keyword KAsm ->
+    (* 内联汇编语句（语句一）：asm("模板", out=变量, in=变量, clobber="...")。
+       命名实参 out=/in= 可重复且顺序任意；模板 $0.. 对应 out（先）再 in。
+       是否在 unsafe 块内由 typeck 检查（parser 只负责形状） *)
+    ignore (next p);
+    expect p LParen "(";
+    let tmpl =
+      (match peek p with
+       | (StrLit s, _) -> ignore (next p); s
+       | (tk, tpos) ->
+         err tpos (Printf.sprintf "asm expects a string literal template, got %s" (pp_token tk)))
+    in
+    let outs = ref [] and ins = ref [] and clob = ref None in
+    (* 命名实参分派：in 是关键字（KIn），out/clobber 为普通标识符 *)
+    let named key kp =
+      expect p Assign "=";
+      match key with
+      | "out" ->
+        let (v, vp) = expect_ident_pos p "asm out= variable" in
+        outs := (v, vp) :: !outs
+      | "in" ->
+        let (v, vp) = expect_ident_pos p "asm in= variable" in
+        ins := (v, vp) :: !ins
+      | "clobber" ->
+        (match peek p with
+         | (StrLit s, _) -> ignore (next p); clob := Some s
+         | (tk, tpos) ->
+           err tpos (Printf.sprintf "asm clobber= expects a string literal, got %s" (pp_token tk)))
+      | _ -> err kp "asm named arguments are out=/in=/clobber="
+    in
+    let rec args () =
+      match peek p with
+      | (RParen, _) -> ignore (next p)
+      | (Comma, _) -> ignore (next p); args ()
+      | (Ident key, kp) ->
+        ignore (next p);
+        named key kp;
+        args ()
+      | (Keyword KIn, kp) ->
+        ignore (next p);
+        named "in" kp;
+        args ()
+      | (tk, tpos) ->
+        err tpos (Printf.sprintf "asm expects out=/in=/clobber= or ')', got %s" (pp_token tk))
+    in
+    args ();
+    end_of_stmt p;
+    SAsm (tmpl, List.rev !outs, List.rev !ins, !clob, tp)
   | Ident "lock" when (match peek2 p with (LParen, _) | (Dot, _) -> false | _ -> true) ->
     (* lock 块（v3.26 P0-3）：lock m { }——m 为 mutex 句柄变量表达式。
        `lock(` 保持表达式调用（zfy_mutex_lock 语句形式）；`lock m {` 为块形式，

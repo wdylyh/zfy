@@ -1,0 +1,69 @@
+// 原子内建 + 内存序测试（v3.31）
+// 单线程语义验证 + 双线程竞争验证（结果必须确定）
+let i64 shared_counter = 0
+
+fn void add_many()
+  for let i32 i = 0, i < 1000000, i++
+    atomic_inc(&shared_counter)
+
+fn main()
+  // 1. store / load（含旧形态：默认 SeqCst）
+  let i64 v = 0
+  atomic_store(&v, 5, Ordering.Release)
+  assert_eq(atomic_load(&v, Ordering.Acquire), 5)
+  // 2. fetch_add：返回加前旧值
+  let old = atomic_add(&v, 10, Ordering.AcqRel)
+  assert_eq(old, 5)
+  assert_eq(atomic_load(&v), 15)
+  // 3. sub / and / or / xor / exchange（均返回运算前旧值）
+  assert_eq(atomic_sub(&v, 3, Ordering.SeqCst), 15)
+  assert_eq(atomic_load(&v), 12)
+  atomic_store(&v, 6)
+  assert_eq(atomic_and(&v, 3, Ordering.AcqRel), 6)
+  assert_eq(atomic_load(&v), 2)
+  assert_eq(atomic_or(&v, 5, Ordering.AcqRel), 2)
+  assert_eq(atomic_load(&v), 7)
+  assert_eq(atomic_xor(&v, 1, Ordering.AcqRel), 7)
+  assert_eq(atomic_load(&v), 6)
+  assert_eq(atomic_exchange(&v, 9, Ordering.AcqRel), 6)
+  assert_eq(atomic_load(&v), 9)
+  // 4. CAS：成功 true / 失败 false（失败不改值）
+  let ok1 = atomic_compare_exchange(&v, 9, 21, Ordering.AcqRel, Ordering.Acquire)
+  if not ok1
+    panic("cas success expected")
+  assert_eq(atomic_load(&v), 21)
+  let ok2 = atomic_compare_exchange(&v, 99, 5, Ordering.AcqRel, Ordering.Acquire)
+  if ok2
+    panic("cas failure expected")
+  assert_eq(atomic_load(&v), 21)
+  // 5. 8/16/32 位元素宽度
+  let i8 x8 = 0
+  atomic_store(&x8, 3, Ordering.SeqCst)
+  assert_eq(atomic_load(&x8, Ordering.SeqCst), 3)
+  let i16 x16 = 0
+  assert_eq(atomic_add(&x16, 7, Ordering.AcqRel), 0)
+  assert_eq(atomic_load(&x16), 7)
+  let i32 x32 = 0
+  assert_eq(atomic_add(&x32, 5, Ordering.AcqRel), 0)
+  assert_eq(atomic_load(&x32), 5)
+  // 6. fence：SeqCst 与 Acquire 均合法（Relaxed 为空操作不崩溃）
+  atomic_fence(Ordering.SeqCst)
+  atomic_fence(Ordering.Acquire)
+  atomic_fence(Ordering.Relaxed)
+  // 7. volatile 内存映射 I/O 语义
+  let i64 mm = 0
+  unsafe
+    volatile_store(&mm, 123)
+  assert_eq(volatile_load(&mm), 123)
+  // 8. 双线程各加 1e6 次：join 后结果确定
+  let t1 = spawn(add_many)
+  let t2 = spawn(add_many)
+  join(t1)
+  join(t2)
+  assert_eq(shared_counter, 2000000)
+  // 9. 幂等 join：第二次 join 为已完成的空操作
+  join(t1)
+  // 10. detach：放弃句柄所有权，线程继续独立执行
+  let t3 = spawn(fn() => sleep(20))
+  detach(t3)
+  output("atomic ok")

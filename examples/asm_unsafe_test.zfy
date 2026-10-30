@@ -1,0 +1,4 @@
+// 负例（v3.31）：内联汇编必须在 unsafe 块内
+fn main()
+  let i64 d = 0
+  asm("nop", out=d, clobber="memory")

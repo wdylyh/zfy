@@ -133,6 +133,24 @@ type instr =
        h = 槽字段 0；code = 堆块头部；call code(h, args) *)
   | MFunAddr of string * string
     (* 函数入口地址：dst 寄存器持有 LLVM 符号文本（@名），作函数指针值 *)
+  | MAsm of string * (string * zty) list * operand list * string list
+    (* 内联汇编（v3.31，语句）：(模板, out（槽名, 类型）列表, in 值列表, clobber
+       寄存器名列表)。llvmgen 发 call <ret> asm sideeffect；模板 $0.. 依次对应
+       out（先）再 in（后）；out 结果按槽写回（boxed 槽经 ptr_of 取箱地址） *)
+  | MAtomicLoad of string * operand * zty * int
+    (* 原子读：目标寄存器, 指针, 元素类型, 内存序（0..4） *)
+  | MAtomicStore of operand * operand * zty * int
+    (* 原子写：指针, 值, 元素类型, 内存序 *)
+  | MAtomicRMW of string * string * operand * operand * zty * int
+    (* 原子读改写：目标寄存器, 运算(add/sub/and/or/xor/xchg), 指针, 值, 类型, 序 *)
+  | MAtomicCAS of string * operand * operand * operand * zty * int * int
+    (* 比较交换：目标(bool), 指针, 期望值, 新值, 类型, 成功序, 失败序 *)
+  | MFence of int
+    (* 内存屏障（内存序 0..4；0=Relaxed 无操作） *)
+  | MVolatileLoad of string * operand * zty
+    (* volatile 读（内存映射 I/O）：目标寄存器, 指针, 元素类型 *)
+  | MVolatileStore of operand * operand * zty
+    (* volatile 写（内存映射 I/O）：指针, 值, 元素类型 *)
 
 type block = { bid : int; mutable body : instr list; mutable term : term option }
 
@@ -458,6 +476,34 @@ let flatten_field_root (l : lctx) (root : texpr) : operand * int list * zty =
   in
   go [] root
 
+(* 原子/volatile 内建名解析（v3.31）：typeck 产出规范名
+   zfy_atomic_{load,store,add,sub,and,or,xor,exchange,cas}_<宽>,
+   zfy_atomic_fence、zfy_volatile_{load,store}_<宽>。
+   atomic_inc 不在此列（继续走 runtime 调用）。返回 (运算, 位宽)；
+   volatile 运算名带 "v" 前缀（vload/vstore） *)
+let atomic_core_name (name : string) : (string * int) option =
+  if name = "zfy_atomic_fence" then Some ("fence", 0)
+  else
+    let pfx =
+      if String.length name > 11 && String.sub name 0 11 = "zfy_atomic_" then
+        Some (11, "")
+      else if String.length name > 13 && String.sub name 0 13 = "zfy_volatile_" then
+        Some (13, "v")
+      else None
+    in
+    match pfx with
+    | None -> None
+    | Some (pl, vp) ->
+      (match String.rindex_opt name '_' with
+       | Some i when i > pl ->
+         let op = String.sub name pl (i - pl) in
+         let ws = String.sub name (i + 1) (String.length name - i - 1) in
+         (match op, int_of_string_opt ws with
+          | ("load" | "store" | "add" | "sub" | "and" | "or" | "xor"
+            | "exchange" | "cas"), Some w -> Some (vp ^ op, w)
+          | _ -> None)
+       | _ -> None)
+
 let rec lexpr l (e : texpr) : operand =
   match e.e with
   | EIntK n ->
@@ -593,6 +639,58 @@ let rec lexpr l (e : texpr) : operand =
     let d = fresh l in
     emit l (MCall (Some d, "zfy_panic_msg", [], TString));
     op (OLocal d) e.ety
+  | ECallK (f, args, _moves) when atomic_core_name f <> None ->
+    (* 原子/volatile 内建（v3.31）：直发 LLVM 原子/volatile 指令（不经 runtime）。
+       实参序已由 typeck 规整（内存序位置为 i32 常量 0..4） *)
+    let (aop, _w) =
+      match atomic_core_name f with Some x -> x | None -> assert false
+    in
+    let oargs = List.map (lexpr l) args in
+    (* 元素类型按需取：fence 没有指针实参（唯一实参是内存序 i32） *)
+    let elem_ty () =
+      match oargs with
+      | p :: _ ->
+        (match p.oty with
+         | TPtr et -> et
+         | t ->
+           merr e.epos "atomic builtin expects a pointer argument, got %s"
+             (Hir.pp_zty t))
+      | [] -> merr e.epos "atomic builtin expects a pointer argument"
+    in
+    let ord (o : operand) : int =
+      match o.o with
+      | OInt n -> Int64.to_int n
+      | _ -> merr e.epos "atomic ordering must be a constant (Ordering.*)"
+    in
+    (match aop, oargs with
+     | "load", [ p; o ] ->
+       let d = fresh l in
+       emit l (MAtomicLoad (d, p, elem_ty (), ord o));
+       op (OLocal d) e.ety
+     | "store", [ p; v; o ] ->
+       emit l (MAtomicStore (p, v, elem_ty (), ord o));
+       op (OInt 0L) TVoid
+     | ("add" | "sub" | "and" | "or" | "xor" | "exchange"), [ p; v; o ] ->
+       let d = fresh l in
+       let opn = if aop = "exchange" then "xchg" else aop in
+       emit l (MAtomicRMW (d, opn, p, v, elem_ty (), ord o));
+       op (OLocal d) e.ety
+     | "cas", [ p; ex; nw; os; of_ ] ->
+       let d = fresh l in
+       emit l (MAtomicCAS (d, p, ex, nw, elem_ty (), ord os, ord of_));
+       op (OLocal d) e.ety
+     | "fence", [ o ] ->
+       (* 内存屏障：唯一实参是内存序，没有指针 *)
+       emit l (MFence (ord o));
+       op (OInt 0L) TVoid
+     | "vload", [ p ] ->
+       let d = fresh l in
+       emit l (MVolatileLoad (d, p, elem_ty ()));
+       op (OLocal d) e.ety
+     | "vstore", [ p; v ] ->
+       emit l (MVolatileStore (p, v, elem_ty ()));
+       op (OInt 0L) TVoid
+     | _ -> merr e.epos "malformed atomic/volatile builtin call %s" f)
   | ECallK (f, args, moves) ->
     (* spawn 特判（P0-1c 类别 2）：env 所有权移交线程（线程体结束线程侧
        释放）。实参为语句临时闭包时从 stmt_temps 摘除（宿主不再释放）；
@@ -1506,6 +1604,10 @@ and lstmt_inner l (s : tstmt) : unit =
     let r = fresh l in
     emit l (MBinop (r, bop, op (OLocal old) v.ety, ov));
     emit l (MStoreK (pv, v.ety, op (OLocal r) v.ety))
+  | SAsmK (tmpl, outs, ins, clob) ->
+    (* 内联汇编（v3.31）：in 实参求值后发 MAsm；out 按槽写回由 llvmgen 完成 *)
+    let oins = List.map (fun (x, _) -> lexpr l x) ins in
+    emit l (MAsm (tmpl, outs, oins, clob))
   | SUnsafeK b ->
     (* unsafe 块：门禁在 typeck 已检查；块内关闭下标越界检查（@unchecked） *)
     let saved = l.unchecked in
@@ -1995,6 +2097,15 @@ let uses_of (i : instr) : string list =
   | MClCall (_, cb, args, _) ->
     operand_names cb @ List.concat_map operand_names args
   | MFunAddr _ -> []
+  | MAsm (_, _, ins, _) -> List.concat_map operand_names ins
+  | MAtomicLoad (_, p, _, _) -> operand_names p
+  | MAtomicStore (p, v, _, _) -> operand_names p @ operand_names v
+  | MAtomicRMW (_, _, p, v, _, _) -> operand_names p @ operand_names v
+  | MAtomicCAS (_, p, ex, nw, _, _, _) ->
+    operand_names p @ operand_names ex @ operand_names nw
+  | MFence _ -> []
+  | MVolatileLoad (_, p, _) -> operand_names p
+  | MVolatileStore (p, v, _) -> operand_names p @ operand_names v
 
 let pure_dst (i : instr) : string option =
   match i with

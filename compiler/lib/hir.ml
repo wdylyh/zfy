@@ -170,6 +170,11 @@ and tstmt_kind =
     (* 指针解引用复合赋值：p* op= v（p 表达式, 运算, 右值）；p*++ 亦归此 *)
   | SUnsafeK of tblock
     (* unsafe 块：仅标记作用域（typeck 时放开指针算术门禁），降码时透明展开 *)
+  | SAsmK of string * (string * zty) list * (texpr * zty) list * string list
+    (* 内联汇编（语句）：(模板, out（槽名, 类型）列表, in（值, 类型）列表,
+       clobber 寄存器名列表)。模板 $0..$n 依次对应 out（先）再 in（后）；
+       已在 typeck 确认处于 unsafe 块内。llvmgen 发 sideeffect 内联汇编，
+       out 结果按槽写回（boxed 槽经 ptr_of 取箱地址） *)
   | SBlockK of tblock
     (* 透明块（v3.6 for-in 降码承载）：纯顺序组合，无独立作用域/栈帧。
        mir/llvmgen 平铺为指令序列 *)

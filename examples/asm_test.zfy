@@ -1,0 +1,28 @@
+// 内联汇编 + volatile 语义测试（v3.31）
+// 只用无害指令（nop/movq/mfence），不触发特权指令；回归环境真跑 exe
+fn main()
+  // 1. 零输出 asm：nop（验证模板与 unsafe 门禁路径）
+  unsafe
+    asm("nop")
+  // 2. 单输出：把输入寄存器搬到输出变量（AT&T 语法，$0=out $1=in）
+  let i64 dst = 0
+  let i64 v = 42
+  unsafe
+    asm("movq $1, $0", out=dst, in=v)
+  assert_eq(dst, 42)
+  // 3. 多输出：$0/$1 为 out（先），$2/$3 为 in（后）
+  let i64 a = 0
+  let i64 b = 0
+  unsafe
+    asm("movq $2, $0; movq $3, $1", out=a, out=b, in=v, in=dst)
+  assert_eq(a, 42)
+  assert_eq(b, 42)
+  // 4. clobber 并入约束串（mfence 为无害屏障指令）
+  unsafe
+    asm("mfence", clobber="memory")
+  // 5. volatile 读写：内存映射 I/O 用 volatile_*，禁止优化掉访问
+  let i64 mm = 7
+  unsafe
+    volatile_store(&mm, 11)
+  assert_eq(volatile_load(&mm), 11)
+  output("asm ok")
