@@ -1,0 +1,37 @@
+// 审计 b：iface 装箱循环重赋值 / 列表容器 / remove / 实参传递
+// （ZFY_LEAK_DEBUG=1 应 0 泄漏）
+interface Shape
+    fn i64 area()
+
+struct Sq
+    i64 v = 0
+    fn i64 area()
+        return self.v
+
+fn i64 use_shape(let Shape s)
+    return s.area()
+
+fn main()
+    // ① 循环重赋值：旧装箱 rc -1（MMoveSeq 释放目标旧值）
+    let Shape d = Shape(Sq(1))
+    let i64 i = 0
+    while i < 10
+        d = Shape(Sq(i))
+        i = i + 1
+    output(d.area())
+    // ② 列表：push / 下标覆盖（set_agg 先释放旧元素）/ remove（返回副本，
+    //    被删槽位 dtor 释放）
+    let Shape[] xs
+    xs = push(xs, Shape(Sq(1)))
+    xs = push(xs, Shape(Sq(2)))
+    xs = push(xs, Shape(Sq(3)))
+    xs[1] = Shape(Sq(9))
+    let Shape gone = remove(xs, 0)
+    // 元素读出：move 仅限局部变量（E3150）→ 用 for-in 元素副本路径
+    // （MSeqGet 深拷贝 retain 份额，每轮循环变量退出释放）
+    let i64 acc2 = gone.area()
+    for x0 in xs
+        acc2 = acc2 + x0.area()
+    // ③ 实参传递：借用语义（MCallOwn 借传槽地址，无 retain）
+    output(use_shape(Shape(Sq(4))))
+    output("iface ok")

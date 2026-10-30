@@ -6,6 +6,87 @@ exception MirError of pos * string
 
 let merr p fmt = Printf.ksprintf (fun s -> raise (MirError (p, s))) fmt
 
+(* 任务一：整数溢出检查开关（与 Llvmgen.set_wrap_overflow 同步）。
+   检查模式（默认）：常量折叠出溢出 → 编译期错误（消息含
+   "constant overflow"）；--wrap-overflow：保持旧的静默回绕折叠。 *)
+let wrap_overflow = ref false
+let set_wrap_overflow b = wrap_overflow := b
+
+(* 任务二：顶层函数符号属性（driver 在类型检查前从 AST 登记）：
+   export "name" → 导出别名；section "seg" → 链接段；internal → 不导出 *)
+let fn_export : (string, string) Hashtbl.t = Hashtbl.create 8
+let fn_section : (string, string) Hashtbl.t = Hashtbl.create 8
+let fn_internal : (string, unit) Hashtbl.t = Hashtbl.create 8
+
+(* 有符号整数类型 w 位的取值范围（w ≤ 64；w = 64 用 Int64 极值） *)
+let int_range_of (w : int) : int64 * int64 =
+  if w >= 64 then (Int64.min_int, Int64.max_int)
+  else (Int64.neg (Int64.shift_left 1L (w - 1)),
+        Int64.sub (Int64.shift_left 1L (w - 1)) 1L)
+
+(* 无符号整数类型 w 位的最大值（w ≤ 64；w = 64 为全 1 位型 -1L） *)
+let uint_max_of (w : int) : int64 =
+  if w >= 64 then -1L else Int64.sub (Int64.shift_left 1L w) 1L
+
+let const_overflow p what =
+  merr p "constant overflow in integer %s" what
+
+(* 任务一：常量整数运算的编译期溢出判定（仅检查模式生效） *)
+let check_const_binop (p : pos) (bop : binop) (x : int64) (y : int64)
+    (t : zty) : unit =
+  if !wrap_overflow then ()
+  else
+    match t with
+    | TInt w ->
+      let (mn, mx) = int_range_of w in
+      (match bop with
+       | BAdd ->
+         let r = Int64.add x y in
+         if w < 64 then begin
+           if r < mn || r > mx then const_overflow p "addition"
+         end else if (x > 0L && y > 0L && r < 0L) || (x < 0L && y < 0L && r >= 0L) then
+           const_overflow p "addition"
+       | BSub ->
+         let r = Int64.sub x y in
+         if w < 64 then begin
+           if r < mn || r > mx then const_overflow p "subtraction"
+         end else if (x >= 0L && y < 0L && r < 0L) || (x < 0L && y >= 0L && r >= 0L) then
+           const_overflow p "subtraction"
+       | BMul ->
+         if w < 64 then begin
+           let r = Int64.mul x y in
+           if r < mn || r > mx then const_overflow p "multiplication"
+         end else if x <> 0L && y <> 0L then begin
+           let r = Int64.mul x y in
+           if (x = -1L && y = Int64.min_int) || (y = -1L && x = Int64.min_int)
+              || Int64.div r x <> y then
+             const_overflow p "multiplication"
+         end
+       | BDiv | BMod ->
+         if w = 64 && x = Int64.min_int && y = -1L then
+           const_overflow p "division"
+       | _ -> ())
+    | TUint w ->
+      let mx = uint_max_of w in
+      (match bop with
+       | BAdd ->
+         if Int64.unsigned_compare x (Int64.sub mx y) > 0 then
+           const_overflow p "addition"
+       | BSub ->
+         if Int64.unsigned_compare x y < 0 then const_overflow p "subtraction"
+       | BMul ->
+         if y <> 0L && Int64.unsigned_compare x (Int64.unsigned_div mx y) > 0 then
+           const_overflow p "multiplication"
+       | _ -> ())
+    | _ -> ()
+
+let check_const_uneg (p : pos) (x : int64) (t : zty) : unit =
+  if !wrap_overflow then ()
+  else
+    match t with
+    | TInt w -> let (mn, _) = int_range_of w in if x = mn then const_overflow p "negation"
+    | _ -> ()
+
 type operand = { o : op_kind; oty : zty }
 and op_kind =
   | OInt of int64
@@ -573,10 +654,18 @@ let rec lexpr l (e : texpr) : operand =
        op (OLocal d) TBool
      | _ ->
        let d = fresh l in
+       (* 任务一：常量折叠前的溢出检查（只用左操作数类型：算术结果类型
+          与左操作数一致；比较结果为 bool 不检查） *)
+       (match oa.o, ob.o with
+        | OInt x, OInt y -> check_const_binop e.epos b x y a.ety
+        | _ -> ());
        emit l (MBinop (d, b, oa, ob));
        op (OLocal d) e.ety)
   | EUnK (u, a) ->
     let oa = lexpr l a in
+    (match u, oa.o with
+     | UNeg, OInt x -> check_const_uneg e.epos x a.ety
+     | _ -> ());
     let d = fresh l in
     emit l (MUnop (d, u, oa));
     op (OLocal d) e.ety

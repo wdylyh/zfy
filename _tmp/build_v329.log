@@ -1,0 +1,313 @@
+File "D:\zfy\compiler\lib\parser.ml", lines 960-997, characters 2-78:
+960 | ..match decl_shape base_ty groups with
+961 |   | (_, _, _, _ :: _) when (match p.toks with (Assign, _) :: _ -> true | _ -> false) ->
+962 |     err tp "nested array/list declarations do not support initializers yet"
+963 |   | (ety, len, true, _) ->
+964 |     (* 列表：[]（变量维度为动态） *)
+...
+994 |        (match is_const with
+995 |         | true -> err tp "const requires an initializer"
+996 |         | false -> ());
+997 |        SDecl (is_const, is_frac, is_unred, is_shared, name, ty_opt, None, tp))
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+(_, None, false, _::_)
+(However, some guarded clause may match this value.)
+File "D:\zfy\compiler\lib\parser.ml", lines 1835-1851, characters 2-62:
+1835 | ..match decl_shape base_ty groups with
+1836 |   | (pty, None, false, []) ->
+1837 |     { pname = name; pty; pfrac = is_frac; pseq = PScalar;
+1838 |       pconst = is_const; punred = is_unred; pref = is_ref; ppos = tp0 }
+1839 |   | (pty, None, true, _) ->
+...
+1848 |     if is_const || is_unred then err tp0 "array/list parameters do not support const/unred";
+1849 |     { pname = name; pty; pfrac = false; pseq = PArray len;
+1850 |       pconst = false; punred = false; pref = is_ref; ppos = tp0 }
+1851 |   | (_, _, _, _ :: _) -> err tp0 "unsupported parameter shape"
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+(_, Some _, true, [])
+File "D:\zfy\compiler\lib\parser.ml", line 2363, characters 8-16:
+2363 |     let is_const =
+               ^^^^^^^^
+Warning 26 [unused-var]: unused variable is_const.
+File "D:\zfy\compiler\lib\resolve.ml", line 291, characters 6-25:
+291 |     | IMod _ | IModFile _ -> assert false
+            ^^^^^^^^^^^^^^^^^^^
+Warning 11 [redundant-case]: this match case is unused.
+File "D:\zfy\compiler\lib\resolve.ml", lines 577-582, characters 17-78:
+577 | .................{ lam with
+578 |                    lparams = lam.lparams;
+579 |                    lcaps = lam.lcaps;
+580 |                    lbody = (match lam.lbody with
+581 |                             | LExpr x -> LExpr (rw_expr m x)
+582 |                             | LBlock (bl, rt) -> LBlock (rw_block m bl, rt)) }.
+Warning 23 [useless-record-with]: all the fields are explicitly listed in this record:
+the 'with' clause is useless.
+File "D:\zfy\compiler\lib\resolve.ml", line 642, characters 8-24:
+642 |       | SLock (mx, b, p) -> SLock (rw_expr m mx, rw_block m b, p)
+              ^^^^^^^^^^^^^^^^
+Warning 11 [redundant-case]: this match case is unused.
+File "D:\zfy\compiler\lib\typeck.ml", line 38, characters 4-13:
+38 |   | TUint 128 -> true
+         ^^^^^^^^^
+Warning 11 [redundant-case]: this match case is unused.
+File "D:\zfy\compiler\lib\typeck.ml", lines 485-502, characters 2-16:
+485 | ..match resolve z with
+486 |   | TInt n -> "i" ^ string_of_int n
+487 |   | TUint n -> "u" ^ string_of_int n
+488 |   | TFloat n -> "f" ^ string_of_int n
+489 |   | TBool -> "bool" | TChar -> "char" | TString -> "string" | TVoid -> "void"
+...
+499 |        及其他形态标签无碰撞（Box$i32err$i64 等） *)
+500 |     "err$" ^ tag_of_zty e
+501 |   | TFunSig _ | TVar _ | TError ->
+502 |     assert false.............................................................
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+TFile
+File "D:\zfy\compiler\lib\typeck.ml", line 495, characters 4-17:
+495 |   | TArray (t, n) -> "a" ^ string_of_int n ^ "$" ^ tag_of_zty t
+          ^^^^^^^^^^^^^
+Warning 11 [redundant-case]: this match case is unused.
+File "D:\zfy\compiler\lib\typeck.ml", line 496, characters 4-11:
+496 |   | TList t -> "l$" ^ tag_of_zty t
+          ^^^^^^^
+Warning 11 [redundant-case]: this match case is unused.
+File "D:\zfy\compiler\lib\typeck.ml", lines 591-606, characters 2-64:
+591 | ..match resolve z with
+592 |   | TInt n -> TNamed (Printf.sprintf "i%d" n, p)
+593 |   | TUint n -> TNamed (Printf.sprintf "u%d" n, p)
+594 |   | TFloat n -> TNamed (Printf.sprintf "f%d" n, p)
+595 |   | TBool -> TNamed ("bool", p) | TChar -> TNamed ("char", p)
+...
+603 |     TSeq (ast_of_zty p e, p)
+604 |   | TArray (e, n) -> TSeqN (ast_of_zty p e, EInt (Int64.of_int n, p), p)
+605 |   | TFrac _ | TFunSig _ | TVar _ | TError ->
+606 |     terr p "this type cannot be used as a generic type argument"
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+TFile
+File "D:\zfy\compiler\lib\typeck.ml", lines 610-621, characters 2-68:
+610 | ..match t with
+611 |   | TNamed (s, sp) ->
+612 |     (match List.assoc_opt s map with
+613 |      | Some z -> ast_of_zty sp z
+614 |      | None -> t)
+...
+618 |   | TSeq (t2, sp) -> TSeq (subst_ty_ast map t2, sp)
+619 |   | TSeqN (t2, len, sp) -> TSeqN (subst_ty_ast map t2, len, sp)
+620 |   | TFun (r, ts, sp) -> TFun (subst_ty_ast map r, List.map (subst_ty_ast map) ts, sp)
+621 |   | TApp (n, ts, sp) -> TApp (n, List.map (subst_ty_ast map) ts, sp)
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+TClo (_, _, _)
+File "D:\zfy\compiler\lib\typeck.ml", lines 675-731, characters 2-50:
+675 | ..match s with
+676 |   | SDecl (c, f, u, sh, n, t, init, p) ->
+677 |     SDecl (c, f, u, sh, n, Option.map (subst_ty_ast map) t,
+678 |            Option.map (subst_expr map) init, p)
+679 |   | SSeqDecl (c, f, u, sh, n, t, len, isl, inits, p) ->
+...
+728 |                           | m -> m);
+729 |                   mbody = subst_block map arm.mbody })
+730 |             arms, p)
+731 |   | SBlock (b, p) -> SBlock (subst_block map b, p)
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+SLock (_, _, _)
+File "D:\zfy\compiler\lib\typeck.ml", lines 959-984, characters 2-18:
+959 | ..match t with
+960 |   | TNamed (s, _) when List.mem s tparams ->
+961 |     (match List.assoc_opt s !mref with
+962 |      | Some z' -> resolve z' = z
+963 |      | None -> mref := (s, z) :: !mref; true)
+...
+981 |         | Some zs when List.length zs = List.length targs ->
+982 |           List.for_all2 (fun ta zb -> match_gty g tparams p ta zb mref) targs zs
+983 |         | _ -> false)
+984 |      | _ -> false)
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+(TClo (_, _, _)|TSeq (_, _)|TSeqN (_, _, _))
+File "D:\zfy\compiler\lib\typeck.ml", lines 1366-1385, characters 2-61:
+1366 | ..match resolve t.ety with
+1367 |   | TString -> t
+1368 |   | TChar -> mk (ECallK ("zfy_tostr_char", [ t ], [])) TString
+1369 |   | TBool -> mk (ECallK ("zfy_tostr_bool", [ t ], [])) TString
+1370 |   | TInt 64 -> mk (ECallK ("zfy_tostr_i64", [ t ], [])) TString
+...
+1382 |     mk (ECallK ("zfy_tostr_f64", [ c ], [])) TString
+1383 |   | TFrac _ | TArray _ | TList _ | TStruct _ | TVoid | TVar _
+1384 |    | TPtr _ | TFunSig _ | TErr _ ->
+1385 |      terr p "type %s cannot convert to string" (pp_zty t.ety)
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+(TFile|TError)
+File "D:\zfy\compiler\lib\typeck.ml", lines 1491-1492, characters 9-54:
+1491 | .........let (_, Some vt) = cont_kv env.g s p in
+1492 |          mkf "zfy_map_values" [ TStruct s ] (TList vt)
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+(_, None)
+File "D:\zfy\compiler\lib\typeck.ml", lines 1887-1916, characters 8-68:
+1887 | ........match lam.lbody with
+1888 |         | LExpr e ->
+1889 |           let te = check_expr env e in
+1890 |           let rt0 = resolve te.ety in
+1891 |           (* 未求解 TVar（无期望上下文，如 fn(x) => x）：立即默认化，
+...
+1913 |               List.rev_append rest [ { last with s = SReturnK (Some te) } ]
+1914 |             | _ -> tb
+1915 |           in
+1916 |           ((match ret0 with Some r -> r | None -> assert false), tb)
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+LBlock (_, None)
+File "D:\zfy\compiler\lib\typeck.ml", line 2673, characters 10-84:
+2673 |           terr p' "bitwise not (~) requires an integer type, got %s" (pp_zty t1.ety);
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Warning 21 [nonreturning-statement]: this statement never returns (or has an unsound type.)
+File "D:\zfy\compiler\lib\typeck.ml", line 4002, characters 10-76:
+4002 |           terr (pos_of_expr base) "%s must be a list variable or field" what;
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Warning 21 [nonreturning-statement]: this statement never returns (or has an unsound type.)
+File "D:\zfy\compiler\lib\typeck.ml", lines 5179-5183, characters 2-35:
+5179 | ..match o with
+5180 |   | Ast.Add -> BAdd | Ast.Sub -> BSub | Ast.Mul -> BMul | Ast.Div -> BDiv
+5181 |   | Ast.Mod -> BMod | Ast.Eq -> BEq | Ast.Ne -> BNe | Ast.Lt -> BLt
+5182 |   | Ast.Gt -> BGt | Ast.Le -> BLe | Ast.Ge -> BGe
+5183 |   | Ast.And -> BAnd | Ast.Or -> BOr
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+(BitAnd|BitOr|Xor|Shl|Shr|Pow)
+File "D:\zfy\compiler\lib\typeck.ml", line 5377, characters 15-23:
+5377 |   | EField _ | EIndex _ ->
+                      ^^^^^^^^
+Warning 12 [redundant-subpat]: this sub-pattern is unused.
+File "D:\zfy\compiler\lib\typeck.ml", line 5639, characters 13-58:
+5639 |       | _ -> terr p "lock target must be a mutex variable"; "?"
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Warning 21 [nonreturning-statement]: this statement never returns (or has an unsound type.)
+File "D:\zfy\compiler\lib\typeck.ml", line 5866, characters 81-82:
+5866 |                   | EIntK _ | EFloatK _ | EStrK _ | ECharK _ | EBoolK _ | ENullK _ -> false
+                                                                                        ^
+Warning 28 [wildcard-arg-to-constant-constr]: wildcard pattern given as argument to a constant constructor
+File "D:\zfy\compiler\lib\typeck.ml", lines 5922-5933, characters 13-65:
+5922 | .............(match seqty with
+5923 |               | TList _ -> mk (SAssignK ({ e = EVarK l.lslot; ety = TList e; epos = p' },
+5924 |                                          mk_lit e elems, false, false))
+5925 |               | TArray _ ->
+5926 |                 (* 定长数组目标：字面量长度须一致（整体替换语义） *)
+...
+5930 |                      (List.length exprs) n
+5931 |                  | _ ->
+5932 |                    mk (SAssignK ({ e = EVarK l.lslot; ety = TList e; epos = p' },
+5933 |                                  mk_lit e elems, false, false))))
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+(TBool|TChar|TString|TVoid|TFile|TError|TInt _|TUint _|TFloat _|TFrac _|
+TStruct _|TPtr _|TErr _|TFunSig (_, _)|TVar _)
+File "D:\zfy\compiler\lib\typeck.ml", lines 6004-6006, characters 10-22:
+6004 | ..........terr te.epos
+6005 |             "statement discards a value of type %s (cast/find/push/remove and user functions return values; assign it to a variable: x = f(...))"
+6006 |             (pp_zty t).
+Warning 21 [nonreturning-statement]: this statement never returns (or has an unsound type.)
+File "D:\zfy\compiler\lib\typeck.ml", lines 5615-6442, characters 2-50:
+5615 | ..match st with
+5616 |   | SDecl (isconst, is_frac, is_unred, is_shared, name, ty_opt, init, p) when init <> None && is_unwrap_block (Option.get init) ->
+5617 |     (match ty_opt with
+5618 |      | Some ty ->
+5619 |        if is_shared then
+...
+6439 |       match lookup_var env nm with
+6440 |       | Some l -> l.lslot | None -> assert false
+6441 |     in
+6442 |     mk (SDeclK (false, slot, tcl.ety, tcl, false))
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+(SDeclList _|SBlock (_, _))
+File "D:\zfy\compiler\lib\typeck.ml", line 1277, characters 6-11:
+1277 |   let width = (match elem with TInt w | TUint w -> w | _ -> 0) in
+             ^^^^^
+Warning 26 [unused-var]: unused variable width.
+File "D:\zfy\compiler\lib\typeck.ml", line 4077, characters 16-18:
+4077 |             let ta =
+                       ^^
+Warning 26 [unused-var]: unused variable ta.
+File "D:\zfy\compiler\lib\typeck.ml", line 7247, characters 14-19:
+7247 |           let selfp = mk_self mp in
+                     ^^^^^
+Warning 26 [unused-var]: unused variable selfp.
+File "D:\zfy\compiler\lib\mir.ml", lines 435-1051, characters 2-23:
+ 435 | ..match e.e with
+ 436 |   | EIntK n ->
+ 437 |     (match e.ety with
+ 438 |      | TFloat _ -> op (OFloat (Int64.to_float n)) e.ety
+ 439 |      | _ -> op (OInt n) e.ety)
+...
+1048 |     (* sort_chk 内部克隆：展平用临时列表就地释放 *)
+1049 |     emit l (MCall (None, "zfy_seq_free", [ op (OLocal acc) (TList elem) ], TVoid));
+1050 |     add_temp l d (FSeq false);
+1051 |     op (OLocal d) e.ety
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+ETryK _
+File "D:\zfy\compiler\lib\mir.ml", lines 1851-1922, characters 2-20:
+1851 | ..match i with
+1852 |   | MCopy (_, v, _) -> operand_names v
+1853 |   | MStrAppend (name, ops) ->
+1854 |     (* 槽名计为 use：名字后续仍被读时本语句不可删（同时是 def） *)
+1855 |     name :: List.concat_map operand_names ops
+...
+1919 |     List.concat_map operand_names items
+1920 |   | MClCall (_, cb, args, _) ->
+1921 |     operand_names cb @ List.concat_map operand_names args
+1922 |   | MFunAddr _ -> []
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+MTry _
+File "D:\zfy\compiler\lib\llvmgen.ml", lines 86-100, characters 2-69:
+ 86 | ..match t with
+ 87 |   | TInt n | TUint n -> n / 8
+ 88 |   | TFloat n -> n / 8
+ 89 |   | TBool | TChar -> 1
+ 90 |   | TString -> 8
+...
+ 97 |     (match find_struct g s with
+ 98 |      | Some sd -> fst (Hir.struct_size_align g.structs sd)
+ 99 |      | None -> lerr None "undefined struct %s" s)
+100 |   | TVoid | TVar _ | TError -> lerr None "cannot determine type size"
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+TFile
+File "D:\zfy\compiler\lib\llvmgen.ml", lines 424-430, characters 12-46:
+424 | ............function
+425 |     | OInt n -> Printf.sprintf "OInt %Ld" n
+426 |     | OFloat f -> Printf.sprintf "OFloat %g" f
+427 |     | OStr s -> Printf.sprintf "OStr \"%s\"" (String.escaped s)
+428 |     | OBool b -> Printf.sprintf "OBool %b" b
+429 |     | OChar c -> Printf.sprintf "OChar %C" c
+430 |     | OLocal n -> Printf.sprintf "OLocal %s" n
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+OBig _
+File "D:\zfy\compiler\lib\llvmgen.ml", lines 1692-2665, characters 2-50:
+1692 | ..match i with
+1693 |   | MCopy (name, v, ty) ->
+1694 |     if String.length name > 0 && name.[0] = '%'
+1695 |        && not (Hashtbl.mem fc.allocas name)
+1696 |     then begin
+...
+2662 |          | _ -> lerr None "freed temp type is not a struct"
+2663 |        in
+2664 |        emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s addr
+2665 |      | None -> lerr None "undefined temp %s" name)
+Warning 8 [partial-match]: this pattern-matching is not exhaustive.
+Here is an example of a case that is not matched:
+MTry _
+File "D:\zfy\compiler\lib\llvmgen.ml", line 2746, characters 25-46:
+2746 |         | TStruct s when is_move_only_sname_ll s ->
+                                ^^^^^^^^^^^^^^^^^^^^^
+Error: Unbound value is_move_only_sname_ll
+Hint: Did you mean is_move_only_sname?

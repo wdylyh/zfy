@@ -1919,6 +1919,19 @@ let parse_param p =
       pconst = false; punred = false; pref = is_ref; ppos = tp0 }
   | (_, _, _, _ :: _) -> err tp0 "unsupported parameter shape"
 
+(* 位域宽度尾缀 `: N`（v3.32）：N 为整数字面量（正数，≤ 字段类型位宽由
+   typeck 校验）。无冒号返回 None，冒号后非法则报错 *)
+let parse_field_bits p : int option =
+  match peek p with
+  | (Colon, cp) ->
+    ignore (next p);
+    (match next p with
+     | (IntLit n, _) when n > 0L && n <= 128L ->
+       Some (Int64.to_int n)
+     | (IntLit _, bp) -> err bp "bitfield width must be between 1 and 128"
+     | (_, bp) -> err bp "bitfield width must be an integer literal")
+  | _ -> None
+
 (* struct 字段块：每行一个字段（或 fn 方法，v3.2）；块以 DEDENT 结束。
    返回 (字段, 方法) 对 *)
 let rec parse_struct_fields p facc macc =
@@ -1991,14 +2004,23 @@ let rec parse_struct_fields p facc macc =
       | (Assign, _) -> ignore (next p); Some (parse_expr p)
       | _ -> None
     in
+    (* 位域（v3.32，方案甲）：`TYPE name : N` —— 仅标量整型字段、且无默认值 *)
+    let fbits = parse_field_bits p in
     (match fseq with
      | PScalar -> ()
      | _ ->
        (match fdefault with
         | Some _ -> err ftp "array/list struct fields cannot have default values"
         | None -> ()));
+    (match fbits with
+     | Some _ when fseq <> PScalar ->
+       err ftp "bitfield width is only allowed on scalar fields"
+     | Some _ when fdefault <> None ->
+       err ftp "bitfield fields cannot have default values"
+     | _ -> ());
     end_of_stmt p;
-    parse_struct_fields p ({ fname = name; fty; fseq; fdefault; fpos = ftp } :: facc) macc
+    parse_struct_fields p
+      ({ fname = name; fty; fseq; fdefault; fpos = ftp; fbits } :: facc) macc
   | (_, tp) -> err tp "struct field syntax: TYPE NAME [= default]"
 
 (* 模块体：缩进块内每行一个顶层项（fn/struct/mod/use/...；可嵌套 mod） *)
@@ -2053,6 +2075,35 @@ and parse_item p =
     (* pub 修饰：仅模块内顶层合法（root 顶层 pub 由 resolve 忽略并告警容忍） *)
     ignore (next p);
     IPub (parse_item p, tp)
+  | Keyword KExport | Keyword KSection | Keyword KInternal ->
+    (* 符号属性前缀（v3.32）：export "sym" / section "seg" / internal，
+       可叠加；作用于其后 fn（pub fn 亦可）。*)
+    let rec read_attrs ex sec intl =
+      match peek p with
+      | (Keyword KExport, _) ->
+        ignore (next p);
+        (match next p with
+         | (StrLit s, _) -> read_attrs (Some s) sec intl
+         | (_, sp) -> err sp "export requires a string literal symbol name")
+      | (Keyword KSection, _) ->
+        ignore (next p);
+        (match next p with
+         | (StrLit s, _) -> read_attrs ex (Some s) intl
+         | (_, sp) -> err sp "section requires a string literal section name")
+      | (Keyword KInternal, _) ->
+        ignore (next p);
+        read_attrs ex sec true
+      | _ -> (ex, sec, intl)
+    in
+    let (ex, sec, intl) = read_attrs None None false in
+    let rec apply it =
+      match it with
+      | IFn f -> IFn { f with fexport = ex; fsection = sec; finternal = intl }
+      | IPub (inner, pp) -> IPub (apply inner, pp)
+      | _ ->
+        err tp "export/section/internal attributes apply to top-level functions only"
+    in
+    apply (parse_item p)
   | Keyword KMod ->
     (* mod name;  → 文件模块（body 在 name.zfy / name/mod.zfy，resolve 加载）
        mod name（换行缩进块）→ 内联模块，块内为顶层项，可嵌套 *)
@@ -2342,24 +2393,57 @@ and parse_item p =
          | None -> ()
          | _ when fseq = PScalar -> ()
          | _ -> err ftp "array/list struct fields cannot have default values");
+        let fbits = parse_field_bits p in
+        (match fbits with
+         | Some _ when fseq <> PScalar ->
+           err ftp "bitfield width is only allowed on scalar fields"
+         | Some _ when fdefault <> None ->
+           err ftp "bitfield fields cannot have default values"
+         | _ -> ());
         end_of_stmt p;
-        let f0 = { fname; fty; fseq; fdefault; fpos = ftp } in
+        let f0 = { fname; fty; fseq; fdefault; fpos = ftp; fbits } in
         (match peek p with
          | (Indent, _) -> parse_struct_fields p [ f0 ] []
          | _ -> ([ f0 ], []))
       | _ -> parse_struct_fields p [] []
     in
     p.tynames <- name :: p.tynames;
-    IStruct { name; packed; fields; pos = tp; tparams; tcons; methods }
-  | Keyword KExtern ->
-    (* extern "C"：缩进块内每行一个 C 函数声明（类型 (frac)? 名字(参数)），
-       解析为多个 IExtern 函数（块结构不保留） *)
+    IStruct { name; packed; fields; pos = tp; tparams; tcons; methods;
+              is_union = false }
+  | Keyword KUnion ->
+    (* union（v3.32）：union 名 缩进块——每行一个字段（类型 名字），
+       全部字段共享偏移 0；字段限标量（typeck 校验）。无方法。 *)
     ignore (next p);
+    let name = expect_ident p "union name" in
+    skip_trivia p;
     (match peek p with
-     | (StrLit "C", _) -> ignore (next p)
-     | (StrLit s, sp) ->
-       err sp (Printf.sprintf "extern supports only \"C\", got \"%s\"" s)
-     | (_, sp) -> err sp "expected \"C\" after extern");
+     | (Indent, _) ->
+       let (fields, methods) = parse_struct_fields p [] [] in
+       if methods <> [] then err tp "union cannot have methods";
+       p.tynames <- name :: p.tynames;
+       IStruct { name; packed = false; fields; pos = tp; tparams = [];
+                 tcons = []; methods = []; is_union = true }
+     | (_, fp) ->
+       err fp "union requires a newline and an indented field block")
+  | Keyword KExtern ->
+    (* extern "ABI"：缩进块内每行一个 C 函数声明（类型 (frac)? 名字(参数[,...])），
+       解析为多个 IExtern 函数（块结构不保留）。
+       ABI 变体（v3.32）：C/stdcall/fastcall/vectorcall/thiscall；
+       参数列表末尾 ... 表示可变参数（printf 风格）。 *)
+    ignore (next p);
+    let abi =
+      match peek p with
+      | (StrLit s, sp) ->
+        ignore (next p);
+        if s = "C" || s = "c" then "C"
+        else if List.mem s [ "stdcall"; "fastcall"; "vectorcall"; "thiscall" ] then s
+        else
+          err sp
+            (Printf.sprintf
+               "unsupported extern ABI \"%s\" (expected C, stdcall, fastcall, vectorcall or thiscall)"
+               s)
+      | (_, sp) -> err sp "expected an ABI string after extern (e.g. extern \"C\")"
+    in
     skip_trivia p;
     let rec go acc =
       match peek p with
@@ -2371,21 +2455,30 @@ and parse_item p =
         let (_c, rf, _u, _r2) = parse_modifiers p in
         let name = expect_ident p "extern function name" in
         expect p LParen "(";
+        let varargs = ref false in
         let params =
           let rec go2 acc2 =
             match peek p with
             | (RParen, _) -> ignore (next p); List.rev acc2
+            | (Ellipsis, _) ->
+              ignore (next p);
+              varargs := true;
+              (match peek p with
+               | (RParen, _) -> ignore (next p); List.rev acc2
+               | (_, tp') -> err tp' "variadic ... must end the argument list")
             | _ ->
               let pd = parse_param p in
               (match peek p with
                | (Comma, _) -> ignore (next p); go2 (pd :: acc2)
                | (RParen, _) -> ignore (next p); List.rev (pd :: acc2)
+               | (Ellipsis, _) -> go2 (pd :: acc2)
                | (_, tp') -> err tp' "expected ',' or ')' to end the argument list")
           in
           go2 []
         in
         end_of_stmt p;
-        go ({ ename = name; eparams = params; eret = rt; erfrac = rf; epos = tp } :: acc)
+        go ({ ename = name; eparams = params; eret = rt; erfrac = rf; epos = tp;
+              eabi = abi; evarargs = !varargs } :: acc)
     in
     IExtern { funcs = go []; pos = tp }
   | Keyword KType ->
@@ -2474,7 +2567,8 @@ and parse_item p =
       | None -> err tp "function declaration requires a return type (or use void)"
     in
     IFn { name; params; ret; rfrac = is_frac; runred = is_unred;
-          body; pos = tp; tparams; tcons }
+          body; pos = tp; tparams; tcons;
+          fexport = None; fsection = None; finternal = false }
   | Ident _ ->
     if looks_like_decl p then
       err tp "declaration syntax: let TYPE (frac)? (const)? (unred)? NAME [= init] (declarations must start with 'let')"

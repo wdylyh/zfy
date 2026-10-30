@@ -1,0 +1,22 @@
+// 审计 f（疑点实证）：句柄作 lambda 实参的 EClCallK tmp retain 路径——
+// lambda 参数不接受闭包类型（E2006），句柄实参传闭包调用语法不可达；
+// 此处改测可达的等价路径：①用户函数接收闭包参数（MCallOwn 借传）
+// ②闭包调用 string 实参（深拷贝 + 被调接管）。ZFY_LEAK_DEBUG=1 应 0 泄漏
+fn i64 apply(let fn(i64) -> i64 g)
+    return g(3)
+
+fn main()
+    let i64 base = 5
+    let fn(i64) -> i64 inner = fn(i64 x) => x + base
+    let i64 n = 0
+    let i64 i = 0
+    while i < 5
+        n = apply(inner)
+        i = i + 1
+    output(n)
+    // 闭包调用带 string 实参（聚合实参深拷贝临时 + 被调形参 owned 接管）
+    let string greet = "hi "
+    let fn(string) -> string mk = fn(string who) => greet + who
+    let string s = mk("zfy")
+    output(s)
+    output("cloarg ok")

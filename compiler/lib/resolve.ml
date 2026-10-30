@@ -677,11 +677,14 @@ let resolve (main : program) (main_dir : string)
                      runred = f.runred;
                      body = rw_block m f.body;
                      pos = f.pos;
-                     tparams = f.tparams; tcons = f.tcons } :: !out
+                     tparams = f.tparams; tcons = f.tcons;
+                     fexport = f.fexport; fsection = f.fsection;
+                     finternal = f.finternal } :: !out
       | IStruct s ->
         out := IStruct { name = flat_prefix m.mpath ^ s.name; packed = s.packed;
                          fields = List.map (rw_field m) s.fields; pos = s.pos;
                          tparams = s.tparams; tcons = s.tcons;
+                         is_union = s.is_union;
                          methods =
                            List.map
                              (fun mth ->

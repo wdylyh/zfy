@@ -1,0 +1,20 @@
+// 定位变体 d5：push 循环 + for-in（无下标覆盖）
+interface Shape
+    fn i64 area()
+
+struct Sq
+    i64 v = 0
+    fn i64 area()
+        return self.v
+
+fn main()
+    let Shape[] xs
+    let i64 i = 0
+    while i < 5
+        xs = push(xs, Shape(Sq(i)))
+        i = i + 1
+    let i64 acc = 0
+    for t in xs
+        acc = acc + t.area()
+    output(acc)
+    output("d5 ok")

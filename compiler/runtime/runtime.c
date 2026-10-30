@@ -3386,6 +3386,15 @@ void zfy_os_random_u64(unsigned long long *out) {
 #endif
 }
 
+/* ---------- 整数溢出 panic（任务一：默认检查）----------
+   LLVM 侧用 llvm.*.with.overflow 内建/前置比较判定溢出，命中时调用本函数。
+   走 zfy_die → zfy_panic 路径（打印位置、可被 try() 捕获）。 */
+void zfy_overflow_panic(const char *op, long long a, long long b) {
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s (left=%lld, right=%lld)", op, a, b);
+    zfy_die(buf);
+}
+
 /* ---------- ** 幂运算（v3.3）：整数快速幂 ----------
    平方乘法；有符号版负指数得 0（整数幂无意义取截断语义）；
    内部按无符号回绕乘法（与 LLVM mul 一致，避免 C 有符号溢出 UB） */
@@ -3407,6 +3416,60 @@ unsigned long long zfy_pow_ull(unsigned long long b, unsigned long long e) {
         if (e & 1) r *= b;
         b *= b;
         e >>= 1;
+    }
+    return r;
+}
+
+/* 带溢出标志的 64 位幂（任务一检查模式）：结果保持回绕语义（与旧版一致），
+   溢出时置 ov=1；调用方（LLVM guard）决定 panic。 */
+long long zfy_pow_ll_ov(long long b, long long e, unsigned char *ov);
+unsigned long long zfy_pow_ull_ov(unsigned long long b, unsigned long long e,
+                                  unsigned char *ov);
+
+long long zfy_pow_ll_ov(long long b, long long e, unsigned char *ov) {
+    if (e < 0) { *ov = 0; return 0; }
+    /* 有符号幂：按绝对值计算，再按结果符号判定是否超出有符号范围。
+       不能直接把负底数当无符号位型（(-3)^2 会因 (2^64-3)^2 无符号溢出误报） */
+    unsigned long long m = (unsigned long long)b;
+    int neg = b < 0 && (e & 1);
+    if (b < 0) m = 0ULL - m;
+    unsigned long long lim = neg ? (1ULL << 63) : ((1ULL << 63) - 1);
+    unsigned long long r = 1;
+    unsigned long long ee = (unsigned long long)e;
+    *ov = 0;
+    while (ee > 0) {
+        if (ee & 1) {
+            unsigned long long t;
+            if (__builtin_mul_overflow(r, m, &t)) *ov = 1;
+            else if (t > lim) *ov = 1;
+            r = t;
+        }
+        ee >>= 1;
+        if (ee > 0) {
+            unsigned long long t;
+            if (__builtin_mul_overflow(m, m, &t)) *ov = 1;
+            m = t;
+        }
+    }
+    return neg ? (long long)(0ULL - r) : (long long)r;
+}
+
+unsigned long long zfy_pow_ull_ov(unsigned long long b, unsigned long long e,
+                                  unsigned char *ov) {
+    unsigned long long r = 1;
+    *ov = 0;
+    while (e > 0) {
+        if (e & 1) {
+            unsigned long long t;
+            if (__builtin_mul_overflow(r, b, &t)) *ov = 1;
+            r = t;
+        }
+        e >>= 1;
+        if (e > 0) {
+            unsigned long long t;
+            if (__builtin_mul_overflow(b, b, &t)) *ov = 1;
+            b = t;
+        }
     }
     return r;
 }
@@ -3446,6 +3509,69 @@ void zfy_pow_i128(long long out[2],
         b *= b;
         e >>= 1;
     }
+    out[0] = (unsigned long long)r;
+    out[1] = (unsigned long long)(r >> 64);
+}
+
+/* 带溢出标志的 128 位幂（任务一检查模式）：结果保持回绕语义，
+   任一乘法溢出时置 ov=1（调用方 LLVM guard 决定 panic） */
+void zfy_pow_u128_ov(unsigned long long out[2],
+                     unsigned long long blo, unsigned long long bhi,
+                     unsigned long long elo, unsigned long long ehi,
+                     unsigned char *ov) {
+    unsigned __int128 b = ((unsigned __int128)bhi << 64) | blo;
+    unsigned __int128 e = ((unsigned __int128)ehi << 64) | elo;
+    unsigned __int128 r = 1;
+    *ov = 0;
+    while (e > 0) {
+        if (e & 1) {
+            unsigned __int128 t;
+            if (__builtin_mul_overflow(r, b, &t)) *ov = 1;
+            r = t;
+        }
+        e >>= 1;
+        if (e > 0) {
+            unsigned __int128 t;
+            if (__builtin_mul_overflow(b, b, &t)) *ov = 1;
+            b = t;
+        }
+    }
+    out[0] = (unsigned long long)r;
+    out[1] = (unsigned long long)(r >> 64);
+}
+
+void zfy_pow_i128_ov(long long out[2],
+                     long long blo, long long bhi,
+                     long long elo, long long ehi,
+                     unsigned char *ov) {
+    if (ehi < 0) { out[0] = 0; out[1] = 0; *ov = 0; return; } /* 负指数 → 0 */
+    /* 有符号 128 位幂：同 64 位版，按绝对值 + 符号位判定（避免负底数平方
+       被无符号溢出规则误报） */
+    unsigned __int128 e = ((unsigned __int128)(unsigned long long)ehi << 64)
+                          | (unsigned long long)elo;
+    unsigned __int128 m = ((unsigned __int128)(unsigned long long)bhi << 64)
+                          | (unsigned long long)blo;
+    int neg = bhi < 0 && (e & 1);
+    if (bhi < 0) m = (unsigned __int128)0 - m;
+    unsigned __int128 lim = neg ? ((unsigned __int128)1 << 127)
+                                : (((unsigned __int128)1 << 127) - 1);
+    unsigned __int128 r = 1;
+    *ov = 0;
+    while (e > 0) {
+        if (e & 1) {
+            unsigned __int128 t;
+            if (__builtin_mul_overflow(r, m, &t)) *ov = 1;
+            else if (t > lim) *ov = 1;
+            r = t;
+        }
+        e >>= 1;
+        if (e > 0) {
+            unsigned __int128 t;
+            if (__builtin_mul_overflow(m, m, &t)) *ov = 1;
+            m = t;
+        }
+    }
+    if (neg) r = (unsigned __int128)0 - r;
     out[0] = (unsigned long long)r;
     out[1] = (unsigned long long)(r >> 64);
 }

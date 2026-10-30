@@ -1,0 +1,12 @@
+// 审计 h（探测）：句柄存 struct 字段后 struct 整体覆盖——
+// 预期 typeck 拒绝（用户 struct 禁 move-only 字段），若放行则观察覆盖
+// 路径旧字段是否释放。仅探测记录，不作为回归用例
+struct Holder
+    i64 x = 0
+    mutex$ m
+
+fn main()
+    let Holder h = Holder(1)
+    let Holder h2 = h
+    output(h2.x)
+    output("struct field ok")

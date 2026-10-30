@@ -1,0 +1,11 @@
+// 探测：返回闭包句柄形参（借用形参 return 后调用方双槽同 rc）——
+// 若 typeck 放行，观察是否 double-free/悬垂。仅探测记录
+fn (fn(i64) -> i64) passthru(let fn(i64) -> i64 g)
+    return g
+
+fn main()
+    let i64 base = 5
+    let fn(i64) -> i64 inner = fn(i64 x) => x + base
+    let fn(i64) -> i64 got = passthru(inner)
+    output(got(2))
+    output("passthru ok")

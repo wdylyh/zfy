@@ -604,7 +604,8 @@ let expand_uses (main : program) (main_dir : string)
       reg name fpos;
       out := IFn { name; params = fparams; ret = fret; rfrac = false;
                   runred = false; body = rw_block m fbody; pos = fpos;
-                  tparams = []; tcons = [] } :: !out
+                  tparams = []; tcons = [];
+                  fexport = None; fsection = None; finternal = false } :: !out
     in
     let rec go_mod ns_mod mname its2 =
       List.iter
@@ -671,14 +672,22 @@ let expand_uses (main : program) (main_dir : string)
                  out := IFn { name = gname; params = selfp :: mth.mparams;
                               ret = mth.mret; rfrac = mth.mrfrac; runred = false;
                               body = rw_block mm mth.mbody; pos = mth.mpos;
-                              tparams = []; tcons = [] } :: !out)
+                              tparams = []; tcons = [];
+                              fexport = None; fsection = None;
+                              finternal = false } :: !out)
                methods)
         | IExtern it ->
           (* extern "C" 原样并入（符号链接期解析；重名由 typeck 报错） *)
           out := IExtern it :: !out
         | ITypeAlias it ->
           (* type 别名原样并入（重名由 typeck 报错） *)
-          out := ITypeAlias it :: !out)
+          out := ITypeAlias it :: !out
+        | (IIf _ | IEnum _) as it ->
+          (* interface/enum 原样并入（类型名无命名空间，重名由 typeck 报错） *)
+          out := it :: !out
+        | IUseP _ | IModFile _ | IPub _ ->
+          (* strip 已拦截 IUseP/IModFile 并剥掉 IPub：此处仅为穷尽性兜底 *)
+          ())
       items
   in
   let rec load_use base_dir (upath, uimport, ualias, upos) =
@@ -756,7 +765,9 @@ let desugar_main_methods (prog : program) : program =
             in
             out := IFn { name = gname; params = selfp :: mth.mparams;
                          ret = mth.mret; rfrac = mth.mrfrac; runred = false;
-                         body = mth.mbody; pos = mth.mpos; tparams = []; tcons = [] } :: !out)
+                         body = mth.mbody; pos = mth.mpos; tparams = []; tcons = [];
+                         fexport = None; fsection = None;
+                         finternal = false } :: !out)
           methods
       | it -> out := it :: !out)
     prog;
@@ -909,6 +920,20 @@ let rec run_checked ?(src : string option) ?(acc : zerr list = [])
             List.iter (fun (p, m) -> add `Parse p m) (List.rev !perrs);
             (* 主文件 struct 方法脱糖（v3.2；导入文件的已在 expand_uses 处理） *)
             let prog = desugar_main_methods prog in
+            (* 任务二：符号可见性/链接段属性登记（llvmgen 生成 define/alias 用） *)
+            List.iter
+              (fun (it : Ast.item) ->
+                match it with
+                | Ast.IFn f ->
+                  (match f.fexport with
+                   | Some n -> Hashtbl.replace Mir.fn_export f.name n
+                   | None -> ());
+                  (match f.fsection with
+                   | Some s -> Hashtbl.replace Mir.fn_section f.name s
+                   | None -> ());
+                  if f.finternal then Hashtbl.replace Mir.fn_internal f.name ()
+                | _ -> ())
+              prog;
             let hir = Typeck.check_program prog in
             List.iter (fun (p, m) -> add `Type p m)
               (List.rev !(Typeck.collected));

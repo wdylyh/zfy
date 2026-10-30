@@ -1,0 +1,17 @@
+// 审计 a：闭包 env 循环覆盖 / 裸函数包装重赋值（ZFY_LEAK_DEBUG=1 应 0 泄漏）
+// 旧 env 应在覆盖（MMoveSeq 释放目标旧值）与作用域退出（MFreeClo）时释放
+// （裸函数名赋值句柄变量需显式 move，E3000——不测；lambda 覆盖已覆盖该路径）
+fn main()
+    let i64 base = 1
+    // ① 循环覆盖：每轮新 env 块，旧 env 随覆盖释放（rc -1）
+    let fn() -> i64 f = fn() -> i64
+        return base
+    let i64 i = 0
+    while i < 10
+        f = fn() -> i64
+            return base + i
+        i = i + 1
+    output(f())
+    // ② lambda 立即调用：临时 env 语句末释放
+    output((fn(i32 x) => x + 1)(41))
+    output("clo ok")

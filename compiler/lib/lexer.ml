@@ -429,6 +429,14 @@ let tokenize ?(file = "") src =
           end
           else begin
             (* 算符/标点 *)
+            (* 三字符：...（extern 可变参数尾缀，v3.32） *)
+            let three =
+              String.sub l.src l.i (min 3 (String.length l.src - l.i)) in
+            if three = "..." then begin
+              let p = pos l in
+              advance l 3;
+              push Ellipsis p
+            end else begin
             let two = String.sub l.src l.i (min 2 (String.length l.src - l.i)) in
             (match List.assoc_opt two punct2 with
              | Some t ->
@@ -460,6 +468,7 @@ let tokenize ?(file = "") src =
                   let c = l.src.[l.i] in
                   err (pos l)
                     (Printf.sprintf "illegal character '%c' (0x%02X)" c (Char.code c))));
+            end;
             loop ()
           end
     end

@@ -1,0 +1,14 @@
+// 定位变体 f1：仅 apply(inner) 循环（用户函数收闭包参数）
+fn i64 apply(let fn(i64) -> i64 g)
+    return g(3)
+
+fn main()
+    let i64 base = 5
+    let fn(i64) -> i64 inner = fn(i64 x) => x + base
+    let i64 n = 0
+    let i64 i = 0
+    while i < 5
+        n = apply(inner)
+        i = i + 1
+    output(n)
+    output("f1 ok")

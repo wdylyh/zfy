@@ -207,13 +207,18 @@ type param = { pname : string; pty : ty; pfrac : bool; pseq : pseq_kind;
      函数体内自动解引用读写（仅标量/string，extern/函数指针不支持）；
      pconst：函数体内不可赋值；punred：入口不做 frac 归一 *)
 
-(* extern "C" 块内的单个 C 函数声明 *)
+(* extern "C" 块内的单个 C 函数声明。
+   eabi：调用约定（"C"/"stdcall"/"fastcall"/"vectorcall"/"thiscall"）；
+   evarargs：参数列表以 ... 结尾（调用点可传任意多个标量/string/指针实参） *)
 type extern_fn =
-  { ename : string; eparams : param list; eret : ty; erfrac : bool; epos : pos }
+  { ename : string; eparams : param list; eret : ty; erfrac : bool; epos : pos;
+    eabi : string; evarargs : bool }
 
-(* struct 字段：类型 名字 [= 默认值]；类型可为标量/T[N]/T[]/其他 struct *)
+(* struct 字段：类型 名字 [= 默认值]；类型可为标量/T[N]/T[]/其他 struct。
+   fbits：位域宽度（`u8 a : 3` 的 3；None = 普通字段）。位域仅限标量整型字段 *)
 type sfield =
-  { fname : string; fty : ty; fseq : pseq_kind; fdefault : expr option; fpos : pos }
+  { fname : string; fty : ty; fseq : pseq_kind; fdefault : expr option;
+    fpos : pos; fbits : int option }
 
 (* struct 方法（v3.2 随机数模块）：struct 块内 fn 定义；
    脱糖为顶层 IFn <S>__<m>，隐式首参 self = ref let <S>（可变接收者） *)
@@ -234,14 +239,18 @@ type item =
        use a::b as m;       binds=[("m", ["a";"b"])]（绑定模块） *)
   | IFn of { name : string; params : param list; ret : ty option; rfrac : bool;
              runred : bool; body : block; pos : pos; tparams : string list;
-             tcons : string list }
+             tcons : string list;
+             fexport : string option;  (* export "sym"：导出符号名（no_mangle） *)
+             fsection : string option; (* section "seg"：链接段 *)
+             finternal : bool }        (* internal：不导出（LLVM internal 链接性） *)
     (* fn 前缀函数（new.md 2026-10-10）：fn (类型)? (frac)? (const)? (unred)? 名(参数)；
        ret=None 仅限 main（隐含 i32，return 可省）；runred：返回类型带 unred
        （返回值不做 frac 归一）；tparams：泛型类型参数（fn <T, U> ...），空 = 普通；
        tcons：与 tparams 等长的约束列表（"num"/"cmp"/"any"，v3.15） *)
   | IStruct of { name : string; packed : bool; fields : sfield list; pos : pos;
                  tparams : string list; tcons : string list;
-                 methods : smethod list }
+                 methods : smethod list;
+                 is_union : bool }         (* union：全部字段共享偏移 0 *)
     (* tparams：泛型类型参数（struct Box<T, U>），空 = 普通 struct；tcons 同 IFn *)
   | IMod of string * item list * pos
     (* 内联模块 mod name（缩进块体，可嵌套）；resolve 展开为扁平名 *)

@@ -1,0 +1,142 @@
+// 任务二回归：FFI 表达力补齐
+// 覆盖：union 布局（字段共享偏移 0 / sizeof / alignof / 值语义）、
+//       位域读写掩码（struct packed）、变参 extern（printf 风格）、
+//       ABI 变体声明（stdcall/fastcall/vectorcall/thiscall）、
+//       extern 返回 T*/T[]（unsafe 语义：指针/序列所有权归 C 侧）、
+//       符号属性（export 导出名 / section 链接段 / internal 不导出）。
+
+// ---- 1) 变参 extern：固定形参 + ...，实参任意多标量/string/指针 ----
+extern "C"
+    i32 printf(let string fmt, ...)
+
+// ---- 2) ABI 变体：只声明（验证 ABI 名被接受并生成对应调用约定）----
+extern "stdcall"
+    i32 abi_stdcall_probe(let i32 a, let i32 b)
+extern "fastcall"
+    i32 abi_fastcall_probe(let i32 a, let i32 b)
+extern "vectorcall"
+    i32 abi_vectorcall_probe(let i32 a, let i32 b)
+extern "thiscall"
+    i32 abi_thiscall_probe(let i32 a, let i32 b)
+
+// ---- 3) extern 返回 T* / T[]（unsafe：返回的内存由 C 侧持有，
+//        zfy 侧不得释放；T[] 实际是裸序列描述符指针，长度约定由 C 侧定义）----
+extern "C"
+    i32* abi_ptr_ret(let i32 n)
+    i32[] abi_seq_ret(let i32 n)
+
+// ---- union 一等支持：所有字段偏移 0，无标签，值语义 ----
+union Value
+    i32 i
+    f32 f
+    u8 b
+
+union Wide
+    i64 big
+    f64 d
+
+// ---- 位域（方案甲）：packed struct 内的整数字段，位从 LSB 起 ----
+struct packed Flags
+    u8 lo: 3
+    u8 mid: 4
+    i8 sgn: 4
+
+// ---- 4) 符号属性：导出名 / 链接段 / internal ----
+export "zfy_exported_add" fn i32 add_impl(let i32 a, let i32 b)
+    return a + b
+
+internal fn i32 hidden_double(let i32 x)
+    return x * 2
+
+section "zfy_init" fn i32 in_init(let i32 x)
+    return x + 1
+
+fn main()
+    let i32 bad = 0
+
+    // ---- union：位置构造 = 第一字段；命名构造亦可用 ----
+    let Value v = Value(5)
+    if v.i != 5
+        bad++
+    let Value nv = Value(i=7)
+    if nv.i != 7
+        bad++
+
+    // ---- union：字段全部从偏移 0 起（写 f32 后读 i32 得到 IEEE 位型）----
+    v.f = 3.5                                  // 0x40600000
+    if v.i != 1080033280
+        bad++
+    v.b = 0xFF                                 // 覆盖最低字节 → 0x406000FF
+    if v.i != 1080033535
+        bad++
+
+    // ---- union：sizeof = 最大字段，alignof = 最大对齐 ----
+    if sizeof(Value) != 4 or alignof(Value) != 4
+        bad++
+    if sizeof(Wide) != 8 or alignof(Wide) != 8
+        bad++
+    let Wide w = Wide(big=1234567890123)
+    if w.big != 1234567890123
+        bad++
+    w.d = 2.5
+    if w.big != 4612811918334230528            // 2.5 的 f64 位型
+        bad++
+    // 值语义：整体赋值是 memcpy（副本独立）
+    let Wide w2 = copy(w)
+    w2.big = 7
+    if w.d != 2.5
+        bad++
+
+    // ---- 位域：命名构造 + 读回（掩码/符号扩展）----
+    let Flags fl = Flags(lo=5, mid=9, sgn=-3)
+    if fl.lo != 5 or fl.mid != 9 or fl.sgn != -3
+        bad++
+    // 写：超出位宽的高位被掩码丢弃（13 & 7 = 5）
+    fl.lo = 13
+    if fl.lo != 5
+        bad++
+    // 有符号位域：4 位写入 8 后按符号扩展读回 -8
+    fl.sgn = 8
+    if fl.sgn != -8
+        bad++
+    // 相邻位域互不干扰
+    if fl.mid != 9
+        bad++
+    // 复合赋值走同一 read-modify-write 路径
+    fl.mid += 1
+    if fl.mid != 10
+        bad++
+    if fl.lo != 5 or fl.sgn != -8
+        bad++
+    if sizeof(Flags) != 3 or alignof(Flags) != 1
+        bad++
+
+    // ---- 变参 extern：任意多标量/string 实参（默认提升 C 语义）----
+    let i32 vn = 42
+    let f64 vf = 1.5
+    let string vs = "zfy"
+    let bool vb = true
+    let char vc = 'A'
+    let i8 small = 7
+    let i32 vres = printf("va: %d %s %.2f %d %d %d\n", vn, vs, vf, vb, vc, small)
+    if vres <= 0
+        bad++
+    // 字面量实参按默认型收口（整数 i64 / 浮点 f64）；Win64 下浮点变参
+    // 需在调用点显式写函数类型 `call double (ptr, ...)` 才会进 GP 影子槽
+    let i32 vres2 = printf("lit: %.2f %d\n", 2.5, 7)
+    if vres2 <= 0
+        bad++
+
+    // ---- 符号属性函数可正常调用 ----
+    if add_impl(1, 2) != 3
+        bad++
+    if hidden_double(4) != 8
+        bad++
+    if in_init(41) != 42
+        bad++
+
+    if bad != 0
+        output("ffi_test FAILED: ", bad, "\n")
+        return 1
+    output("ffi_test OK\n")
+    return 0

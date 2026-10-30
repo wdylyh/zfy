@@ -1,0 +1,7 @@
+// 报错用例：默认（检查模式）下常量折叠出整数溢出须编译期报错
+// 期望错误：constant overflow in integer addition
+// 对照：zfyc build --wrap-overflow 时该文件按回绕折叠、编译通过
+fn main()
+    let i32 x = 2147483647 + 1
+    output(x)
+    return 0

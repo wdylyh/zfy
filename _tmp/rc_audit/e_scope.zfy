@@ -1,0 +1,39 @@
+// 审计 e：块内局部句柄（闭包/iface/mutex/chan）离开作用域释放
+// ZFY_LEAK_DEBUG=1 应 0 泄漏
+interface Shape
+    fn i64 area()
+
+struct Sq
+    i64 v = 0
+    fn i64 area()
+        return self.v
+
+fn main()
+    let i64 acc = 0
+    let i64 base = 10
+    // ① if 块内局部句柄
+    if true
+        let m = mutex_new()
+        lock m
+            acc = acc + 1
+        unlock(m)
+        let chan<i32> ch
+        chan_send(ch, 3)
+        acc = acc + (chan_recv(ch) ?? 0)
+        chan_close(ch)
+        let Shape d = Shape(Sq(2))
+        acc = acc + d.area()
+        let fn() -> i64 f = fn() -> i64
+            return base
+        acc = acc + f()
+    // ② while 块内：每轮声明 iface/闭包句柄并随作用域释放
+    //    （lambda 捕获须外层作用域变量——E4019 限制，捕获 main 顶层 base）
+    let i64 i = 0
+    while i < 3
+        let Shape d2 = Shape(Sq(i))
+        let fn() -> i64 g = fn() -> i64
+            return base + 1
+        acc = acc + d2.area() + g()
+        i = i + 1
+    output(acc)
+    output("scope ok")

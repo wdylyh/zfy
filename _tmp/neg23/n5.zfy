@@ -1,0 +1,6 @@
+fn main()
+    let i32[] xs = 1, 2, 3
+    let i32[]* const p = borrow(xs)
+    output(p^[0])
+    xs[1] = 9
+    output(xs[1])

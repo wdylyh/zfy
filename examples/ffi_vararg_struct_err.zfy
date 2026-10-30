@@ -1,0 +1,13 @@
+// 报错用例：变参 extern 不能按值收 struct/列表/数组/frac/T!
+// 期望错误：variadic argument 2 of put_s must be a scalar/string/pointer value
+extern "C"
+    i32 put_s(let string tag, ...)
+
+struct P
+    i32 x
+
+fn main()
+    let P p = P(x=1)
+    let i32 r = put_s("p", p)
+    output(r)
+    return 0

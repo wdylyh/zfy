@@ -1,0 +1,12 @@
+struct Inner
+    i32 x
+    i32 y
+struct Outer
+    Inner ix
+    i32 other
+fn main()
+    let Outer s = Outer(ix=Inner(x=1, y=2), other=3)
+    let p = borrow(s.ix.x)
+    output(p^)
+    s = Outer(ix=Inner(x=9, y=9), other=9)
+    output(s.ix.x)

@@ -1,0 +1,5 @@
+fn main()
+    let i32 n = 7
+    let fn() -> void f = fn() -> void
+        output(n)
+    f()

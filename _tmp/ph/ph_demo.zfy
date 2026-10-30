@@ -1,0 +1,19 @@
+mod widgets;
+use widgets::{App, UI}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let App app = App()
+    if app.open(360, 200, "ph") != 0
+        return
+    let UI inp = UI("input")
+    inp.pos(30, 60)
+    inp.size(280, 36)
+    inp.placeholder("请输入内容…")
+    let i32 k = app.add(inp)
+    let i32 f = 0
+    while f < 240 and app.alive()
+        app.step()
+        gui_frame_sleep(app.t0)
+        f++
+    app.close()

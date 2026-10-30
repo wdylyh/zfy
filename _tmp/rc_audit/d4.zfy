@@ -1,0 +1,18 @@
+// 定位变体 d4：push 循环 + 下标覆盖（无 for-in）
+interface Shape
+    fn i64 area()
+
+struct Sq
+    i64 v = 0
+    fn i64 area()
+        return self.v
+
+fn main()
+    let Shape[] xs
+    let i64 i = 0
+    while i < 5
+        xs = push(xs, Shape(Sq(i)))
+        i = i + 1
+    xs[2] = Shape(Sq(100))
+    output(length(xs))
+    output("d4 ok")

@@ -1,0 +1,16 @@
+fn main()
+    rand.seed(9)
+    let i32 hits = 0
+    let i32 i = 0
+    while i < 100
+        let i64 v = rand(2, 5)
+        if v**2 >= 4 and v**2 <= 16
+            hits++
+        i++
+    output(hits)
+    output("\n")
+    rand.seed(9)
+    let i64 v0 = rand(2, 5)
+    output(v0)
+    output("\n")
+    return 0

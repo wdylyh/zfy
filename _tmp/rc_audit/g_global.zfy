@@ -1,0 +1,19 @@
+// 审计 g：全局句柄变量循环覆盖（临时源 MMoveSeq 路径应释放全局槽旧值）
+// ZFY_LEAK_DEBUG=1 应 0 泄漏（进程退出时 g 仍存活 = 1 份额不算泄漏）
+interface Shape
+    fn i64 area()
+
+struct Sq
+    i64 v = 0
+    fn i64 area()
+        return self.v
+
+let Shape g = Shape(Sq(0))
+
+fn main()
+    let i64 i = 1
+    while i <= 5
+        g = Shape(Sq(i))
+        i = i + 1
+    output(g.area())
+    output("global ok")

@@ -1,0 +1,6 @@
+fn main()
+    let i32 x = 1
+    let p = borrow(x)
+    output(p^)
+    x = 5
+    output(x)

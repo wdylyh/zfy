@@ -9,6 +9,7 @@ type keyword =
   | KRemove | KImport | KAs | KSep | KEnd | KDelim
   | KFail | KPanic | KErr
   | KStruct | KPacked | KMove | KCopy | KBorrow | KRef | KNull | KUnsafe | KExtern | KType
+  | KUnion | KExport | KSection | KInternal
   | KEnum | KMatch | KInterface | KUi
   | KShared | KLet | KFn | KIn
   | KAsm
@@ -28,6 +29,8 @@ let keyword_table =
     "fail", KFail; "panic", KPanic; "err", KErr;
     "sep", KSep; "end", KEnd; "delim", KDelim;
     "struct", KStruct; "packed", KPacked; "move", KMove; "copy", KCopy;
+    "union", KUnion; "export", KExport; "section", KSection;
+    "internal", KInternal;
     "borrow", KBorrow;
     "ref", KRef; "null", KNull;
     "unsafe", KUnsafe; "extern", KExtern; "type", KType;
@@ -60,6 +63,7 @@ type token =
   | Shl (* << *) | Shr (* >> *) | Pipe (* | *) | Tilde (* ~ *)
   | Pow (* ** 幂，右结合（v3.3） *)
   | Question (* ? *) | QuestionQuestion (* ?? *) | Bang (* ! *)
+  | Ellipsis (* ...：extern 可变参数列表尾缀 *)
   | Caret (* ^：解引用后缀 p^（new2.md #10，替代 p* 消歧） *)
   | Dot
   | Newline
@@ -82,6 +86,8 @@ let pp_keyword = function
   | KRemove -> "remove" | KImport -> "import" | KAs -> "as"
   | KFail -> "fail" | KPanic -> "panic" | KErr -> "err"
   | KStruct -> "struct" | KPacked -> "packed" | KMove -> "move"
+  | KUnion -> "union" | KExport -> "export" | KSection -> "section"
+  | KInternal -> "internal"
   | KCopy -> "copy" | KBorrow -> "borrow" | KRef -> "ref"
   | KNull -> "null" | KUnsafe -> "unsafe" | KExtern -> "extern" | KType -> "type"
   | KSep -> "sep" | KEnd -> "end" | KDelim -> "delim"
@@ -111,6 +117,7 @@ let pp_token = function
   | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Le -> "<=" | Ge -> ">="
   | Shl -> "<<" | Shr -> ">>" | Pipe -> "|" | Tilde -> "~" | Pow -> "**"
   | Question -> "?" | QuestionQuestion -> "??" | Bang -> "!"
+  | Ellipsis -> "..."
   | Caret -> "^"
   | Dot -> "."
   | Newline -> "\\n" | Indent -> "INDENT" | Dedent -> "DEDENT" | Eof -> "EOF"

@@ -49,8 +49,12 @@ let int_fits (v : int64) (t : zty) : bool =
 let frac_lits : (int, int64 * int64) Hashtbl.t = Hashtbl.create 16
 
 (* 9d：extern "C" 函数名名单（i128 参数按引用传、返回值按 <2 x i64> 接收，
-   与 clang win32 的 __int128 ABI 一致） *)
+   与 clang win32 的 __int128 ABI 一致）。
+   任务二：同时登记调用约定与变参标记 (abi, varargs)——llvmgen 据此生成
+   declare/调用约定前缀并做变参默认提升（iN<32→i32、f32→double）。 *)
 let extern_fns : (string, unit) Hashtbl.t = Hashtbl.create 8
+let extern_meta : (string, string * bool * int) Hashtbl.t = Hashtbl.create 8
+  (* (ABI, 是否变参, 固定形参个数) *)
 
 (* struct 方法表（v3.2 随机数模块）：(struct 名, 方法名) → 脱糖后全局函数名。
    driver 在 expand_uses（导入文件）/脱糖 pass（主文件）里填充；
@@ -160,10 +164,14 @@ type fn_sig = { params : zty list; prefs : bool list; ret : zty; runred : bool }
      runred：返回类型带 unred（返回值不做 frac 归一，new.md 2026-10-10） *)
 
 (* struct 声明信息（字段 default 为 AST 表达式，构造时检查） *)
-type sdefk = { spacked : bool; sfields : (string * zty * expr option) list }
+type sdefk = { spacked : bool; sfields : (string * zty * expr option) list;
+               sunion : bool; sbits : int list }
+  (* sunion：union 声明（字段共享偏移 0，sizeof = 最大字段）；
+     sbits：与 sfields 等长的位域宽度（0 = 普通字段） *)
 
 (* 泛型声明模板（new2.md 第2条 方案B）：tparams 非空才入表 *)
 type gstructk = { gtp : string list; gcons : string list; gpacked : bool;
+                  gis_union : bool;
                   gfields : sfield list; gmethods : smethod list; gpos : pos }
 type gfnk = { gtp : string list; gcons : string list; gparams : param list;
               gret : ty option; grfrac : bool; gbody : block; gpos : pos }
@@ -564,7 +572,8 @@ let ensure_clo_struct (g : genv) (ret : zty) (ptys : zty list) : string =
   let mangle = clo_mangle ret ptys in
   if not (Hashtbl.mem g.structs mangle) then begin
     Hashtbl.replace g.structs mangle
-      { spacked = false; sfields = [ ("h", TPtr (TUint 8), None) ] };
+      { spacked = false; sfields = [ ("h", TPtr (TUint 8), None) ];
+        sunion = false; sbits = [] };
     Hashtbl.replace g.closigs mangle (ptys, ret)
   end;
   mangle
@@ -584,7 +593,8 @@ let is_chan_struct (s : string) =
 let ensure_handle_struct (g : genv) (mangle : string) : string =
   if not (Hashtbl.mem g.structs mangle) then begin
     Hashtbl.replace g.structs mangle
-      { spacked = false; sfields = [ ("h", TPtr (TUint 8), None) ] };
+      { spacked = false; sfields = [ ("h", TPtr (TUint 8), None) ];
+        sunion = false; sbits = [] };
     if not (Hashtbl.mem g.gtargs mangle) then
       Hashtbl.replace g.gtargs mangle []
   end;
@@ -639,7 +649,8 @@ let ensure_box_struct (g : genv) (ty : zty) : string =
   let name = "zbox$" ^ tag_of_zty ty in
   if not (Hashtbl.mem g.structs name) then
     Hashtbl.replace g.structs name
-      { spacked = false; sfields = [ ("v", ty, None) ] };
+      { spacked = false; sfields = [ ("v", ty, None) ];
+        sunion = false; sbits = [] };
   name
 
 (* ③ & 捕获落堆箱登记：把槽记到声明函数名下（跨 lambda 归因经 decl_of） *)
@@ -918,7 +929,8 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
     in
     if not (Hashtbl.mem g.structs mangle) then begin
       Hashtbl.replace g.structs mangle
-        { spacked = false; sfields = [ ("h", TPtr (TUint 8), None) ] };
+        { spacked = false; sfields = [ ("h", TPtr (TUint 8), None) ];
+        sunion = false; sbits = [] };
       Hashtbl.replace g.gtargs mangle
         (match vt with Some v -> [ kt; v ] | None -> [ kt ])
     end;
@@ -1013,7 +1025,8 @@ and instantiate_struct_zty (g : genv) (gname : string)
     gname ^ "$" ^ String.concat "$" (List.map (fun (_, z) -> tag_of_zty z) map) in
   if Hashtbl.mem g.structs mangle then TStruct mangle
   else begin
-    Hashtbl.replace g.structs mangle { spacked = gs.gpacked; sfields = [] };
+    Hashtbl.replace g.structs mangle
+      { spacked = gs.gpacked; sfields = []; sunion = false; sbits = [] };
     Hashtbl.replace g.gstructpos mangle p;
     let seen = ref [] in
     let sfields =
@@ -1043,7 +1056,12 @@ and instantiate_struct_zty (g : genv) (gname : string)
           (sf.fname, ft, sf.fdefault))
         gs.gfields
     in
-    Hashtbl.replace g.structs mangle { spacked = gs.gpacked; sfields };
+    Hashtbl.replace g.structs mangle
+      { spacked = gs.gpacked; sfields;
+        sunion = gs.gis_union;
+        sbits =
+          List.map (fun (sf : Ast.sfield) -> match sf.fbits with
+            | Some n -> n | None -> 0) gs.gfields };
     Hashtbl.replace g.gtargs mangle (List.map snd map);
     (* v3.15：实例化方法（如有）——登记 method_tbl + 逐方法实例检查 *)
     if gs.gmethods <> [] then !method_inst_hook g gname map mangle p;
@@ -1140,14 +1158,16 @@ let structs_list (g : genv) : Hir.sdef list =
   Hashtbl.fold
     (fun k v acc ->
       { Hir.sname = k; Hir.spacked = v.spacked;
-        Hir.sfields = List.map (fun (n, t, _) -> (n, t)) v.sfields } :: acc)
+        Hir.sfields = List.map (fun (n, t, _) -> (n, t)) v.sfields;
+        Hir.sunion = v.sunion; Hir.sbits = v.sbits } :: acc)
     g.structs []
 
 (* ErrCode 标准错误码常量（ErrCode.<名>；自定义码直接写字面量，须 ≥100） *)
 let errcode_const = function
   | "OK" -> Some 0L | "DIV_ZERO" -> Some 1L | "OOB" -> Some 2L
   | "NOT_FOUND" -> Some 3L | "IO" -> Some 4L | "CAST" -> Some 5L
-  | "INPUT" -> Some 6L | "EOF" -> Some 7L | "CUSTOM" -> Some 100L
+  | "INPUT" -> Some 6L | "EOF" -> Some 7L | "OVERFLOW" -> Some 12L
+  | "CUSTOM" -> Some 100L
   | _ -> None
 
 (* ---------- 表达式检查 ---------- *)
@@ -2220,7 +2240,8 @@ and check_lambda env (lam : lambda) (lp : pos) (nmopt : string option)
       if not (Hashtbl.mem env.g.structs clenv_name) then
         Hashtbl.replace env.g.structs clenv_name
           { spacked = false;
-            sfields = List.map (fun (fn2, ft) -> (fn2, ft, None)) env_fields };
+            sfields = List.map (fun (fn2, ft) -> (fn2, ft, None)) env_fields;
+            sunion = false; sbits = List.map (fun _ -> 0) env_fields };
       (* 组装 tfn 并登记 lambda 函数签名（首参 env 指针） *)
       let sig_params = TPtr (TStruct clenv_name) :: ptys in
       Hashtbl.replace env.g.fns fname
@@ -2305,7 +2326,8 @@ and wrap_fn_as_clo env p fname (ptys : zty list) (ret : zty) =
   let wname = Printf.sprintf "lambda$w_%s$%d" fname n in
   if not (Hashtbl.mem env.g.structs clenv_name) then
     Hashtbl.replace env.g.structs clenv_name
-      { spacked = false; sfields = [ ("code", TPtr (TUint 8), None) ] };
+      { spacked = false; sfields = [ ("code", TPtr (TUint 8), None) ];
+        sunion = false; sbits = [ 0 ] };
   let sig_params = TPtr (TStruct clenv_name) :: ptys in
   Hashtbl.replace env.g.fns wname
     { params = sig_params; prefs = List.map (fun _ -> false) sig_params;
@@ -3804,6 +3826,47 @@ and check_call env p np name0 targs origs modes dlam =
            terr p "abs expects an integer or float argument, got %s" (pp_zty (resolve a.ety)))
       | _ -> terr p "abs expects exactly 1 argument"
     end
+    else if List.mem name0
+              [ "wrapping_add"; "wrapping_sub"; "wrapping_mul"; "wrapping_neg";
+                "checked_add"; "checked_sub"; "checked_mul";
+                "saturating_add"; "saturating_sub"; "saturating_mul" ] then begin
+      (* 任务一：显式溢出内建（永不 panic）
+         wrapping_*  回绕结果，返回与参数同宽同类型
+         checked_*   返回 T!（成功 code=0，溢出 code=12 OVERFLOW）
+         saturating_* 饱和到类型边界
+         llvmgen 按前缀 wrap$/check$/sat$ 生成（见 gen_call 内建分支） *)
+      let parts = String.split_on_char '_' name0 in
+      let kind = List.hd parts in
+      let opn = List.nth parts 1 in
+      let prefix =
+        if kind = "wrapping" then "wrap$"
+        else if kind = "checked" then "check$" else "sat$"
+      in
+      name := prefix ^ opn;
+      let nargs = if opn = "neg" then 1 else 2 in
+      if List.length targs <> nargs then
+        terr p "%s expects %d argument(s), got %d" name0 nargs (List.length targs);
+      let ty_of (a : texpr) =
+        match resolve a.ety with
+        | (TInt _ | TUint _) as t -> t
+        | TVar _ -> a.ety
+        | t -> terr p "%s expects integer arguments, got %s" name0 (pp_zty t)
+      in
+      let t = ty_of (List.hd targs) in
+      List.iter
+        (fun (a : texpr) ->
+          ignore (ty_of a);
+          (match resolve a.ety, resolve t with
+           | TVar _, _ | _, TVar _ -> ()
+           | t1, t2 when t1 <> t2 ->
+             terr p "%s expects both arguments to have the same integer type (%s vs %s)"
+               name0 (pp_zty t1) (pp_zty t2)
+           | _ -> ()))
+        (List.tl targs);
+      let ret = if kind = "checked" then TErr t else t in
+      { params = List.map (fun _ -> t) targs;
+        prefs = List.map (fun _ -> false) targs; ret; runred = false }
+    end
     else
     match List.assoc_opt name0 builtin_fns_aux with
     | Some (ptys, ret) -> { params = ptys; prefs = List.map (fun _ -> false) ptys; ret; runred = false }
@@ -3818,9 +3881,20 @@ and check_call env p np name0 targs origs modes dlam =
            name := mangled;
            Hashtbl.find env.g.fns mangled
          end else terr np "%s" (undef_fix env np name0 "function"))
-  in  if List.length sig_.params <> List.length targs then
+  in
+  (* 任务二：变参 extern 允许超出固定形参数量的额外实参（任意多个
+     标量/string/指针实参）；非变参仍要求严格数量匹配 *)
+  let va_info = Hashtbl.find_opt extern_meta name0 in
+  let is_va = match va_info with Some (_, true, _) -> true | _ -> false in
+  let nfix = List.length sig_.params in
+  if is_va then begin
+    if List.length targs < nfix then
+      terr p "function %s expects at least %d arguments, got %d"
+        !name nfix (List.length targs)
+  end
+  else if nfix <> List.length targs then
     terr p "function %s expects %d arguments, got %d"
-      !name (List.length sig_.params) (List.length targs);
+      !name nfix (List.length targs);
   (* v3.30 ②：剩余延迟 lambda（普通函数/内置闭包形参）：期望 = 形参闭包
      类型（conv_ty 后为 closure$ struct，亦兼容源码 TClo）。形参不是闭包
      类型 → cannot infer（要求显式）。 *)
@@ -3876,30 +3950,67 @@ and check_call env p np name0 targs origs modes dlam =
           terr p "File parameters are move-only: pass with %s(move x)" !name)
     sig_.params;
   let targs =
-    List.map2
-      (fun ta (pt, orig) ->
-        match resolve pt, orig with
-        | TFrac w, Some rhs when is_frac_arith rhs ->
-          (* frac 参数位置含 / 的算术实参（new.md 2026-10-11）：整棵按分数算
-             （v3.29：顶层 bare n/d 报错提示写 (n/d)，(n/d) 精确构造） *)
-          frac_bare_guard rhs;
-          check_frac_expr env rhs w
-        | TStruct ps, Some (EVar (fn, fp))
-          when is_clo_struct ps && (match ta.e with EFunPtrK _ -> true | _ -> false) ->
-          (* 函数名 → 闭包句柄（v3.7）：谓词/比较器/归并参数接受裸函数名，
-             经 wrapper 包装（首参 env 丢弃，实参透传） *)
-          let (cptys, cret) = clo_sig env.g ps p in
-          (match resolve ta.ety with
-           | TPtr (TFunSig (fps, fret)) when fps = cptys && fret = cret ->
-             wrap_fn_as_clo env fp fn cptys cret
-           | TPtr (TFunSig (fps, fret)) ->
-             terr fp "function %s signature (%s) -> %s does not match the expected closure (%s) -> %s"
-               fn (String.concat ", " (List.map pp_zty fps)) (pp_zty fret)
-               (String.concat ", " (List.map pp_zty cptys)) (pp_zty cret)
-           | _ -> coerce p ta pt)
-        | _ -> coerce p ta pt)
-      targs
-      (List.combine sig_.params origs)
+    (* 变参：前 nfix 个按形参规则弱化/转换；其余实参只做种类校验
+       （struct/list/array/frac/T! 按值传不支持，编译期报错） *)
+    let rec split n xs =
+      if n <= 0 then ([], xs)
+      else
+        match xs with
+        | x :: rest -> let (a, b) = split (n - 1) rest in (x :: a, b)
+        | [] -> ([], [])
+    in
+    let fixed_pairs, var_pairs = split nfix (List.combine targs origs) in
+    let fixed =
+      List.map2
+        (fun (ta, orig) pt ->
+          match resolve pt, orig with
+          | TFrac w, Some rhs when is_frac_arith rhs ->
+            (* frac 参数位置含 / 的算术实参（new.md 2026-10-11）：整棵按分数算
+               （v3.29：顶层 bare n/d 报错提示写 (n/d)，(n/d) 精确构造） *)
+            frac_bare_guard rhs;
+            check_frac_expr env rhs w
+          | TStruct ps, Some (EVar (fn, fp))
+            when is_clo_struct ps && (match ta.e with EFunPtrK _ -> true | _ -> false) ->
+            (* 函数名 → 闭包句柄（v3.7）：谓词/比较器/归并参数接受裸函数名，
+               经 wrapper 包装（首参 env 丢弃，实参透传） *)
+            let (cptys, cret) = clo_sig env.g ps p in
+            (match resolve ta.ety with
+             | TPtr (TFunSig (fps, fret)) when fps = cptys && fret = cret ->
+               wrap_fn_as_clo env fp fn cptys cret
+             | TPtr (TFunSig (fps, fret)) ->
+               terr fp "function %s signature (%s) -> %s does not match the expected closure (%s) -> %s"
+                 fn (String.concat ", " (List.map pp_zty fps)) (pp_zty fret)
+                 (String.concat ", " (List.map pp_zty cptys)) (pp_zty cret)
+             | _ -> coerce p ta pt)
+          | _ -> coerce p ta pt)
+        fixed_pairs sig_.params
+    in
+    (* 变参实参：无固定形参约束，故只接受标量/string/指针（struct/列表/
+       数组/frac/T! 不可按值传给 C 变参函数）。未定型字面量（ety 为
+       TVar）按默认型收口（整数 i64、浮点 f64），否则 coerce 阶段无从
+       求解；浮点字面量绝不可落整数型（floaty_texpr 判定） *)
+    let var_pairs =
+      List.mapi
+        (fun j (ta, orig) ->
+          let t =
+            match resolve ta.ety with
+            | TVar _ -> if floaty_texpr ta then TFloat 64 else TInt 64
+            | z -> z
+          in
+          let ok =
+            match resolve t with
+            | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString
+            | TPtr _ | TFunSig _ -> true
+            | _ -> false
+          in
+          if not ok then
+            terr p
+              "variadic argument %d of %s must be a scalar/string/pointer value (struct, list, array, frac and T! cannot be passed by value to a variadic C function)"
+              (nfix + j + 1) !name;
+          (coerce p ta t, orig))
+        var_pairs
+    in
+    fixed @ List.map fst var_pairs
   in
   let moves = List.map (fun m -> m = 1) modes in
   { e = ECallK (time_rt_name !name, targs, moves); ety = sig_.ret; epos = p }
@@ -4510,6 +4621,15 @@ and check_struct_new env p name (args : call_arg list) : texpr =
         in
         go 0 sd.sfields)
       named;
+    if sd.sunion then begin
+      (* union（任务二）：只允许一个活跃字段——命名实参只能给一个字段，
+         位置实参按第一字段解释（多于一个即重复初始化） *)
+      let n =
+        Array.fold_left (fun acc v -> match v with Some _ -> acc + 1 | None -> acc) 0 vals
+      in
+      if n > 1 then
+        terr p "union %s: only one field may be initialized" name
+    end;
     let tvals =
       List.mapi
         (fun i (_, ft, fdef) ->
@@ -7346,6 +7466,10 @@ let builtin_names = [ "try"; "panic_msg"; "length"; "find"; "trim"; "split"; "re
                       (* 时间内建（v3.3.6）+ 内建 datetime struct 名 *)
                       "now"; "tick_ms"; "sleep_ms"; "localtime"; "mktime";
                       "os_args"; "os_env"; "assert_eq";
+                      (* 任务一：显式溢出内建（wrapping/checked/saturating） *)
+                      "wrapping_add"; "wrapping_sub"; "wrapping_mul"; "wrapping_neg";
+                      "checked_add"; "checked_sub"; "checked_mul";
+                      "saturating_add"; "saturating_sub"; "saturating_mul";
                       "datetime" ]
 
 (* 参数 -> zty：
@@ -7390,7 +7514,8 @@ let check_program (prog : program) : hir =
      ErrCode 为虚拟常量命名空间（编译期查表），无对应 struct *)
   Hashtbl.replace g.structs "Err"
     { spacked = false;
-      sfields = [ ("code", TInt 32, None); ("msg", TString, None) ] };
+      sfields = [ ("code", TInt 32, None); ("msg", TString, None) ];
+      sunion = false; sbits = [ 0; 0 ] };
   (* 内建 datetime struct（v3.3.6 时间内建）：localtime 的返回类型，
      8×i32 与 runtime.c zfy_datetime 布局一致；用户不得重名（见 builtin_names） *)
   Hashtbl.replace g.structs "datetime"
@@ -7398,7 +7523,8 @@ let check_program (prog : program) : hir =
       sfields = [ ("year", TInt 32, None); ("month", TInt 32, None);
                   ("day", TInt 32, None); ("hour", TInt 32, None);
                   ("minute", TInt 32, None); ("second", TInt 32, None);
-                  ("weekday", TInt 32, None); ("yday", TInt 32, None) ] };
+                  ("weekday", TInt 32, None); ("yday", TInt 32, None) ];
+      sunion = false; sbits = [ 0; 0; 0; 0; 0; 0; 0; 0 ] };
   (* 收集函数名（struct 名与函数名冲突检查用） *)
   let fn_names = Hashtbl.create 16 in
   List.iter
@@ -7417,7 +7543,8 @@ let check_program (prog : program) : hir =
           Hashtbl.add seen_structs name ();
           (* 泛型 struct 不入普通表（裸名 Box 报 undefined type） *)
           if tparams = [] then
-            Hashtbl.replace g.structs name { spacked = false; sfields = [] }
+            Hashtbl.replace g.structs name
+              { spacked = false; sfields = []; sunion = false; sbits = [] }
         end
       | _ -> ())
     prog;
@@ -7426,7 +7553,8 @@ let check_program (prog : program) : hir =
   let struct_pos : (string, pos) Hashtbl.t = g.gstructpos in
   List.iter
     (function
-      | IStruct { name; packed; fields; pos; tparams; tcons; methods } ->
+      | IStruct { name; packed; fields; pos; tparams; tcons; methods;
+                  is_union } ->
         if List.mem name builtin_names then
           terr pos "struct name %s conflicts with a builtin, rename it" name;
         if Hashtbl.mem fn_names name then
@@ -7437,6 +7565,7 @@ let check_program (prog : program) : hir =
             terr pos "duplicate type parameter in %s" name;
           Hashtbl.replace g.gstructs name
             { gtp = tparams; gcons = tcons; gpacked = packed;
+              gis_union = is_union;
               gfields = fields; gmethods = methods; gpos = pos };
           Hashtbl.replace struct_pos name pos
         end
@@ -7466,6 +7595,38 @@ let check_program (prog : program) : hir =
               (sf.fname, ft, sf.fdefault))
             fields
         in
+        (* 位域宽度表（与 sfields 等长；0 = 普通字段） *)
+        let sbits =
+          List.map
+            (fun (sf : Ast.sfield) ->
+              match sf.fbits with Some n -> n | None -> 0)
+            fields
+        in
+        (* union / 位域校验：union 字段限标量或指针（布局为 [maxsize x i8]，
+           聚合字段需额外 bitcast，v1 不支持）；位域仅限 struct packed 内的
+           整数字段，宽度不得超过类型位宽 *)
+        List.iter2
+          (fun (sf : Ast.sfield) (_, ft, _) ->
+            (match sf.fbits with
+             | Some n ->
+               if not packed then
+                 terr sf.fpos "bit fields are only allowed in struct packed";
+               (match resolve ft with
+                | TInt w | TUint w ->
+                  if n > w then
+                    terr sf.fpos
+                      "bit width %d exceeds the width of %s" n (pp_zty (resolve ft))
+                | _ -> terr sf.fpos "bit field type must be an integer type")
+             | None -> ());
+            if is_union then
+              (match resolve ft with
+               | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString
+               | TPtr _ | TFunSig _ -> ()
+               | _ ->
+                 terr sf.fpos
+                   "union field type must be a scalar or pointer type (got %s)"
+                   (pp_zty (resolve ft))))
+          fields sfields;
         (* 字段重名检查 *)
         let seen = ref [] in
         List.iter
@@ -7474,7 +7635,8 @@ let check_program (prog : program) : hir =
               terr pos "struct %s has duplicate field %s" name fn2;
             seen := fn2 :: !seen)
           sfields;
-        Hashtbl.replace g.structs name { spacked = packed; sfields };
+        Hashtbl.replace g.structs name
+          { spacked = packed; sfields; sunion = is_union; sbits };
         Hashtbl.replace struct_pos name pos
         end
       | _ -> ())
@@ -7611,13 +7773,19 @@ let check_program (prog : program) : hir =
             let rty = conv_ty g f.epos f.eret in
             (match rty with
              | TErr _ -> terr f.epos "extern functions do not support a T! return type (the error model is for zfy functions only)"
-             | TList _ | TArray _ ->
-               terr f.epos "extern functions do not support array/list return types (zfy seq is not a C type)"
              | _ -> ());
+            (* 任务二：变参只能用 C 调用约定（stdcall/fastcall/thiscall/
+               vectorcall 在 x86 ABI 中不允许可变参数列表） *)
+            if f.evarargs && f.eabi <> "C" && f.eabi <> "c" then
+              terr f.epos
+                "variadic extern functions require the C calling convention (got \"%s\")"
+                f.eabi;
             Hashtbl.replace g.fns f.ename
               { params = ptys; prefs = List.map (fun _ -> false) ptys; ret = rty; runred = false };
             (* 9d：登记 extern 名单——llvmgen 对 i128 参数/返回值做 ABI 适配 *)
-            Hashtbl.replace extern_fns f.ename ())
+            Hashtbl.replace extern_fns f.ename ();
+            (* 任务二：ABI 与变参标记（llvmgen 生成 declare/调用用） *)
+            Hashtbl.replace extern_meta f.ename (f.eabi, f.evarargs, List.length ptys))
           funcs
       | IIf { name; methods; parent; defaults; pos } ->
         (* interface（v3.13）：注册方法表 + 接口值 struct iface$<名>
@@ -7630,7 +7798,8 @@ let check_program (prog : program) : hir =
         Hashtbl.replace g.structs ("iface$" ^ name)
           { spacked = false;
             sfields = [ ("data", TPtr (TUint 8), None);
-                        ("vt", TPtr (TUint 8), None) ] };
+                        ("vt", TPtr (TUint 8), None) ];
+            sunion = false; sbits = [ 0; 0 ] };
         (* 接口名 → 句柄 struct 别名（let Drawable d 可解析） *)
         Hashtbl.replace g.aliases name (TStruct ("iface$" ^ name));
         (* 继承（v3.20）：父接口方法在前（vtable 槽序一致）；子重名方法报错 *)
@@ -7700,7 +7869,9 @@ let check_program (prog : program) : hir =
             (fun i (t, _) -> (Printf.sprintf "f%d" i, t, None))
             !slot_keys
         in
-        Hashtbl.replace g.structs mangle { spacked = false; sfields };
+        Hashtbl.replace g.structs mangle
+          { spacked = false; sfields; sunion = false;
+            sbits = List.map (fun _ -> 0) sfields };
         Hashtbl.replace g.gtargs mangle [];
         Hashtbl.replace g.gstructpos mangle pos;
         Hashtbl.replace g.enums name (variants', mangle)

@@ -55,6 +55,13 @@ let panic_mode = ref "exit"
 let panic_exit_code = ref 1
 let set_panic_opts mode code = panic_mode := mode; panic_exit_code := code
 
+(* 任务一：整数溢出检查开关。默认开启（debug/release 同策略）；
+   --wrap-overflow（或 -Wno-overflow-check）切回旧的静默回绕语义。
+   仅影响编译器生成的代码与常量折叠，浮点 IEEE 语义不受影响。 *)
+let wrap_overflow = ref false
+let set_wrap_overflow b = wrap_overflow := b
+let overflow_checked () = not !wrap_overflow
+
 let width_of (t : zty) : int =
   match t with
   | TInt n | TUint n -> n
@@ -493,6 +500,102 @@ let cmp_op_int unsigned = function
   | BGe -> if unsigned then "uge" else "sge"
   | _ -> assert false
 
+(* ---------- 整数溢出检查（任务一） ----------
+   策略：条件成立时 br 到行内"冷块"，冷块调 runtime zfy_overflow_panic
+   （内部走 zfy_die → panic，可被 try() 捕获），随后 unreachable；
+   条件不成立落回 ok 块继续原指令流。检查本身为纯 LLVM 内建
+   （llvm.sadd.with.overflow.* 等），无额外函数调用开销。 *)
+
+(* 诊断值统一转 i64（i128/u128 取低 64 位；bool/char 零扩展） *)
+let ov_diag64 fc (o : operand) : string =
+  let (v, t) = val_of fc o in
+  match o.oty with
+  | TInt 128 | TUint 128 ->
+    let r = fresh_r fc in
+    emitf fc "  %s = trunc %s %s to i64" r t v; r
+  | TBool ->
+    let r = fresh_r fc in
+    emitf fc "  %s = zext i1 %s to i64" r v; r
+  | TChar ->
+    let r = fresh_r fc in
+    emitf fc "  %s = zext i8 %s to i64" r v; r
+  | TInt w when w < 64 ->
+    let r = fresh_r fc in
+    emitf fc "  %s = sext i%d %s to i64" r w v; r
+  | TUint w when w < 64 ->
+    let r = fresh_r fc in
+    emitf fc "  %s = zext i%d %s to i64" r w v; r
+  | _ -> v
+
+(* 条件成立 → 溢出 panic（msg 为操作名，a/b 为诊断左右操作数） *)
+let ov_guard fc (cond : string) msg (a : operand) (b : operand) : unit =
+  let bad = fresh_lbl fc and ok = fresh_lbl fc in
+  emitf fc "  br i1 %s, label %%%s, label %%%s" cond bad ok;
+  emitf fc "%s:" bad;
+  let s = intern_string fc.g msg in
+  emitf fc "  call void @zfy_overflow_panic(ptr %s, i64 %s, i64 %s)"
+    s (ov_diag64 fc a) (ov_diag64 fc b);
+  emitf fc "  unreachable";
+  emitf fc "%s:" ok
+
+(* 带溢出位的算术：LLVM 内建返回 {iN, i1}，extractvalue 取值/溢出位 *)
+let ov_arith fc d (signed : bool) (sz : int) (op : string)
+    (va : string) (vb : string) (a : operand) (b : operand) : unit =
+  let t = Printf.sprintf "i%d" sz in
+  let intr =
+    Printf.sprintf "llvm.%s%s.with.overflow.i%d"
+      (if signed then "s" else "u") op sz
+  in
+  let pair = fresh_r fc in
+  emitf fc "  %s = call {%s, i1} @%s(%s %s, %s %s)" pair t intr t va t vb;
+  let ov = fresh_r fc in
+  emitf fc "  %s = extractvalue {%s, i1} %s, 1" ov t pair;
+  emitf fc "  %s = extractvalue {%s, i1} %s, 0" d t pair;
+  ov_guard fc ov (Printf.sprintf "integer %s overflow" op) a b
+
+(* 除法/取余前置检查：除零 + 有符号 INT_MIN / -1 *)
+let ov_div_guard fc (signed : bool) (sz : int) (va : string) (vb : string)
+    (a : operand) (b : operand) : unit =
+  let t = Printf.sprintf "i%d" sz in
+  let z = fresh_r fc in
+  emitf fc "  %s = icmp eq %s %s, 0" z t vb;
+  let cond =
+    if signed then begin
+      let mn = fresh_r fc in
+      emitf fc "  %s = shl %s 1, %d" mn t (sz - 1);
+      let m1 = fresh_r fc in
+      emitf fc "  %s = icmp eq %s %s, -1" m1 t vb;
+      let me = fresh_r fc in
+      emitf fc "  %s = icmp eq %s %s, %s" me t va mn;
+      let both = fresh_r fc in
+      emitf fc "  %s = and i1 %s, %s" both m1 me;
+      let c = fresh_r fc in
+      emitf fc "  %s = or i1 %s, %s" c z both;
+      c
+    end else z
+  in
+  ov_guard fc cond "integer division by zero or overflow" a b
+
+(* 移位量检查：左移/右移的移位量必须落在 [0, 位宽) *)
+let ov_shift_guard fc (sz : int) (vb : string) (bt : string)
+    (a : operand) (b : operand) : unit =
+  let c = fresh_r fc in
+  emitf fc "  %s = icmp uge %s %s, %d" c bt vb sz;
+  ov_guard fc c "shift amount out of range" a b
+
+(* 幂运算结果是否落在目标宽度（小宽度在 64 位内计算后再回验） *)
+let ov_fits fc (signed : bool) (sz : int) (wide : string) : string =
+  let t = Printf.sprintf "i%d" sz in
+  let tr = fresh_r fc in
+  emitf fc "  %s = trunc i64 %s to %s" tr wide t;
+  let back = fresh_r fc in
+  emitf fc "  %s = %s %s %s to i64" back (if signed then "sext" else "zext") t tr;
+  let eq = fresh_r fc in
+  emitf fc "  %s = icmp eq i64 %s, %s" eq back wide;
+  let ne = fresh_r fc in
+  emitf fc "  %s = xor i1 %s, true" ne eq;
+  ne
+
 let gen_binop fc d bop (a : operand) (b : operand) =
   if is_agg a.oty then lerr None "aggregate type does not support arithmetic";
   let (va, tya) = val_of fc a and (vb, _) = val_of fc b in
@@ -551,21 +654,42 @@ let gen_binop fc d bop (a : operand) (b : operand) =
      | BNe -> emitf fc "  %s = icmp ne i1 %s, %s" d va vb
      | _ -> lerr None "bool type does not support this operation")
   | TUint _ ->
+    let w = width_of a.oty in
     (match bop with
+     (* 任务一：默认检查 + - * 的无符号溢出（with.overflow 内建），
+        --wrap-overflow 走下方原 add/sub/mul（静默回绕） *)
+     | BAdd when overflow_checked () -> ov_arith fc d false w "add" va vb a b
+     | BSub when overflow_checked () -> ov_arith fc d false w "sub" va vb a b
+     | BMul when overflow_checked () -> ov_arith fc d false w "mul" va vb a b
      | BAdd -> emitf fc "  %s = add %s %s, %s" d tya va vb
      | BSub -> emitf fc "  %s = sub %s %s, %s" d tya va vb
      | BMul -> emitf fc "  %s = mul %s %s, %s" d tya va vb
+     | BDiv when overflow_checked () ->
+       ov_div_guard fc false w va vb a b;
+       emitf fc "  %s = udiv %s %s, %s" d tya va vb
+     | BMod when overflow_checked () ->
+       ov_div_guard fc false w va vb a b;
+       emitf fc "  %s = urem %s %s, %s" d tya va vb
      | BDiv -> emitf fc "  %s = udiv %s %s, %s" d tya va vb
      | BMod -> emitf fc "  %s = urem %s %s, %s" d tya va vb
      | BBitAnd -> emitf fc "  %s = and %s %s, %s" d tya va vb
      | BBitOr -> emitf fc "  %s = or %s %s, %s" d tya va vb
      | BBitXor -> emitf fc "  %s = xor %s %s, %s" d tya va vb
+     | BShl when overflow_checked () ->
+       ov_shift_guard fc w vb tya a b;
+       emitf fc "  %s = shl %s %s, %s" d tya va vb
+     | BShr when overflow_checked () ->
+       ov_shift_guard fc w vb tya a b;
+       emitf fc "  %s = lshr %s %s, %s" d tya va vb
      | BShl -> emitf fc "  %s = shl %s %s, %s" d tya va vb
      | BShr -> emitf fc "  %s = lshr %s %s, %s" d tya va vb
      | BPow ->
        (* ** 整数幂：运行时快速幂（无符号版），≤64 位；结果截回目标宽度。
-          128 位走 zfy_pow_u128 64 位对接口（参数/结果全 64 位，规避
-          win32 __int128 ABI），LLVM 侧拆/拼 i128（v3.3.3） *)
+          128 位走 64 位对接口（参数/结果全 64 位，规避 win32 __int128 ABI），
+          LLVM 侧拆/拼 i128（v3.3.3）。检查模式用 *_ov 版本：runtime 用
+          __builtin_mul_overflow 置溢出标志，LLVM 侧 guard 后 panic *)
+       let oflag = fresh_r fc in
+       emitf_entry fc "  %s = alloca i1" oflag;
        if tya = "i128" then begin
          let blo = fresh_r fc in
          emitf fc "  %s = trunc %s %s to i64" blo tya va;
@@ -581,8 +705,12 @@ let gen_binop fc d bop (a : operand) (b : operand) =
          emitf fc "  %s = trunc i128 %s to i64" ehi eh1;
          let op = fresh_r fc in
          emitf_entry fc "  %s = alloca [2 x i64]" op;
-         emitf fc "  call void @zfy_pow_u128(ptr %s, i64 %s, i64 %s, i64 %s, i64 %s)"
-           op blo bhi elo ehi;
+         emitf fc "  call void @zfy_pow_u128_ov(ptr %s, i64 %s, i64 %s, i64 %s, i64 %s, ptr %s)"
+           op blo bhi elo ehi oflag;
+         let ov = fresh_r fc in
+         emitf fc "  %s = load i1, ptr %s" ov oflag;
+         if overflow_checked () then
+           ov_guard fc ov "integer power overflow" a b;
          let p1 = fresh_r fc in
          emitf fc "  %s = getelementptr inbounds [2 x i64], ptr %s, i32 0, i32 1" p1 op;
          let lo = fresh_r fc in
@@ -606,31 +734,68 @@ let gen_binop fc d bop (a : operand) (b : operand) =
              z
          in
          let a64 = ext va and b64 = ext vb in
-         (match tya with
-          | "i64" ->
-            emitf fc "  %s = call i64 @zfy_pow_ull(i64 %s, i64 %s)" d a64 b64
-          | _ ->
-            let c = fresh_r fc in
-            emitf fc "  %s = call i64 @zfy_pow_ull(i64 %s, i64 %s)" c a64 b64;
-            emitf fc "  %s = trunc i64 %s to %s" d c tya)
+         if tya = "i64" && not (overflow_checked ()) then
+           emitf fc "  %s = call i64 @zfy_pow_ull_ov(i64 %s, i64 %s, ptr %s)"
+             d a64 b64 oflag
+         else begin
+           let c = fresh_r fc in
+           emitf fc "  %s = call i64 @zfy_pow_ull_ov(i64 %s, i64 %s, ptr %s)"
+             c a64 b64 oflag;
+           let ov = fresh_r fc in
+           emitf fc "  %s = load i1, ptr %s" ov oflag;
+           if overflow_checked () then begin
+             let bad =
+               if tya = "i64" then ov
+               else
+                 let fit = ov_fits fc false w c in
+                 let b2 = fresh_r fc in
+                 emitf fc "  %s = or i1 %s, %s" b2 ov fit;
+                 b2
+             in
+             ov_guard fc bad "integer power overflow" a b
+           end;
+           if tya = "i64" then
+             emitf fc "  %s = add i64 %s, 0" d c
+           else
+             emitf fc "  %s = trunc i64 %s to %s" d c tya
+         end
        end
      | bopc -> emitf fc "  %s = icmp %s %s %s, %s" d (cmp_op_int true bopc) tya va vb)
   | _ ->
+    let w = width_of a.oty in
     (match bop with
+     (* 任务一：默认检查 + - * 的有符号溢出；--wrap-overflow 静默回绕 *)
+     | BAdd when overflow_checked () -> ov_arith fc d true w "add" va vb a b
+     | BSub when overflow_checked () -> ov_arith fc d true w "sub" va vb a b
+     | BMul when overflow_checked () -> ov_arith fc d true w "mul" va vb a b
      | BAdd -> emitf fc "  %s = add %s %s, %s" d tya va vb
      | BSub -> emitf fc "  %s = sub %s %s, %s" d tya va vb
      | BMul -> emitf fc "  %s = mul %s %s, %s" d tya va vb
+     | BDiv when overflow_checked () ->
+       ov_div_guard fc true w va vb a b;
+       emitf fc "  %s = sdiv %s %s, %s" d tya va vb
+     | BMod when overflow_checked () ->
+       ov_div_guard fc true w va vb a b;
+       emitf fc "  %s = srem %s %s, %s" d tya va vb
      | BDiv -> emitf fc "  %s = sdiv %s %s, %s" d tya va vb
      | BMod -> emitf fc "  %s = srem %s %s, %s" d tya va vb
      | BBitAnd -> emitf fc "  %s = and %s %s, %s" d tya va vb
      | BBitOr -> emitf fc "  %s = or %s %s, %s" d tya va vb
      | BBitXor -> emitf fc "  %s = xor %s %s, %s" d tya va vb
+     | BShl when overflow_checked () ->
+       ov_shift_guard fc w vb tya a b;
+       emitf fc "  %s = shl %s %s, %s" d tya va vb
+     | BShr when overflow_checked () ->
+       ov_shift_guard fc w vb tya a b;
+       emitf fc "  %s = ashr %s %s, %s" d tya va vb
      | BShl -> emitf fc "  %s = shl %s %s, %s" d tya va vb
      | BShr -> emitf fc "  %s = ashr %s %s, %s" d tya va vb
      | BPow ->
        (* ** 整数幂：运行时快速幂（有符号版，负指数得 0）。
-          128 位走 zfy_pow_i128 64 位对接口（同无符号版，v3.3.3）；
+          128 位走 zfy_pow_i128_ov 64 位对接口（同无符号版，v3.3.3）；
           hi 用 lshr 取原始位型（补码语义由 runtime 内部转换处理） *)
+       let oflag = fresh_r fc in
+       emitf_entry fc "  %s = alloca i1" oflag;
        if tya = "i128" then begin
          let blo = fresh_r fc in
          emitf fc "  %s = trunc %s %s to i64" blo tya va;
@@ -646,8 +811,12 @@ let gen_binop fc d bop (a : operand) (b : operand) =
          emitf fc "  %s = trunc i128 %s to i64" ehi eh1;
          let op = fresh_r fc in
          emitf_entry fc "  %s = alloca [2 x i64]" op;
-         emitf fc "  call void @zfy_pow_i128(ptr %s, i64 %s, i64 %s, i64 %s, i64 %s)"
-           op blo bhi elo ehi;
+         emitf fc "  call void @zfy_pow_i128_ov(ptr %s, i64 %s, i64 %s, i64 %s, i64 %s, ptr %s)"
+           op blo bhi elo ehi oflag;
+         let ov = fresh_r fc in
+         emitf fc "  %s = load i1, ptr %s" ov oflag;
+         if overflow_checked () then
+           ov_guard fc ov "integer power overflow" a b;
          let p1 = fresh_r fc in
          emitf fc "  %s = getelementptr inbounds [2 x i64], ptr %s, i32 0, i32 1" p1 op;
          let lo = fresh_r fc in
@@ -671,13 +840,31 @@ let gen_binop fc d bop (a : operand) (b : operand) =
              z
          in
          let a64 = ext va and b64 = ext vb in
-         (match tya with
-          | "i64" ->
-            emitf fc "  %s = call i64 @zfy_pow_ll(i64 %s, i64 %s)" d a64 b64
-          | _ ->
-            let c = fresh_r fc in
-            emitf fc "  %s = call i64 @zfy_pow_ll(i64 %s, i64 %s)" c a64 b64;
-            emitf fc "  %s = trunc i64 %s to %s" d c tya)
+         if tya = "i64" && not (overflow_checked ()) then
+           emitf fc "  %s = call i64 @zfy_pow_ll_ov(i64 %s, i64 %s, ptr %s)"
+             d a64 b64 oflag
+         else begin
+           let c = fresh_r fc in
+           emitf fc "  %s = call i64 @zfy_pow_ll_ov(i64 %s, i64 %s, ptr %s)"
+             c a64 b64 oflag;
+           let ov = fresh_r fc in
+           emitf fc "  %s = load i1, ptr %s" ov oflag;
+           if overflow_checked () then begin
+             let bad =
+               if tya = "i64" then ov
+               else
+                 let fit = ov_fits fc true w c in
+                 let b2 = fresh_r fc in
+                 emitf fc "  %s = or i1 %s, %s" b2 ov fit;
+                 b2
+             in
+             ov_guard fc bad "integer power overflow" a b
+           end;
+           if tya = "i64" then
+             emitf fc "  %s = add i64 %s, 0" d c
+           else
+             emitf fc "  %s = trunc i64 %s to %s" d c tya
+         end
        end
      | bopc -> emitf fc "  %s = icmp %s %s %s, %s" d (cmp_op_int false bopc) tya va vb)
 
@@ -688,7 +875,22 @@ let gen_unop fc d u (a : operand) =
   | UNeg ->
     (match a.oty with
      | TFloat _ -> emitf fc "  %s = fneg %s %s" d tya va
-     | _ -> emitf fc "  %s = sub %s 0, %s" d tya va)
+     | TUint _ -> emitf fc "  %s = sub %s 0, %s" d tya va
+     | _ ->
+       (* 任务一：一元负号的有符号溢出（MIN 取反）默认 panic；
+          --wrap-overflow 回绕 *)
+       if overflow_checked () then begin
+         let w = width_of a.oty in
+         let t = Printf.sprintf "i%d" w in
+         let intr = Printf.sprintf "llvm.ssub.with.overflow.i%d" w in
+         let pair = fresh_r fc in
+         emitf fc "  %s = call {%s, i1} @%s(%s 0, %s %s)" pair t intr t t va;
+         let ov = fresh_r fc in
+         emitf fc "  %s = extractvalue {%s, i1} %s, 1" ov t pair;
+         emitf fc "  %s = extractvalue {%s, i1} %s, 0" d t pair;
+         ov_guard fc ov "integer negation overflow" a a
+       end else
+         emitf fc "  %s = sub %s 0, %s" d tya va)
   | UNot -> emitf fc "  %s = xor %s %s, 1" d tya va
   | UBitNot -> emitf fc "  %s = xor %s %s, -1" d tya va
 
@@ -1135,6 +1337,159 @@ let ensure_clofree (g : gctx) (clenv : string) : string =
   end;
   sym
 
+(* ---------- 任务一：显式溢出内建（wrapping/saturating/checked） ----------
+   wrap$add/sub/mul/neg 纯 LLVM 回绕运算；sat$* 用 llvm.*.sat 内建；
+   check$* 用 with.overflow 内建，溢出时写 OVERFLOW 码（12）而非 panic。 *)
+
+(* 把标量值 v（LLVM 类型 vt）写入 %err.<elem> 槽 addr 的 value 字段 *)
+let err_store_value fc (addr : string) (ety : zty) (v : string) (vt : string) : unit =
+  let vp = gen_gep fc addr (ll_ty (TErr ety)) 2 in
+  match Typeck.resolve ety with
+  | TInt 128 | TUint 128 ->
+    emitf fc "  store i128 %s, ptr %s" v vp
+  | TUint _ ->
+    let z =
+      if vt = "i64" then v
+      else
+        let r = fresh_r fc in
+        emitf fc "  %s = zext %s %s to i64" r vt v; r
+    in
+    emitf fc "  store i64 %s, ptr %s" z vp
+  | TInt _ ->
+    let z =
+      if vt = "i64" then v
+      else
+        let r = fresh_r fc in
+        emitf fc "  %s = sext %s %s to i64" r vt v; r
+    in
+    emitf fc "  store i64 %s, ptr %s" z vp
+  | _ -> lerr None "checked_*: unsupported result element type"
+
+let gen_checked_arith fc dst (op : string) (a : operand) (b : operand)
+    (ret_ty : zty) : unit =
+  match dst with
+  | None -> lerr None "checked_* result must be captured"
+  | Some d ->
+    let (addr, ty) =
+      match Hashtbl.find_opt fc.allocas d with
+      | Some x -> x
+      | None -> lerr None "checked_* result must be captured into a variable"
+    in
+    let elem = (match ty with TErr e -> e | _ -> lerr None "checked_* expects T! result") in
+    emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr;
+    let (va, ta) = val_of fc a in
+    let (vb, _) = val_of fc b in
+    let signed = (match a.oty with TInt _ -> true | _ -> false) in
+    let w = width_of a.oty in
+    let intr =
+      Printf.sprintf "llvm.%s%s.with.overflow.i%d"
+        (if signed then "s" else "u") op w
+    in
+    let t = Printf.sprintf "i%d" w in
+    let pair = fresh_r fc in
+    emitf fc "  %s = call {%s, i1} @%s(%s %s, %s %s)" pair t intr t va t vb;
+    let ov = fresh_r fc in
+    emitf fc "  %s = extractvalue {%s, i1} %s, 1" ov t pair;
+    let vres = fresh_r fc in
+    emitf fc "  %s = extractvalue {%s, i1} %s, 0" vres t pair;
+    let bad = fresh_lbl fc and ok = fresh_lbl fc in
+    emitf fc "  br i1 %s, label %%%s, label %%%s" ov bad ok;
+    emitf fc "%s:" bad;
+    let cp = gen_gep fc addr (ll_ty ty) 0 in
+    emitf fc "  store i32 12, ptr %s" cp;
+    emitf fc "  br label %%%s" ok;
+    emitf fc "%s:" ok;
+    err_store_value fc addr elem vres ta
+
+(* 饱和运算：llvm.<s|u><add|sub|mul>.sat.iN *)
+let gen_saturating fc dst (op : string) (a : operand) (b : operand) : unit =
+  match dst with
+  | None -> ()
+  | Some d ->
+    let (va, ta) = val_of fc a in
+    let (vb, _) = val_of fc b in
+    let signed = (match a.oty with TInt _ -> true | _ -> false) in
+    if op = "mul" then begin
+      (* 当前 LLVM 无 *mul.sat 内建：用 with.overflow + 按符号钳位。
+         有符号：真积符号 = sign(a) xor sign(b)（溢出时据此选 MIN/MAX）；
+         无符号：溢出只可能向上 → MAX。 *)
+      let intr =
+        Printf.sprintf "llvm.%smul.with.overflow.%s" (if signed then "s" else "u") ta
+      in
+      let pair = fresh_r fc in
+      emitf fc "  %s = call {%s, i1} @%s(%s %s, %s %s)" pair ta intr ta va ta vb;
+      let vv = fresh_r fc in
+      emitf fc "  %s = extractvalue {%s, i1} %s, 0" vv ta pair;
+      let ov = fresh_r fc in
+      emitf fc "  %s = extractvalue {%s, i1} %s, 1" ov ta pair;
+      let w = width_of a.oty in
+      if signed then begin
+        let (mn, mx) = Mir.int_range_of w in
+        let neg = fresh_r fc in
+        emitf fc "  %s = icmp slt %s %s, 0" neg ta va;
+        let neg2 = fresh_r fc in
+        emitf fc "  %s = icmp slt %s %s, 0" neg2 ta vb;
+        let samesign = fresh_r fc in
+        emitf fc "  %s = xor i1 %s, %s" samesign neg neg2;
+        let satv = fresh_r fc in
+        emitf fc "  %s = select i1 %s, %s %Ld, %s %Ld" satv samesign ta mn ta mx;
+        emitf fc "  %s = select i1 %s, %s %s, %s %s" d ov ta satv ta vv
+      end else begin
+        let mx = Mir.uint_max_of w in
+        emitf fc "  %s = select i1 %s, %s %Ld, %s %s" d ov ta mx ta vv
+      end
+    end
+    else begin
+      let intr =
+        Printf.sprintf "llvm.%s%s.sat.%s" (if signed then "s" else "u") op ta
+      in
+      emitf fc "  %s = call %s @%s(%s %s, %s %s)" d ta intr ta va ta vb
+    end
+
+let gen_wrapping fc dst (op : string) (a : operand) (b : operand) : unit =
+  match dst with
+  | None -> ()
+  | Some d ->
+    let (va, ta) = val_of fc a in
+    (match b.oty with
+     | TVoid ->
+       (* wrapping_neg：单目 *)
+       emitf fc "  %s = sub %s 0, %s" d ta va
+     | _ ->
+       let (vb, _) = val_of fc b in
+       emitf fc "  %s = %s %s %s, %s" d op ta va vb)
+
+(* 任务二：extern 调用约定（ABI 名 → LLVM 调用约定关键字前缀；"" = 默认 ccc） *)
+let cc_of_abi (abi : string) : string =
+  match abi with
+  | "stdcall" -> "x86_stdcallcc "
+  | "fastcall" -> "x86_fastcallcc "
+  | "vectorcall" -> "x86_vectorcallcc "
+  | "thiscall" -> "x86_thiscallcc "
+  | _ -> ""
+
+(* 任务二：变参实参的默认提升（C 默认实参提升：iN(n<32) → i32，
+   f16/f32 → double；其余按原类型传） *)
+let va_promote fc (o : operand) : string * string =
+  let (v, t) = val_of fc o in
+  match Typeck.resolve o.oty with
+  | TBool ->
+    let r = fresh_r fc in
+    emitf fc "  %s = zext i1 %s to i32" r v; ("i32", r)
+  | TChar ->
+    let r = fresh_r fc in
+    emitf fc "  %s = zext i8 %s to i32" r v; ("i32", r)
+  | TInt w when w < 32 ->
+    let r = fresh_r fc in
+    emitf fc "  %s = sext %s %s to i32" r t v; ("i32", r)
+  | TUint w when w < 32 ->
+    let r = fresh_r fc in
+    emitf fc "  %s = zext %s %s to i32" r t v; ("i32", r)
+  | TFloat 32 | TFloat 16 ->
+    let r = fresh_r fc in
+    emitf fc "  %s = fpext %s %s to double" r t v; ("double", r)
+  | _ -> (t, v)
+
 let gen_call fc dst name (args : operand list) (ret_ty : zty) =
   if name = "zfy_thread_spawn" then begin
     (* spawn（P0-1c 类别 2）：env 所有权移交线程。统一调 zfy_thread_spawn_d
@@ -1363,11 +1718,28 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
           emitf fc "  %s = add %s %s, 0" d t v
         | TInt _ ->
           let (v, t) = val_of fc a in
-          let neg = fresh_r fc in
-          emitf fc "  %s = sub %s 0, %s" neg t v;
-          let c = fresh_r fc in
-          emitf fc "  %s = icmp slt %s %s, 0" c t v;
-          emitf fc "  %s = select i1 %s, %s %s, %s %s" d c t neg t v
+          if overflow_checked () then begin
+            (* 任务一：|MIN| 溢出 panic（与 Rust 一致）；浮点无关 *)
+            let w = width_of a.oty in
+            let tw = Printf.sprintf "i%d" w in
+            let intr = Printf.sprintf "llvm.ssub.with.overflow.i%d" w in
+            let pair = fresh_r fc in
+            emitf fc "  %s = call {%s, i1} @%s(%s 0, %s %s)" pair tw intr tw tw v;
+            let ov = fresh_r fc in
+            emitf fc "  %s = extractvalue {%s, i1} %s, 1" ov tw pair;
+            let neg = fresh_r fc in
+            emitf fc "  %s = extractvalue {%s, i1} %s, 0" neg tw pair;
+            let c = fresh_r fc in
+            emitf fc "  %s = icmp slt %s %s, 0" c t v;
+            emitf fc "  %s = select i1 %s, %s %s, %s %s" d c t neg t v;
+            ov_guard fc ov "integer negation overflow" a a
+          end else begin
+            let neg = fresh_r fc in
+            emitf fc "  %s = sub %s 0, %s" neg t v;
+            let c = fresh_r fc in
+            emitf fc "  %s = icmp slt %s %s, 0" c t v;
+            emitf fc "  %s = select i1 %s, %s %s, %s %s" d c t neg t v
+          end
         | TFloat 32 ->
           let (v, _) = val_of fc a in
           emitf fc "  %s = call float @fabsf(float %s)" d v
@@ -1433,12 +1805,32 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
        in
        let sp = tostr_ptr fc v in
        emitf fc "  %s = call ptr @zfy_prec_str(ptr %s, i64 %s)" d sp n64)
+  (* 任务一：显式溢出内建（typeck 已把名字改写为 wrap$/sat$/check$+op） *)
+  | ("wrap$add" | "wrap$sub" | "wrap$mul"), [ a; b ] ->
+    gen_wrapping fc dst (String.sub name 5 (String.length name - 5)) a b
+  | "wrap$neg", [ a ] ->
+    gen_wrapping fc dst "neg" a { o = OInt 0L; oty = TVoid }
+  | ("sat$add" | "sat$sub" | "sat$mul"), [ a; b ] ->
+    gen_saturating fc dst (String.sub name 4 (String.length name - 4)) a b
+  | ("check$add" | "check$sub" | "check$mul"), [ a; b ] ->
+    gen_checked_arith fc dst (String.sub name 6 (String.length name - 6)) a b ret_ty
   | _ ->
     let callee = if name = "main" then "@zfy.main" else "@" ^ name in
     let is_ext = Hashtbl.mem Typeck.extern_fns name in
+    let emeta = Hashtbl.find_opt Typeck.extern_meta name in
+    (* 任务二：调用约定前缀 + 变参固定形参个数 *)
+    let cc = match emeta with Some (abi, _, _) -> cc_of_abi abi | None -> "" in
+    let va_nfix =
+      match emeta with Some (_, true, n) -> Some n | _ -> None
+    in
     let targs =
-      List.map
-        (fun (o : operand) ->
+      List.mapi
+        (fun i (o : operand) ->
+          match va_nfix with
+          | Some n when i >= n ->
+            (* 变参实参：默认提升（形参类型无约束） *)
+            va_promote fc o
+          | _ ->
           if is_agg o.oty then begin
             (* 聚合参数按指针传递 *)
             let (p, _) = ptr_of fc o in
@@ -1461,6 +1853,23 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
       String.concat ""
         (List.map (fun (t, v) -> Printf.sprintf ", %s %s" t v) targs)
     in
+    (* 变参调用：调用点显式写出被调函数类型（固定形参 + "..."）——
+       Win64 下变参浮点实参需要「同时放进 GP 影子槽」的复制，LLVM 后端
+       依赖调用点的函数类型信息；省略形如 `call i32 @printf(...)` 会漏掉
+       该复制，导致 printf("%f", 1.5) 打印 0.000000（实测 C 编译器总是
+       发射 `call i32 (ptr, ...) @printf(...)`） *)
+    let va_fty =
+      match va_nfix with
+      | Some n ->
+        let rec take k l =
+          if k <= 0 then []
+          else match l with [] -> [] | x :: r -> x :: take (k - 1) r
+        in
+        let fixed = List.map fst (take n targs) in
+        Printf.sprintf " (%s%s)" (String.concat ", " fixed)
+          (if fixed = [] then "..." else ", ...")
+      | None -> ""
+    in
     if is_agg ret_ty then begin
       match dst with
       | None -> lerr None "aggregate return value must be captured"
@@ -1468,7 +1877,7 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
         if not (Hashtbl.mem fc.allocas d) then
           lerr None "aggregate return value must be captured into a variable";
         let (addr, _) = Hashtbl.find fc.allocas d in
-        emitf fc "  call void %s(ptr %s%s)" callee addr args_str
+        emitf fc "  call %svoid %s(ptr %s%s)" cc callee addr args_str
     end
     else begin
       let args_str =
@@ -1476,19 +1885,19 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
         else String.sub args_str 2 (String.length args_str - 2)
       in
       match ret_ty, dst with
-      | TVoid, _ -> emitf fc "  call void %s(%s)" callee args_str
+      | TVoid, _ -> emitf fc "  call %svoid%s %s(%s)" cc va_fty callee args_str
       | TBool, Some d when List.mem name bool_i32_rts ->
         (* 运行时 i32 布尔（has/del/contains）：icmp 转 i1（v3.6） *)
         let r = fresh_r fc in
-        emitf fc "  %s = call i32 %s(%s)" r callee args_str;
+        emitf fc "  %s = call %si32%s %s(%s)" r cc va_fty callee args_str;
         emitf fc "  %s = icmp ne i32 %s, 0" d r
       | rt, Some d when is_ext && is_i128 rt ->
         (* 9d：extern i128 返回值按 <2 x i64> 接收后 bitcast（clang win32 ABI） *)
         let r = fresh_r fc in
-        emitf fc "  %s = call <2 x i64> %s(%s)" r callee args_str;
+        emitf fc "  %s = call %s<2 x i64> %s(%s)" r cc callee args_str;
         emitf fc "  %s = bitcast <2 x i64> %s to i128" d r
       | rt, Some d ->
-        emitf fc "  %s = call %s %s(%s)" d (ll_ty rt) callee args_str
+        emitf fc "  %s = call %s%s%s %s(%s)" d cc (ll_ty rt) va_fty callee args_str
       | _ -> lerr None "non-void return value must be used"
     end
 
@@ -1588,7 +1997,14 @@ let rec gen_field_path fc (p : string) (ty : zty) (idxs : int list) : string =
       | TStruct s -> s
       | _ -> lerr None "field access target is not a struct"
     in
-    let fp = gen_gep fc p (ll_ty ty) i in
+    (* union：全部字段共享偏移 0 → 字段地址即基址（LLVM 类型为单元素载体，
+       不能按字段序号 GEP）。位域字段在 packed struct 内独占一个声明类型的
+       存储单元，仍按字段序号 GEP 到该单元，掩码在读写侧处理 *)
+    let fp =
+      match find_struct fc.g s with
+      | Some sd when sd.sunion -> p
+      | _ -> gen_gep fc p (ll_ty ty) i
+    in
     let fty =
       match find_struct fc.g s with
       | Some sd ->
@@ -1598,6 +2014,91 @@ let rec gen_field_path fc (p : string) (ty : zty) (idxs : int list) : string =
       | None -> lerr None "undefined struct %s" s
     in
     gen_field_path fc fp fty rest
+
+(* ---------- 位域（任务二，方案甲） ----------
+   仅允许出现在 packed struct 内的整数字段；每个位域字段独占一个其声明
+   类型的存储单元（sbits 位宽 > 0 表示位域），位编号从 LSB 起。访问一律
+   生成显式掩码代码（读：掩码/符号扩展；写：read-modify-write），无需
+   unsafe。 *)
+
+(* 沿字段链定位最终字段：返回 (位宽, 字段类型)；位宽 0 = 普通字段 *)
+let field_info_at (g : gctx) (rootty : zty) (idxs : int list) : int * zty =
+  let rec go ty = function
+    | [] -> (0, ty)
+    | i :: rest ->
+      let s =
+        match ty with
+        | TStruct s -> s
+        | TPtr (TStruct s) -> s
+        | _ -> ""
+      in
+      (match find_struct g s with
+       | Some sd ->
+         let fty =
+           match List.nth_opt sd.sfields i with
+           | Some (_, t) -> t
+           | None -> TError
+         in
+         if rest = [] then
+           ((match List.nth_opt sd.sbits i with Some b -> b | None -> 0), fty)
+         else go fty rest
+       | None -> (0, ty))
+  in
+  go rootty idxs
+
+(* 位域读：load 存储单元 → 掩码（无符号）/ 符号扩展（有符号） *)
+let gen_bitfield_load fc (dst : string) (fp : string) (fty : zty)
+    (bits : int) : unit =
+  let t = ll_ty fty in
+  let w = width_of fty in
+  let raw = fresh_r fc in
+  emitf fc "  %s = load %s, ptr %s" raw t fp;
+  match Typeck.resolve fty with
+  | TInt _ -> begin
+      (* 有符号：左移丢弃高位后算术右移即可掩码 + 符号扩展 *)
+      let bits = min bits (w - 1) in
+      let r = fresh_r fc in
+      emitf fc "  %s = shl %s %s, %d" r t raw (w - bits);
+      emitf fc "  %s = ashr %s %s, %d" dst t r (w - bits)
+    end
+  | _ ->
+    let mask =
+      if bits >= w then "-1"
+      else Int64.to_string (Int64.sub (Int64.shift_left 1L bits) 1L)
+    in
+    emitf fc "  %s = and %s %s, %s" dst t raw mask
+
+(* 位域写：read-modify-write（清位后置入低 N 位；位偏移恒 0） *)
+let gen_bitfield_store fc (fp : string) (fty : zty) (bits : int)
+    (v : operand) : unit =
+  let t = ll_ty fty in
+  let w = width_of fty in
+  let (vv, vt) = val_of fc v in
+  if vt <> t then lerr None "bitfield value type %s does not match field type %s" vt t;
+  let mask =
+    if bits >= w then "-1"
+    else Int64.to_string (Int64.sub (Int64.shift_left 1L bits) 1L)
+  in
+  let nmask =
+    if bits >= w then "0" else Int64.to_string (Int64.lognot (Int64.sub (Int64.shift_left 1L bits) 1L))
+  in
+  let raw = fresh_r fc in
+  emitf fc "  %s = load %s, ptr %s" raw t fp;
+  let cleared = fresh_r fc in
+  emitf fc "  %s = and %s %s, %s" cleared t raw nmask;
+  let masked = fresh_r fc in
+  emitf fc "  %s = and %s %s, %s" masked t vv mask;
+  let nv = fresh_r fc in
+  emitf fc "  %s = or %s %s, %s" nv t cleared masked;
+  emitf fc "  store %s %s, ptr %s" t nv fp
+
+(* 零字面量判定（union 构造时跳过未初始化字段的写入——槽已整体清零，
+   跳过与写入零值等价，避免覆盖唯一活跃字段） *)
+let is_zero_lit (o : operand) : bool =
+  match o.o with
+  | OInt 0L | OBig "0" | OBool false -> true
+  | OFloat f -> f = 0.0
+  | _ -> false
 
 (* 字段写入（值语义：深拷贝新值；free_old 时先释放旧资源） *)
 let gen_field_store ~(free_old : bool) fc (fp : string) (v : operand) : unit =
@@ -2530,15 +3031,36 @@ let gen_instr fc (i : instr) : unit =
     Hashtbl.replace fc.regs d r
   | MStructNew (d, ty, fields) ->
     (* struct 构造：聚合槽清零后逐字段写入（槽已清零，无需释放旧值；
-       缺省字段保持零值位模式） *)
+       缺省字段保持零值位模式）。union：全部字段共享基址，只写真正被
+       初始化的字段（零字面量字段跳过——与槽整体清零等价，且避免覆盖
+       唯一活跃字段）；位域字段走显式掩码写入 *)
     let addr = fresh_r fc in
     emitf_entry fc "  %s = alloca %s" addr (ll_ty ty);
     Hashtbl.replace fc.allocas d (addr, ty);
     emitf fc "  store %s zeroinitializer, ptr %s" (ll_ty ty) addr;
+    let sd = match ty with TStruct s -> find_struct fc.g s | _ -> None in
+    let is_union = match sd with Some sd -> sd.sunion | None -> false in
     List.iter
       (fun (idx, v) ->
-        let fp = gen_gep fc addr (ll_ty ty) idx in
-        gen_field_store ~free_old:false fc fp v)
+        if is_union then begin
+          if not (is_zero_lit v) then gen_field_store ~free_old:false fc addr v
+        end else begin
+          let fp = gen_gep fc addr (ll_ty ty) idx in
+          let bits =
+            match sd with
+            | Some sd -> (match List.nth_opt sd.sbits idx with Some b -> b | None -> 0)
+            | None -> 0
+          in
+          if bits > 0 then begin
+            let fty =
+              match sd with
+              | Some sd -> (match List.nth_opt sd.sfields idx with Some (_, t) -> t | None -> TError)
+              | None -> TError
+            in
+            gen_bitfield_store fc fp fty bits v
+          end
+          else gen_field_store ~free_old:false fc fp v
+        end)
       fields
   | MFieldGet (d, root, rootty, idxs, fty) ->
     (* 字段读取：GEP 链直达最终字段。标量/string/seq 字段 load 值（借用，
@@ -2578,9 +3100,20 @@ let gen_instr fc (i : instr) : unit =
        gen_memcpy fc addr fp (size_of fc.g fty);
        Hashtbl.replace fc.allocas d (addr, fty)
      | _ ->
-       let r = fresh_r fc in
-       emitf fc "  %s = load %s, ptr %s" r (ll_ty fty) fp;
-       Hashtbl.replace fc.regs d r)
+       let (bits, _) = field_info_at fc.g base_ty idxs in
+       if bits > 0 then begin
+         (* 位域读：掩码/符号扩展（结果仍是声明类型）。注意 MIR 临时名
+            不能直接作 SSA 名——结果写 fresh 寄存器并登记到 regs，后续
+            OLocal 引用才可解析 *)
+         let r = fresh_r fc in
+         gen_bitfield_load fc r fp fty bits;
+         Hashtbl.replace fc.regs d r
+       end
+       else begin
+         let r = fresh_r fc in
+         emitf fc "  %s = load %s, ptr %s" r (ll_ty fty) fp;
+         Hashtbl.replace fc.regs d r
+       end)
   | MFieldStore (root, rootty, idxs, v) ->
     (* 字段写入：GEP 链直达字段，深拷贝新值 + 释放旧值（指针根自动解引用） *)
     let (rp, base_ty) =
@@ -2590,7 +3123,9 @@ let gen_instr fc (i : instr) : unit =
       | _ -> lerr None "invalid root type for field access"
     in
     let fp = gen_field_path fc rp base_ty idxs in
-    gen_field_store ~free_old:true fc fp v
+    let (bits, fty) = field_info_at fc.g base_ty idxs in
+    if bits > 0 then gen_bitfield_store fc fp fty bits v
+    else gen_field_store ~free_old:true fc fp v
   | MEmptySeq (d, ty) ->
     (* 数组/列表字段缺省分配：定长数组按声明长度分配全零槽；
        列表空起步（长度 0、容量 8，随 push 扩容）。
@@ -2751,6 +3286,9 @@ let gen_instr fc (i : instr) : unit =
       | _ -> lerr None "invalid root type for field address"
     in
     let fp = gen_field_path fc rp base_ty idxs in
+    (* 位域没有独立可寻址地址（写路径需 read-modify-write） *)
+    let (bits, _) = field_info_at fc.g base_ty idxs in
+    if bits > 0 then lerr None "cannot take the address of a bitfield";
     Hashtbl.replace fc.regs d fp
   | MElemAddr (d, base, idx, elem, checked) ->
     (* 元素地址：&a[i] / &p[i]（显式取地址无越界检查）或写目标定位
@@ -2999,8 +3537,19 @@ let gen_fn g (f : mfn) : string =
            f.mparams)
   in
   let fname = if f.mname = "main" then "@zfy.main" else "@" ^ f.mname in
+  (* 任务二：符号可见性/链接段（export "name" / section "seg" / internal） *)
+  let sym = f.mname in
+  let exported = Hashtbl.find_opt Mir.fn_export sym in
+  let is_internal = Hashtbl.mem Mir.fn_internal sym in
+  let sect =
+    match Hashtbl.find_opt Mir.fn_section sym with
+    | Some s -> Printf.sprintf " section \"%s\"" s
+    | None -> ""
+  in
   Buffer.add_string buf
-    (Printf.sprintf "define %s %s(%s) {\n" ret_ll fname params_ll);
+    (Printf.sprintf "define %s%s %s(%s)%s {\n"
+       (if is_internal then "internal " else "")
+       ret_ll fname params_ll sect);
   (* 参数落槽（所有权传参约定：string/数组/列表实参的指针值即资源本体，
      直接接管进本地槽，不再克隆——调用方对非 move 实参已先行克隆） *)
   List.iter
@@ -3097,6 +3646,18 @@ let gen_fn g (f : mfn) : string =
   Buffer.add_buffer buf ebuf;
   Buffer.add_buffer buf body;
   Buffer.add_string buf "}\n";
+  (* 任务二：export "name" → 追加别名 @name = alias <fn 类型>, ptr @<原名>
+     （定义符号保持原名不变，对外按导出名可见；internal 不导出）。 *)
+  (match exported with
+   | Some exp when exp <> f.mname && not is_internal ->
+     let atys =
+       String.concat ", "
+         ((if is_agg f.mret then [ "ptr" ] else [])
+          @ List.map (fun (_, t) -> if is_agg t then "ptr" else ll_ty t) f.mparams)
+     in
+     Buffer.add_string buf
+       (Printf.sprintf "@%s = alias %s (%s), ptr %s\n" exp ret_ll atys fname)
+   | _ -> ());
   Buffer.contents buf
 
 (* ---------- 模块生成 ---------- *)
@@ -3106,7 +3667,26 @@ let gen_fn g (f : mfn) : string =
    一致；packed 用 <{ }>（紧排无填充），与手算 packed 布局一致。
    故字段 GEP 的元素序号即字段序号（勿再插入显式 padding 元素——
    那会使 GEP 字段序号与 LLVM 元素序号错位，见 w-006 段错误）。 *)
-let gen_struct_type_def (_ : gctx) (sd : sdef) : string =
+(* union：全部字段共享偏移 0，LLVM 类型只需承载"大小 + 对齐"。
+   载体类型按 (size, align) 选单个标量（i8/i16/i32/i64/i128），字段访问
+   一律以基址为目标（见 gen_field_path），不按元素序号 GEP。 *)
+let union_body (g : gctx) (sd : sdef) : string =
+  ignore sd;
+  let (sz, al) = Hir.struct_size_align g.structs sd in
+  let elt =
+    match sz with
+    | 1 -> "i8"
+    | 2 -> "i16"
+    | 4 -> "i32"
+    | 16 -> "i128"
+    | _ -> "i64"
+  in
+  ignore al;
+  Printf.sprintf "%s = type { %s }" (struct_ty_name sd.sname) elt
+
+let gen_struct_type_def (g : gctx) (sd : sdef) : string =
+  if sd.sunion then union_body g sd ^ "\n"
+  else begin
   let body =
     String.concat ", " (List.map (fun (_, fty) -> ll_ty fty) sd.sfields)
   in
@@ -3114,6 +3694,7 @@ let gen_struct_type_def (_ : gctx) (sd : sdef) : string =
     Printf.sprintf "%s = type <{ %s }>\n" (struct_ty_name sd.sname) body
   else
     Printf.sprintf "%s = type { %s }\n" (struct_ty_name sd.sname) body
+  end
 
 (* 生成 @zfy_struct_free_<名>(ptr)：逐字段释放堆资源
    （string/seq/嵌套 struct 递归；运行时 free 函数均 NULL 安全）。
@@ -3125,8 +3706,14 @@ let gen_struct_type_def (_ : gctx) (sd : sdef) : string =
    字段级 move-only 类型（嵌套句柄/接口/闭包借拷）跳过——级联会双释放 *)
 let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
   let sn = struct_ty_name sd.sname in
+  (* union（任务二）：只有一个活跃字段，按哪个字段释放无法判定（字段访问
+     共享同一块存储），free 视为空操作（指针/string 字段的生命周期由使用方
+     约定管理，参见 grammar §7 union 小节） *)
+  if sd.sunion then
+    Printf.sprintf
+      "define void @zfy_struct_free_%s(ptr %%p) {\n  ret void\n}\n" sd.sname
   (* 内建容器 map$/set$（v3.6）：句柄 struct 整体走 runtime 深释放 *)
-  if Typeck.is_map_struct sd.sname || (String.length sd.sname > 4 && String.sub sd.sname 0 4 = "set$") then
+  else if Typeck.is_map_struct sd.sname || (String.length sd.sname > 4 && String.sub sd.sname 0 4 = "set$") then
     Printf.sprintf
       "define void @zfy_struct_free_%s(ptr %%p) {\n  call void @zfy_map_free(ptr %%p)\n  ret void\n}\n"
       sd.sname
@@ -3211,9 +3798,16 @@ let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
    （string strdup / seq clone / 嵌套 struct 递归 assign）。顺序：先拷贝
    新值、后释放 dst 旧资源（src 可能引用 dst 自身字段，先释放会悬垂）。
    运行时 free/strdup/clone 均 NULL 安全，无需判空分支 *)
-let gen_struct_assign_fn (sd : sdef) : string =
+let gen_struct_assign_fn (g : gctx) (sd : sdef) : string =
+  (* union（任务二）：值语义 = 整块 memcpy（活跃字段唯一，无深拷贝概念） *)
+  if sd.sunion then begin
+    let (sz, _) = Hir.struct_size_align g.structs sd in
+    Printf.sprintf
+      "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n  call void @llvm.memcpy.p0.p0.i64(ptr %%dst, ptr %%src, i64 %d, i1 false)\n  ret void\n}\n"
+      sd.sname sz
+  end
   (* 内建容器 map$/set$（v3.6）：整体深拷贝（值语义） *)
-  if Typeck.is_map_struct sd.sname || (String.length sd.sname > 4 && String.sub sd.sname 0 4 = "set$") then
+  else if Typeck.is_map_struct sd.sname || (String.length sd.sname > 4 && String.sub sd.sname 0 4 = "set$") then
     Printf.sprintf
       "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n  call void @zfy_map_assign(ptr %%dst, ptr %%src)\n  ret void\n}\n"
       sd.sname
@@ -3452,6 +4046,14 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare i64 @zfy_pow_ull(i64, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_pow_u128(ptr, i64, i64, i64, i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_pow_i128(ptr, i64, i64, i64, i64)\n";
+  (* 任务一：带溢出标志的幂与溢出 panic（检查模式） *)
+  Buffer.add_string g.mbuf "declare i64 @zfy_pow_ll_ov(i64, i64, ptr)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_pow_ull_ov(i64, i64, ptr)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_pow_u128_ov(ptr, i64, i64, i64, i64, ptr)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_pow_i128_ov(ptr, i64, i64, i64, i64, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_overflow_panic(ptr, i64, i64)\n";
   (* 时间内建（v3.3.6）：zfy_time_local 为 sret 形态（首参 = datetime 结果槽） *)
   Buffer.add_string g.mbuf "declare i64 @zfy_time_now()\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_time_tick()\n";
@@ -3888,11 +4490,32 @@ let gen_program (m : mir) : string =
     || n = "free"   (* P0-1c：prelude 手写 declare，防重复 declare 报错 *)
     || n = "str_len" || n = "zfy.prec" || n = "abs"
     || n = "pow" || n = "powf"   (* ** 幂与 pow 内建共用 prelude declare，避免重复声明 *)
+    (* 任务一：显式溢出内建（wrap$/sat$/check$+op）由 gen_call 内联生成，无外部符号 *)
+    || (String.length n >= 5 && String.sub n 0 5 = "wrap$")
+    || (String.length n >= 4 && String.sub n 0 4 = "sat$")
+    || (String.length n >= 6 && String.sub n 0 6 = "check$")
   in
   let decls : (string, string * string) Hashtbl.t = Hashtbl.create 8 in
   let add_decl name (args : operand list) ret =
     if not (is_rt_name name) && not (Hashtbl.mem decls name) then begin
       let is_ext = Hashtbl.mem Typeck.extern_fns name in
+      let emeta = Hashtbl.find_opt Typeck.extern_meta name in
+      let cc = match emeta with Some (abi, _, _) -> cc_of_abi abi | None -> "" in
+      (* 变参：declare 只列固定形参 + "..."（调用点的额外实参不做类型）
+         ——按固定形参个数截断实参表 *)
+      let args =
+        match emeta with
+        | Some (_, true, n) ->
+          let rec take k l =
+            if k <= 0 then []
+            else match l with [] -> [] | x :: r -> x :: take (k - 1) r
+          in
+          take n args
+        | _ -> args
+      in
+      let va_tail =
+        match emeta with Some (_, true, _) -> ", ..." | _ -> ""
+      in
       let atys =
         List.map
           (fun (o : operand) ->
@@ -3906,7 +4529,7 @@ let gen_program (m : mir) : string =
         else if is_ext && is_i128 ret then "<2 x i64>"   (* 9d：sret 等价形式 *)
         else ll_ty ret
       in
-      Hashtbl.replace decls name (rty, String.concat ", " atys)
+      Hashtbl.replace decls name (cc ^ rty, String.concat ", " atys ^ va_tail)
     end
   in
   List.iter
@@ -3968,6 +4591,6 @@ let gen_program (m : mir) : string =
   List.iter
     (fun sd ->
       Buffer.add_string g.mbuf (gen_struct_free_fn g sd);
-      Buffer.add_string g.mbuf (gen_struct_assign_fn sd))
+      Buffer.add_string g.mbuf (gen_struct_assign_fn g sd))
     m.mstructs;
   Buffer.contents g.mbuf ^ Buffer.contents fbuf

@@ -1,0 +1,35 @@
+// 审计 d：容器句柄路径——push 原地追加、xs[i] 覆盖、remove 丢弃、
+// 整体 move 清空重赋值。载体用 iface 句柄（用户 struct 禁句柄字段，
+// 闭包列表语法不支持——见 h 用例）。ZFY_LEAK_DEBUG=1 应 0 泄漏
+interface Shape
+    fn i64 area()
+
+struct Sq
+    i64 v = 0
+    fn i64 area()
+        return self.v
+
+fn main()
+    let Shape[] xs
+    // ① push 原地追加（xs = push(xs, ...) 特判：set_agg retain 进列表）
+    let i64 i = 0
+    while i < 5
+        xs = push(xs, Shape(Sq(i)))
+        i = i + 1
+    output(length(xs))
+    // ② 下标覆盖：旧元素 dtor（rc release）
+    xs[2] = Shape(Sq(100))
+    let i64 acc3 = 0
+    for t in xs
+        acc3 = acc3 + t.area()
+    output(acc3)
+    // ③ remove 丢弃：副本临时语句末释放、槽位左移 dtor
+    let Shape r = remove(xs, 4)
+    output(r.area())
+    output(length(xs))
+    // ④ 整体重赋值清空（move 免克隆：旧列表整体 seq_free → 逐元素 rc release）
+    let Shape[] ys
+    xs = ys
+    output(length(xs))
+    // ⑤ 列表作用域退出：ys 的元素逐个 rc release
+    output("container ok")

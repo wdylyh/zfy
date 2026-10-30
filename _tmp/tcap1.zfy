@@ -1,0 +1,8 @@
+fn main()
+    let i32 n = 7
+    let fn() -> i32 g = fn() -> i32
+        return n
+    let fn() -> i32 h = fn [&g]() -> i32
+        return g()
+    output(h())
+    output(g())

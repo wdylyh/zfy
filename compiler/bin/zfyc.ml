@@ -111,6 +111,14 @@ let extract_flags (argv : string array) : string array =
          exit 2);
       go (i + 2)
     end
+    else if argv.(i) = "--wrap-overflow"
+            || argv.(i) = "-Wno-overflow-check" then begin
+      (* 任务一：整数溢出静默回绕（旧语义）；默认检查模式。
+         常量折叠同步切回回绕折叠 *)
+      Llvmgen.set_wrap_overflow true;
+      Mir.set_wrap_overflow true;
+      go (i + 1)
+    end
     else begin
       rest := argv.(i) :: !rest;
       go (i + 1)

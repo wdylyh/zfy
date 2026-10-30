@@ -1,0 +1,7 @@
+// 定位变体 f2：仅闭包调用 string 实参（mk("zfy")）
+fn main()
+    let string greet = "hi "
+    let fn(string) -> string mk = fn(string who) => greet + who
+    let string s = mk("zfy")
+    output(s)
+    output("f2 ok")

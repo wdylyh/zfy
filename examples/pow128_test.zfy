@@ -1,4 +1,18 @@
 // 128 位整数幂（v3.3.3）回归：断言失败 exit 1
+// 说明：默认检查模式下整数幂溢出 panic（可被 try 捕获）；
+//       --wrap-overflow 编译时恢复旧回绕语义（2^128 = 0，模 2^128）
+fn void pow_ov_128()
+    let u128 b = 2
+    let u128 e = 128
+    let u128 r = b ** e
+    output(r)
+
+fn void pow_ov_big()
+    let u128 b = 2
+    let u128 e = 18446744073709551616
+    let u128 r = b ** e
+    output(r)
+
 fn u128 ipow128(let u128 b, let u128 e)
     // 对照实现：循环乘（验证 ** 与手写幂一致）
     let u128 r = 1
@@ -26,14 +40,13 @@ fn main()
         bad++
     if f ** e23 != 11920928955078125
         bad++
-    // 回绕：2^128 = 0（模 2^128）
-    let u128 e128 = 128
-    if b ** e128 != 0
+    // 溢出：2^128 在检查模式下 panic（try 捕获）；--wrap-overflow 下回绕为 0
+    if try(pow_ov_128) != false
         bad++
-    // 大指数（64 位对高位路径）：2^(2^64) = 0、1^big = 1
+    // 大指数（64 位对高位路径）：2^(2^64) 溢出 panic、1^big = 1
+    if try(pow_ov_big) != false
+        bad++
     let u128 eb = 18446744073709551616
-    if b ** eb != 0
-        bad++
     let u128 one = 1
     if one ** eb != 1
         bad++

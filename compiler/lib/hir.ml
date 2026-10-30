@@ -25,7 +25,11 @@ type zty =
                                        不会流到 MIR/LLVM（有错不进后续阶段） *)
 
 (* struct 定义（typeck 收集后随 HIR/MIR 传递，llvmgen 生成布局与深拷贝辅助） *)
-type sdef = { sname : string; spacked : bool; sfields : (string * zty) list }
+type sdef = { sname : string; spacked : bool; sfields : (string * zty) list;
+              sunion : bool;  (* union：全部字段共享偏移 0（大小=最大字段） *)
+              sbits : int list }
+  (* sbits：与 sfields 等长的位域宽度（0 = 普通字段）。位域字段在布局上
+     独占其声明类型的存储单元（v1 简化，见 grammar §7.1） *)
 
 type binop =
   BAdd | BSub | BMul | BDiv | BMod | BEq | BNe | BLt | BGt | BLe | BGe | BAnd | BOr
@@ -294,7 +298,18 @@ let rec ty_size_align (structs : sdef list) (t : zty) : int * int =
    - 非 packed：C 布局（字段偏移按各自对齐取整，总大小对齐到最大字段对齐）
    - packed：字段紧凑排列（无填充），整体对齐 1 *)
 and struct_size_align (structs : sdef list) (sd : sdef) : int * int =
-  if sd.spacked then begin
+  if sd.sunion then begin
+    (* union：大小 = 最大字段大小（构建期已校验字段非聚合/非引用类型），
+       对齐 = 最大字段对齐；至少 1 字节 *)
+    let size = ref 1 and al = ref 1 in
+    List.iter
+      (fun (_, ft) ->
+        let (s, a) = ty_size_align structs ft in
+        if s > 0 then begin size := max !size s; al := max !al a end)
+      sd.sfields;
+    (align_up !size !al, !al)
+  end
+  else if sd.spacked then begin
     let size =
       List.fold_left
         (fun acc (_, ft) ->
@@ -321,7 +336,9 @@ and struct_size_align (structs : sdef list) (sd : sdef) : int * int =
 let struct_field_offsets (structs : sdef list) (sd : sdef)
     : int list * int * int =
   let (tsize, talign) = struct_size_align structs sd in
-  if sd.spacked then begin
+  if sd.sunion then
+    (List.map (fun _ -> 0) sd.sfields, tsize, talign)
+  else if sd.spacked then begin
     let rec go off = function
       | [] -> ([], off)
       | (_, ft) :: rest ->

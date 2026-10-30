@@ -51,12 +51,13 @@ fn main()
   - 错误传播是 `e?`。
 - **分号**：语句位置非法（写了报错）；仅空语句占位可用。
 
-## 2. 关键字（53 个）
+## 2. 关键字（57 个）
 
 ```
 if else while for return true false pub mod use break continue
 const frac unred reduce and or not xor output input cast array list
 remove import as sep end delim fail panic err struct packed move copy
+union export section internal
 borrow ref null unsafe extern type enum match interface ui shared let fn in asm
 ```
 
@@ -66,6 +67,8 @@ borrow ref null unsafe extern type enum match interface ui shared let fn in asm
 - `xor`：二元异或运算符。**`^` 不是异或**——它只作后缀解引用。
 - `asm`：内联汇编语句（v3.31，见 §15.1；须写在 `unsafe` 块内）。
 - `in`：asm 命名实参 `in=` 的关键字写法（§15.1），因此**不能当标识符**。
+- `union`：union 声明（§7.1）；`export`/`section`/`internal`：函数符号属性
+  前缀（§7.3，可叠加在 `fn`/`pub fn` 前）。
 
 ## 3. 类型系统
 
@@ -234,6 +237,65 @@ struct Counter
   → `h.next_u64()`）。
 - **泛型 struct 方法**见 §28.2。
 
+### 7.1 union（v3.32）
+
+```
+union Value
+    i32 i
+    f32 f
+    u8 b
+```
+
+- 所有字段**共享偏移 0**；无绑定标签（读哪个字段由程序员负责，安全语义
+  与 C union 一致：写入一个字段后读另一个字段得到"位型重解释"）。
+- `sizeof(U)` = 最大字段大小（按最大对齐向上取整，至少 1 字节）；
+  `alignof(U)` = 最大字段对齐。
+- 字段类型限**标量或指针**（整数/浮点/bool/char/string/指针/函数指针）；
+  嵌套 struct/数组/列表/frac/T! 字段报错（需要时用指针字段 + 显式转换）。
+- 构造：位置形式 `Value(5)` = 初始化第一字段；命名形式 `Value(i=5)`。
+  **一次只能初始化一个字段**（多个非零字段报错）；未初始化字段保持零。
+- 值语义：赋值/传参/`copy` 一律整体 memcpy（副本独立，不做深拷贝——
+  union 内不存 string 之外的所有权资源；string 字段请自行管理）。
+- 只能声明字段，不能有方法。
+
+### 7.2 位域（struct packed 内，v3.32）
+
+```
+struct packed Flags
+    u8 lo: 3
+    u8 mid: 4
+    i8 sgn: 4
+```
+
+- 语法 `TYPE 名字: N`，须在 `struct packed` 内（普通 struct 内报错）；
+  `TYPE` 必须是整数类型，`N` 是编译期整数字面量且 `1 ≤ N ≤ 位宽`。
+- 存储：每个位域字段**独占一个其声明类型的存储单元**（v1 简化，不做
+  相邻位域合并），位从 LSB 起。
+- 读写一律生成**显式掩码代码**（读：无符号按 `& (2^N-1)`、有符号先左移
+  再算术右移做符号扩展；写：read-modify-write 清位后置入低 N 位）。
+  普通代码即可使用，**不必包 `unsafe`**（与 C 位域不同，没有指针访问）。
+- 取位域地址（`&f.lo`）报错；位域字段不能有默认值，也不能用于
+  `sizeof` 字段偏移。
+- C ABI 兼容性：本实现的布局**不与 C 编译器**的位域打包规则一致
+  （C 会把相邻窄位域塞进同一单元）；与 C 交互请改用普通整数字段 +
+  显式掩码，或按本实现约定对齐结构体大小。
+
+### 7.3 符号属性（export / section / internal，v3.32）
+
+```
+export "zfy_exported_add" fn i32 add_impl(let i32 a, let i32 b)
+internal fn i32 hidden_double(let i32 x)
+section "zfy_init" fn i32 in_init(let i32 x)
+```
+
+- `export "sym"`：给函数额外导出符号名为 `sym`（同 C 的
+  `__attribute__((alias))`）——zfy 内部调用仍用原函数名，链接方按 `sym`
+  引用（相当于 `#[no_mangle]` + 指定导出名）。
+- `section "seg"`：函数落在指定链接段（等价 GCC `__attribute__((section))`）。
+- `internal`：符号不导出（`internal` 链接性，仅供本模块使用）。
+- 三者可叠加、顺序任意，**只能作用于顶层函数**（struct 字段/方法报错）。
+- `export`/`section` 须跟字符串字面量，否则报错。
+
 ## 8. 语句全集
 
 | 语句 | 语法与要点 |
@@ -295,7 +357,9 @@ xor         位异或（关键字；^ 是解引用后缀不是异或）
 
 - **移位/位运算仅整数（char 提升 i32）**；`x << k` / `x >> k` 的 k 会被
   coerce 到左操作数类型（变量移位量建议直接用同宽类型，避免窄化报错）。
-- 移位量 ≥ 位宽 = 未定义（LLVM poison），自行保证 0 ≤ k < 位宽。
+- **移位量越界 = 运行期 panic**（默认检查模式）：`k < 0` 或 `k >= 位宽`
+  抛 panic"shift overflow"（**已被 `try()` 捕获**）；不再有 LLVM poison/
+  未定义行为。`--wrap-overflow` 模式下恢复旧语义（按硬件行为移位）。
 
 - **`??` 值形式**：`let i32 v = 可能失败 ?? 默认值`。
 - **`??` 块形式**：`??` 后**直接换行 + 缩进块**（不是 `?? +`！）：
@@ -345,7 +409,7 @@ xor         位异或（关键字；^ 是解引用后缀不是异或）
 | 模块（内联） | `mod 名字` + 缩进块（块内为顶层项，可嵌套） |
 | 导出 | `pub` 修饰任意顶层项（模块内合法；root 顶层 pub 容忍并告警） |
 | use | `use a::b::item [as x]`；分组 `use a::b::{x, y as z}`（花括号内可折行、允许尾逗号）；整模块 `use a::b [as m]`；单段整模块 `use 模块名 [as 别名]`（成员以 `别名.成员名` 访问，仅 pub 可见）；分组/路径 use 的**首段无本地 mod 声明时自动按 `mod 首段;` 处理**（查本目录与父链 stdlib——显式 mod 优先，无需重复声明） |
-| extern | `extern "C"` + 缩进块；**每行：`返回类型 [frac] 名(参数)`——返回类型是旧式直接写类型（不加 let），参数是 let 形式**：<br>`i64 strlen(let string s)` ✓、`let i64 strlen(...)` ✗ |
+| extern | `extern "C"`（或 `"stdcall"` / `"fastcall"` / `"vectorcall"` / `"thiscall"`）+ 缩进块；**每行：`返回类型 [frac] 名(参数)`——返回类型是旧式直接写类型（不加 let），参数是 let 形式**：<br>`i64 strlen(let string s)` ✓、`let i64 strlen(...)` ✗。<br>**变参**：形参表尾写 `...`——`i32 printf(let string fmt, ...)`；调用点可传任意多标量/string/指针实参（i8/i16/i32/bool/char 默认提升 i32，f16/f32 提升 double），struct/列表/数组/frac/`T!` 按值传报错。<br>**序列返回**：允许 `T[]` / `T*` 返回（unsafe 语义：C 侧缓冲区直接交给 zfy，生命周期归调用方/需自行释放）。<br>非法 ABI 名编译期报错（E2031）。 |
 
 内联模块示例：
 
@@ -585,8 +649,32 @@ fn main()
 ## 15. 运行期语义备忘
 
 - 下标/切片越界（含负下标）→ panic（exit 101），无 Python 式负索引。
-- i64 及以下整数溢出**静默回绕**；`/` `%` 向零截断（`-7 / 2 = -3`）。
-- 整数除零 = 硬件异常；frac 除零走 panic。
+- **整数溢出默认检查（v3.32）**：`+ - *`、一元 `-`、`**`（整数底数）、
+  移位量越界/负移位、整除/取余的除零、`INT_MIN / -1`、`|e|` 对 MIN 一律
+  **运行期 panic**（可被 `try()` 捕获，`panic_msg()` 取消息；panic
+  "integer add overflow" 等）。复合赋值 `+= -= *=`、`++`/`--`、for 更新段
+  走同一路径；u8..u128 同样检查（无符号按无符号溢出位）。**浮点不受影响**
+  （IEEE 语义不变）。
+- 编译开关 `zfyc build --wrap-overflow`（别名 `-Wno-overflow-check`）：
+  切回旧的**静默回绕**语义（`+ - *` `**` 移位不检查、溢出按位宽回绕）。
+- **显式溢出内建**（永不 panic，任何模式下行为一致）：
+
+  | 内建 | 语义 | 返回类型 |
+  |---|---|---|
+  | `wrapping_add(a, b)` / `wrapping_sub` / `wrapping_mul` | 回绕 | 与实参**同宽同类型** |
+  | `wrapping_neg(a)` | 取负回绕 | 同上 |
+  | `saturating_add` / `saturating_sub` / `saturating_mul` | 饱和到类型边界 | 同上 |
+  | `checked_add` / `checked_sub` / `checked_mul` | 溢出返回错误值 | `T!`（成功 code=0，溢出 `ErrCode.OVERFLOW`=12） |
+
+  实参须同为整数类型（宽度/符号不一致报错）；未定型字面量实参按默认型
+  （`i64`）或外层期望定型——**观察 i32 回绕/饱和请传 i32 变量**。
+  `checked_*` 的溢出走 `??` 兜底，不 panic：
+  `let i32! c = checked_add(2147483647, 1) ?? -1`。
+- **常量折叠溢出**：检查模式下编译期报错（`constant overflow in integer
+  addition/subtraction/multiplication/division/negation`）；`--wrap-overflow`
+  下按回绕折叠。
+- `/` `%` 向零截断（`-7 / 2 = -3`）；**整数除零 = panic**（不再硬件异常，
+  亦被 try 捕获）；frac 除零走 panic。
 - 所有权：返回数组/列表/string = 指针移交（RVO）。
   **struct 赋值/初始化取消隐式深拷贝**（new.md）：RHS 为既有值的变量/
   字段/元素链时必须写 `copy(x)`（显式深拷贝）或 `move x`（所有权转移，
@@ -714,10 +802,10 @@ let u8 y = -1            // E3155：负值不在 u8 范围
 - `(* *)` 不是注释；块注释内可含中文/UTF-8。
 - 字符串无内建字典序排序（可用 `<` 自行比较）。
 - struct 不能整体 output。
-- extern 不支持序列（数组/列表）返回。
-- 溢出无检查（i128 除外：字面量编译期范围校验）。
-- 移位量 ≥ 位宽未定义（LLVM poison）；`x & 1 == 1` 按优先级解析为
-  `x & (1 == 1)`，位运算与比较混用建议加括号。
+- extern 允许 `T[]` / `T*` 返回（unsafe 语义，§10）；变参只收标量/string/指针。
+- 整数溢出**默认检查**（`+ - *`、一元负号、`**`、`abs` 溢出即 panic，可被
+  `try()` 捕获）；`--wrap-overflow` 切回静默回绕（§15）。
+- `x & 1 == 1` 按优先级解析为 `x & (1 == 1)`，位运算与比较混用建议加括号。
 - 分数字面量写 `(n/d)`（§5）；裸 `n/d` 是整数除法，落 frac 目标报错。
   浮点缩放常量请写成科学计数法（如 `1.1102230246251565e-16`）而非
   `1.0/9007199254740992.0`。
@@ -726,7 +814,8 @@ let u8 y = -1            // E3155：负值不在 u8 范围
 - **`**` 整数幂**：≤64 位走 zfy_pow_ll/ull；
   i128/u128 走 zfy_pow_u128/i128（64 位对接口，指数支持完整 128 位，
   如 `2 ** 2^64`）；跨宽度提升与通用算术一致（`u64 ** i32` 隐式宽化）；
-  整数负指数 = 0；整数溢出回绕无检查。
+  整数负指数 = 0；**整数溢出默认 panic**（检查模式，§15；`--wrap-overflow`
+  下按回绕语义）。
 - **浮点与整数不能隐式混算**：含浮点字面量的表达式与
   整数变量混算报 E3190（如 `2.0 * x`，x 为 i64）——请显式
   `cast(x, f64)`；纯字面量混合树（`2.5 + 1`）整树按浮点算（f32 上下文

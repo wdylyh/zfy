@@ -1,0 +1,7 @@
+fn void take(let i32[] xs)
+    output(length(xs))
+fn main()
+    let i32[] xs = 1, 2
+    let p = borrow(xs)
+    output(p^[0])
+    take(move xs)

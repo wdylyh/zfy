@@ -1,0 +1,7 @@
+// 报错用例：不支持的 extern ABI 名（只允许 C/stdcall/fastcall/vectorcall/thiscall）
+// 期望错误：unsupported extern ABI "sysv64"
+extern "sysv64"
+    i32 abi_probe(let i32 a)
+
+fn main()
+    return 0

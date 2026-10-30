@@ -1,0 +1,30 @@
+// 审计 c：mutex / chan 句柄循环内声明（作用域退出释放）、close 路径、
+// 顶层存活句柄（不算泄漏）。ZFY_LEAK_DEBUG=1 应 0 泄漏
+fn main()
+    // ① 循环内 mutex：每轮 mutex_new，作用域退出 zfy_mutex_free（rc release）
+    let i64 i = 0
+    while i < 5
+        let m = mutex_new()
+        lock m
+            i = i + 1
+        unlock(m)
+    output(i)
+    // ② 循环内 chan：声明即构造，close 后作用域退出释放
+    let i64 j = 0
+    while j < 5
+        let chan<string> ch
+        chan_send(ch, "x")
+        output(chan_recv(ch) ?? "miss")
+        chan_close(ch)
+        output(chan_recv(ch) ?? "miss")
+        j = j + 1
+    // ③ 顶层句柄：进程退出时仍存活（不计泄漏）
+    let m2 = mutex_new()
+    lock m2
+        output("locked")
+    unlock(m2)
+    let chan<i32> ch2
+    chan_send(ch2, 7)
+    output(chan_recv(ch2) ?? -1)
+    chan_close(ch2)
+    output("mc ok")

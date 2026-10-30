@@ -1,0 +1,9 @@
+struct Bag
+    i32 a
+    i32 m
+fn main()
+    let Bag b = Bag(a=1, m=2)
+    let p = borrow(b.a)
+    output(p^)
+    b.a = 9
+    output(b.a)

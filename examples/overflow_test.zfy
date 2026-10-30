@@ -1,0 +1,206 @@
+// 任务一回归：整数溢出默认检查（panic 可被 try 捕获）+ 显式回绕/饱和/检查内建
+// 说明：默认（检查模式）下 + - * / % ** 移位 一元负号 |e| 溢出即 panic；
+// wrapping_* 永回绕、saturating_* 饱和、checked_* 返回 T!（溢出 code=OVERFLOW）。
+fn void boom_add()
+    let i32 m = 2147483647
+    let i32 r = m + 1
+    output(r)
+
+fn void boom_sub()
+    let i32 m = -2147483647 - 1
+    let i32 r = m - 1
+    output(r)
+
+fn void boom_mul()
+    let i32 m = 100000
+    let i32 r = m * m
+    output(r)
+
+fn void boom_neg()
+    let i32 m = -2147483647 - 1
+    let i32 r = -m
+    output(r)
+
+fn void boom_pow()
+    let i32 b = 2
+    let i32 e = 31
+    let i32 r = b**e
+    output(r)
+
+fn void boom_divzero()
+    let i32 m = 7
+    let i32 z = 0
+    let i32 r = m / z
+    output(r)
+
+fn void boom_modzero()
+    let i32 m = 7
+    let i32 z = 0
+    let i32 r = m % z
+    output(r)
+
+fn void boom_min_div()
+    let i32 m = -2147483647 - 1
+    let i32 d = -1
+    let i32 r = m / d
+    output(r)
+
+fn void boom_shl()
+    let i32 v = 1
+    let i32 n = 32
+    let i32 r = v << n
+    output(r)
+
+fn void boom_negshift()
+    let i32 v = 8
+    let i32 n = -1
+    let i32 r = v >> n
+    output(r)
+
+fn void boom_abs()
+    let i32 m = -2147483647 - 1
+    let i32 r = |m|
+    output(r)
+
+fn void boom_compound()
+    let i32 m = 2147483647
+    let i32 r = 0
+    r = m
+    r += 1
+    output(r)
+
+fn void boom_inc()
+    let i32 m = 2147483647
+    m++
+    output(m)
+
+fn void boom_u32()
+    let u32 m = 4294967295
+    let u32 r = m + 1
+    output(r)
+
+fn void boom_i64()
+    let i64 m = 9223372036854775807
+    let i64 r = m + 1
+    output(r)
+
+fn main()
+    let i32 bad = 0
+
+    // ---- 不溢出的正常路径保持正确 ----
+    let i32 x = 2147483646
+    if x + 1 != 2147483647
+        bad++
+    let i32 y = -2147483647 - 1
+    if y + 1 != -2147483647
+        bad++
+    if 2 + 3 != 5 or 10 - 4 != 6 or 6 * 7 != 42
+        bad++
+    if -5 != 0 - 5
+        bad++
+
+    // ---- 各类溢出 panic 被 try 捕获（try 返回 false） ----
+    if try(boom_add) != false
+        bad++
+    if try(boom_sub) != false
+        bad++
+    if try(boom_mul) != false
+        bad++
+    if try(boom_neg) != false
+        bad++
+    if try(boom_pow) != false
+        bad++
+    if try(boom_divzero) != false
+        bad++
+    if try(boom_modzero) != false
+        bad++
+    if try(boom_min_div) != false
+        bad++
+    if try(boom_shl) != false
+        bad++
+    if try(boom_negshift) != false
+        bad++
+    if try(boom_abs) != false
+        bad++
+    if try(boom_compound) != false
+        bad++
+    if try(boom_inc) != false
+        bad++
+    if try(boom_u32) != false
+        bad++
+    if try(boom_i64) != false
+        bad++
+
+    // ---- 分数字面量/浮点不受影响（IEEE 语义不变） ----
+    let f64 f = 1.0 / 0.0
+    if f == 0.0
+        bad++
+
+    // ---- wrapping_*：永不 panic，回绕结果与参数同宽同类型 ----
+    // 注意：内建按实参类型定型，纯字面量实参默认 i64（不溢出）；
+    // 要观察 i32 回绕须传 i32 变量（Rust 同款"与参数同宽"语义）
+    let i32 imax = 2147483647
+    let i32 iunit = 1
+    if wrapping_add(imax, iunit) != -2147483647 - 1
+        bad++
+    let i32 mn = -2147483647 - 1
+    if wrapping_sub(mn, iunit) != 2147483647
+        bad++
+    let i32 m100k = 100000
+    if wrapping_mul(m100k, m100k) != 1410065408   // 10^10 mod 2^32
+        bad++
+    if wrapping_neg(mn) != mn
+        bad++
+    let u32 umax = 4294967295
+    if wrapping_add(umax, 1) != 0
+        bad++
+    let u64 ubig = 9223372036854775807
+    let u64 uw = wrapping_mul(ubig, 4)
+    if uw != 0xFFFFFFFFFFFFFFFC
+        bad++
+
+    // ---- checked_*：成功返回 code=0 的值，溢出返回 OVERFLOW（不 panic） ----
+    let i32! ok = checked_add(1, 2)
+    if (ok ?? -999) != 3
+        bad++
+    let i32! ov = checked_add(2147483647, 1)
+    if (ov ?? -999) != -999
+        bad++
+    let i32 code = 0
+    let i32 c2 = handled(ov, ref code)
+    if code != ErrCode.OVERFLOW
+        bad++
+    if c2 != 0
+        bad++
+    let u64! oku = checked_mul(3, 5)
+    if (oku ?? 0) != 15
+        bad++
+    let u64! ovu = checked_mul(4294967296, 4294967296)   // 2^64 溢出
+    if (ovu ?? 0) != 0
+        bad++
+
+    // ---- saturating_*：饱和到类型边界 ----
+    if saturating_add(imax, iunit) != 2147483647
+        bad++
+    if saturating_sub(mn, iunit) != -2147483647 - 1
+        bad++
+    if saturating_mul(m100k, m100k) != 2147483647
+        bad++
+    let u32 us = 4294967295
+    if saturating_add(us, 1) != 4294967295
+        bad++
+    if saturating_sub(us, us) != 0
+        bad++
+
+    if bad != 0
+        output("overflow_test FAILED: ", bad, "\n")
+        return 1
+    output("overflow_test OK\n")
+    return 0
+
+// 取错误码：在 ?? 兜底块里读 err.code，同时返回兜底值
+fn i32 handled(let i32! v, ref let i32 code)
+    let i32 r = v ??
+        code = err.code
+        0
+    return r
