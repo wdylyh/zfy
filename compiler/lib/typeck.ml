@@ -1392,12 +1392,27 @@ and const_eval (env : env) (e : texpr) : int64 option =
         | BBitAnd -> Some (Int64.logand x y)
         | BBitOr -> Some (Int64.logor x y)
         | BBitXor -> Some (Int64.logxor x y)
-        | BShl when y >= 0L && y < 64L -> Some (Int64.shift_left x (Int64.to_int y))
-        | BShr when y >= 0L && y < 64L ->
-          (* 与 llvmgen 一致：有符号 ashr、无符号 lshr *)
-          (match resolve e.ety with
-           | TUint _ -> Some (Int64.shift_right_logical x (Int64.to_int y))
-           | _ -> Some (Int64.shift_right x (Int64.to_int y)))
+        | (BShl | BShr) as shop ->
+          (* 移位常量折叠：计数先按操作数位宽校验（v3.33）——常量表达式
+             的移位越界是可证明的运行期 panic，编译期直接报错（fail-fast；
+             运行期语义见 llvmgen 冷块 panic）。此前折叠按 i64 域计算且
+             只查 y<64，1 << 33（i32）被静默算成 2^33 逃过检查 *)
+          let fail () =
+            terr e.epos
+              "shift count %Ld overflows a %d-bit operand in a constant expression \
+               (runtime shifts panic; split the shift or use a wider type)" y
+              (match resolve a.ety with TInt w | TUint w -> w | _ -> 64)
+          in
+          (match resolve a.ety with
+           | TInt w | TUint w when y >= Int64.of_int w -> fail ()
+           | _ ->
+             if y < 0L || y >= 64L then None
+             else if shop = BShl then Some (Int64.shift_left x (Int64.to_int y))
+             else
+               (* 与 llvmgen 一致：有符号 ashr、无符号 lshr *)
+               (match resolve e.ety with
+                | TUint _ -> Some (Int64.shift_right_logical x (Int64.to_int y))
+                | _ -> Some (Int64.shift_right x (Int64.to_int y))))
         | BPow ->
           (** 幂常量折叠（v3.3.2）：与 runtime zfy_pow_ll/ull 语义一致——
               负指数 = 0、乘法按 64 位回绕（Int64.mul 天然回绕），
@@ -2909,6 +2924,65 @@ and check_expr env (e : expr) : texpr =
         if (frac_lit_side rl tl && floaty_side rr tr)
         || (frac_lit_side rr tr && floaty_side rl tl) then
           terr p' "a fraction literal (n/d) cannot be mixed with floats (assign it to a typed variable first)";
+        (* v3.33：双侧均为 (n/d) 分数字面量（含已折叠的字面量树）→ 编译期
+           按精确有理数折叠成单个分数字面量节点（EIntK + frac_lits 登记），
+           落型完整复用单字面量的全部期望路径（int=截断整除 / float=查表
+           实数除 / frac=精确构造 / 无期望=i32 frac 兜底）。此前两侧 TVar
+           盲目 unify，frac 期望报 E3000 不可推断、float 期望错误地按截断
+           整数转 f64（(1/3)+(2/3) 得 0.0 而非 1.0）、比较按截断值误判。
+           溢出：中间乘积按 i64 回绕（与运行时 frac 同宽语义一致） *)
+        let rec lit_of t =
+          match resolve t.ety with
+          | TVar _ when is_frac_lit_t t -> Some (frac_lit_get t)
+          | _ -> None
+        in
+        let mk_frac_fold n d =
+          let (n, d) = if d < 0L then (Int64.neg n, Int64.neg d) else (n, d) in
+          (* 约分（gcd）：输出形态与运行时 frac 归一一致（9/9 → 1/1） *)
+          let rec gcd a b =
+            if b = 0L then (if a < 0L then Int64.neg a else a)
+            else gcd b (Int64.rem a b)
+          in
+          let g = gcd n d in
+          let (n, d) =
+            if g > 1L then (Int64.div n g, Int64.div d g) else (n, d)
+          in
+          incr var_counter;
+          let id = !var_counter in
+          Hashtbl.replace frac_lits id (n, d);
+          mk (EIntK (Int64.div n d)) (TVar id)
+        in
+        let collapsed =
+          match lit_of tl, lit_of tr with
+          | Some (n1, d1), Some (n2, d2) ->
+            (match bop with
+             | (BEq | BNe | BLt | BGt | BLe | BGe) as cmp ->
+               (* 精确比较：交叉相乘（d 恒正，无需通分） *)
+               let l = Int64.mul n1 d2 and r = Int64.mul n2 d1 in
+               let b =
+                 (match cmp with
+                  | BEq -> l = r | BNe -> l <> r | BLt -> l < r
+                  | BGt -> l > r | BLe -> l <= r | BGe -> l >= r)
+               in
+               Some (mk (EBoolK b) TBool)
+             | BAdd ->
+               Some (mk_frac_fold (Int64.add (Int64.mul n1 d2) (Int64.mul n2 d1))
+                       (Int64.mul d1 d2))
+             | BSub ->
+               Some (mk_frac_fold (Int64.sub (Int64.mul n1 d2) (Int64.mul n2 d1))
+                       (Int64.mul d1 d2))
+             | BMul ->
+               Some (mk_frac_fold (Int64.mul n1 n2) (Int64.mul d1 d2))
+             | BDiv ->
+               if n2 = 0L then
+                 terr p' "fraction literal division by zero (zero divisor)";
+               Some (mk_frac_fold (Int64.mul n1 d2) (Int64.mul d1 n2))
+             | _ -> None (* BMod/BPow/位移：维持既有整数语义路径 *))
+          | _ -> None
+        in
+        (match collapsed with
+         | Some te -> te
+         | None ->
         let other_int t =
           match t with TInt _ | TUint _ | TChar -> true | _ -> false in
         (if (floaty_side rl tl && other_int rr)
@@ -2969,6 +3043,7 @@ and check_expr env (e : expr) : texpr =
             (tl, tr, res_ty)
         in
         mk (EBinK (bop, tl, tr)) res_ty
+        )
       end
   | EUn (op, e1, p') ->
     let t1 = check_expr env e1 in
@@ -5637,6 +5712,11 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
           | None ->
             let t = check_expr env e in
             (match resolve t.ety with
+             | TVar _ when is_frac_lit_t t ->
+               (* 分数字面量树（v3.33 编译期精确折叠为单字面量节点）：
+                  与单字面量推断一致 → i32 frac；checked 置 None 让初值
+                  在期望 TFrac 上下文重检（精确构造，同 lit_ty 路径） *)
+               (true, TNamed ("i32", p), None)
              | TVar _ ->
                terr p "cannot infer the declaration type from this initializer; give an explicit type"
              | _ when is_frac0 ->
