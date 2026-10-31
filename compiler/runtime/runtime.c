@@ -2030,6 +2030,14 @@ void zfy_map_put_s_str(zfy_map **mp, const char *k, char *v) {
     zfy_map_put_raw(mp, 0, k, (unsigned long long)(size_t)zfy_strdup(v), 1);
 }
 
+/* ---- RAII 零槽探测（v3.35）：全零槽跳过用户 drop ---- */
+
+int zfy_slot_is_zero(void *p, long long n) {
+    const char *q = (const char *)p;
+    for (long long i = 0; i < n; i++) if (q[i]) return 0;
+    return 1;
+}
+
 /* ---- 128 位键通道（v3.34）：16 字节二进制键，k_s 复用为缓冲指针 ---- */
 
 /* 键打包：lo/hi 两个 i64 -> 堆上 16 字节缓冲（调用后所有权归 map 表） */

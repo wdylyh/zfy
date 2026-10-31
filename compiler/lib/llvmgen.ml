@@ -2415,10 +2415,27 @@ let gen_instr fc (i : instr) : unit =
     let (dstp, _) = ptr_of fc (operand_of_name name ty) in
     (match ty with
      | TStruct s ->
-       (* struct：释放目标旧资源后槽 memcpy（资源所有权随临时移交） *)
-       emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s dstp;
+       (* v3.35 RAII：覆盖语义（同 assign）——旧值机械级联释放（rel，
+          不调 drop：对象逻辑存活至作用域退出），随后整槽清零（rel 后
+          字段悬垂，防 move_from 内机械字段赋值 double-free），再接管：
+          用户定义 move_from 时调 move_from(dst, src) 逐字段窃取，否则
+          槽 memcpy（资源所有权随临时移交）。两路之后 MClear 整槽清零
+          （防源残留悬垂字段）。无任何 hook 的 struct：free 即 rel
+          （单函数布局），直接引用 free *)
+       let has_hook =
+         Option.is_some (Hashtbl.find_opt Typeck.method_tbl (s, "move_from"))
+         || Option.is_some (Hashtbl.find_opt Typeck.method_tbl (s, "copy_from"))
+         || Option.is_some (Hashtbl.find_opt Typeck.method_tbl (s, "drop")) in
+       if has_hook then begin
+         emitf fc "  call void @zfy_struct_rel_%s(ptr %s)" s dstp;
+         emitf fc "  call void @llvm.memset.p0.i64(ptr %s, i8 0, i64 %d, i1 false)"
+           dstp (size_of fc.g ty)
+       end else
+         emitf fc "  call void @zfy_struct_free_%s(ptr %s)" s dstp;
        let (sp, _) = ptr_of fc v in
-       gen_memcpy fc dstp sp (size_of fc.g ty)
+       (match Hashtbl.find_opt Typeck.method_tbl (s, "move_from") with
+        | Some mf -> emitf fc "  call void @%s(ptr %s, ptr %s)" mf dstp sp
+        | None -> gen_memcpy fc dstp sp (size_of fc.g ty))
      | TFile ->
        (* File：目标旧句柄自动 close（幂等，null/已关闭跳过）后接管新句柄 *)
        let ov = fresh_r fc in
@@ -2437,9 +2454,16 @@ let gen_instr fc (i : instr) : unit =
        if st <> "ptr" then lerr None "invalid move target slot type %s" st;
        emitf fc "  store ptr %s, ptr %s" sv dstp)
   | MClear (name, ty) ->
-    (* move 后清槽：资源所有权已移交，置空防 RAII 双释放 *)
+    (* move 后清槽：资源所有权已移交，置空防 RAII 双释放。
+       struct 整槽清零（v3.35 修复：此前只清首 8 字节，多资源 struct 的
+       其余字段在源槽悬垂——源槽生命周期结束时级联释放 → 双释放堆损坏）。
+       drop 钩子路径亦依赖全零（drop 必须容忍零值字段） *)
     let (dstp, _) = ptr_of fc (operand_of_name name ty) in
-    emitf fc "  store ptr null, ptr %s" dstp
+    (match ty with
+     | TStruct _ ->
+       emitf fc "  call void @llvm.memset.p0.i64(ptr %s, i8 0, i64 %d, i1 false)"
+         dstp (size_of fc.g ty)
+     | _ -> emitf fc "  store ptr null, ptr %s" dstp)
   | MBinop (d, bop, a, b) ->
     let r = fresh_r fc in
     gen_binop fc r bop a b;
@@ -3876,6 +3900,39 @@ let gen_struct_type_def (g : gctx) (sd : sdef) : string =
    - closure$<sig>：field0 = env 块地址 → @zfy_env_free（t-049/C：env 自
      描述析构——块内 dtor 级联释放捕获副本 + rc 递减 + free 块）。
    字段级 move-only 类型（嵌套句柄/接口/闭包借拷）跳过——级联会双释放 *)
+(* 单字段级联释放（v3.35 从 gen_struct_free_fn 抽出，rel/free 两段共用） *)
+let emit_field_release b sd sn i fty is_clenv =
+  let emit : 'a. ('a, unit, string, unit) format4 -> 'a =
+    fun fmt -> Printf.ksprintf (fun s -> Buffer.add_string b (s ^ "\n")) fmt
+  in
+  let fp = Printf.sprintf "%%f%d" i and v = Printf.sprintf "%%v%d" i in
+  match fty with
+  | TStruct s2 when is_move_only_sname_ll s2 && not is_clenv -> ()
+    (* move-only 字段：共享借用拷，不级联（双释放） *)
+  | TStruct s2 when is_move_only_sname_ll s2 ->
+    (* clenv 捕获副本：递归 rc release *)
+    emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+    emit "  call void @zfy_struct_free_%s(ptr %s)" s2 fp
+  | TPtr (TStruct s2)
+    when String.length s2 > 5 && String.sub s2 0 5 = "zbox$" ->
+    (* & 捕获字段（t-049/C）：zbox 堆箱指针（MClNew 写入时 retain 过），
+       release 箱（归零析构载荷 + free） *)
+    emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+    emit "  %s = load ptr, ptr %s" v fp;
+    emit "  call void @zfy_rc_release(ptr %s, ptr @zfy_struct_free_%s)" v s2
+  | TString ->
+    emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+    emit "  %s = load ptr, ptr %s" v fp;
+    emit "  call void @zfy_free_str(ptr %s)" v
+  | TArray _ | TList _ ->
+    emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+    emit "  %s = load ptr, ptr %s" v fp;
+    emit "  call void @zfy_seq_free(ptr %s)" v
+  | TStruct s2 ->
+    emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
+    emit "  call void @zfy_struct_free_%s(ptr %s)" s2 fp
+  | _ -> ()
+
 let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
   let sn = struct_ty_name sd.sname in
   (* union（任务二）：只有一个活跃字段，按哪个字段释放无法判定（字段访问
@@ -3931,39 +3988,49 @@ let gen_struct_free_fn (g : gctx) (sd : sdef) : string =
      字段是共享借拷才 skip，此处不可跳过（泄漏） *)
   let is_clenv =
     String.length sd.sname > 6 && String.sub sd.sname 0 6 = "clenv$" in
-  emit "define void @zfy_struct_free_%s(ptr %%p) {" sd.sname;
-  List.iteri
-    (fun i (_, fty) ->
-      let fp = Printf.sprintf "%%f%d" i and v = Printf.sprintf "%%v%d" i in
-      match fty with
-      | TStruct s2 when is_move_only_sname_ll s2 && not is_clenv -> ()
-        (* move-only 字段：共享借用拷，不级联（双释放） *)
-      | TStruct s2 when is_move_only_sname_ll s2 ->
-        (* clenv 捕获副本：递归 rc release *)
-        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
-        emit "  call void @zfy_struct_free_%s(ptr %s)" s2 fp
-      | TPtr (TStruct s2)
-        when String.length s2 > 5 && String.sub s2 0 5 = "zbox$" ->
-        (* & 捕获字段（t-049/C）：zbox 堆箱指针（MClNew 写入时 retain 过），
-           release 箱（归零析构载荷 + free） *)
-        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
-        emit "  %s = load ptr, ptr %s" v fp;
-        emit "  call void @zfy_rc_release(ptr %s, ptr @zfy_struct_free_%s)" v s2
-      | TString ->
-        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
-        emit "  %s = load ptr, ptr %s" v fp;
-        emit "  call void @zfy_free_str(ptr %s)" v
-      | TArray _ | TList _ ->
-        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
-        emit "  %s = load ptr, ptr %s" v fp;
-        emit "  call void @zfy_seq_free(ptr %s)" v
-      | TStruct s2 ->
-        emit "  %s = getelementptr inbounds %s, ptr %%p, i32 0, i32 %d" fp sn i;
-        emit "  call void @zfy_struct_free_%s(ptr %s)" s2 fp
-      | _ -> ())
-    sd.sfields;
-  Buffer.add_string b "  ret void\n}\n";
-  Buffer.contents b
+  (* v3.35 RAII：用户定义 drop（fn void drop()）时生成
+     rel（字段级联释放，无 drop）+ free = drop + rel 两段。
+     drop 在字段释放前调用（用户先清理外部资源，字段仍走默认级联）；
+     move 后/未初始化路径以全零字段调用 drop——用户 drop 必须幂等且
+     容忍零值字段。copy_from（拷贝构造）经 rel 释放旧值（见 assign） *)
+  let drop_g =
+    if is_clenv then None
+    else Hashtbl.find_opt Typeck.method_tbl (sd.sname, "drop") in
+  (* rel 独立发射条件：drop（free 两段化）或 move_from/copy_from
+     （覆盖路径需机械级联释放，见 MMoveSeq/assign hook） *)
+  let need_rel =
+    drop_g <> None
+    || (not is_clenv
+        && (Option.is_some (Hashtbl.find_opt Typeck.method_tbl (sd.sname, "move_from"))
+            || Option.is_some (Hashtbl.find_opt Typeck.method_tbl (sd.sname, "copy_from")))) in
+  if not need_rel then begin
+    (* 无任何 hook：free 即 rel，保持单函数（既有布局不变） *)
+    emit "define void @zfy_struct_free_%s(ptr %%p) {" sd.sname;
+    List.iteri (fun i (_, fty) -> emit_field_release b sd sn i fty is_clenv)
+      sd.sfields;
+    Buffer.add_string b "  ret void\n}\n";
+    Buffer.contents b
+  end else begin
+    let drop_g = match drop_g with Some g -> g | None -> assert false in
+    let (fsz, _) = Hir.struct_size_align g.structs sd in
+    emit "define void @zfy_struct_rel_%s(ptr %%p) {" sd.sname;
+    List.iteri (fun i (_, fty) -> emit_field_release b sd sn i fty is_clenv)
+      sd.sfields;
+    emit "  ret void";
+    emit "}";
+    emit "define void @zfy_struct_free_%s(ptr %%p) {" sd.sname;
+    (* 零槽保护：声明初始化/move 清源等路径槽为全零（从未初始化），
+       跳过 drop（否则用户 drop 读到 null 字段即段错误） *)
+    emit "  %%zz = call i1 @zfy_slot_is_zero(ptr %%p, i64 %d)" fsz;
+    emit "  br i1 %%zz, label %%zskip, label %%zdo";
+    emit "zskip:";
+    emit "  ret void";
+    emit "zdo:";
+    emit "  call void @%s(ptr %%p)" drop_g;
+    emit "  call void @zfy_struct_rel_%s(ptr %%p)" sd.sname;
+    Buffer.add_string b "  ret void\n}\n";
+    Buffer.contents b
+  end
   end
 
 (* 生成 @zfy_struct_assign_<名>(ptr dst, ptr src)：逐字段深拷贝
@@ -4044,6 +4111,29 @@ let gen_struct_assign_fn (g : gctx) (sd : sdef) : string =
     fun fmt -> Printf.ksprintf (fun s -> Buffer.add_string b (s ^ "\n")) fmt
   in
   let sn = struct_ty_name sd.sname in
+  (* v3.35 RAII：用户定义 copy_from（fn void copy_from(ref let S src)）
+     时拷贝构造接管：别名守卫（自赋值 a = a 直跳）→ rel 旧值（机械级联
+     释放，不调 drop——覆盖语义）+ 整槽清零（rel 后字段悬垂，防 copy_from
+     内机械字段赋值 double-free）→ 调 copy_from(dst, src) 逐字段填新。
+     ifnew 路径 dst 为全新零块：rel/memset 均为无操作 *)
+  (match Hashtbl.find_opt Typeck.method_tbl (sd.sname, "copy_from") with
+   | Some cf ->
+     let (fsz, _) = Hir.struct_size_align g.structs sd in
+     Printf.ksprintf (Buffer.add_string b)
+       "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {\n\
+       \  %%alias = icmp eq ptr %%dst, %%src\n\
+       \  br i1 %%alias, label %%done, label %%go\n\
+        go:\n\
+       \  call void @zfy_struct_rel_%s(ptr %%dst)\n\
+       \  call void @llvm.memset.p0.i64(ptr %%dst, i8 0, i64 %d, i1 false)\n\
+       \  call void @%s(ptr %%dst, ptr %%src)\n\
+       \  br label %%done\n\
+        done:\n\
+       \  ret void\n\
+        }\n"
+       sd.sname sd.sname fsz cf;
+     Buffer.contents b
+   | None ->
   emit "define void @zfy_struct_assign_%s(ptr %%dst, ptr %%src) {" sd.sname;
   let (ls, _, _) = Hir.struct_layout g.structs sd in
   let prev_member = ref (-1) in
@@ -4111,6 +4201,7 @@ let gen_struct_assign_fn (g : gctx) (sd : sdef) : string =
     sd.sfields;
   Buffer.add_string b "  ret void\n}\n";
   Buffer.contents b
+  )
   end
 
 let gen_program (m : mir) : string =
@@ -4331,6 +4422,7 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_print_bool(i32)\n";
   (* 释放辅助 *)
   Buffer.add_string g.mbuf "declare void @zfy_free_str(ptr)\n";
+  Buffer.add_string g.mbuf "declare i1 @zfy_slot_is_zero(ptr, i64)\n";
   Buffer.add_string g.mbuf "declare ptr @zfy_strdup(ptr)\n";
   (* P0-1/P0-4（v3.27）：跟踪错误消息分配、全局资源注册表、句柄释放、
      线程移交 spawn、panic 退出档位 *)

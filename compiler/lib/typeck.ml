@@ -7098,6 +7098,17 @@ and check_stmt env (st : stmt) : tstmt =
              Hashtbl.replace env.moved src_slot ();
              mk (SAssignK ({ e = EVarK slot; ety = lty; epos = p' },
                            { e = EVarK src_slot; ety = lty; epos = p2 }, false, true))
+           | EMoveOf (EVar (n2, p2), _) when n2 <> name && lookup_var env n2 <> None ->
+             (* 显式 move 赋值：同自动 move——所有权转移（mov=true，mir 侧
+                MMoveSeq + MClear 源槽），v3.35 前此路径误入深拷贝（copy_from）
+                且源不清空。check_move_arg 已标记源 moved *)
+             let trhs0 = check_expr env rhs' in
+             ignore (coerce p' trhs0 lty);
+             let src_slot =
+               (match lookup_var env n2 with
+                | Some s -> s.lslot | None -> assert false) in
+             mk (SAssignK ({ e = EVarK slot; ety = lty; epos = p' },
+                           { e = EVarK src_slot; ety = lty; epos = p2 }, false, true))
            | _ ->
              let lty = l.lty in
              if (match resolve lty with TStruct _ -> true | _ -> false)

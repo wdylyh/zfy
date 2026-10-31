@@ -1,0 +1,36 @@
+// 自定义析构/拷贝构造/移动构造（v3.35 RAII 钩子）
+struct Res
+    string tag
+    i32 alive = 1
+    fn void drop()
+        if self.alive == 1
+            output("drop:" + self.tag)
+        self.alive = 0
+    fn void copy_from(ref let Res src)
+        self.tag = "copy<" + src.tag + ">"
+        self.alive = src.alive
+    fn void move_from(ref let Res src)
+        self.tag = src.tag
+        self.alive = src.alive
+        src.alive = 0
+fn Res make(let string t)
+    let Res r = Res(t, 1)
+    return move(r)
+fn main()
+    // 1) 作用域退出 drop（函数调用 3 次验证释放配平）
+    let i32 i = 0
+    while i < 3
+        let Res a = make("s" + to_str(i))
+        output("use:" + a.tag)
+        i++
+    // 2) copy_from：拷贝独立、源不受影响
+    let Res p = make("orig")
+    let Res q = copy(p)
+    output("q=" + q.tag)
+    output("p=" + p.tag)
+    // 3) move_from：move 赋值转移所有权
+    let Res m1 = make("m1")
+    let Res m2 = Res("placeholder", 1)
+    m2 = move(m1)
+    output("m2=" + m2.tag)
+    output("ok")
