@@ -959,8 +959,9 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
         (match kz with
          | TInt w when w <= 64 -> ()
          | TUint w when w <= 64 -> ()
+         | TInt 128 | TUint 128 -> ()   (* v3.34：128 位键（kbig 16 字节二进制键通道） *)
          | TString -> ()
-         | _ -> terr pp "map key must be an integer (<=64-bit) or string");
+         | _ -> terr pp "map key must be an integer (<=128-bit) or string");
         let vz = arg_zty vta in
         (match vz with
          | TInt w when w <= 64 -> ()
@@ -973,8 +974,9 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
         (match ez with
          | TInt w when w <= 64 -> ()
          | TUint w when w <= 64 -> ()
+         | TInt 128 | TUint 128 -> ()   (* v3.34：128 位元素（kbig 通道） *)
          | TString -> ()
-         | _ -> terr pp "set element must be an integer (<=64-bit) or string");
+         | _ -> terr pp "set element must be an integer (<=128-bit) or string");
         (ez, None)
       | "map", _ -> terr pp "map expects 2 type arguments: map<K, V>"
       | _ -> terr pp "set expects 1 type argument: set<T>"
@@ -1712,6 +1714,17 @@ and big_ok (digits : string) (unsigned : bool) : bool =
 and map_key_arg env p (tidx : texpr) : string * texpr =
   match resolve tidx.ety with
   | TString -> ("s", coerce p tidx TString)
+  | TInt 128 | TUint 128 ->
+    (* v3.34：128 位键 → 16 字节二进制键（kbig 通道）。zfy_map_key128
+       打包 lo/hi 两个 i64 为堆上 16 字节缓冲（表拥有）；运行时哈希
+       mix64(lo)^rot(mix64(hi))、eq = memcmp16 *)
+    let hi_t =
+      { e = EBinK (BShr, tidx, { e = EIntK 64L; ety = TInt 128; epos = tidx.epos });
+        ety = TInt 128; epos = tidx.epos }
+    in
+    ( "k",
+      { e = ECallK ("zfy_map_key128", [ to_i64 tidx; to_i64 hi_t ], []);
+        ety = TString; epos = tidx.epos } )
   | _ -> ("i", to_i64 tidx)
 
 (* map 值种类标签（运行时函数后缀）：整数统一 i64 位模式 *)
@@ -1746,14 +1759,14 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
     in
     (* 整数键/值实参统一 i64 槽（运行时 8 字节） *)
     let key_param kt =
-      match resolve kt with TString -> TString | _ -> TInt 64
+      match resolve kt with TString | TInt 128 | TUint 128 -> TString | _ -> TInt 64
     in
     match name0, targs with
     | "set_add", [ s; x ] ->
       (match resolve s.ety with
        | TStruct sn when cont_kind sn = Some "set" ->
          let (kt, _) = cont_kv env.g sn p in
-         let kf = (match resolve kt with TString -> "s" | _ -> "i") in
+         let kf = (match resolve kt with TString -> "s" | TInt 128 | TUint 128 -> "k" | _ -> "i") in
          mkf ("zfy_set_add_" ^ kf) [ TStruct sn; key_param kt ] TVoid
        | t -> terr p "set_add expects a set, got %s" (pp_zty t))
     | ("map_len" | "set_len"), [ m ] ->
@@ -1768,7 +1781,7 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
          mkf "zfy_str_contains" [ TString; TString ] TBool
        | TStruct s when cont_kind s <> None ->
          let (kt, _) = cont_kv env.g s p in
-         let kf = (match resolve kt with TString -> "s" | _ -> "i") in
+         let kf = (match resolve kt with TString -> "s" | TInt 128 | TUint 128 -> "k" | _ -> "i") in
          mkf ("zfy_map_has_" ^ kf) [ TStruct s; key_param kt ] TBool
        | TList _ ->
          let e = seq_elem m in
@@ -1786,7 +1799,7 @@ and container_call env p name0 (targs : texpr list) : (string * fn_sig) option =
       (match resolve m.ety with
        | TStruct s when cont_kind s <> None ->
          let (kt, _) = cont_kv env.g s p in
-         let kf = (match resolve kt with TString -> "s" | _ -> "i") in
+         let kf = (match resolve kt with TString -> "s" | TInt 128 | TUint 128 -> "k" | _ -> "i") in
          mkf ("zfy_map_del_" ^ kf) [ TStruct s; key_param kt ] TBool
        | t -> terr p "%s expects a map/set, got %s" name0 (pp_zty t))
     | "keys", [ m ] ->
@@ -3554,8 +3567,9 @@ and check_expr env (e : expr) : texpr =
        let marg = map_self_arg env p' tb in
        (match cont_kv env.g s p' with
         | (kt, Some vt) ->
-          ignore kt;
           let tidx = check_expr env idx in
+          (* 先按声明键类型收敛（字面量默认 i64 须绑到 128 位键类型） *)
+          let tidx = coerce p' tidx kt in
           let (kf, karg) = map_key_arg env p' tidx in
           let vtag = map_vtag p' vt in
           mk (ECallK (Printf.sprintf "zfy_map_get_err_%s_%s" kf vtag,
@@ -3962,6 +3976,26 @@ and check_call env p np name0 targs origs modes dlam =
            List.filter (fun (j, _, _) -> j <> i) dl)
         | None -> (ts, dl))
       (targs, dlam) dlam
+  in
+  (* v3.34：map/set 内建调用（has/del/contains/set_add 等）的 128 位键
+     归一化——键实参统一打包为 zfy_map_key128 二进制键（kf="k" 通道）；
+     [] 读写在 map_key_arg 内已处理，此处覆盖其余键实参位置 *)
+  let targs =
+    match targs with
+    | m :: k :: rest ->
+      (match resolve m.ety with
+       | TStruct s when cont_kind s = Some "map" || cont_kind s = Some "set" ->
+         (match Hashtbl.find_opt env.g.gtargs s with
+          | Some (kt :: _) ->
+            (match resolve kt with
+             | TInt 128 | TUint 128 ->
+               (* 先按声明键类型收敛实参（字面量默认 i64 须绑到 128 位），再打包 *)
+               let (_, karg) = map_key_arg env p (coerce p k kt) in
+               (m :: karg :: rest)
+             | _ -> targs)
+          | _ -> targs)
+       | _ -> targs)
+    | _ -> targs
   in
   let sig_ =
     match container_call env p name0 targs with
@@ -6717,7 +6751,8 @@ and check_stmt env (st : stmt) : tstmt =
              let tidx = check_expr env idx in
              let trhs = check_expr env rhs in
              (match cont_kv env.g s ap with
-              | (_, Some vt) ->
+              | (kt, Some vt) ->
+                let tidx = coerce ap tidx kt in
                 let (kf, karg) = map_key_arg env ap tidx in
                 let vtag = map_vtag ap vt in
                 let varg =

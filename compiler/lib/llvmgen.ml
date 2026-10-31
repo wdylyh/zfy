@@ -1332,7 +1332,8 @@ let zfy_thunk (fname : string) (ptys : zty list) (ret : zty) : string =
 
 (* 运行时 i32 布尔返回集（v3.6）：gen_call 做 icmp ne 0 → i1 *)
 let bool_i32_rts =
-  [ "zfy_map_has_i"; "zfy_map_has_s"; "zfy_map_del_i"; "zfy_map_del_s";
+  [ "zfy_map_has_i"; "zfy_map_has_s"; "zfy_map_has_k";
+    "zfy_map_del_i"; "zfy_map_del_s"; "zfy_map_del_k";
     "zfy_contains_i8"; "zfy_contains_i16"; "zfy_contains_i32";
     "zfy_contains_i64"; "zfy_contains_u8"; "zfy_contains_u16";
     "zfy_contains_u32"; "zfy_contains_u64"; "zfy_contains_f32";
@@ -1563,6 +1564,13 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
        let (sp, _) = ptr_of fc s in
        let (vv, _) = val_of fc v in
        emitf fc "  call void @zfy_map_put_s_i64(ptr %s, ptr %s, i64 1)" sp vv)
+  | "zfy_set_add_k", [ s; v ] ->
+    (* 128 位键 set_add（v3.34）：键实参已是 zfy_map_key128 打包的 ptr *)
+    (match dst with
+     | _ ->
+       let (sp, _) = ptr_of fc s in
+       let (vv, _) = val_of fc v in
+       emitf fc "  call void @zfy_map_put_k_i64(ptr %s, ptr %s, i64 1)" sp vv)
   | "zfy_map_values", [ m ] ->
     (* 值列表（v3.6）：vstr/元素宽度由返回类型推导（常量实参注入） *)
     (match dst, ret_ty with
@@ -4502,6 +4510,11 @@ let gen_program (m : mir) : string =
       "declare void @zfy_map_put_s_f32(ptr, ptr, float)\n";
       "declare void @zfy_map_put_s_f64(ptr, ptr, double)\n";
       "declare void @zfy_map_put_s_str(ptr, ptr, ptr)\n";
+      "declare void @zfy_map_put_k_i64(ptr, ptr, i64)\n";
+      "declare void @zfy_map_put_k_f32(ptr, ptr, float)\n";
+      "declare void @zfy_map_put_k_f64(ptr, ptr, double)\n";
+      "declare void @zfy_map_put_k_str(ptr, ptr, ptr)\n";
+      "declare ptr @zfy_map_key128(i64, i64)\n";
       "declare void @zfy_map_get_err_i_i64(ptr sret(%err.i64), ptr, i64)\n";
       "declare void @zfy_map_get_err_i_f32(ptr sret(%err.f32), ptr, i64)\n";
       "declare void @zfy_map_get_err_i_f64(ptr sret(%err.f64), ptr, i64)\n";
@@ -4510,10 +4523,16 @@ let gen_program (m : mir) : string =
       "declare void @zfy_map_get_err_s_f32(ptr sret(%err.f32), ptr, ptr)\n";
       "declare void @zfy_map_get_err_s_f64(ptr sret(%err.f64), ptr, ptr)\n";
       "declare void @zfy_map_get_err_s_str(ptr sret(%err.str), ptr, ptr)\n";
+      "declare void @zfy_map_get_err_k_i64(ptr sret(%err.i64), ptr, ptr)\n";
+      "declare void @zfy_map_get_err_k_f32(ptr sret(%err.f32), ptr, ptr)\n";
+      "declare void @zfy_map_get_err_k_f64(ptr sret(%err.f64), ptr, ptr)\n";
+      "declare void @zfy_map_get_err_k_str(ptr sret(%err.str), ptr, ptr)\n";
       "declare i32 @zfy_map_has_i(ptr, i64)\n";
       "declare i32 @zfy_map_has_s(ptr, ptr)\n";
       "declare i32 @zfy_map_del_i(ptr, i64)\n";
       "declare i32 @zfy_map_del_s(ptr, ptr)\n";
+      "declare i32 @zfy_map_has_k(ptr, ptr)\n";
+      "declare i32 @zfy_map_del_k(ptr, ptr)\n";
       "declare i64 @zfy_map_len(ptr)\n";
       "declare void @zfy_map_clear(ptr)\n";
       "declare void @zfy_map_assign(ptr, ptr)\n";

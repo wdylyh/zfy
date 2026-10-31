@@ -1,0 +1,20 @@
+// map/set 128 位键
+fn main()
+    let map<i128, string> m
+    let i128 k1 = 123456789012345678901234567890
+    let i128 k2 = 999999999999999999999999999999
+    m[k1] = "big-a"
+    m[k2] = "big-b"
+    output(m[k1] ?? "miss")
+    output(m[k2] ?? "miss")
+    output(m[42] ?? "miss")              // 小键也可（i128 通道）
+    output(map_has(m, k2))               // true
+    output(map_del(m, k1))               // true
+    output(map_has(m, k1))               // false
+    output(map_len(m))                   // 2
+    let set<u128> s
+    set_add(s, 18446744073709551615 + 1)
+    set_add(s, 18446744073709551615 + 2)
+    set_add(s, 18446744073709551615 + 1)
+    output(set_len(s))                   // 2（去重）
+    output("ok")

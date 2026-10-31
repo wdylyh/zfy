@@ -1906,6 +1906,7 @@ typedef struct zfy_map {
     long long nbuckets;
     long long size;
     int kstr;               /* 1 = string 键 */
+    int kbig;               /* 1 = 128 位二进制键（k_s 指向 16 字节缓冲，表拥有） */
     int vstr;               /* 1 = string 值（首 put 时确定，释放/克隆用） */
 } zfy_map;
 
@@ -1916,6 +1917,12 @@ static unsigned long long zfy_mix64(unsigned long long x) {
 }
 
 static unsigned long long zfy_hash_key(const zfy_map *m, long long ki, const char *ks) {
+    if (m->kbig) {
+        /* 128 位键：低/高两个字分别 mix 后合并 */
+        unsigned long long lo, hi;
+        memcpy(&lo, ks, 8); memcpy(&hi, ks + 8, 8);
+        return zfy_mix64(lo) ^ (zfy_mix64(hi) * 0x9e3779b97f4a7c15ULL);
+    }
     if (!m->kstr) return zfy_mix64((unsigned long long)ki);
     unsigned long long h = 1469598103934665603ULL;
     for (const unsigned char *p = (const unsigned char *)ks; *p; p++) {
@@ -1925,6 +1932,7 @@ static unsigned long long zfy_hash_key(const zfy_map *m, long long ki, const cha
 }
 
 static int zfy_key_eq(const zfy_map *m, const zfy_ment *e, long long ki, const char *ks) {
+    if (m->kbig) return memcmp(e->k_s, ks, 16) == 0;
     if (m->kstr) return strcmp(e->k_s, ks) == 0;
     return e->k_i == ki;
 }
@@ -1933,7 +1941,7 @@ static zfy_map *zfy_map_alloc(int kstr) {
     zfy_map *m = (zfy_map *)malloc(sizeof(zfy_map));
     if (!m) zfy_die("map: 内存分配失败");
     m->buckets = NULL; m->nbuckets = 0; m->size = 0;
-    m->kstr = kstr; m->vstr = 0;
+    m->kstr = kstr; m->kbig = 0; m->vstr = 0;
     return m;
 }
 
@@ -1957,7 +1965,7 @@ static void zfy_map_put_raw(zfy_map **mp, long long ki, const char *ks,
         }
         free(m->buckets); m->buckets = nb; m->nbuckets = nn;
     }
-    const char *ks2 = m->kstr ? ks : NULL;
+    const char *ks2 = (m->kstr || m->kbig) ? ks : NULL;
     unsigned long long h = zfy_hash_key(m, ki, ks2);
     unsigned long long idx = h & (unsigned long long)(m->nbuckets - 1);
     for (zfy_ment *e = m->buckets[idx]; e; e = e->next) {
@@ -1973,7 +1981,13 @@ static void zfy_map_put_raw(zfy_map **mp, long long ki, const char *ks,
     e->next = m->buckets[idx];
     e->hash = h;
     e->k_i = ki;
-    e->k_s = m->kstr ? zfy_strdup(ks) : NULL;
+    if (m->kbig) {
+        e->k_s = (char *)malloc(16);
+        if (!e->k_s) zfy_die("map: 内存分配失败");
+        memcpy(e->k_s, ks, 16);
+    } else {
+        e->k_s = m->kstr ? zfy_strdup(ks) : NULL;
+    }
     e->val = v;
     m->buckets[idx] = e;
     m->size++;
@@ -2016,13 +2030,47 @@ void zfy_map_put_s_str(zfy_map **mp, const char *k, char *v) {
     zfy_map_put_raw(mp, 0, k, (unsigned long long)(size_t)zfy_strdup(v), 1);
 }
 
+/* ---- 128 位键通道（v3.34）：16 字节二进制键，k_s 复用为缓冲指针 ---- */
+
+/* 键打包：lo/hi 两个 i64 -> 堆上 16 字节缓冲（调用后所有权归 map 表） */
+char *zfy_map_key128(long long lo, long long hi) {
+    char *buf = (char *)malloc(16);
+    if (!buf) zfy_die("map: 内存分配失败");
+    memcpy(buf, &lo, 8); memcpy(buf + 8, &hi, 8);
+    return buf;
+}
+
+static void zfy_map_put_k_raw(zfy_map **mp, const char *kb,
+                              unsigned long long v, int vstr) {
+    zfy_map *m = *mp;
+    if (!m) { m = zfy_map_alloc(0); m->kbig = 1; *mp = m; }
+    if (!m->kbig) zfy_die("map: 键类型不匹配（128 位键通道）");
+    zfy_map_put_raw(mp, 0, kb, v, vstr);
+}
+void zfy_map_put_k_i64(zfy_map **mp, char *k, long long v) {
+    zfy_map_put_k_raw(mp, k, (unsigned long long)v, 0);
+}
+void zfy_map_put_k_f32(zfy_map **mp, char *k, float v) {
+    union { float f; unsigned long long u; } c;
+    c.u = 0; c.f = v;
+    zfy_map_put_k_raw(mp, k, c.u, 0);
+}
+void zfy_map_put_k_f64(zfy_map **mp, char *k, double v) {
+    union { double d; unsigned long long u; } c;
+    c.d = v;
+    zfy_map_put_k_raw(mp, k, c.u, 0);
+}
+void zfy_map_put_k_str(zfy_map **mp, char *k, char *v) {
+    zfy_map_put_k_raw(mp, k, (unsigned long long)(size_t)zfy_strdup(v), 1);
+}
+
 /* 读：按值种类写入 err.value（与 LLVM MErrValue 约定一致：
  * 整数 → sext i64、浮点 → double、string → strdup 所有权副本）；
  * 缺失产 NOT_FOUND 错误。空表/未分配直接报缺失（nbuckets=0 时掩码无意义） */
 static zfy_ment *zfy_map_find_raw(zfy_map **mp, long long ki, const char *ks) {
     zfy_map *m = *mp;
     if (!m || m->size == 0) return NULL;
-    const char *ks2 = m->kstr ? ks : NULL;
+    const char *ks2 = (m->kstr || m->kbig) ? ks : NULL;
     unsigned long long h = zfy_hash_key(m, ki, ks2);
     unsigned long long idx = h & (unsigned long long)(m->nbuckets - 1);
     for (zfy_ment *e = m->buckets[idx]; e; e = e->next)
@@ -2083,11 +2131,52 @@ void zfy_map_get_err_s_str(zfy_err *out, zfy_map **mp, const char *k) {
     if (e) get_ok_str(out, e->val); else MAP_MISS(out);
 }
 
+void zfy_map_get_err_k_i64(zfy_err *out, zfy_map **mp, char *k) {
+    zfy_ment *e = zfy_map_find_raw(mp, 0, k);
+    if (e) get_ok_i(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_k_f32(zfy_err *out, zfy_map **mp, char *k) {
+    zfy_ment *e = zfy_map_find_raw(mp, 0, k);
+    if (e) get_ok_f32(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_k_f64(zfy_err *out, zfy_map **mp, char *k) {
+    zfy_ment *e = zfy_map_find_raw(mp, 0, k);
+    if (e) get_ok_f64(out, e->val); else MAP_MISS(out);
+}
+void zfy_map_get_err_k_str(zfy_err *out, zfy_map **mp, char *k) {
+    zfy_ment *e = zfy_map_find_raw(mp, 0, k);
+    if (e) get_ok_str(out, e->val); else MAP_MISS(out);
+}
+
+int zfy_map_has_k(zfy_map **mp, char *k) {
+    return zfy_map_find_raw(mp, 0, k) != NULL;
+}
+int zfy_map_del_k(zfy_map **mp, char *k) {
+    zfy_map *m = *mp;
+    if (!m || m->size == 0) return 0;
+    const char *ks2 = (m->kstr || m->kbig) ? k : NULL;
+    unsigned long long h = zfy_hash_key(m, 0, ks2);
+    unsigned long long idx = h & (unsigned long long)(m->nbuckets - 1);
+    for (zfy_ment **pp = &m->buckets[idx]; *pp; pp = &(*pp)->next) {
+        zfy_ment *e = *pp;
+        if (e->hash == h && zfy_key_eq(m, e, 0, ks2)) {
+            *pp = e->next;
+            if (m->vstr) free((void *)(unsigned long long)e->val);
+            if (e->k_s) free(e->k_s);
+            free(e);
+            m->size--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+
 /* has / del / len / clear / clone / free */
 static int zfy_map_has_raw(zfy_map **mp, long long ki, const char *ks) {
     zfy_map *m = *mp;
     if (!m) return 0;
-    const char *ks2 = m->kstr ? ks : NULL;
+    const char *ks2 = (m->kstr || m->kbig) ? ks : NULL;
     unsigned long long h = zfy_hash_key(m, ki, ks2);
     unsigned long long idx = h & (unsigned long long)(m->nbuckets - 1);
     for (zfy_ment *e = m->buckets[idx]; e; e = e->next)
@@ -2100,7 +2189,7 @@ int zfy_map_has_s(zfy_map **mp, const char *k) { return zfy_map_has_raw(mp, 0, k
 static int zfy_map_del_raw(zfy_map **mp, long long ki, const char *ks) {
     zfy_map *m = *mp;
     if (!m) return 0;
-    const char *ks2 = m->kstr ? ks : NULL;
+    const char *ks2 = (m->kstr || m->kbig) ? ks : NULL;
     unsigned long long h = zfy_hash_key(m, ki, ks2);
     unsigned long long idx = h & (unsigned long long)(m->nbuckets - 1);
     for (zfy_ment **pp = &m->buckets[idx]; *pp; pp = &(*pp)->next) {
@@ -2143,6 +2232,7 @@ void zfy_map_clear(zfy_map **mp) {
 static zfy_map *zfy_map_clone_raw(zfy_map *src) {
     if (!src) return NULL;
     zfy_map *m = zfy_map_alloc(src->kstr);
+    m->kbig = src->kbig;
     m->vstr = src->vstr;
     for (long long b = 0; b < src->nbuckets; b++) {
         for (zfy_ment *e = src->buckets[b]; e; e = e->next)
