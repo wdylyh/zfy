@@ -997,3 +997,43 @@ v3.23 所有权系统已知限制全部落地（commit 见 git log 最新）：
 - 列表整体借用：`let T[]* const p = borrow(xs)`，`p^[i]`/`p^` 传参均可用
 - 嵌套路径粒度：borrow(s.ix.x) 前缀重叠判定，父路径写拦截、兄弟路径放行
 - 新正例 nll_test / listborrow_test / nestborrow_test；7 个负例双向拦截全对；全量回归 failures: 0；grammar.md §15 已同步
+---
+id: w-056
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-31 09:50
+---
+三项体验改进已落地（commit 8971dba，基于你的 v3.32.0）：
+- frac 转出：cast(f, i64/u64) 截断整除、cast(f, f64/f32) 实数除（MIR 新指令 MFracCast，纯 IR 无运行时调用）
+- copy/move 必标错误文案补 fresh value 豁免说明（构造调用/函数返回值不需标记）
+- 顶层解析级联抑制：失败项后连锁错误只计数，末尾以 E2007 汇总"N cascade error(s) suppressed"
+- 注意：_tmp/_reg.sh 不感知负例/flag，19 个 *_err 与 asm/freestanding 样例恒 FAIL 属既有状态；正式 runner 请用 bench/regress.ps1
+---
+id: w-057
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-31 11:40
+---
+v3.33 缺陷迭代第一二轮已落地（commits a03c6e2 + 835118e）：
+- 分数字面量树精确折叠：双侧 (n/d) 的 + - * / 编译期按精确有理数折叠为单字面量节点（gcd 约分），修复三类缺陷：frac 期望 E3000 不可推断 / f64 期望错误截断为 0.0 / 比较按截断值误判（(1/3)==(2/6)）；除数 0 编译期报错。注意整数期望语义变化：(1/3)+(2/3) 落 i32 = 1（精确折叠后截断），不是 0+0=0
+- 移位常量折叠按操作数位宽校验（1<<33 编译期报错，此前静默按 i64 算出 2^33）
+- 常量折叠四则按位宽校验 + i64 本域 add/sub/mul 预检；wrap_overflow 开关下沉 typeck（llvmgen 委托同源，你的 Mir.set_wrap_overflow 不受影响）
+- 新例：fracfold_test（正例）、shiftconst_err / ovfconst_err（负例带 .expect）
+- 第三轮探针（string/match/map/lambda/接口/切片/try/溢出内建）未发现新缺陷；_tmp/_reg.sh 的 stdin 样例（io_test/input_delim_test）需喂输入，非缺陷
+---
+id: w-058
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-31 14:05
+---
+本轮五项类型系统任务全部落地（commits 3c2340b + 2c5d91d + 6fea911 + 7d15605）：
+- 泛型实参放开：frac（单写=i32 frac）/函数类型（fn(T...)->R 无损往返闭包）可作实参；File 仍拒绝（move-only 不进 struct 字段）
+- 浮点隐式宽化：浮点与整数变量混算整数侧自动 cast 到浮点宽度，E3190 移除；浮点字面量落整数槽仍 narrowing 报错
+- map/set 128 位键：i128/u128 走 kbig 16 字节二进制键通道（memcmp 比较 + mix64 双字哈希），put/get/has/del/set_add 全套 + 深拷贝
+- 泛型约束十档：num/cmp/any + eq/ord/hash/str/int/float/seq；dry check 代表表同步扩充
+- 泛型接口（7d15605）：interface 名<T...> 模板登记 + 构造点从实现方法签名结构对齐推断实参 + instantiate_iface 单态化（mangle 名$tags）；泛型接口暂禁默认方法体
+- 顺带修了两个既有缺陷：typeck IIf 分支 else 作用域漏包 begin/end（泛型接口 T 报 undefined type 的根因）；接口分派 string 实参未克隆（字面量指针被 zfy_free_str 释放 → 堆损坏 0xC0000374，非泛型接口同样命中）
+- grammar.md 已同步（§25/§19.1/§27.3/§28.1/浮点宽化）；examples/giface_test 双实现全断言；回归 114 正例 PASS、20 个负例/特判与基线一致（_tmp/_reg.sh 不感知负例属既有状态，正式 runner 用 bench/regress.ps1）
