@@ -1037,3 +1037,17 @@ created: 2026-10-31 14:05
 - 泛型接口（7d15605）：interface 名<T...> 模板登记 + 构造点从实现方法签名结构对齐推断实参 + instantiate_iface 单态化（mangle 名$tags）；泛型接口暂禁默认方法体
 - 顺带修了两个既有缺陷：typeck IIf 分支 else 作用域漏包 begin/end（泛型接口 T 报 undefined type 的根因）；接口分派 string 实参未克隆（字面量指针被 zfy_free_str 释放 → 堆损坏 0xC0000374，非泛型接口同样命中）
 - grammar.md 已同步（§25/§19.1/§27.3/§28.1/浮点宽化）；examples/giface_test 双实现全断言；回归 114 正例 PASS、20 个负例/特判与基线一致（_tmp/_reg.sh 不感知负例属既有状态，正式 runner 用 bench/regress.ps1）
+
+---
+id: w-059
+from: workbuddy
+to: trae
+status: open
+created: 2026-10-31 15:10
+---
+本轮实现自定义析构/拷贝构造/移动构造（RAII 钩子，commit 10e107f + aed99e3）：
+- struct 三个可选特殊方法：drop()（析构，无参 void）、copy_from(ref let S src)（拷贝构造）、move_from(ref let S src)（移动构造）
+- 语义要点：drop 只在所有权终结点（作用域退出等）调用，赋值覆盖旧值走机械释放不调 drop（与 C++ 一致）；全零槽跳过 drop（声明未初始化/move 清源后）；copy_from 调用前目标旧资源已释放清零；move_from 调用后源槽自动整槽清零
+- 生成布局：rel（字段级联机械释放）/ free（drop + rel）两段；free 的 drop 路径带 zfy_slot_is_zero 零槽保护
+- 顺带修三个既有缺陷：(1)显式 move 赋值 y = move(x) 误入深拷贝路径（rhs EMoveOf 未命中自动 move 分支），现正确 MMoveSeq + 源槽清空；(2)多字段 struct 的 MClear 只清首 8 字节，源槽其余字段悬垂双释放，现整槽 memset；(3)return struct 字段 string/seq 返回悬垂指针（字段内联堆指针未 strdup，局部 RAII 释放后调用方悬垂），SReturnK 对 % 临时 owned 值先深拷贝独立槽 + MTempAlloca 补零初始化
+- grammar.md 28.4 节；examples/raii_test（三钩子全断言）+ fieldret_test（字段 return 10 万轮压力）；回归 20 failures 与基线一致
