@@ -1,0 +1,23 @@
+fn <T> T pick(let T a, let T b, let bool c)
+    if c
+        return a
+    return b
+fn main()
+    let frac a = (1/2)
+    let frac b = (3/4)
+    output(pick(a, b, false))            // 3/4 —— T=frac 往返
+    output(pick(1, 2, true))             // 1
+    output("ok")
+// File 作泛型函数实参（T = File，move 语义传递）
+fn <F> F echo_open(let F f, let string mode)
+    return f
+fn void dump(let File f)
+    write(f, "via generic\n")
+fn void main2()
+    let File w = open("_tmp/probe/v4_out.tmp", "w") ?? panic("open fail")
+    let File w2 = echo_open(move w, "w")
+    dump(move w2)
+    output("moved-ok")
+    let File r = open("_tmp/probe/v4_out.tmp", "r") ?? panic("open fail")
+    output(read_all(r))
+    close(r)

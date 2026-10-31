@@ -751,7 +751,21 @@ let rec ast_of_zty (p : pos) (z : zty) : ty =
        单态化零成本）。AST 形态 = TSeq/TSeqN（conv_ty 兜底路径同款） *)
     TSeq (ast_of_zty p e, p)
   | TArray (e, n) -> TSeqN (ast_of_zty p e, EInt (Int64.of_int n, p), p)
-  | TFrac _ | TFunSig _ | TVar _ | TError ->
+  | TFile -> TNamed ("File", p)
+  | TFrac e ->
+    (* v3.34：frac 可作泛型实参——AST 形态 = TNamed "frac"（= i32 frac，
+       与源码书写一致）；非 i32 元素的 frac 无无损 AST 形态，暂不支持 *)
+    (match resolve e with
+     | TInt 32 -> TNamed ("frac", p)
+     | _ ->
+       terr p "frac with element type %s cannot be used as a generic type argument (only i32 frac)"
+         (pp_zty e);
+       TNamed ("frac", p))
+  | TFunSig (ptys, ret) ->
+    (* v3.34：函数类型可作泛型实参——AST 形态 = 闭包类型 fn(T...) -> R，
+       conv 回 TPtr(TFunSig...) 无损 *)
+    TClo (List.map (ast_of_zty p) ptys, ast_of_zty p ret, p)
+  | TVar _ | TError ->
     terr p "this type cannot be used as a generic type argument"
 
 (* AST 类型层替换：TNamed（类型参数名）-> 实参类型的 AST 形态 *)
@@ -1022,8 +1036,9 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
              let z = resolve (conv_ty g pp ta) in
              (match z with
               | TErr _ -> ()   (* T! 可作泛型实参（new.md 第1条；字段聚合语义复用 T! 槽） *)
-              | TFrac _ -> terr pp "frac cannot be a type argument"
-              | TFile -> terr pp "File cannot be a type argument (move-only handle)"
+              | TFrac _ -> ()  (* v3.34：frac 可作泛型实参（槽宽 frac$ 值聚合） *)
+              | TFile ->
+                terr pp "File cannot be a struct type argument (move-only handle); pass it as a function parameter instead"
               | TVar _ -> terr pp "a generic type argument must be a concrete type"
               | _ -> ());
              z)
@@ -3034,16 +3049,20 @@ and check_expr env (e : expr) : texpr =
          | None ->
         let other_int t =
           match t with TInt _ | TUint _ | TChar -> true | _ -> false in
-        (if (floaty_side rl tl && other_int rr)
-        || (floaty_side rr tr && other_int rl) then begin
-          let show t x =
-            match resolve t with
-            | TVar _ when floaty_texpr x -> "f64"  (* 未定浮点字面量子树 *)
-            | t -> pp_zty t
-          in
-          terr p' "floating-point and integer operands cannot be mixed without an explicit cast, got %s and %s"
-            (show rl tl) (show rr tr)
-        end);
+        (* v3.34：浮点字面量（未定子树）与整数变量混算 → 整数侧隐式宽化
+           到浮点侧宽度（此前报 E3190 拒绝）。浮点优先语义：int op float
+           = float，与赋值/比较路径的字面量语义一致；f32 侧宽化到 f32。
+           整数槽期望浮点字面量收窄的场景仍由落型路径报错不受影响 *)
+        let tl, tr =
+          if floaty_side rl tl && other_int rr then
+            let w = (match resolve rl with TFloat w -> w | _ -> 64) in
+            (tl, mk (ECastK (tr, TFloat w)) (TFloat w))
+          else if floaty_side rr tr && other_int rl then
+            let w = (match resolve rr with TFloat w -> w | _ -> 64) in
+            (mk (ECastK (tl, TFloat w)) (TFloat w), tr)
+          else (tl, tr)
+        in
+        let rl = resolve tl.ety and rr = resolve tr.ety in
         let res_ty =
           match bop with
           | BEq | BNe | BLt | BGt | BLe | BGe ->
