@@ -217,8 +217,12 @@ type gstructk = { gtp : string list; gcons : string list; gpacked : bool;
 type gfnk = { gtp : string list; gcons : string list; gparams : param list;
               gret : ty option; grfrac : bool; gbody : block; gpos : pos }
 
-(* 约束判定（v3.15）：num = 算术+比较（整数/浮点）；cmp = 比较（数值/string/
-   char/bool）；any/空 = 无约束。实参校验与 dry check 代表类型共用 *)
+(* 约束判定（v3.15 / v3.34 扩展）：
+   num = 算术+比较（整数/浮点）；cmp = 比较（数值/string/char/bool）；
+   eq = 相等比较（数值/string/char/bool/指针）；ord = 全序（数值/string/char）；
+   hash = 可作 map/set 键（≤128 位标量/string）；str = 可 output（标量/string/frac）；
+   int = 仅整数；float = 仅浮点；seq = 列表/定长数组；any/空 = 无约束
+   （仅值语义通用操作）。实参校验与 dry check 代表类型共用 *)
 let constr_ok (c : string) (z : zty) : bool =
   match c with
   | "num" ->
@@ -227,12 +231,39 @@ let constr_ok (c : string) (z : zty) : bool =
     (match z with
      | TInt _ | TUint _ | TFloat _ | TString | TChar | TBool -> true
      | _ -> false)
+  | "eq" ->
+    (match z with
+     | TInt _ | TUint _ | TFloat _ | TString | TChar | TBool | TPtr _ -> true
+     | _ -> false)
+  | "ord" ->
+    (match z with
+     | TInt _ | TUint _ | TFloat _ | TString | TChar -> true
+     | _ -> false)
+  | "hash" ->
+    (match z with
+     | TInt _ | TUint _ | TString -> true   (* 含 128 位（kbig 通道） *)
+     | _ -> false)
+  | "str" ->
+    (match z with
+     | TInt _ | TUint _ | TFloat _ | TBool | TChar | TString | TFrac _ -> true
+     | _ -> false)
+  | "int" ->
+    (match z with TInt _ | TUint _ -> true | _ -> false)
+  | "float" ->
+    (match z with TFloat _ -> true | _ -> false)
+  | "seq" ->
+    (match z with TList _ | TArray _ -> true | _ -> false)
   | _ -> true
 
-(* dry check 代表类型：num/cmp → i64（体在此类操作上具代表性）；any → None
+(* dry check 代表类型：可代表的约束给标量代表（eq/ord/hash/str/int → i64、
+   float → f64、num → i64、cmp → i64）；seq → list<i64>；any → None
    （无法代表，跳过该参数——全约束才可 dry check） *)
 let constr_rep (c : string) : zty option =
-  match c with "num" | "cmp" -> Some (TInt 64) | _ -> None
+  match c with
+  | "seq" -> Some (TList (TInt 64))
+  | "float" -> Some (TFloat 64)
+  | "num" | "cmp" | "eq" | "ord" | "hash" | "str" | "int" -> Some (TInt 64)
+  | _ -> None
 
 
 type genv = { fns : (string, fn_sig) Hashtbl.t;
@@ -8589,6 +8620,9 @@ let check_program (prog : program) : hir =
           | cs when List.for_all (fun c -> c = "num") cs ->
             [ List.map (fun _ -> TInt 64) cs; List.map (fun _ -> TFloat 64) cs ]
           | cs when List.for_all (fun c -> c = "cmp") cs ->
+            [ List.map (fun _ -> TInt 64) cs; List.map (fun _ -> TString) cs ]
+          | cs when List.for_all (fun c -> c = "eq" || c = "ord" || c = "hash" || c = "str") cs ->
+            (* v3.34：字符串/整数双代表（两类操作形态差异大） *)
             [ List.map (fun _ -> TInt 64) cs; List.map (fun _ -> TString) cs ]
           | _ ->
             (* 混合约束：统一用各参数自己的代表类型，单次尝试 *)

@@ -284,10 +284,12 @@ and parse_tparams p =
   expect p Lt "<";
   let parse_constr npos =
     match peek p with
-    | (Ident c, _) when c = "num" || c = "cmp" || c = "any" ->
+    | (Ident c, _)
+      when c = "num" || c = "cmp" || c = "any" || c = "eq" || c = "ord"
+        || c = "hash" || c = "str" || c = "int" || c = "float" || c = "seq" ->
       ignore (next p); c
     | (_, cp) ->
-      err cp "expected a constraint (num/cmp/any) after ':' for type parameter"
+      err cp "expected a constraint (num/cmp/eq/ord/hash/str/int/float/seq/any) after ':' for type parameter"
   in
   let rec go acc =
     let n = expect_ident p "type parameter" in

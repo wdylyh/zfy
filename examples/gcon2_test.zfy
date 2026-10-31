@@ -1,0 +1,27 @@
+fn <T: eq> bool teq(let T a, let T b)
+    return a == b
+fn <T: ord> T tmin(let T a, let T b)
+    if a < b
+        return a
+    return b
+fn <K: hash> i32 hmark(let K k)
+    return 1
+fn <T: seq> i32 slen(let T xs)
+    return length(xs)
+fn f32 favg(let f32 a, let f32 b)
+    return (a + b) / 2
+fn i32 isum(let i32 a, let i32 b)
+    return a + b
+fn main()
+    output(teq("a", "a"))
+    output(teq(3, 4))
+    output(tmin("b", "a"))
+    output(tmin(7, 2))
+    let i128 k = 123456789012345678901234567890
+    output(hmark(k))                 // 1 —— hash 放行 i128
+    output(hmark("key"))             // 1 —— hash 放行 string
+    let i32[] xs = 1, 2, 3
+    output(slen(xs))                 // 3 —— seq
+    output(favg(1.5, 2.5))
+    output(isum(3, 4))
+    output("ok")
