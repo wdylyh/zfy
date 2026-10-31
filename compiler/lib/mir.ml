@@ -1751,6 +1751,22 @@ and lstmt_inner l (s : tstmt) : unit =
     (* 先求返回值，再释放全部局部资源（RAII）；
        若返回值本身就�?owned 局部变量，跳过其释放（所有权随返回转移）�?       本语句的临时串所有权同样随返回转移，不再释放 *)
     let v = Option.map (lexpr l) e in
+    (* 字段链/嵌套表达式读出的 owned 值（% 临时寄存器）不拥有资源所有权——
+       返回前深拷贝到独立临时槽（string strdup / seq clone），随后局部
+       RAII 释放不影响返回值（v3.35 修复：return x.a 返回悬垂指针，
+       mk 作用域 free x 后调用方持有已释放堆串 → 堆损坏）。变量槽返回
+       （OLocal 非 % 前缀）保持既有所有权转移语义不动 *)
+    let v = Option.map
+        (fun (vo : operand) ->
+          match vo.o, vo.oty with
+          | OLocal n, (TString | TArray _ | TList _) when n.[0] = '%' ->
+            let tmp = fresh l in
+            emit l (MTempAlloca (tmp, vo.oty));
+            emit l (MCopy (tmp, vo, vo.oty));
+            { vo with o = OLocal tmp }
+          | _ -> vo)
+        v
+    in
     (* 非 unred frac 返回前原地约分（w-017）：四则运算的运行时结果不经归一，
        声明/赋值存槽路径有 MNorm 兜底，return 路径此前缺失（产出 8/16 形态）。
        返回类型不支持 unred 修饰，凡直接返回 frac 一律约分；

@@ -1,0 +1,11 @@
+struct W
+    string a = ""
+fn string mk()
+    let W x = W("z")
+    return x.a
+fn main()
+    let i32 i = 0
+    while i < 100000
+        let string _t = mk()
+        i++
+    output("ok")

@@ -2826,9 +2826,18 @@ let gen_instr fc (i : instr) : unit =
     let (dv, dt) = val_of fc den in
     emitf fc "  store %s %s, ptr %s" dt dv dp
   | MTempAlloca (name, ty) ->
-    (* 归一用临时聚合槽：入口块 alloca（循环内不重复分配栈空间） *)
+    (* 归一用临时聚合槽：入口块 alloca（循环内不重复分配栈空间）；
+       指针/聚合槽置零——MCopy 写入路径先释放槽旧值，未初始化垃圾
+       指针会被 free（v3.35 return 深拷贝临时槽复用此节点） *)
     let addr = Printf.sprintf "%%v%s" (String.sub name 1 (String.length name - 1)) in
     emitf_entry fc "  %s = alloca %s" addr (ll_ty ty);
+    (match ty with
+     | TString | TArray _ | TList _ | TFile ->
+       emitf_entry fc "  store ptr null, ptr %s" addr
+     | TStruct _ | TErr _ | TFrac _ ->
+       emitf_entry fc "  call void @llvm.memset.p0.i64(ptr %s, i8 0, i64 %d, i1 false)"
+         addr (size_of fc.g ty)
+     | _ -> ());
     Hashtbl.replace fc.allocas name (addr, ty)
   | MNorm (name, ty) ->
     (* 非 unred frac 槽存入后自动约分 *)
