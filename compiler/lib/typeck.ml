@@ -15,6 +15,12 @@ let terr p fmt =
 let freestanding = ref false
 let set_freestanding (b : bool) = freestanding := b
 
+(* 整数溢出检查开关（v3.33 自 typeck 侧下沉，llvmgen 委托同源）：
+   默认开启；--wrap-overflow 切回静默回绕——常量折叠与运行期检查一致 *)
+let wrap_overflow = ref false
+let set_wrap_overflow (b : bool) = wrap_overflow := b
+let overflow_checked () = not !wrap_overflow
+
 (* freestanding 下禁用的内建名（依赖 OS 或 CRT：文件 I/O、线程/互斥/
    chan、时间/计时、环境变量、setjmp 帧）。rand 纯引擎与原子/volatile
    保留（不依赖 OS）。 *)
@@ -1383,52 +1389,95 @@ and const_eval (env : env) (e : texpr) : int64 option =
   | EBinK (op, a, b) ->
     (match const_eval env a, const_eval env b with
      | Some x, Some y ->
-       (match op with
-        | BAdd -> Some (Int64.add x y)
-        | BSub -> Some (Int64.sub x y)
-        | BMul -> Some (Int64.mul x y)
-        | BDiv when y <> 0L -> Some (Int64.div x y)
-        | BMod when y <> 0L -> Some (Int64.rem x y)
-        | BBitAnd -> Some (Int64.logand x y)
-        | BBitOr -> Some (Int64.logor x y)
-        | BBitXor -> Some (Int64.logxor x y)
-        | (BShl | BShr) as shop ->
-          (* 移位常量折叠：计数先按操作数位宽校验（v3.33）——常量表达式
-             的移位越界是可证明的运行期 panic，编译期直接报错（fail-fast；
-             运行期语义见 llvmgen 冷块 panic）。此前折叠按 i64 域计算且
-             只查 y<64，1 << 33（i32）被静默算成 2^33 逃过检查 *)
-          let fail () =
-            terr e.epos
-              "shift count %Ld overflows a %d-bit operand in a constant expression \
-               (runtime shifts panic; split the shift or use a wider type)" y
-              (match resolve a.ety with TInt w | TUint w -> w | _ -> 64)
-          in
-          (match resolve a.ety with
-           | TInt w | TUint w when y >= Int64.of_int w -> fail ()
-           | _ ->
-             if y < 0L || y >= 64L then None
-             else if shop = BShl then Some (Int64.shift_left x (Int64.to_int y))
-             else
-               (* 与 llvmgen 一致：有符号 ashr、无符号 lshr *)
-               (match resolve e.ety with
-                | TUint _ -> Some (Int64.shift_right_logical x (Int64.to_int y))
-                | _ -> Some (Int64.shift_right x (Int64.to_int y))))
-        | BPow ->
-          (** 幂常量折叠（v3.3.2）：与 runtime zfy_pow_ll/ull 语义一致——
-              负指数 = 0、乘法按 64 位回绕（Int64.mul 天然回绕），
-              平方乘迭代 *)
-          if y < 0L then Some 0L
-          else begin
-            let rec go acc b e =
-              if e = 0L then acc
-              else
-                let acc =
-                  if Int64.logand e 1L = 1L then Int64.mul acc b else acc in
-                go acc (Int64.mul b b) (Int64.shift_right_logical e 1)
-            in
-            Some (go 1L x y)
-          end
-        | _ -> None)
+       (* v3.33：常量折叠结果按操作数类型位宽校验——与移位修复同因：
+          折叠按 i64 域计算，2147483647 + 1（i32）被静默算成 2147483648
+          逃过运行期溢出检查。常量表达式的溢出可证明 → 编译期报错
+          （fail-fast；--wrap-overflow 时与运行期一致静默回绕）。
+          结果类型未定（TVar）时不校验，落型路径已有范围守卫 *)
+       let check v =
+         match resolve e.ety with
+         | (TInt w | TUint w) as et when overflow_checked () ->
+           let ok =
+             match et with
+             | TUint _ -> v >= 0L && (w >= 64 || Int64.lognot v = Int64.shift_right_logical Int64.minus_one w)
+             | _ -> int_fits v (TInt w)
+           in
+           if not ok then
+             terr e.epos
+               "integer constant overflow: %Ld does not fit in %s (constant expression)"
+               v (pp_zty et)
+         | _ -> ()
+       in
+       let folded =
+         (match op with
+          | BAdd ->
+            (* i64 本域预检：折叠用 Int64 运算会静默回绕，窄类型靠后续
+               int_fits 精确拦截，仅 64 位需在此预检（v3.33） *)
+            if resolve e.ety = TInt 64
+               && ((y > 0L && x > Int64.sub Int64.max_int y)
+                   || (y < 0L && x < Int64.sub Int64.min_int y)) then
+              terr e.epos "constant overflow in integer addition (%Ld + %Ld)" x y;
+            Some (Int64.add x y)
+          | BSub ->
+            if resolve e.ety = TInt 64
+               && ((y < 0L && x > Int64.add Int64.max_int y)
+                   || (y > 0L && x < Int64.add Int64.min_int y)) then
+              terr e.epos "constant overflow in integer subtraction (%Ld - %Ld)" x y;
+            Some (Int64.sub x y)
+          | BMul ->
+            (try
+               if resolve e.ety = TInt 64 && x <> 0L && y <> 0L
+                  && (Int64.div Int64.max_int x < y
+                      || Int64.div Int64.min_int x > y) then
+                 terr e.epos "constant overflow in integer multiplication (%Ld * %Ld)" x y
+             with Division_by_zero -> ());
+            Some (Int64.mul x y)
+          | BDiv when y <> 0L -> Some (Int64.div x y)
+          | BMod when y <> 0L -> Some (Int64.rem x y)
+          | BBitAnd -> Some (Int64.logand x y)
+          | BBitOr -> Some (Int64.logor x y)
+          | BBitXor -> Some (Int64.logxor x y)
+          | (BShl | BShr) as shop ->
+            (* 移位常量折叠：计数先按操作数位宽校验（v3.33）——常量表达式
+               的移位越界是可证明的运行期 panic，编译期直接报错（fail-fast；
+               运行期语义见 llvmgen 冷块 panic）。此前折叠按 i64 域计算且
+               只查 y<64，1 << 33（i32）被静默算成 2^33 逃过检查 *)
+            (match resolve a.ety with
+             | TInt w | TUint w when y >= Int64.of_int w ->
+               terr e.epos
+                 "shift count %Ld overflows a %d-bit operand in a constant expression \
+                  (runtime shifts panic; split the shift or use a wider type)" y w
+             | _ ->
+               if y < 0L || y >= 64L then None
+               else if shop = BShl then Some (Int64.shift_left x (Int64.to_int y))
+               else
+                 (* 与 llvmgen 一致：有符号 ashr、无符号 lshr *)
+                 (match resolve e.ety with
+                  | TUint _ -> Some (Int64.shift_right_logical x (Int64.to_int y))
+                  | _ -> Some (Int64.shift_right x (Int64.to_int y))))
+          | BPow ->
+            (** 幂常量折叠（v3.3.2）：与 runtime zfy_pow_ll/ull 语义一致——
+                负指数 = 0、乘法按 64 位回绕（Int64.mul 天然回绕），
+                平方乘迭代 *)
+            if y < 0L then Some 0L
+            else begin
+              let rec go acc b e =
+                if e = 0L then acc
+                else
+                  let acc =
+                    if Int64.logand e 1L = 1L then Int64.mul acc b else acc in
+                  go acc (Int64.mul b b) (Int64.shift_right_logical e 1)
+              in
+              Some (go 1L x y)
+            end
+          | _ -> None)
+       in
+       (match folded with
+        | Some v when (match op with
+                       | BAdd | BSub | BMul | BDiv | BMod -> true
+                       | _ -> false) -> check v
+        | _ -> ());
+       folded
      | _ -> None)
   | _ -> None
 

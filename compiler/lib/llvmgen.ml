@@ -77,8 +77,8 @@ let fn_sym (name : string) : string =
    --wrap-overflow（或 -Wno-overflow-check）切回旧的静默回绕语义。
    仅影响编译器生成的代码与常量折叠，浮点 IEEE 语义不受影响。 *)
 let wrap_overflow = ref false
-let set_wrap_overflow b = wrap_overflow := b
-let overflow_checked () = not !wrap_overflow
+let set_wrap_overflow b = Typeck.set_wrap_overflow b
+let overflow_checked () = Typeck.overflow_checked ()
 
 let width_of (t : zty) : int =
   match t with
