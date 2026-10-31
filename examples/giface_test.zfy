@@ -1,0 +1,31 @@
+// 泛型接口：interface Store<K, V>
+interface Store<K, V>
+    fn K echo(let K a, let V b)
+    fn V pick(let K a, let V b)
+    fn i32 tag()
+struct IntStore
+    i32 v = 7
+    fn i32 echo(let i32 a, let string b)
+        return a
+    fn string pick(let i32 a, let string b)
+        return b + "!"
+    fn i32 tag()
+        return 1
+struct BigStore
+    i128 w = 1
+    fn i128 echo(let i128 a, let i32 b)
+        return a
+    fn i32 pick(let i128 a, let i32 b)
+        return b + 1
+    fn i32 tag()
+        return 2
+fn main()
+    let Store<i32, string> s = Store(IntStore())
+    output(s.echo(41, "x"))          // 41
+    output(s.pick(1, "hi"))          // hi!
+    output(s.tag())                  // 1
+    let Store<i128, i32> b = Store(BigStore())
+    output(b.echo(10, 3))            // 10
+    output(b.pick(1, 3))             // 4
+    output(b.tag())                  // 2
+    output("ok")

@@ -15,12 +15,14 @@ type lexer = {
   mutable paren_depth : int;    (* 括号深度 > 0 时忽略换行与缩进 *)
   mutable brace_depth : int;    (* use 分组 a::b::{...} 的花括号计数（配对 paren_depth） *)
   mutable pend_cont : bool;     (* 上一行以二元运算符结尾：下一行自动续行，不做缩进测量 *)
+  mutable lt_open : int;        (* 行内未闭合的 < 计数：> 闭合泛型时不作续行（v3.34） *)
   mutable at_line_start : bool; (* 当前是否处于行首缩进判定点 *)
 }
 
 let make src file =
   { src; file; i = 0; line = 1; col = 1; indents = [ 0 ];
-    paren_depth = 0; brace_depth = 0; pend_cont = false; at_line_start = true }
+    paren_depth = 0; brace_depth = 0; pend_cont = false; at_line_start = true;
+    lt_open = 0 }
 
 let peek l k =
   let j = l.i + k in
@@ -284,8 +286,16 @@ let keyword_lookup s = List.assoc_opt s Tokens.keyword_table
 
 let tokenize ?(file = "") src =
   let l = make src file in
+  l.lt_open <- 0;
   let acc = ref [] in
-  let push tok p = acc := (tok, p) :: !acc in
+  let push tok p =
+    (match tok with
+     | Lt -> l.lt_open <- l.lt_open + 1
+     | Gt when l.lt_open > 0 -> l.lt_open <- l.lt_open - 1
+     | Gt -> ()   (* 泛型已闭：这是比较/移位运算符 *)
+     | _ -> ());
+    acc := (tok, p) :: !acc
+  in
   let rec loop () =
     if l.i >= String.length l.src then begin
       (* EOF：收尾所有未闭合缩进 *)
@@ -370,6 +380,8 @@ let tokenize ?(file = "") src =
             let cont =
               match !acc with
               | (Newline, _) :: _ | (Indent, _) :: _ | (Dedent, _) :: _ -> false
+              | (Gt, _) :: _ when l.lt_open = 0 ->
+                false   (* v3.34：闭合泛型实参列表的 >（如 interface Foo<T>） *)
               | (t, _) :: _ -> Tokens.is_line_cont t
               | [] -> false
             in

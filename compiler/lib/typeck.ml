@@ -106,6 +106,16 @@ let method_tbl : (string * string, string) Hashtbl.t = Hashtbl.create 16
    iface_impls：已实现 (接口名, struct 名) 集合（llvmgen 生成 thunk/vtable 用）。
    check_program 开头重置（与 method_tbl 同策略） *)
 let iface_tbl : (string, (string * zty list * zty) list) Hashtbl.t = Hashtbl.create 8
+
+(* 泛型接口模板（v3.34）：名 -> (类型参数[名,约束], 方法签名[原始 AST],
+   父接口, 默认实现, 声明位置)。实例化（TApp/构造点推断）后单态化登记进
+   iface_tbl / g.aliases / g.structs（mangle = 名$<tags>） *)
+let iface_gtbl :
+  (string, ((string * string) list
+            * (ty option * string * param list * pos) list
+            * string option
+            * (string * param list * ty option * block * pos) list
+            * pos)) Hashtbl.t = Hashtbl.create 8
 (* 接口默认方法体（v3.20）：iface 名 -> (方法名, ast 参数, 返回, 块, pos) *)
 let iface_defaults :
   (string, (string * param list * ty option * block * pos) list) Hashtbl.t =
@@ -1055,9 +1065,18 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
     Hashtbl.replace g.gtargs mangle [ ez ];
     TStruct mangle
   | TApp (n, targs, pp) ->
+    (* 泛型接口实例化（v3.34）：Store<i32> -> iface$Store$i32（单态化） *)
+    if Hashtbl.mem iface_gtbl n then begin
+      let (tps, _, _, _, _) = Hashtbl.find iface_gtbl n in
+      if List.length targs <> List.length tps then
+        terr pp "generic interface %s expects %d type arguments, got %d"
+          n (List.length tps) (List.length targs);
+      let ztys = List.map (fun ta -> resolve (conv_ty g pp ta)) targs in
+      instantiate_iface g n ztys pp
+    end
     (* 泛型实例化 Box<i32, T*>（new2.md 第2条）：按模板展开注册具体
        struct，monomorphization 完全在 typeck 内完成 *)
-    (match Hashtbl.find_opt g.gstructs n with
+    else (match Hashtbl.find_opt g.gstructs n with
      | None -> terr pp "undefined generic struct: %s" n
      | Some gs ->
        if List.length targs <> List.length gs.gtp then
@@ -1105,6 +1124,61 @@ let rec conv_ty (g : genv) p (t : ty) : zty =
         | _ -> ());
        TArray (e, Int64.to_int n)
      | _ -> terr pp "fixed array type length must be a non-negative integer literal here")
+
+(* 泛型接口实例化（v3.34，幂等）：单态化方法签名（subst AST 后 conv）、
+   注册 iface$<名>$<tags> 句柄 struct / 别名 / 方法表；父接口为同名模板时
+   以同实参实例化。默认实现 v1 不支持（body 内 T 替换未实现） *)
+and instantiate_iface (g : genv) (iname : string) (ztys : zty list) (p : pos) : zty =
+  let (tps, methods, parent, defaults, dpos) = Hashtbl.find iface_gtbl iname in
+  let mangle = iname ^ "$" ^ String.concat "$" (List.map tag_of_zty ztys) in
+  let ifstruct = "iface$" ^ mangle in
+  if not (Hashtbl.mem g.structs ifstruct) then begin
+    List.iter2
+      (fun (_, c) z ->
+        if not (constr_ok c z) then
+          terr p "type argument %s does not satisfy constraint '%s' of interface %s"
+            (pp_zty z) c iname)
+      tps ztys;
+    if defaults <> [] then
+      terr dpos "default methods are not supported on generic interface %s (v1)" iname;
+    let mapl = List.combine (List.map fst tps) ztys in
+    let parent_ms =
+      match parent with
+      | Some pn ->
+        let pn_key =
+          if Hashtbl.mem iface_gtbl pn then begin
+            ignore (instantiate_iface g pn ztys p);
+            pn ^ "$" ^ String.concat "$" (List.map tag_of_zty ztys)
+          end else pn
+        in
+        (match Hashtbl.find_opt iface_tbl pn_key with
+         | Some ms -> ms
+         | None -> terr p "unknown parent interface %s (define it first)" pn)
+      | None -> []
+    in
+    let own_ms =
+      List.map
+        (fun (ret, mn, params, mp) ->
+          (mn, List.map (fun (pd : param) -> conv_ty g mp (subst_ty_ast mapl pd.pty)) params,
+           (match ret with
+            | Some t -> conv_ty g mp (subst_ty_ast mapl t)
+            | None -> TVoid)))
+        methods
+    in
+    List.iter
+      (fun (mn, _, _) ->
+        if List.exists (fun (n, _, _) -> n = mn) parent_ms then
+          terr p "interface %s redefines inherited method %s (override not supported)" mangle mn)
+      own_ms;
+    Hashtbl.replace g.structs ifstruct
+      { spacked = false;
+        sfields = [ ("data", TPtr (TUint 8), None);
+                    ("vt", TPtr (TUint 8), None) ];
+        sunion = false; sbits = [ 0; 0 ] };
+    Hashtbl.replace g.aliases mangle (TStruct ifstruct);
+    Hashtbl.replace iface_tbl mangle (parent_ms @ own_ms)
+  end;
+  TStruct ifstruct
 
 (* 注册具体实例（幂等）：先占位再展开字段（自引用指针字段可引用）；
    值形态自引用由字段自查拦截，跨实例值环由检查末尾的循环嵌套复检拦截 *)
@@ -3214,6 +3288,10 @@ and check_expr env (e : expr) : texpr =
           mk (EUnK (UBitNot, t1)) t1.ety))
   | ECall (callee, args, p') ->
     (match callee with
+     | EVar (name, np) when Hashtbl.mem iface_gtbl name ->
+       (* 泛型接口构造（v3.34）：Store(implVal)——类型实参从实现 struct
+          的方法签名推断（接口签名中 TNamed 出现位逐一对应） *)
+       check_giface_ctor env p' name args
      | EVar (name, np) when Hashtbl.mem iface_tbl name ->
        (* 接口构造（v3.13）：Drawable(p) *)
        check_iface_ctor env p' name args
@@ -3893,6 +3971,120 @@ and try_method env name p' args =
            | _ -> None)
         | _ -> None))
   | _ -> None
+
+(* 泛型接口构造（v3.34）：Store(implVal)——从实现 struct 的方法签名推断
+   类型实参：接口方法签名（原始 AST）中的类型参数位置与具体方法签名的
+   zty 逐一结构对齐（TNamed/TPtr/TErr/TSeq 一层展开），冲突/缺失报错；
+   推断后 instantiate_iface 单态化并登记实现对 *)
+and check_giface_ctor env p iname args =
+  let (tps, methods, _parent, defaults, dpos) = Hashtbl.find iface_gtbl iname in
+  if defaults <> [] then
+    terr dpos "default methods are not supported on generic interface %s (v1)" iname;
+  if List.length args <> 1 then
+    terr p "interface constructor %s expects exactly 1 struct argument" iname;
+  let pos_arg = function CPos e | CCopy e -> Some e | _ -> None in
+  let tv =
+    match args with
+    | [ a ] ->
+      (match pos_arg a with
+       | Some e -> check_expr env e
+       | None -> terr p "interface constructor %s takes a plain struct value" iname)
+    | _ -> assert false
+  in
+  let sname =
+    match resolve tv.ety with
+    | TStruct s when not (is_iface_name s) -> s
+    | t -> terr p "interface constructor %s expects a struct value, got %s" iname (pp_zty t)
+  in
+  (* 绑定收集：T 名 -> zty option *)
+  let binds = List.map (fun (n, _) -> (n, ref None)) tps in
+  let bind nm z =
+    match List.assoc_opt nm binds with
+    | None -> ()
+    | Some cell ->
+      (match !cell with
+       | None -> cell := Some z
+       | Some z0 ->
+         let z0r = resolve z0 and zr = resolve z in
+         if z0r <> zr && z0r <> TError && zr <> TError then
+           terr p "conflicting type argument for %s in interface %s: %s vs %s"
+             nm iname (pp_zty z0r) (pp_zty zr))
+  in
+  (* 结构对齐一层：接口 AST 类型 vs 具体 zty；TNamed(T) 处绑定 *)
+  let rec align ast z =
+    match ast with
+    | TNamed (n, _) when List.mem_assoc n binds -> bind n (resolve z)
+    | TPtr (t, _) ->
+      (match resolve z with
+       | TPtr z' -> align t z'
+       | _ -> terr p "interface %s method parameter shape mismatch (expected pointer)" iname)
+    | TErr (t, _) ->
+      (match resolve z with
+       | TErr z' -> align t z'
+       | _ -> terr p "interface %s method parameter shape mismatch (expected T!)" iname)
+    | TSeq (t, _) ->
+      (match resolve z with
+       | TList z' -> align t z'
+       | _ -> terr p "interface %s method parameter shape mismatch (expected list)" iname)
+    | _ -> ()   (* 具体类型位不产绑定（签名核验在实例化后统一做） *)
+  in
+  List.iter
+    (fun (ret, mn, params, mp) ->
+      let gname =
+        match Hashtbl.find_opt method_tbl (sname, mn) with
+        | Some g -> g
+        | None ->
+          terr p "struct %s does not implement interface %s (missing method %s)"
+            sname iname mn
+      in
+      match Hashtbl.find_opt env.g.fns gname with
+      | None -> terr p "internal: method %s not registered" gname
+      | Some fsig ->
+        if List.length params + 1 <> List.length fsig.params then
+          terr p "struct %s does not implement interface %s (method %s arity mismatch)"
+            sname iname mn;
+        List.iteri
+          (fun j (pd : param) ->
+            align pd.pty (List.nth fsig.params (j + 1)))
+          params;
+        (match ret with
+         | Some t -> align t fsig.ret
+         | None -> ()))
+    methods;
+  let ztys =
+    List.map
+      (fun (n, cell) ->
+        match !cell with
+        | Some z -> z
+        | None ->
+          terr p "cannot infer type argument %s of interface %s (it appears in no method signature); write the instantiation explicitly at the declaration site"
+            n iname)
+      binds
+  in
+  let ifstruct =
+    match instantiate_iface env.g iname ztys p with
+    | TStruct s -> s
+    | _ -> assert false
+  in
+  let mangle = String.sub ifstruct 6 (String.length ifstruct - 6) in
+  (* 签名核验（与具体接口构造同款）：方法表 vs 实现方法签名 *)
+  let selfp = TPtr (TStruct sname) in
+  List.iter
+    (fun (mn, ptys, ret) ->
+      match Hashtbl.find_opt method_tbl (sname, mn) with
+      | Some gname ->
+        (match Hashtbl.find_opt env.g.fns gname with
+         | Some fsig ->
+           if fsig.params <> (selfp :: ptys) || fsig.ret <> ret then
+             terr p "struct %s does not implement interface %s (method %s signature mismatch)"
+               sname iname mn
+         | None -> terr p "internal: method %s not registered" gname)
+      | None -> terr p "struct %s does not implement interface %s (missing method %s)"
+          sname iname mn)
+    (Hashtbl.find iface_tbl mangle);
+  Hashtbl.replace iface_impls (mangle, sname) ();
+  { e = ECallK ("$ifnew$" ^ mangle ^ "$" ^ sname, [ tv ], []);
+    ety = TStruct ifstruct; epos = p }
 
 (* 接口构造（v3.13）：IfaceName(structValue)——核对 struct 方法集与签名
    （同名同签名：全局方法签名 = self ptr :: 接口参数），登记 (iface, struct)
@@ -7777,6 +7969,7 @@ let check_program (prog : program) : hir =
       gused = Hashtbl.create 16 } in
   (* 接口表重置（v3.13，与 method_tbl 同策略：单文件单进程防御性重置） *)
   Hashtbl.reset iface_tbl;
+  Hashtbl.reset iface_gtbl;
   Hashtbl.reset iface_defaults;
   Hashtbl.reset iface_impls;
   (* 内建 Err struct（解包块内 err 变量的类型）：code + msg。
@@ -8063,7 +8256,17 @@ let check_program (prog : program) : hir =
             (* 任务二：ABI 与变参标记（llvmgen 生成 declare/调用用） *)
             Hashtbl.replace extern_meta f.ename (f.eabi, f.evarargs, List.length ptys))
           funcs
-      | IIf { name; methods; parent; defaults; pos } ->
+      | IIf { name; methods; parent; tparams; defaults; pos } ->
+        if tparams <> [] then begin
+          (* 泛型接口模板（v3.34）：登记原始 AST 签名，TApp/构造点推断
+             实例化（instantiate_iface 单态化） *)
+          if Hashtbl.mem iface_gtbl name then
+            terr pos "duplicate interface definition: %s" name;
+          if Hashtbl.mem g.structs name || Hashtbl.mem fn_names name
+             || List.mem name builtin_names then
+            terr pos "%s conflicts with an existing struct/function/builtin name" name;
+          Hashtbl.replace iface_gtbl name (tparams, methods, parent, defaults, pos);
+        end else begin
         (* interface（v3.13）：注册方法表 + 接口值 struct iface$<名>
            { ptr data; ptr vt }。struct 隐式实现（构造时核对签名） *)
         if Hashtbl.mem iface_tbl name then
@@ -8101,6 +8304,7 @@ let check_program (prog : program) : hir =
           own_ms;
         Hashtbl.replace iface_tbl name (parent_ms @ own_ms);
         Hashtbl.replace iface_defaults name defaults
+        end
       | IEnum { name; variants; pos } ->
         (* enum（v3.9）：注册 enum$<名> struct = tag + 类型槽字段；
            载荷按类型分槽（Rect(f64,f64) 占两个 f64 槽，Named(string)

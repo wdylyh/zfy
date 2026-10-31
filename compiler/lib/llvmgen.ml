@@ -1509,6 +1509,22 @@ let va_promote fc (o : operand) : string * string =
     emitf fc "  %s = fpext %s %s to double" r t v; ("double", r)
   | _ -> (t, v)
 
+(* 拆 "$ifnew$<iface>$<struct>" / "$ifcall$<iface>$<method>" 的后缀段：
+   iface mangle（Foo$i32）与实现 struct（Wrap$i32）都可能含 $，无法按
+   定位符拆——在每个 $ 位置尝试 split，取第一个满足 ok(前缀, 后缀) 的
+   （前缀 = 已注册接口，后缀 = 已知 struct / 该接口方法）。 *)
+let split_after_iface fc sfx ok =
+  let n = String.length sfx in
+  let rec go i =
+    if i >= n then lerr None "malformed iface builtin name %s" sfx
+    else if String.unsafe_get sfx i = '$' then begin
+      let pre = String.sub sfx 0 i in
+      let suf = String.sub sfx (i + 1) (n - i - 1) in
+      if ok pre suf then (pre, suf) else go (i + 1)
+    end else go (i + 1)
+  in
+  go 0
+
 let gen_call fc dst name (args : operand list) (ret_ty : zty) =
   if name = "zfy_thread_spawn" then begin
     (* spawn（P0-1c 类别 2）：env 所有权移交线程。统一调 zfy_thread_spawn_d
@@ -1649,9 +1665,12 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
      | None -> lerr None "$ifnew must be captured"
      | Some d ->
        let sfx = String.sub name 7 (String.length name - 7) in
-       let i = String.index sfx '$' in
+       (* iface mangle（Foo$i32）与实现 struct（Wrap$i32）都可能含 $：
+          按"前缀是已注册接口"匹配拆分点（若多义取最先匹配） *)
        let (iname, sname) =
-         (String.sub sfx 0 i, String.sub sfx (i + 1) (String.length sfx - i - 1)) in
+         split_after_iface fc sfx (fun pre s ->
+           Hashtbl.mem Typeck.iface_tbl pre
+           && Option.is_some (find_struct fc.g s)) in
        (match find_struct fc.g sname with
         | Some sd ->
           let (sz, _) = Hir.struct_size_align fc.g.structs sd in
@@ -1681,9 +1700,14 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
     (* 接口方法分派（v3.13）：data/vt 从接口值槽读出，vt[slot] 间接调用。
        实参：iface 值按槽指针；其余按值（聚合再按指针——v1 限标量/string） *)
     let sfx = String.sub name 8 (String.length name - 8) in
-    let i = String.index sfx '$' in
+    (* iface mangle 与方法名的边界都可能含 $：按"前缀是已注册接口且
+       后缀是该接口的方法"匹配拆分点 *)
     let (iname, mname) =
-      (String.sub sfx 0 i, String.sub sfx (i + 1) (String.length sfx - i - 1)) in
+      split_after_iface fc sfx (fun pre suf ->
+        match Hashtbl.find_opt Typeck.iface_tbl pre with
+        | Some ms -> List.exists (fun (mn, _, _) -> mn = suf) ms
+        | None -> false)
+    in
     let imethods =
       (match Hashtbl.find_opt Typeck.iface_tbl iname with
        | Some m -> m | None -> lerr None "undefined interface %s" iname)
@@ -1716,7 +1740,15 @@ let gen_call fc dst name (args : operand list) (ret_ty : zty) =
     let targs2 =
       List.map
         (fun (o : operand) ->
-          if is_agg o.oty then
+          if o.oty = TString then begin
+            (* 所有权语义配平：接口方法参数（let string）在被调方 free，
+               调用点须克隆——字面量直接传会把 @.str 只读指针交给 free
+               （堆损坏，z3 探针实证）。普通调用 own_arg 同款约定 *)
+            let (v, _) = val_of fc o in
+            let cp = fresh_r fc in
+            emitf fc "  %s = call ptr @zfy_strdup(ptr %s)" cp v;
+            ("ptr", cp)
+          end else if is_agg o.oty then
             let (p, _) = ptr_of fc o in ("ptr", p)
           else
             let (v, t) = val_of fc o in (t, v))

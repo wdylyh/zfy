@@ -265,11 +265,14 @@ type item =
     (* 顶层声明：仅允许 const 标量（编译期常量，使用处内联，不生成运行时槽） *)
   | IIf of { name : string; methods : (ty option * string * param list * pos) list;
              parent : string option;
+             tparams : (string * string) list;
              defaults : (string * param list * ty option * block * pos) list;
              pos : pos }
     (* interface 接口（v3.13）：缩进块内每行一个方法签名 fn ret? 名(参数)——
        struct 方法同名同签名（除 self）即隐式实现。
        继承（v3.20）：interface A: B——A 的方法表 = B 的方法 @ A 自己。
+       泛型接口（v3.34）：tparams <> [] 时为模板（方法签名可引用类型参数），
+       经 TApp（Store<i32>）/构造点推断实例化，单态化为 iface$<名>$<tags>。
        默认实现（v3.20）：签名后跟缩进块体——struct 未实现该方法时按
        实现者合成（self 指向实现 struct，self.m2 静态分派）。
        接口类型 = struct iface$<名> { ptr data; ptr vt }（vtable 分派） *)

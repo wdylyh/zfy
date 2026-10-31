@@ -2260,6 +2260,13 @@ and parse_item p =
        接口类型 = struct iface$<名> { ptr data; ptr vt }，vtable 分派 *)
     ignore (next p);
     let iname = expect_ident p "interface name" in
+    (* 泛型接口（v3.34）：interface Store<T, U: num>——类型参数经 TApp
+       （Store<i32>）单态化实例化 *)
+    let tparams =
+      match peek p with
+      | (Lt, _) -> parse_tparams p
+      | _ -> []
+    in
     (* 继承（v3.20）：interface A: B——B 的方法并入 A（父在前） *)
     let iparent =
       match peek p with
@@ -2314,7 +2321,7 @@ and parse_item p =
       | (_, tp') -> err tp' "interface requires a newline and an indented method-signature block"));
     let ms = methods [] in
     let defs = List.rev !defaults in
-    IIf { name = iname; methods = ms; parent = iparent;
+    IIf { name = iname; methods = ms; parent = iparent; tparams = tparams;
           defaults = defs; pos = tp }
 
   | Keyword KEnum ->
