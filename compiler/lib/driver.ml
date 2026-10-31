@@ -896,6 +896,11 @@ let rec run_checked ?(src : string option) ?(acc : zerr list = [])
         | Ok prog ->
           (* 主文件 parse 恢复收集的错误先入列（头插列表反转成源码顺序） *)
           List.iter (fun (p, m) -> add `Parse p m) (List.rev pp.Parser.errs);
+          if pp.Parser.nsup > 0 then
+            add `Parse { file = path; line = 0; col = 0 }
+              (Printf.sprintf
+                 "%d cascade error(s) suppressed (recovery after a top-level parse failure; fix the first error and recompile)"
+                 pp.Parser.nsup);
           let perrs = ref [] in
           (* 模块解析 pass（new2.md 第4条）：内联/文件 mod、pub、use 路径
              语法；旧 use file.zfy 保留原样交 expand_uses *)

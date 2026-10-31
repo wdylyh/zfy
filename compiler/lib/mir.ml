@@ -139,6 +139,10 @@ type instr =
        zfy_panic（含 runtime 内部越界/除零等）打印 "  at file:line" *)
   | MAlloca of string * zty                      (* 变量槽（入口块统一分配�?*)
   | MFracNew of string * zty * operand * operand (* 分数字面量：… frac 类型, 分子, 分母 *)
+  | MFracCast of string * operand * zty
+    (* cast(frac, T) 转出（v3.23）：(目标寄存器, frac 操作数, 目标类型)。
+       i64/u64 = n/d 截断整除（sdiv/udiv）；f64/f32 = n/d 实数除。
+       frac 槽按 %frac.SUF {n, d} 布局直接 GEP 读字段，无需运行时调用 *)
   | MBoxAlloc of string * zty
     (* t-049/C：& 捕获堆箱槽的 rc 堆箱分配（槽名, 载荷类型=声明类型）。
        必须在声明点发射：循环体内声明逐轮分配，与作用域退出 MFreeVar 的
@@ -668,6 +672,13 @@ let rec lexpr l (e : texpr) : operand =
      | _ -> ());
     let d = fresh l in
     emit l (MUnop (d, u, oa));
+    op (OLocal d) e.ety
+  | ECastK (a, t) when (match a.ety with TFrac _ -> true | _ -> false) ->
+    (* cast(frac, T)（v3.23）：frac 转出（i64/u64 截断整除、f64/f32 实数除，
+       typeck 已限定目标与元素宽度）；frac 槽按 {n, d} 布局读字段 *)
+    let oa = lexpr l a in
+    let d = fresh l in
+    emit l (MFracCast (d, oa, e.ety));
     op (OLocal d) e.ety
   | ECastK (a, t) when a.ety = TString ->
     (* string → 数值 cast：错误值路径（e.ety 为 TErr）以 sret 写 TErr 聚合，
@@ -2141,6 +2152,7 @@ let uses_of (i : instr) : string list =
   | MAlloca _ -> []
   | MBoxAlloc _ -> []
   | MFracNew (_, _, a, b) -> operand_names a @ operand_names b
+  | MFracCast (_, a, _) -> operand_names a
   | MNorm _ -> []
   | MTempAlloca _ -> []
   | MSeqRemove (_, s, idx, _, _) -> operand_names s @ operand_names idx

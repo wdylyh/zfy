@@ -9,9 +9,11 @@ let err p msg = raise (ParseError (p, msg))
 type parser =
   { mutable toks : (token * pos) list;
     mutable tynames : string list;  (* 已知类型名：内建 + 本文件 struct/type 别名 *)
-    mutable errs : (pos * string) list }  (* 已收集待恢复的错误（多错误报告） *)
+    mutable errs : (pos * string) list;  (* 已收集待恢复的错误（多错误报告） *)
+    mutable mute : bool;            (* 级联抑制：顶层项失败后到下一个成功项为止，错误只计数不记录 *)
+    mutable nsup : int }            (* 被 mute 抑制的错误数（driver 末尾汇总提示） *)
 
-let make toks = { toks = toks; tynames = type_names; errs = [] }
+let make toks = { toks = toks; tynames = type_names; errs = []; mute = false; nsup = 0 }
 
 let pos_of (t, p) = p
 let eof_pos = { file = ""; line = 0; col = 0 }
@@ -21,7 +23,9 @@ let peek3 p = match p.toks with _ :: _ :: x :: _ -> x | _ -> (Eof, eof_pos)
 let next p = match p.toks with [] -> (Eof, eof_pos) | x :: r -> p.toks <- r; x
 
 (* 记录错误（供语句级恢复后统一报告） *)
-let record_err p pos msg = p.errs <- (pos, msg) :: p.errs
+let record_err p pos msg =
+  if p.mute then p.nsup <- p.nsup + 1
+  else p.errs <- (pos, msg) :: p.errs
 
 (* 语句级恢复：丢弃 token 直到语句边界（Newline/Dedent/Eof），至少消耗一个 *)
 let rec sync_stmt p =
@@ -2587,11 +2591,19 @@ let parse_program p =
     match peek p with
     | (Eof, _) -> List.rev acc
     | _ ->
-      (* 顶层项级错误恢复：记录后跳到下一顶层项继续（多错误收集） *)
-      (try go (parse_item p :: acc)
-       with ParseError (ep, em) ->
-         record_err p ep em;
-         sync_top p;
-         go acc)
+      (* 顶层项级错误恢复：记录后跳到下一顶层项继续（多错误收集）。
+         级联抑制（v3.23）：顶层项解析失败后置 mute——同一处损伤引发
+         的连锁错误只计数不报告，直到下一个顶层项完整解析成功才解除；
+         抑制总数由 driver 末尾汇总提示 *)
+      let r =
+        try Some (parse_item p)
+        with ParseError (ep, em) ->
+          record_err p ep em;
+          sync_top p;
+          None
+      in
+      (match r with
+       | Some it -> p.mute <- false; go (it :: acc)
+       | None -> p.mute <- true; go acc)
   in
   go []

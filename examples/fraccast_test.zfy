@@ -1,0 +1,19 @@
+// frac 转出 cast 测试（v3.23）：cast(frac, i64/u64) 截断整除、cast(frac, f64/f32) 实数除
+fn main()
+    let frac f = (22/7)
+    output(f)                       // 期望 22/7
+    let f64 x = cast(f, f64)
+    output(x)                       // 期望 3.142857...
+    let i64 q = cast(f, i64)
+    output(q)                       // 期望 3
+    let frac g = (10/4)
+    output(cast(g, f64))            // 期望 2.5
+    output(cast(g, i64))            // 期望 2（截断）
+    let i32 t = 7
+    let frac h = cast(t, frac)      // 转入仍可用
+    output(h)                       // 期望 7/1
+    // 表达式位置（临时 frac）转出
+    output(cast((f + g), i64))        // 22/7+10/4 = (88+70)/28 = 158/28 = 79/14 ≈ 5.64 → 5
+    output(cast((f + g), f64))        // 5.642857...
+    output(cast((7/2), f32) * cast((3/2), f32))  // 3.5*1.5 = 5.25
+    output("ok")

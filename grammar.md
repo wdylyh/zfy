@@ -487,7 +487,7 @@ fn main()
 | `utf8_char_at(s, i)` | 第 i 个码点（0 起），返回单码点 string |
 | `utf8_sub(s, a, b)` | 按码点闭区间切片 |
 | `sizeof(T)` / `alignof(T)` | 编译期常量 |
-| `cast(e, T)` | 显式转换（含 string→数值；失败产 `T!` 错误值，i128/u128 目标同样产错误值）。`cast(e, frac)` 支持——int/bool/char → n/1；float **字面量**按二进制精确转分数（0.5→1/2）；非字面量 float 拒绝 |
+| `cast(e, T)` | 显式转换（含 string→数值；失败产 `T!` 错误值，i128/u128 目标同样产错误值）。`cast(e, frac)` 支持——int/bool/char → n/1；float **字面量**按二进制精确转分数（0.5→1/2）；非字面量 float 拒绝。**frac 转出**（v3.23+）：`cast(f, i64)`/`cast(f, u64)` = n/d 截断整除（sdiv/udiv 语义，向零取整）、`cast(f, f64)`/`cast(f, f32)` = n/d 实数除（3.23+）；限整数元素宽 ≤64 的 frac；表达式位置（临时 frac，如 `cast(f + g, i64)`）同支持 |
 | `ord(c)` / `chr(n)` | char↔码值 |
 | `sqrt(x)` | 平方根（实参 coerce 到 f64，返回 f64；下同） |
 | `log(x)` / `exp(x)` | 自然对数 / e^x |
@@ -770,6 +770,10 @@ let i64 v = volatile_load(&mm)
 **报错格式**：每条错误带全局递增序号 `[N]`（按文件→行→列排序编号，
 一次编译内连续），后跟错误码、行号、文件名与原因，并附出错行上下文
 （上下各 2 行共 5 行 + `^` 指示列）。超过 30 条折叠，保留汇总行。
+**级联抑制**（v3.23+）：顶层项解析失败后，同一处损伤引发的连锁解析
+错误只计数不报告，直到下一个顶层项完整解析成功才恢复收集；抑制总数
+在错误列表末尾汇总一条 `N cascade error(s) suppressed …`（E2007）——
+用户只需修第一条真实错误后重编译。
 
 ```
 zfy:error[2][E3011] in 5 of main.zfy because (undefined variable: cont (did you mean 'count'? auto-fixed))

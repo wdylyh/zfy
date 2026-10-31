@@ -2773,6 +2773,49 @@ let gen_instr fc (i : instr) : unit =
      | Some (p, _) ->
        emitf fc "  call void @zfy_frac_norm_%s(ptr %s)" (Hir.suffix_of elem) p
      | None -> lerr None "undefined variable %s" name)
+  | MFracCast (d, src, t) ->
+    (* cast(frac, T) 转出（v3.23）：frac 槽 = %frac.SUF {n, d}，
+       GEP 读出两个字段后运算——i64/u64 = 截断整除（sdiv/udiv），
+       f64/f32 = 实数除（fdiv）。分母 0 由 frac 构造期不变量排除 *)
+    let (p, _) = ptr_of fc src in
+    let elem = (match src.oty with TFrac e -> e | _ -> lerr None "frac cast type error") in
+    let suf = Hir.suffix_of elem in
+    let ets = ll_ty elem in
+    let unsigned = (match elem with TUint _ -> true | _ -> false) in
+    let np = fresh_r fc in
+    emitf fc "  %s = getelementptr inbounds %%frac.%s, ptr %s, i32 0, i32 0" np suf p;
+    let dp = fresh_r fc in
+    emitf fc "  %s = getelementptr inbounds %%frac.%s, ptr %s, i32 0, i32 1" dp suf p;
+    let nv = fresh_r fc in
+    emitf fc "  %s = load %s, ptr %s" nv ets np;
+    let dv = fresh_r fc in
+    emitf fc "  %s = load %s, ptr %s" dv ets dp;
+    (match t with
+     | TInt 64 | TUint 64 ->
+       let nw = fresh_r fc and dw = fresh_r fc in
+       if unsigned then begin
+         emitf fc "  %s = zext %s %s to i64" nw ets nv;
+         emitf fc "  %s = zext %s %s to i64" dw ets dv
+       end else begin
+         emitf fc "  %s = sext %s %s to i64" nw ets nv;
+         emitf fc "  %s = sext %s %s to i64" dw ets dv
+       end;
+       let r = fresh_r fc in
+       emitf fc "  %s = %s i64 %s, %s" r (if unsigned then "udiv" else "sdiv") nw dw;
+       Hashtbl.replace fc.regs d r
+     | TFloat 64 | TFloat 32 ->
+       let cvt = if unsigned then "uitofp" else "sitofp" in
+       let nw = fresh_r fc and dw = fresh_r fc in
+       emitf fc "  %s = %s %s %s to double" nw cvt ets nv;
+       emitf fc "  %s = %s %s %s to double" dw cvt ets dv;
+       let r64 = fresh_r fc in
+       emitf fc "  %s = fdiv double %s, %s" r64 nw dw;
+       if t = TFloat 32 then begin
+         let r = fresh_r fc in
+         emitf fc "  %s = fptrunc double %s to float" r r64;
+         Hashtbl.replace fc.regs d r
+       end else Hashtbl.replace fc.regs d r64
+     | _ -> lerr None "unsupported frac cast target")
   | MSeqRemove (d, base, idx, elem, is_list) ->
     (* remove 表达式（v3 2026-10-11）：runtime 原子地"读出被删元素到 out +
        删除"。数组=槽位填零（长度不变）；列表=删除并左移。

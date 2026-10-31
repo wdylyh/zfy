@@ -3552,6 +3552,18 @@ and check_expr env (e : expr) : texpr =
         terr p' "unsupported cast: fraction literal -> %s" (pp_zty t')
     end
     else
+    if (match a with TFrac (TInt w | TUint w) -> w <= 64 | _ -> false) then begin
+      (* cast(frac, T)（v3.23）：frac 转出通道——读出 n/d 后
+         i64/u64 = 截断整除、f64/f32 = 实数除。限整数元素宽 ≤64 的 frac；
+         分母 0 由 frac 构造期不变量排除 *)
+      match b with
+      | (TInt 64 | TUint 64 | TFloat 32 | TFloat 64) ->
+        mk (ECastK (t1, t')) b
+      | _ ->
+        terr p' "cast out of frac supports i64/u64/f32/f64 targets only, got %s"
+          (pp_zty t')
+    end
+    else
     (match b with
      | TFrac elem ->
        let tv =
@@ -5662,7 +5674,7 @@ and check_decl env p isconst is_frac0 is_unred name (ty_opt : ty option) init =
     | Some init ->
     if (match resolve want with TStruct _ -> true | _ -> false)
        && bare_struct_ref env init then
-      terr p "struct initialization requires explicit copy(...) or move ... (no implicit deep copy)";
+      terr p "struct initialization requires explicit copy(x) or move x (no implicit deep copy; fresh values from constructor calls, function returns, copy/move and literals need no marker)";
     (match resolve want, init with
      | TBool, EBool (b, _) ->
       { e = EBoolK b; ety = TBool; epos = p }
@@ -6684,7 +6696,7 @@ and check_stmt env (st : stmt) : tstmt =
              let lty = l.lty in
              if (match resolve lty with TStruct _ -> true | _ -> false)
                 && bare_struct_ref env rhs' then
-               terr p' "struct assignment requires explicit copy(...) or move ... (no implicit deep copy)";
+               terr p' "struct assignment requires explicit copy(x) or move x (no implicit deep copy; fresh values from constructor calls, function returns, copy/move and literals need no marker)";
              let trhs =
                (match resolve lty with
                 | TFrac e when is_frac_arith rhs' ->
@@ -6791,7 +6803,7 @@ and check_stmt env (st : stmt) : tstmt =
                    let (idxs, fty) = chain_fields env p' l.lty segs in
                    if (match resolve fty with TStruct _ -> true | _ -> false)
                       && bare_struct_ref env rhs' then
-                     terr p' "struct field assignment requires explicit copy(...) or move ... (no implicit deep copy)";
+                     terr p' "struct field assignment requires explicit copy(x) or move x (no implicit deep copy; fresh values from constructor calls, function returns, copy/move and literals need no marker)";
                    (* v3.30：字段类型已知 → 作期望 *)
                    let trhs = check_expr_expect env rhs' (Some fty) in
                    let trhs = coerce p' trhs fty in
@@ -6808,7 +6820,7 @@ and check_stmt env (st : stmt) : tstmt =
                       let (idxs, fty) = chain_fields env p' root.ety segs in
                       if (match resolve fty with TStruct _ -> true | _ -> false)
                          && bare_struct_ref env rhs' then
-                        terr p' "struct field assignment requires explicit copy(...) or move ... (no implicit deep copy)";
+                        terr p' "struct field assignment requires explicit copy(x) or move x (no implicit deep copy; fresh values from constructor calls, function returns, copy/move and literals need no marker)";
                       (* v3.30：捕获字段类型已知 → 作期望 *)
                       let trhs = check_expr_expect env rhs' (Some fty) in
                       let trhs = coerce p' trhs fty in
