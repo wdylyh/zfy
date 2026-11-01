@@ -1,4 +1,4 @@
-# zfy 语言规范（v3.35.0，2026-11-01）
+# zfy 语言规范（v3.36.0，2026-11-01）
 
 > 本规范只描述当前语法。旧语法一律删除、不再保留历史版本描述。
 > 适用编译器：`compiler/_build/zfyc.exe` 当前构建。
@@ -1531,6 +1531,109 @@ web → 宿主的消息优先按字符串取，非字符串消息取 JSON 文本
   add/present/remove 一致性、菜单构建/安装/改状态、拖放空投放、
   WebView2 未初始化安全）；示例程序：`demos/webview_demo.zfy`
   （浏览器窗口 + 托盘显示切换 + 菜单退出）。
+
+### 18.11 动画引擎（补间 / 弹簧 / 时间线，v3.36）
+
+`stdlib/anim.zfy` 是**纯 zfy 实现**（不碰 runtime、不加链接库），所有推进都
+以「毫秒增量」为输入，UI 主循环取帧间隔调 `update` 即可。模块不引入任何
+新语法，`use anim::{...}` 后按普通 struct 使用。
+
+```zfy
+mod gui
+mod anim
+use anim::{EASE_CUBIC_OUT, Tween, Spring, Timeline, anim_dt}
+
+let Tween t = Tween(from=0.0, to=1.0, duration=300.0, ease_kind=EASE_CUBIC_OUT)
+while gui_alive()
+    let f64 dt = anim_dt()        // 首帧 0，单帧上限 100ms
+    let f64 v = t.update(dt)      // 缓动后的当前值
+    gui_fill_rect(0, 0, 120, cast(v * 200.0, i32), 0xFF4CC2FF)
+    gui_present()
+```
+
+**缓动与插值**
+
+| API | 说明 |
+| --- | --- |
+| `f64 ease(i32 kind, f64 t)` | 输入夹到 `[0,1]`；输出可越过 `[0,1]`（back / elastic 的正常表现） |
+| `f64 ease_curve(EaseCurve c, f64 t)` | 三次贝塞尔（同 CSS `cubic-bezier`）；`EaseCurve(x1,y1,x2,y2)`，默认 `(0.25, 0.1, 0.25, 1.0)` |
+| `f64 lerp(a, b, t)` / `i32 lerp_i32(a, b, t)` | 数值插值（`t` 自动夹紧） |
+| `u32 lerp_color(u32 a, u32 b, f64 t)` | ARGB 四通道插值（含 alpha） |
+| `f64 lerp_angle(f64 a, f64 b, f64 t)` | 弧度最短弧插值，不跨 ±PI 突变 |
+| `f64 clamp01(t)` / `f64 clampf(v, lo, hi)` | 夹紧助手 |
+| `f64 tween_value(from, to, kind, t)` | 一次性取值（无状态） |
+| `f64 stagger_at(i32 index, f64 step_ms)` | 错峰延迟计算 |
+
+缓动 `kind` 常量（整数，共 29 种）：`EASE_LINEAR / EASE_STEP`，
+`EASE_QUAD/CUBIC/QUART` 各带 `_IN/_OUT/_INOUT`，`EASE_SINE/CIRC/EXPO` 各三向，
+`EASE_BACK/ELASTIC/BOUNCE` 各三向。未知 `kind` 退化为线性。
+
+**Tween（定长补间）**
+
+字段：`from/to/val/elapsed/duration/delay/ease_kind/loop/yoyo/reverse/paused/finished`。
+`loop`：`-1` 无限 / `0` 一次 / `n` 共 `n` 个周期；`yoyo` 奇偶周期自动换向；
+`reverse` 整体 `1→0`。
+
+| 方法 | 说明 |
+| --- | --- |
+| `f64 update(f64 dt_ms)` / `f64 tick(i64 dt_ms)` | 推进并返回当前值；暂停/结束时原值返回 |
+| `f64 progress()` | 原始线性进度 `0..1`（不缓动，配合 `lerp_color` 等） |
+| `void seek(f64 ms)` | 跳到本周期内位置（不含 delay）并重算 |
+| `void restart()/pause()/resume()/toggle_pause()/finish()` | 生命周期控制 |
+| `void set_range/set_duration/set_ease/set_reverse/set_yoyo/set_loop/set_value` | 运行期改参数 |
+| `bool is_done()` / `bool running()` | 状态查询 |
+
+**Spring（弹簧物理）**
+
+字段：`pos/vel/goal/stiffness/damping/mass/rest_delta/rest_speed/resting`。
+半隐式欧拉 + 固定子步长（≤2ms，单帧最多 120 步），帧率波动不影响轨迹。
+
+| API | 说明 |
+| --- | --- |
+| `f64 update(f64 dt_ms)` / `f64 tick(i64 dt_ms)` | 推进并返回位置；已静止时不变 |
+| `void set_goal(f64 g)` | 改目标并重新起振 |
+| `void snap_to(f64 g)` / `void kick(f64 v)` | 立即落位 / 给初速度 |
+| `void set_params(k, c, m)` | 改刚度/阻尼/质量 |
+| `f64 position()` / `bool is_resting()` | 查询 |
+| `spring_gentle()/spring_stiff()/spring_wobbly()/spring_snappy()` | 预置手感（ζ≈1 临界 / ζ≈0.42 弹跳等） |
+
+**Stagger（错峰组）**
+
+`build(from, to, count, step_ms, dur_ms, kind)` 生成 `count` 个补间（第 `i` 个
+延迟 `i*step_ms`）；`update(dt)` 原地推进整组；`value(i)` / `active(i)` /
+`all_done()` / `restart()` / `clear()` / `count()` 查询与控制。
+
+**Timeline（多轨关键帧编排）**
+
+轨道先 `new_track()`（返回下标），关键帧 `key(tr, at_ms, value, ease_kind)`
+（插入后按「轨道 → 时刻」自动排序），采样取「前一关键帧 → 下一关键帧」区间
+按**前一关键帧**的缓动插值；轨道时长 = 最大关键帧时刻。工厂 `tl_1()/tl_2()/tl_3()`
+预建 1/2/3 轨。
+
+| 方法 | 说明 |
+| --- | --- |
+| `void update(f64 dt_ms)` / `void tick(i64 dt_ms)` | 按 `speed` 推进入口 |
+| `void play()/pause()/stop()/seek(f64 ms)` | 播放控制（`play` 在结束时从头） |
+| `void set_loop(bool)` / `void set_speed(f64)` | 循环 / 倍速 |
+| `f64 value(i32 tr)` / `f64 time()` / `f64 duration()` / `f64 progress()` | 查询 |
+| `bool is_playing()` / `bool is_finished()` / `i32 track_count()` | 状态 |
+| `void reset()` | 清空轨道与时间 |
+
+**帧时钟**
+
+| API | 说明 |
+| --- | --- |
+| `f64 anim_dt()` | 基于 `tick_ms()` 的帧间隔毫秒；首帧 `0`，单帧上限 `100`（切后台不瞬移） |
+| `void anim_clock_reset()` | 重置基准（重新进入主循环时调用） |
+| `f64 anim_fps(f64 dt_ms)` | 由增量估算瞬时帧率 |
+
+约定：所有时间参数为**毫秒**；引擎本身不读系统时间（唯一例外是 `anim_dt`
+的帧时钟），因此 headless 与离线渲染可用固定 `dt` 得到完全确定的结果。
+
+- 用例：`examples/anim_test.zfy`（29 种缓动端点/夹紧、贝塞尔、颜色/角度
+  插值、Tween 延迟/循环/往复/反向/暂停、Spring 收敛与过冲、Stagger 错峰、
+  Timeline 乱序插入排序/采样/循环/倍速/seek）；示例程序：
+  `demos/anim_demo.zfy`（缓动曲线网格 + 时间线三轨 + 弹簧球 + 错峰方块）。
 
 ## 19. 内建容器 map / set 与 for-in
 

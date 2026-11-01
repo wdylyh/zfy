@@ -1,0 +1,322 @@
+// examples/anim_test.zfy —— 动画引擎 API 面（headless，纯确定性计算）
+// 覆盖：缓动端点/单调性、贝塞尔、插值、Tween 延迟/循环/往复/反向、
+//      Spring 收敛、Stagger 错峰、Timeline 排序/采样/循环/倍速/seek。
+mod anim
+
+use anim::{EASE_LINEAR, EASE_STEP, EASE_CUBIC_OUT, EASE_BACK_OUT,
+            EASE_ELASTIC_OUT, EASE_BOUNCE_OUT, EASE_SINE_INOUT,
+            ease, ease_curve, EaseCurve, clamp01, clampf, lerp, lerp_i32,
+            lerp_color, lerp_angle, tween_value,
+            Tween, Spring, spring_wobbly, spring_snappy,
+            Stagger, Timeline, tl_1, tl_2,
+            stagger_at, anim_fps}
+
+fn bool near(let f64 a, let f64 b)
+    return abs(a - b) < 0.001
+
+fn main()
+    let i32 fails = 0
+
+    // ===== 1) 缓动：所有 kind 端点必须是 0 / 1 =====
+    let i32 k = 0
+    while k <= 28
+        if not near(ease(k, 0.0), 0.0)
+            output("FAIL ease(", k, ",0)=", ease(k, 0.0), "\n")
+            fails++
+        if not near(ease(k, 1.0), 1.0)
+            output("FAIL ease(", k, ",1)=", ease(k, 1.0), "\n")
+            fails++
+        // 输入越界自动夹紧
+        if not near(ease(k, -1.0), 0.0)
+            fails++
+        if not near(ease(k, 2.0), 1.0)
+            fails++
+        k++
+    // 未知 kind = 线性
+    if not near(ease(999, 0.5), 0.5)
+        output("FAIL ease unknown kind\n")
+        fails++
+    // STEP 在中间保持 0
+    if not near(ease(EASE_STEP, 0.5), 0.0)
+        output("FAIL ease step mid\n")
+        fails++
+    // 常用曲线的中点在合理区间
+    if not near(ease(EASE_SINE_INOUT, 0.5), 0.5)
+        output("FAIL sine inout mid\n")
+        fails++
+    if ease(EASE_BACK_OUT, 0.8) < 1.0
+        output("FAIL back-out should overshoot\n")
+        fails++
+    if ease(EASE_ELASTIC_OUT, 0.35) > 1.2 or ease(EASE_ELASTIC_OUT, 0.35) < 0.9
+        output("FAIL elastic-out range\n")
+        fails++
+    if ease(EASE_BOUNCE_OUT, 0.5) < 0.6
+        output("FAIL bounce-out mid\n")
+        fails++
+
+    // ===== 2) 贝塞尔 =====
+    let EaseCurve lin = EaseCurve(x1=0.0, y1=0.0, x2=1.0, y2=1.0)
+    if not near(ease_curve(lin, 0.5), 0.5)
+        output("FAIL bezier linear mid=", ease_curve(lin, 0.5), "\n")
+        fails++
+    let f64 bz = ease_curve(EaseCurve(), 0.5)
+    if bz < 0.0 or bz > 1.0
+        output("FAIL bezier default out of range=", bz, "\n")
+        fails++
+    if not near(ease_curve(lin, 0.0), 0.0) or not near(ease_curve(lin, 1.0), 1.0)
+        fails++
+
+    // ===== 3) 插值 =====
+    if not near(lerp(10.0, 20.0, 0.5), 15.0) or not near(lerp(10.0, 20.0, 1.5), 20.0)
+        output("FAIL lerp\n")
+        fails++
+    if clamp01(-0.5) != 0.0 or clamp01(1.5) != 1.0
+        fails++
+    if clampf(7.0, 0.0, 5.0) != 5.0 or clampf(-1.0, 0.0, 5.0) != 0.0
+        fails++
+    if lerp_i32(0, 100, 0.5) != 50 or lerp_i32(100, 0, 0.5) != 50
+        output("FAIL lerp_i32\n")
+        fails++
+    // 颜色：黑 ↔ 白 中点 = 0xFF7F7F7F（通道截断）
+    let u32 cm = lerp_color(0xFF000000, 0xFFFFFFFF, 0.5)
+    if cm != 0xFF7F7F7F
+        output("FAIL lerp_color mid=", cm, "\n")
+        fails++
+    let u32 ca = lerp_color(0x80FF0000, 0x000000FF, 0.0)
+    if ca != 0x80FF0000
+        fails++
+    // 角度最短弧：3.0 → -3.0 正向绕 0.283 rad，中点落在 ±PI 附近
+    let f64 am = lerp_angle(3.0, -3.0, 0.5)
+    if abs(abs(am) - 3.1415) > 0.01
+        output("FAIL lerp_angle mid=", am, "\n")
+        fails++
+    if not near(tween_value(0.0, 100.0, EASE_LINEAR, 0.25), 25.0)
+        fails++
+    if not near(stagger_at(3, 40.0), 120.0)
+        fails++
+
+    // ===== 4) Tween：延迟 / 时长 / 结束 =====
+    let Tween tw = Tween(from=0.0, to=100.0, duration=100.0, delay=50.0,
+                         ease_kind=EASE_LINEAR)
+    if not near(tw.update(40.0), 0.0)
+        output("FAIL tween delay\n")
+        fails++
+    if not near(tw.update(20.0), 10.0)    // elapsed=60, local=10 → 10
+        output("FAIL tween delay edge\n")
+        fails++
+    if not near(tw.progress(), 0.1)
+        fails++
+    if not near(tw.update(50.0), 60.0)     // local=60 → 60
+        output("FAIL tween mid val=", tw.val, "\n")
+        fails++
+    if not near(tw.update(50.0), 100.0) or not tw.is_done()
+        output("FAIL tween finish val=", tw.val, "\n")
+        fails++
+    tw.seek(25.0)
+    if not near(tw.val, 25.0) or tw.is_done()
+        output("FAIL tween seek\n")
+        fails++
+    tw.finish()
+    if not near(tw.val, 100.0)
+        fails++
+
+    // 无限循环
+    let Tween lp = Tween(from=0.0, to=100.0, duration=100.0, loop=-1,
+                         ease_kind=EASE_LINEAR)
+    if not near(lp.update(250.0), 50.0) or lp.is_done()
+        output("FAIL tween loop val=", lp.val, "\n")
+        fails++
+
+    // 往复（yoyo）：周期 0 正放、周期 1 反放、周期 2 正放
+    let Tween yo = Tween(from=0.0, to=100.0, duration=100.0, loop=-1,
+                         yoyo=true, ease_kind=EASE_LINEAR)
+    if not near(yo.update(150.0), 50.0)
+        fails++
+    if not near(yo.update(50.0), 0.0)      // elapsed=200：周期 2 起点
+        output("FAIL yoyo cycle end=", yo.val, "\n")
+        fails++
+    if not near(yo.update(50.0), 50.0)
+        fails++
+
+    // 反向
+    let Tween rv = Tween(from=0.0, to=100.0, duration=100.0, reverse=true,
+                         ease_kind=EASE_LINEAR)
+    if not near(rv.update(75.0), 25.0)
+        output("FAIL tween reverse val=", rv.val, "\n")
+        fails++
+
+    // 有限次数 loop=2：结束时停在 to
+    let Tween l2 = Tween(from=0.0, to=100.0, duration=100.0, loop=2,
+                         ease_kind=EASE_LINEAR)
+    if not near(l2.update(250.0), 100.0)
+        output("FAIL tween loop2 end val=", l2.val, "\n")
+        fails++
+    if not l2.is_done()
+        fails++
+
+    // 暂停后推进不变
+    let Tween ps = Tween(duration=100.0, ease_kind=EASE_LINEAR)
+    ps.val = ps.update(30.0)
+    let f64 before = ps.val
+    ps.pause()
+    if not near(ps.update(50.0), before)
+        output("FAIL tween pause\n")
+        fails++
+    ps.resume()
+    if not near(ps.update(70.0), 1.0)
+        fails++
+
+    // ===== 5) Spring =====
+    let Spring sp = Spring(goal=0.0, resting=true)
+    if not sp.is_resting() or sp.update(16.0) != 0.0
+        fails++
+    sp.set_goal(100.0)
+    let i32 si = 0
+    while si < 300 and not sp.is_resting()
+        sp.pos = sp.update(16.0)
+        si++
+    if not sp.is_resting() or not near(sp.position(), 100.0)
+        output("FAIL spring settle pos=", sp.position(), " steps=", si, "\n")
+        fails++
+    // 临界阻尼不应明显过冲
+    let Spring cn = Spring(goal=100.0, resting=true)
+    cn.set_goal(100.0)
+    cn.snap_to(0.0)
+    cn.set_goal(100.0)
+    let f64 peak = 0.0
+    si = 0
+    while si < 300 and not cn.is_resting()
+        let f64 v = cn.update(16.0)
+        if v > peak
+            peak = v
+        si++
+    if peak > 105.0
+        output("FAIL spring critical overshoot=", peak, "\n")
+        fails++
+    // 欠阻尼 wobble 应过冲
+    let Spring wob = spring_wobbly()
+    wob.snap_to(0.0)
+    wob.set_goal(100.0)
+    let f64 wpeak = 0.0
+    si = 0
+    while si < 300 and not wob.is_resting()
+        let f64 v = wob.update(16.0)
+        if v > wpeak
+            wpeak = v
+        si++
+    if wpeak < 105.0
+        output("FAIL spring wobbly should overshoot=", wpeak, "\n")
+        fails++
+    // 预设工厂
+    let Spring sn = spring_snappy()
+    sn.set_goal(50.0)
+    si = 0
+    while si < 400 and not sn.is_resting()
+        sn.pos = sn.update(16.0)
+        si++
+    if not near(sn.position(), 50.0)
+        fails++
+
+    // ===== 6) Stagger =====
+    let Stagger st = Stagger()
+    st.build(0.0, 1.0, 3, 50.0, 100.0, EASE_LINEAR)
+    if st.count() != 3
+        fails++
+    st.update(100.0)
+    if not near(st.value(0), 1.0)
+        output("FAIL stagger[0]=", st.value(0), "\n")
+        fails++
+    if not near(st.value(1), 0.5)
+        output("FAIL stagger[1]=", st.value(1), "\n")
+        fails++
+    if not near(st.value(2), 0.0)
+        output("FAIL stagger[2]=", st.value(2), "\n")
+        fails++
+    if st.all_done()
+        fails++
+    st.update(100.0)
+    if not st.all_done()
+        output("FAIL stagger not done\n")
+        fails++
+    st.restart()
+    if not near(st.value(0), 1.0) or st.all_done()
+        fails++
+    if st.value(-1) != 0.0 or st.value(5) != 0.0
+        fails++
+
+    // ===== 7) Timeline =====
+    let Timeline tl = tl_2()
+    // 故意乱序插入，验证排序
+    tl.key(0, 1000.0, 100.0, EASE_LINEAR)
+    tl.key(0, 0.0, 0.0, EASE_LINEAR)
+    tl.key(1, 500.0, 50.0, EASE_LINEAR)
+    tl.key(1, 0.0, 0.0, EASE_LINEAR)
+    tl.key(1, 1000.0, 100.0, EASE_LINEAR)
+    if tl.track_count() != 2 or not near(tl.duration(), 1000.0)
+        output("FAIL tl track/dur\n")
+        fails++
+    if not near(tl.value(0), 0.0)
+        fails++
+    tl.update(500.0)
+    if not near(tl.value(0), 50.0) or not near(tl.value(1), 50.0)
+        output("FAIL tl sample 500: ", tl.value(0), " ", tl.value(1), "\n")
+        fails++
+    tl.update(250.0)
+    if not near(tl.value(0), 75.0) or not near(tl.value(1), 75.0)
+        output("FAIL tl sample 750\n")
+        fails++
+    if not near(tl.progress(), 0.75) or not near(tl.time(), 750.0)
+        fails++
+    tl.seek(250.0)
+    if not near(tl.value(0), 25.0) or not near(tl.value(1), 25.0)
+        output("FAIL tl seek\n")
+        fails++
+    // 倍速
+    tl.set_speed(2.0)
+    tl.update(100.0)
+    if not near(tl.time(), 450.0) or not near(tl.value(0), 45.0)
+        output("FAIL tl speed t=", tl.time(), "\n")
+        fails++
+    // 循环回绕
+    tl.set_speed(1.0)
+    tl.set_loop(true)
+    tl.update(2000.0)
+    if not near(tl.time(), 450.0)
+        output("FAIL tl loop t=", tl.time(), "\n")
+        fails++
+    // 非循环结束
+    let Timeline t1 = tl_1()
+    t1.key(0, 0.0, 0.0, EASE_LINEAR)
+    t1.key(0, 100.0, 10.0, EASE_LINEAR)
+    t1.update(200.0)
+    if not near(t1.value(0), 10.0) or not t1.is_finished()
+        output("FAIL tl finish\n")
+        fails++
+    t1.play()
+    if not near(t1.time(), 0.0) or not near(t1.value(0), 0.0)
+        fails++
+    t1.pause()
+    if t1.is_playing()
+        fails++
+    t1.stop()
+    if t1.is_playing() or not near(t1.time(), 0.0)
+        fails++
+    // 越界轨道 key / value 安全
+    t1.key(-1, 5.0, 1.0, EASE_LINEAR)
+    t1.key(9, 5.0, 1.0, EASE_LINEAR)
+    if t1.value(-3) != 0.0 or t1.value(9) != 0.0
+        fails++
+    // reset 后空轨
+    t1.reset()
+    if t1.track_count() != 0 or t1.value(0) != 0.0
+        fails++
+
+    // ===== 8) 帧率助手 =====
+    if not near(anim_fps(16.0), 62.5) or anim_fps(0.0) != 0.0
+        fails++
+
+    if fails > 0
+        output("anim test FAIL ", fails, "\n")
+        return 1
+    output("anim test PASS")
+    return 0

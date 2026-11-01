@@ -1,0 +1,204 @@
+// demos/anim_demo.zfy —— 动画引擎演示（缓动曲线 / 时间线 / 弹簧 / 错峰）
+//
+// 用法：anim_demo.exe
+// 控制：空格 暂停/继续 · R 重置 · 鼠标移动牵引弹簧 · Esc 退出
+//
+// 四块内容：
+//   1) 29 条缓动曲线网格：每条曲线上的白点随统一探针 0→1 移动
+//   2) 时间线三轨条：关键帧驱动宽度（缓动由各关键帧指定）
+//   3) 弹簧球：双轴弹簧追随鼠标，展示阻尼与静止
+//   4) 错峰方块：8 个方块逐个弹起（Stagger + BACK_OUT）
+mod gui
+mod anim
+
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_fill_rect, gui_rect,
+          gui_fill_circle, gui_draw_text, gui_present, gui_poll, gui_frame_sleep,
+          Event, EV_KEY, EV_MOVE}
+use anim::{Tween, Spring, Stagger, Timeline, tl_3, anim_dt, anim_fps,
+           ease, clampf, lerp_color,
+           EASE_LINEAR, EASE_BACK_OUT}
+
+fn main()
+    if gui_open(1000, 700, "zfy 动画引擎演示") != 0
+        output("无法创建窗口\n")
+        return 1
+
+    // 统一探针：0→1 循环（1600ms 一圈）
+    let Tween probe = Tween(from=0.0, to=1.0, duration=1600.0, loop=-1,
+                            ease_kind=EASE_LINEAR)
+
+    // 时间线：三轨条，1800ms 循环
+    let Timeline tl = tl_3()
+    tl.key(0, 0.0, 0.0, EASE_LINEAR)
+    tl.key(0, 600.0, 1.0, EASE_LINEAR)
+    tl.key(0, 1200.0, 0.4, EASE_LINEAR)
+    tl.key(0, 1800.0, 0.8, EASE_LINEAR)
+    tl.key(1, 0.0, 1.0, EASE_LINEAR)
+    tl.key(1, 900.0, 0.0, EASE_LINEAR)
+    tl.key(1, 1800.0, 1.0, EASE_LINEAR)
+    tl.key(2, 0.0, 0.2, EASE_LINEAR)
+    tl.key(2, 450.0, 0.9, EASE_LINEAR)
+    tl.key(2, 1350.0, 0.1, EASE_LINEAR)
+    tl.key(2, 1800.0, 0.2, EASE_LINEAR)
+    tl.set_loop(true)
+
+    // 弹簧球（双轴，欠阻尼）
+    let Spring sx = Spring(stiffness=180.0, damping=16.0)
+    let Spring sy = Spring(stiffness=180.0, damping=16.0)
+    sx.snap_to(100.0)
+    sy.snap_to(60.0)
+
+    // 错峰方块
+    let Stagger sq = Stagger()
+    sq.build(6.0, 72.0, 8, 55.0, 320.0, EASE_BACK_OUT)
+
+    let bool paused = false
+    let f64 dt = 0.0
+
+    while gui_alive()
+        let i64 f0 = tick_ms()
+        // ---- 事件 ----
+        let bool reset = false
+        let Event e = Event()
+        while gui_poll(ref e)
+            if e.is(EV_KEY)
+                let i64 k = e.key
+                if k == 27
+                    gui_close()
+                if k == 32
+                    paused = not paused
+                if k == 82 or k == 114
+                    reset = true
+            if e.is(EV_MOVE)
+                sx.set_goal(clampf(cast(e.x, f64) - 420.0, 18.0, 182.0))
+                sy.set_goal(clampf(cast(e.y, f64) - 510.0, 18.0, 112.0))
+
+        // ---- 推进 ----
+        dt = anim_dt()
+        if paused
+            dt = 0.0
+        if reset
+            tl.seek(0.0)
+            sq.restart()
+            probe.restart()
+        probe.val = probe.update(dt)
+        tl.update(dt)
+        sq.update(dt)
+        if sq.all_done()
+            sq.restart()
+        sx.pos = sx.update(dt)
+        sy.pos = sy.update(dt)
+
+        let i32 W = gui_w()
+        let i32 H = gui_h()
+        gui_fill_rect(0, 0, W, H, 0x15151A)
+        gui_draw_text(30, 14, "zfy 动画引擎 · 缓动 / 时间线 / 弹簧 / 错峰", 0xE8E8F0)
+        let string fps_s = "fps " + to_str(cast(anim_fps(dt), i32))
+        if paused
+            fps_s = "已暂停"
+        gui_draw_text(W - 100, 14, fps_s, 0x9A9AA8)
+
+        // ---- 1) 29 条缓动曲线网格（8×4）----
+        let i32 gx = 30
+        let i32 gy = 52
+        let i32 cw = 116
+        let i32 ch = 100
+        let i32 kind_n = 29
+        let i32 row = 0
+        while row < 4
+            let i32 col = 0
+            while col < 8
+                let i32 k = row * 8 + col
+                if k < kind_n
+                    let i32 cx = gx + col * cw
+                    let i32 cy = gy + row * ch
+                    gui_fill_rect(cx, cy, cw - 4, ch - 6, 0x1C1C24)
+                    gui_rect(cx, cy, cw - 4, ch - 6, 0x2E2E3A)
+                    // 曲线区：x ∈ [cx+6, cx+cw-10]，y 基线 cy+80、顶 cy+12
+                    let i32 base_y = cy + 80
+                    let i32 top_y = cy + 12
+                    let i32 span = base_y - top_y
+                    let i32 sw = cw - 16
+                    let i32 ix = 0
+                    while ix < sw
+                        let f64 p = cast(ix, f64) / cast(sw, f64)
+                        let f64 v = ease(k, p)
+                        let i32 yy = base_y - cast(v * cast(span, f64), i32)
+                        let i32 cyy = yy
+                        if cyy < top_y
+                            cyy = top_y
+                        if cyy > base_y
+                            cyy = base_y
+                        gui_fill_rect(cx + 6 + ix, cyy - 1, 2, 2, 0x4CC2FF)
+                        ix++
+                    // 探针点
+                    let f64 pv = probe.val
+                    let f64 ev = ease(k, pv)
+                    let i32 dot_y = base_y - cast(ev * cast(span, f64), i32)
+                    let i32 dot_cy = dot_y
+                    if dot_cy < top_y
+                        dot_cy = top_y
+                    if dot_cy > base_y
+                        dot_cy = base_y
+                    gui_fill_circle(cx + 6 + cast(pv * cast(sw, f64), i32), dot_cy, 3, 0xF0F0F0)
+                    gui_draw_text(cx + 6, cy + 84, "ease " + to_str(k), 0x9A9AA8)
+                col++
+            row++
+
+        // ---- 2) 时间线三轨条 ----
+        gui_draw_text(30, 470, "Timeline · 三轨关键帧（循环 1800ms）", 0xC8C8D0)
+        let i32 bar_x = 130
+        let i32 bar_w = 240
+        let i32 tr = 0
+        while tr < 3
+            let f64 v = tl.value(tr)
+            let i32 by = 505 + tr * 44
+            gui_draw_text(36, by + 4, "轨" + to_str(tr), 0x9A9AA8)
+            gui_fill_rect(bar_x, by, bar_w, 22, 0x2A2A34)
+            let i32 fw = cast(v * 240.0, i32)
+            let u32 col = 0x4CC2FF
+            if tr == 1
+                col = 0xFFC857
+            if tr == 2
+                col = 0x6CCB5F
+            gui_fill_rect(bar_x, by, fw, 22, col)
+            gui_draw_text(bar_x + fw + 8, by + 4, to_str(cast(v * 100.0, i32)) + "%", 0x9A9AA8)
+            tr++
+        let i64 pos = cast(tl.time(), i64)
+        gui_draw_text(36, 640, "t=" + to_str(pos) + "ms", 0x9A9AA8)
+
+        // ---- 3) 弹簧球 ----
+        gui_draw_text(410, 470, "Spring · 鼠标牵引（双轴）", 0xC8C8D0)
+        gui_fill_rect(420, 510, 200, 130, 0x2A2A34)
+        gui_rect(420, 510, 200, 130, 0x3A3A48)
+        let i32 bx = 420 + cast(sx.pos, i32)
+        let i32 byy = 510 + cast(sy.pos, i32)
+        if sx.is_resting() and sy.is_resting()
+            gui_fill_circle(bx, byy, 16, 0x6CCB5F)
+        else
+            gui_fill_circle(bx, byy, 16, 0xFFC857)
+        // 目标十字（当前鼠标点）
+        let tx = 420 + cast(sx.goal, i32)
+        let ty = 510 + cast(sy.goal, i32)
+        gui_fill_rect(tx - 5, ty, 11, 1, 0x707080)
+        gui_fill_rect(tx, ty - 5, 1, 11, 0x707080)
+
+        // ---- 4) 错峰方块 ----
+        gui_draw_text(680, 470, "Stagger · 8 个方块错峰弹起", 0xC8C8D0)
+        let i32 si = 0
+        while si < 8
+            let f64 hv = sq.value(si)
+            let i32 bx2 = 690 + si * 34
+            let i32 bh = cast(hv, i32)
+            let i32 by2 = 640 - bh
+            let f64 t = cast(si, f64) / 7.0
+            let u32 c = lerp_color(0x4CC2FF, 0xFF6B6B, t)
+            gui_fill_rect(bx2, by2, 26, bh, c)
+            si++
+
+        gui_draw_text(30, 672, "空格 暂停 · R 重置 · 鼠标牵引弹簧 · Esc 退出", 0x707080)
+        gui_present()
+        gui_frame_sleep(f0)
+
+    gui_close()
+    return 0

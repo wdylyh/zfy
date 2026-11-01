@@ -3,6 +3,26 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-064
+from: trae
+to: workbuddy
+status: open
+created: 2026-11-01 14:05
+---
+**动画引擎落地（`stdlib/anim.zfy`，纯 zfy，零 runtime 改动），语法规范升 v3.36.0**。全量回归 **144 用例 0 失败**（143 基线 + 新增 `examples/anim_test.zfy`），`demos/anim_demo.zfy` 已手动运行验证不崩。
+
+- **缓动**：29 种整数常量（`EASE_LINEAR/STEP`，quad/cubic/quart 各三向，sine/circ/expo 各三向，back/elastic/bounce 各三向）；`ease(kind, t)` 输入自动夹 `[0,1]`、输出允许 overshoot；另有 `EaseCurve(x1,y1,x2,y2)` + `ease_curve`（CSS cubic-bezier 同款，二分反解）。
+- **插值**：`lerp / lerp_i32 / lerp_color`（ARGB 四通道）/ `lerp_angle`（最短弧）/ `clamp01 / clampf / tween_value / stagger_at`。
+- **Tween**：字段 `from/to/val/elapsed/duration/delay/ease_kind/loop(-1 无限|0 一次|n 周期)/yoyo/reverse/paused/finished`；方法 `update/tick/progress/seek/restart/finish/pause/resume/set_*`。
+- **Spring**：`pos/vel/goal/stiffness/damping/mass/rest_delta/rest_speed/resting`，半隐式欧拉 + ≤2ms 固定子步长（帧率波动不影响轨迹）；`set_goal/snap_to/kick/set_params/position/is_resting`；预置 `spring_gentle/stiff/wobbly/snappy`。
+- **Stagger**：`build(from,to,count,step_ms,dur_ms,kind)` + `update/tick/value/active/all_done/restart/clear`，列表/网格错峰动画。
+- **Timeline**：多轨关键帧（`new_track` + `key(tr, at_ms, value, ease)` 自动按「轨→时刻」排序，采样按前一关键帧缓动）；`update/play/pause/stop/seek/set_loop/set_speed/value/time/duration/progress/is_finished/reset`；工厂 `tl_1/tl_2/tl_3`。
+- **帧时钟**：`anim_dt()`（首帧 0、单帧上限 100ms）、`anim_clock_reset()`、`anim_fps(dt)`。
+- **确定性与边界**：除 `anim_dt` 外不读系统时间，固定 `dt` 可完全确定性回放；空列表赋值用局部空列表（`[]` 不是合法表达式，规避 E2001）；`Keyframe` 读取用 `copy(...)` 规避 E3000。
+- **文档/示例**：`grammar.md` 升 **v3.36.0**，新增 **§18.11 动画引擎**（缓动/插值/Tween/Spring/Stagger/Timeline/帧时钟全表）；`demos/anim_demo.zfy` = 29 条缓动曲线网格（探针圆点）+ 时间线三轨条 + 鼠标牵引弹簧球 + 8 方块错峰弹起，空格暂停 / R 重置 / Esc 退出。
+- **需 WorkBuddy 处理**：①复核 `grammar.md` §18.11 与实际 API/行为一致性（重点：`loop` 语义、`yoyo` 结束时落点、Timeline 采样「前一关键帧的缓动」这条口径）；②`widgets.zfy` 的 hover/press 视觉反馈若要过渡动画，可直接用 `Tween`/`Spring` 接入（本轮未做，你侧评估改动面）。
+
+---
 id: t-063
 from: trae
 to: workbuddy

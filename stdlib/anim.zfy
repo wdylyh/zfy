@@ -1,0 +1,799 @@
+// stdlib/anim.zfy —— UI 动画引擎（补间 / 弹簧 / 时间线，v3.36）
+//
+// 纯 zfy 实现，不依赖 runtime：时间一律用“毫秒增量”驱动，UI 主循环里
+// 取 tick_ms 差值调 update 即可（便捷帧时钟见 anim_dt）。
+//
+// 三层结构：
+//   1) 缓动与插值    ease / ease_curve / lerp / lerp_color / lerp_angle
+//   2) 单体动画      Tween（定长补间，支持延迟/循环/往复/反向）
+//                    Spring（弹簧物理，semi-implicit Euler + 子步长）
+//                    Stagger（一组错峰补间）
+//   3) 编排          Timeline（多轨关键帧，支持循环/倍速/seek）
+//
+// 用法：
+//   mod anim;
+//   use anim::{EASE_OUT_CUBIC, Tween, Spring, Timeline, anim_dt}
+//   let Tween t = Tween(from=0.0, to=1.0, duration=300.0, ease_kind=EASE_OUT_CUBIC)
+//   while gui_alive()
+//       let f64 dt = anim_dt()
+//       let f64 v = t.update(dt)          // 0..1（缓动后）
+//       gui_fill_rect(0, 0, 100, cast(v * 200.0, i32), 0xFF4CC2FF)
+//       gui_present()
+
+let f64 ANIM_PI = 3.141592653589793
+
+// ===== 1) 缓动 =====
+// 所有 kind 都是整数常量（不引入函数指针，任何上下文都能直接传）。
+
+pub let i32 const EASE_LINEAR = 0
+pub let i32 const EASE_STEP = 1        // 前 1 时刻保持 0，到终点才跳 1
+pub let i32 const EASE_QUAD_IN = 2
+pub let i32 const EASE_QUAD_OUT = 3
+pub let i32 const EASE_QUAD_INOUT = 4
+pub let i32 const EASE_CUBIC_IN = 5
+pub let i32 const EASE_CUBIC_OUT = 6
+pub let i32 const EASE_CUBIC_INOUT = 7
+pub let i32 const EASE_QUART_IN = 8
+pub let i32 const EASE_QUART_OUT = 9
+pub let i32 const EASE_QUART_INOUT = 10
+pub let i32 const EASE_SINE_IN = 11
+pub let i32 const EASE_SINE_OUT = 12
+pub let i32 const EASE_SINE_INOUT = 13
+pub let i32 const EASE_EXPO_IN = 14
+pub let i32 const EASE_EXPO_OUT = 15
+pub let i32 const EASE_EXPO_INOUT = 16
+pub let i32 const EASE_CIRC_IN = 17
+pub let i32 const EASE_CIRC_OUT = 18
+pub let i32 const EASE_CIRC_INOUT = 19
+pub let i32 const EASE_BACK_IN = 20
+pub let i32 const EASE_BACK_OUT = 21
+pub let i32 const EASE_BACK_INOUT = 22
+pub let i32 const EASE_ELASTIC_IN = 23
+pub let i32 const EASE_ELASTIC_OUT = 24
+pub let i32 const EASE_ELASTIC_INOUT = 25
+pub let i32 const EASE_BOUNCE_IN = 26
+pub let i32 const EASE_BOUNCE_OUT = 27
+pub let i32 const EASE_BOUNCE_INOUT = 28
+
+// 输入自动夹到 [0,1]；输出可能越过 [0,1]（back/elastic 的正常表现）
+pub fn f64 ease(let i32 kind, let f64 t)
+    let f64 p = t
+    if p < 0.0
+        p = 0.0
+    if p > 1.0
+        p = 1.0
+    if kind == EASE_LINEAR
+        return p
+    if kind == EASE_STEP
+        if p < 1.0
+            return 0.0
+        return 1.0
+    if kind == EASE_QUAD_IN
+        return p * p
+    if kind == EASE_QUAD_OUT
+        let f64 q = 1.0 - p
+        return 1.0 - q * q
+    if kind == EASE_QUAD_INOUT
+        if p < 0.5
+            return 2.0 * p * p
+        let f64 q = 1.0 - p
+        return 1.0 - 2.0 * q * q
+    if kind == EASE_CUBIC_IN
+        return p * p * p
+    if kind == EASE_CUBIC_OUT
+        let f64 q = 1.0 - p
+        return 1.0 - q * q * q
+    if kind == EASE_CUBIC_INOUT
+        if p < 0.5
+            return 4.0 * p * p * p
+        let f64 q = 1.0 - p
+        return 1.0 - 4.0 * q * q * q
+    if kind == EASE_QUART_IN
+        return p * p * p * p
+    if kind == EASE_QUART_OUT
+        let f64 q = 1.0 - p
+        return 1.0 - q * q * q * q
+    if kind == EASE_QUART_INOUT
+        if p < 0.5
+            return 8.0 * p * p * p * p
+        let f64 q = 1.0 - p
+        return 1.0 - 8.0 * q * q * q * q
+    if kind == EASE_SINE_IN
+        return 1.0 - cos(p * ANIM_PI / 2.0)
+    if kind == EASE_SINE_OUT
+        return sin(p * ANIM_PI / 2.0)
+    if kind == EASE_SINE_INOUT
+        return (1.0 - cos(p * ANIM_PI)) / 2.0
+    if kind == EASE_EXPO_IN
+        if p <= 0.0
+            return 0.0
+        return pow(2.0, 10.0 * p - 10.0)
+    if kind == EASE_EXPO_OUT
+        if p >= 1.0
+            return 1.0
+        return 1.0 - pow(2.0, -10.0 * p)
+    if kind == EASE_EXPO_INOUT
+        if p <= 0.0
+            return 0.0
+        if p >= 1.0
+            return 1.0
+        if p < 0.5
+            return pow(2.0, 20.0 * p - 10.0) / 2.0
+        return (2.0 - pow(2.0, -20.0 * p + 10.0)) / 2.0
+    if kind == EASE_CIRC_IN
+        return 1.0 - sqrt(1.0 - p * p)
+    if kind == EASE_CIRC_OUT
+        let f64 q = p - 1.0
+        return sqrt(1.0 - q * q)
+    if kind == EASE_CIRC_INOUT
+        if p < 0.5
+            let f64 x = 2.0 * p
+            return (1.0 - sqrt(1.0 - x * x)) / 2.0
+        let f64 x = -2.0 * p + 2.0
+        return (sqrt(1.0 - x * x) + 1.0) / 2.0
+    if kind == EASE_BACK_IN
+        let f64 c1 = 1.70158
+        let f64 c3 = c1 + 1.0
+        return c3 * p * p * p - c1 * p * p
+    if kind == EASE_BACK_OUT
+        let f64 c1 = 1.70158
+        let f64 c3 = c1 + 1.0
+        let f64 q = p - 1.0
+        return 1.0 + c3 * q * q * q + c1 * q * q
+    if kind == EASE_BACK_INOUT
+        let f64 c2 = 1.70158 * 1.525
+        if p < 0.5
+            let f64 x = 2.0 * p
+            return (x * x * ((c2 + 1.0) * x - c2)) / 2.0
+        let f64 x = 2.0 * p - 2.0
+        return (x * x * ((c2 + 1.0) * x + c2) + 2.0) / 2.0
+    if kind == EASE_ELASTIC_IN
+        if p <= 0.0
+            return 0.0
+        if p >= 1.0
+            return 1.0
+        let f64 c4 = 2.0 * ANIM_PI / 3.0
+        return -pow(2.0, 10.0 * p - 10.0) * sin((p * 10.0 - 10.75) * c4)
+    if kind == EASE_ELASTIC_OUT
+        if p <= 0.0
+            return 0.0
+        if p >= 1.0
+            return 1.0
+        let f64 c4 = 2.0 * ANIM_PI / 3.0
+        return pow(2.0, -10.0 * p) * sin((p * 10.0 - 0.75) * c4) + 1.0
+    if kind == EASE_ELASTIC_INOUT
+        if p <= 0.0
+            return 0.0
+        if p >= 1.0
+            return 1.0
+        let f64 c5 = 2.0 * ANIM_PI / 4.5
+        if p < 0.5
+            return -(pow(2.0, 20.0 * p - 10.0) * sin((20.0 * p - 11.125) * c5)) / 2.0
+        return pow(2.0, -20.0 * p + 10.0) * sin((20.0 * p - 11.125) * c5) / 2.0 + 1.0
+    if kind == EASE_BOUNCE_IN
+        return 1.0 - ease_bounce_out(1.0 - p)
+    if kind == EASE_BOUNCE_OUT
+        return ease_bounce_out(p)
+    if kind == EASE_BOUNCE_INOUT
+        if p < 0.5
+            return (1.0 - ease_bounce_out(1.0 - 2.0 * p)) / 2.0
+        return (1.0 + ease_bounce_out(2.0 * p - 1.0)) / 2.0
+    return p
+
+// bounce-out 分段（ease 内部使用）
+fn f64 ease_bounce_out(let f64 p)
+    let f64 n1 = 7.5625
+    let f64 d1 = 2.75
+    if p < 1.0 / d1
+        return n1 * p * p
+    if p < 2.0 / d1
+        let f64 q = p - 1.5 / d1
+        return n1 * q * q + 0.75
+    if p < 2.5 / d1
+        let f64 q = p - 2.25 / d1
+        return n1 * q * q + 0.9375
+    let f64 q = p - 2.625 / d1
+    return n1 * q * q + 0.984375
+
+// ===== 自定义三次贝塞尔缓动（CSS cubic-bezier 同款）=====
+pub struct EaseCurve
+    f64 x1 = 0.25
+    f64 y1 = 0.1
+    f64 x2 = 0.25
+    f64 y2 = 1.0
+
+// 一维三次贝塞尔：控制点 a、b，端点为 0/1
+fn f64 bez_axis(let f64 t, let f64 a, let f64 b)
+    let f64 u = 1.0 - t
+    return 3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
+
+// 以 x 为时间轴反解 y（二分 16 次，确定性、无导数依赖）
+pub fn f64 ease_curve(let EaseCurve c, let f64 t)
+    let f64 p = t
+    if p <= 0.0
+        return 0.0
+    if p >= 1.0
+        return 1.0
+    let f64 lo = 0.0
+    let f64 hi = 1.0
+    let f64 mid = p
+    let i32 i = 0
+    while i < 16
+        mid = (lo + hi) / 2.0
+        let f64 x = bez_axis(mid, c.x1, c.x2)
+        if x < p
+            lo = mid
+        else
+            hi = mid
+        i++
+    return bez_axis(mid, c.y1, c.y2)
+
+// ===== 插值助手 =====
+pub fn f64 clamp01(let f64 t)
+    if t < 0.0
+        return 0.0
+    if t > 1.0
+        return 1.0
+    return t
+
+pub fn f64 clampf(let f64 v, let f64 lo, let f64 hi)
+    if v < lo
+        return lo
+    if v > hi
+        return hi
+    return v
+
+pub fn f64 lerp(let f64 a, let f64 b, let f64 t)
+    return a + (b - a) * clamp01(t)
+
+pub fn i32 lerp_i32(let i32 a, let i32 b, let f64 t)
+    let f64 p = clamp01(t)
+    let f64 v = cast(a, f64) + (cast(b, f64) - cast(a, f64)) * p
+    return cast(v, i32)
+
+// ARGB（0xAARRGGBB）逐通道线性插值；四通道都参与
+pub fn u32 lerp_color(let u32 a, let u32 b, let f64 t)
+    let f64 p = clamp01(t)
+    let i32 aa = cast((a >> 24) & 0xFF, i32)
+    let i32 ar = cast((a >> 16) & 0xFF, i32)
+    let i32 ag = cast((a >> 8) & 0xFF, i32)
+    let i32 ab = cast(a & 0xFF, i32)
+    let i32 ba = cast((b >> 24) & 0xFF, i32)
+    let i32 br = cast((b >> 16) & 0xFF, i32)
+    let i32 bg = cast((b >> 8) & 0xFF, i32)
+    let i32 bb = cast(b & 0xFF, i32)
+    let i32 ca = lerp_i32(aa, ba, p)
+    let i32 cr = lerp_i32(ar, br, p)
+    let i32 cg = lerp_i32(ag, bg, p)
+    let i32 cb = lerp_i32(ab, bb, p)
+    return cast(ca, u32) << 24 | cast(cr, u32) << 16 | cast(cg, u32) << 8 | cast(cb, u32)
+
+// 角度插值（弧度）走最短弧：结果与 a 同侧连续，不跨越 ±PI 突变
+pub fn f64 lerp_angle(let f64 a, let f64 b, let f64 t)
+    let f64 p = clamp01(t)
+    let f64 d = b - a
+    let f64 two_pi = ANIM_PI * 2.0
+    let f64 dd = d - two_pi * floor((d + ANIM_PI) / two_pi)
+    return a + dd * p
+
+// 错峰延迟：第 index 个元素的起始延迟（毫秒）
+pub fn f64 stagger_at(let i32 index, let f64 step_ms)
+    return cast(index, f64) * step_ms
+
+// ===== 2) Tween：定长补间 =====
+pub struct Tween
+    f64 from = 0.0
+    f64 to = 1.0
+    f64 val = 0.0              // 当前值（缓动后）
+    f64 elapsed = 0.0          // 已流逝毫秒（含 delay）
+    f64 duration = 300.0       // 单周期时长（毫秒，<=0 按 1 处理）
+    f64 delay = 0.0            // 起始延迟（毫秒）
+    i32 ease_kind = EASE_CUBIC_OUT
+    i32 loop = 0               // -1 无限；0 播放一次；n 共播放 n 个周期
+    bool yoyo = false          // 往复：奇偶周期方向交替
+    bool reverse = false       // 整体反向（1→0）
+    bool paused = false
+    bool finished = false
+
+    // 推进 dt_ms 并返回当前值；暂停/已结束时直接返回值
+    fn f64 update(let f64 dt_ms)
+        if self.paused or self.finished
+            return self.val
+        let f64 d = dt_ms
+        if d < 0.0
+            d = 0.0
+        self.elapsed += d
+        return self.compute()
+
+    // 便捷：i64 毫秒
+    fn f64 tick(let i64 dt_ms)
+        return self.update(cast(dt_ms, f64))
+
+    // 重新计算当前值（不推进时间）
+    fn f64 compute()
+        let f64 dur = self.duration
+        if dur <= 0.0
+            dur = 1.0
+        let f64 local = self.elapsed - self.delay
+        if local <= 0.0
+            self.val = self.from
+            return self.val
+        let f64 prog = 0.0
+        if self.loop == 0
+            prog = local / dur
+            if prog >= 1.0
+                prog = 1.0
+                self.finished = true
+        else
+            let f64 cyc_f = floor(local / dur)
+            let i32 cyc = cast(cyc_f, i32)
+            if self.loop > 0 and cyc >= self.loop
+                let i32 last = self.loop - 1
+                prog = 1.0
+                if self.yoyo and last % 2 == 1
+                    prog = 0.0
+                self.finished = true
+            else
+                prog = (local - cyc_f * dur) / dur
+                if prog > 1.0
+                    prog = 1.0
+                if self.yoyo and cyc % 2 == 1
+                    prog = 1.0 - prog
+        let f64 d = prog
+        if self.reverse
+            d = 1.0 - prog
+        self.val = self.from + (self.to - self.from) * ease(self.ease_kind, d)
+        return self.val
+
+    // 原始线性进度 0..1（不做缓动），便于配合 lerp_color 等
+    fn f64 progress()
+        let f64 dur = self.duration
+        if dur <= 0.0
+            dur = 1.0
+        let f64 local = self.elapsed - self.delay
+        if local <= 0.0
+            return 0.0
+        let f64 p = local / dur
+        if p > 1.0
+            p = 1.0
+        return p
+
+    fn bool is_done()
+        return self.finished
+
+    fn bool running()
+        return not self.finished and not self.paused
+
+    fn void restart()
+        self.elapsed = 0.0
+        self.finished = false
+        self.paused = false
+
+    fn void pause()
+        self.paused = true
+
+    fn void resume()
+        self.paused = false
+
+    fn void toggle_pause()
+        self.paused = not self.paused
+
+    // 跳到本周期内的毫秒位置（不含 delay）
+    fn void seek(let f64 ms)
+        let f64 m = ms
+        if m < 0.0
+            m = 0.0
+        self.elapsed = self.delay + m
+        self.finished = false
+        self.val = self.compute()
+
+    fn void finish()
+        self.elapsed = self.delay + self.duration
+        self.finished = true
+        self.val = self.to
+        if self.reverse
+            self.val = self.from
+
+    fn void set_range(let f64 a, let f64 b)
+        self.from = a
+        self.to = b
+
+    fn void set_duration(let f64 ms)
+        self.duration = ms
+
+    fn void set_ease(let i32 kind)
+        self.ease_kind = kind
+
+    fn void set_reverse(let bool on)
+        self.reverse = on
+
+    fn void set_yoyo(let bool on)
+        self.yoyo = on
+
+    fn void set_loop(let i32 n)
+        self.loop = n
+
+    // 直接写当前值（外部拖动/打断动画时用）
+    fn void set_value(let f64 v)
+        self.val = v
+
+// 一次性构造 + 立即取值的常见写法辅助（不改状态）
+pub fn f64 tween_value(let f64 from, let f64 to, let i32 kind, let f64 t)
+    return from + (to - from) * ease(kind, t)
+
+// ===== 2b) Spring：弹簧动画 =====
+// 半隐式欧拉 + 固定子步长（≤2ms），帧率波动不影响轨迹稳定性。
+pub struct Spring
+    f64 pos = 0.0
+    f64 vel = 0.0
+    f64 goal = 0.0
+    f64 stiffness = 170.0      // k
+    f64 damping = 26.0         // c：默认 ζ≈1（临界阻尼，不摆动）
+    f64 mass = 1.0             // m
+    f64 rest_delta = 0.01      // 位移静止阈值
+    f64 rest_speed = 0.05      // 速度静止阈值（单位/秒）
+    bool resting = true
+
+    // 推进并返回位置；已静止时不变
+    fn f64 update(let f64 dt_ms)
+        if self.resting
+            return self.pos
+        let f64 secs = dt_ms / 1000.0
+        if secs <= 0.0
+            return self.pos
+        let i32 steps = cast(ceil(secs / 0.002), i32)
+        if steps < 1
+            steps = 1
+        if steps > 120
+            steps = 120
+        let f64 m = self.mass
+        if m <= 0.0
+            m = 1.0
+        let f64 h = secs / cast(steps, f64)
+        let i32 i = 0
+        while i < steps
+            let f64 force = self.stiffness * (self.goal - self.pos) - self.damping * self.vel
+            self.vel = self.vel + force / m * h
+            self.pos = self.pos + self.vel * h
+            if abs(self.goal - self.pos) < self.rest_delta and abs(self.vel) < self.rest_speed
+                self.pos = self.goal
+                self.vel = 0.0
+                self.resting = true
+            i++
+        return self.pos
+
+    fn f64 tick(let i64 dt_ms)
+        return self.update(cast(dt_ms, f64))
+
+    // 改目标（从静止重新起振）
+    fn void set_goal(let f64 g)
+        self.goal = g
+        self.resting = false
+
+    // 立即落位
+    fn void snap_to(let f64 g)
+        self.goal = g
+        self.pos = g
+        self.vel = 0.0
+        self.resting = true
+
+    fn void set_params(let f64 k, let f64 c, let f64 m)
+        self.stiffness = k
+        self.damping = c
+        self.mass = m
+        self.resting = false
+
+    fn void kick(let f64 v)
+        self.vel = v
+        self.resting = false
+
+    fn bool is_resting()
+        return self.resting
+
+    fn f64 position()
+        return self.pos
+
+// 预置手感：k/c 组合，ζ = c / (2*sqrt(k*m))
+pub fn Spring spring_gentle()
+    return Spring(stiffness=100.0, damping=20.0)
+
+pub fn Spring spring_stiff()
+    return Spring(stiffness=400.0, damping=40.0)
+
+pub fn Spring spring_wobbly()
+    return Spring(stiffness=200.0, damping=12.0)
+
+pub fn Spring spring_snappy()
+    return Spring(stiffness=250.0, damping=20.0)
+
+// ===== 2c) Stagger：一组错峰补间（列表/网格动画常用）=====
+pub struct Stagger
+    Tween[] items
+
+    // 生成 count 个补间，第 i 个延迟 = i*step_ms
+    fn void build(let f64 from, let f64 to, let i32 count, let f64 step_ms,
+                  let f64 dur_ms, let i32 kind)
+        let Tween[] empty
+        self.items = empty
+        let i32 i = 0
+        while i < count
+            let Tween t = Tween(from=from, to=to, duration=dur_ms,
+                                delay=cast(i, f64) * step_ms, ease_kind=kind)
+            self.items = push(self.items, t)
+            i++
+
+    // 推进整组（元素接收者直接原地更新）
+    fn void update(let f64 dt_ms)
+        let i32 i = 0
+        while i < length(self.items)
+            self.items[i].val = self.items[i].update(dt_ms)
+            i++
+
+    fn void tick(let i64 dt_ms)
+        self.update(cast(dt_ms, f64))
+
+    fn f64 value(let i32 index)
+        if index < 0 or index >= length(self.items)
+            return 0.0
+        return self.items[index].val
+
+    fn bool active(let i32 index)
+        if index < 0 or index >= length(self.items)
+            return false
+        return not self.items[index].finished
+
+    fn i32 count()
+        return length(self.items)
+
+    fn bool all_done()
+        let i32 i = 0
+        while i < length(self.items)
+            if not self.items[i].finished
+                return false
+            i++
+        return true
+
+    fn void restart()
+        let i32 i = 0
+        while i < length(self.items)
+            self.items[i].restart()
+            i++
+
+    fn void clear()
+        let Tween[] empty
+        self.items = empty
+
+// ===== 3) Timeline：多轨关键帧时间线 =====
+// 每条轨道是一串 (时刻, 值, 缓动) 关键帧，时刻单位毫秒；
+// 采样时取“最近的关键帧 → 下一关键帧”的区间，按前一关键帧的缓动插值。
+pub struct Keyframe
+    i32 tr = 0
+    f64 at = 0.0
+    f64 val = 0.0
+    i32 ease_kind = EASE_LINEAR
+
+pub struct Timeline
+    Keyframe[] keys
+    f64[] vals
+    f64 t = 0.0
+    f64 dur = 0.0
+    f64 speed = 1.0
+    i32 ntracks = 0
+    bool playing = true
+    bool loop = false
+    bool finished = false
+
+    // 新轨道，返回轨道下标
+    fn i32 new_track()
+        self.vals = push(self.vals, 0.0)
+        self.ntracks++
+        return self.ntracks - 1
+
+    fn i32 track_count()
+        return self.ntracks
+
+    // 插入关键帧（按 轨道/时刻 排序；重复时刻保留后插入的）
+    fn void key(let i32 tr, let f64 at, let f64 val, let i32 kind)
+        if tr < 0 or tr >= self.ntracks
+            return
+        let Keyframe k = Keyframe(tr=tr, at=at, val=val, ease_kind=kind)
+        self.keys = push(self.keys, k)
+        if at > self.dur
+            self.dur = at
+        self.sort_keys()
+
+    // 线性关键帧简写
+    fn void key_lin(let i32 tr, let f64 at, let f64 val)
+        self.key(tr, at, val, EASE_LINEAR)
+
+    fn void sort_keys()
+        let i32 n = length(self.keys)
+        let i32 i = 1
+        while i < n
+            let Keyframe cur = copy(self.keys[i])
+            let i32 j = i - 1
+            while j >= 0 and kf_before(cur, self.keys[j])
+                self.keys[j + 1] = self.keys[j]
+                j--
+            self.keys[j + 1] = cur
+            i++
+
+    // 采样某轨道在 tt 毫秒处的值
+    fn f64 sample(let i32 tr, let f64 tt)
+        let i32 n = length(self.keys)
+        let f64 prev_v = 0.0
+        let f64 prev_t = 0.0
+        let i32 prev_e = EASE_LINEAR
+        let bool have = false
+        let i32 i = 0
+        while i < n
+            let Keyframe k = copy(self.keys[i])
+            if k.tr == tr
+                if not have
+                    if tt <= k.at
+                        return k.val
+                    prev_v = k.val
+                    prev_t = k.at
+                    prev_e = k.ease_kind
+                    have = true
+                else
+                    if tt <= k.at
+                        let f64 span = k.at - prev_t
+                        let f64 p = 0.0
+                        if span > 0.0
+                            p = (tt - prev_t) / span
+                        return prev_v + (k.val - prev_v) * ease(prev_e, p)
+                    prev_v = k.val
+                    prev_t = k.at
+                    prev_e = k.ease_kind
+            i++
+        if have
+            return prev_v
+        return 0.0
+
+    fn void resample()
+        let i32 i = 0
+        while i < self.ntracks
+            self.vals[i] = self.sample(i, self.t)
+            i++
+
+    // 推进 dt_ms（按 speed 倍速）
+    fn void update(let f64 dt_ms)
+        if not self.playing or self.finished
+            return
+        if self.dur <= 0.0
+            self.finished = true
+            return
+        let f64 d = dt_ms * self.speed
+        if d < 0.0
+            d = 0.0
+        self.t = self.t + d
+        if self.t >= self.dur
+            if self.loop
+                self.t = self.t - self.dur * floor(self.t / self.dur)
+            else
+                self.t = self.dur
+                self.finished = true
+        self.resample()
+
+    fn void tick(let i64 dt_ms)
+        self.update(cast(dt_ms, f64))
+
+    fn void play()
+        if self.finished
+            self.t = 0.0
+            self.finished = false
+            self.resample()
+        self.playing = true
+
+    fn void pause()
+        self.playing = false
+
+    fn void stop()
+        self.playing = false
+        self.t = 0.0
+        self.finished = false
+        self.resample()
+
+    fn void seek(let f64 ms)
+        let f64 m = ms
+        if m < 0.0
+            m = 0.0
+        if self.dur > 0.0 and m > self.dur
+            m = self.dur
+        self.t = m
+        self.finished = false
+        self.resample()
+
+    // 轨道当前值（越界返回 0）
+    fn f64 value(let i32 tr)
+        if tr < 0 or tr >= self.ntracks
+            return 0.0
+        return self.vals[tr]
+
+    fn f64 time()
+        return self.t
+
+    fn f64 duration()
+        return self.dur
+
+    fn f64 progress()
+        if self.dur <= 0.0
+            return 0.0
+        return clamp01(self.t / self.dur)
+
+    fn bool is_finished()
+        return self.finished
+
+    fn bool is_playing()
+        return self.playing
+
+    fn void set_loop(let bool on)
+        self.loop = on
+
+    fn void set_speed(let f64 s)
+        self.speed = s
+
+    fn void reset()
+        let Keyframe[] ek
+        let f64[] ev
+        self.keys = ek
+        self.vals = ev
+        self.ntracks = 0
+        self.t = 0.0
+        self.dur = 0.0
+        self.playing = true
+        self.finished = false
+
+// 关键帧排序：先轨道、后时刻
+fn bool kf_before(let Keyframe a, let Keyframe b)
+    if a.tr < b.tr
+        return true
+    if a.tr > b.tr
+        return false
+    return a.at <= b.at
+
+// 时间线工厂：单轨 / 双轨 / 三轨最常用，避免手写 new_track
+pub fn Timeline tl_1()
+    let Timeline t = Timeline()
+    let i32 a = t.new_track()
+    return t
+
+pub fn Timeline tl_2()
+    let Timeline t = Timeline()
+    let i32 a = t.new_track()
+    let i32 b = t.new_track()
+    return t
+
+pub fn Timeline tl_3()
+    let Timeline t = Timeline()
+    let i32 a = t.new_track()
+    let i32 b = t.new_track()
+    let i32 c = t.new_track()
+    return t
+
+// ===== 帧时钟：给 UI 主循环用的毫秒增量 =====
+// 首帧返回 0；单帧上限 100ms（切后台/长卡顿不会让动画瞬移）。
+let i64 g_anim_last = 0
+
+pub fn f64 anim_dt()
+    let i64 now = tick_ms()
+    if g_anim_last <= 0
+        g_anim_last = now
+        return 0.0
+    let i64 d = now - g_anim_last
+    g_anim_last = now
+    if d < 0
+        d = 0
+    if d > 100
+        d = 100
+    return cast(d, f64)
+
+pub fn void anim_clock_reset()
+    g_anim_last = 0
+
+// 由增量换算瞬时帧率（0 增量返回 0）
+pub fn f64 anim_fps(let f64 dt_ms)
+    if dt_ms <= 0.0
+        return 0.0
+    return 1000.0 / dt_ms
