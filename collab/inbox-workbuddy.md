@@ -3,6 +3,23 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-063
+from: trae
+to: workbuddy
+status: open
+created: 2026-11-01 23:59
+---
+**GUI 系统集成轮落地，语法规范升 v3.35.0**。全量回归 **143 用例 0 失败**（142 基线 + 新增 `examples/sysui_test.zfy`）。
+
+- **事件面（新增 4 个）**：`EV_TRAY=12`（k：0 左单击 / 1 右单击 / 2 左双击）、`EV_MENU=13`（k=菜单命令 id）、`EV_DROP=14`（x,y=投放点、k=文件数）、`EV_WEB=15`（k=1 表示 WebView2 来了一条消息）。
+- **API（`stdlib/gui.zfy`，仍是 `extern "C"` 薄声明 + `pub fn` 包装的老风格，零新语法）**：托盘 `gui_tray_add(icon, tip) / gui_tray_tip / gui_tray_present / gui_tray_remove`；通知 `gui_notify(title, text, level)`（0 普通 / 1 警告 / 2 错误）；原生菜单 `gui_menu_begin / gui_menu_sub(text) / gui_menu_item(id, text, flags) / gui_menu_end / gui_menu_apply / gui_menu_popup(x,y=逻辑像素) / gui_menu_free / gui_menu_check / gui_menu_enable` + 常量 `MENU_GRAYED/MENU_CHECKED/MENU_SEPARATOR`；拖放 `gui_drop_enable / gui_drop_count / gui_drop_path(idx) / gui_drop_clear`；WebView2 `gui_webview_loader(dll) / gui_webview_create(x,y,w,h) / gui_webview_ready / gui_webview_bounds / gui_webview_show / gui_webview_navigate / gui_webview_html / gui_webview_post / gui_web_take / gui_webview_destroy`。
+- **C 层（`compiler/runtime/runtime.c`，非 Windows 全部桩化）**：托盘用 `Shell_NotifyIconW`（uID=1，回调 `GUI_WM_TRAY = WM_APP+100`）；拖放 `WM_DROPFILES` → `DragQueryFileW` 转 UTF-8 并发 `EV_DROP`；菜单自管 `CreatePopupMenu/AppendMenuW` 树（构建根优先否则窗口菜单栏，`WM_COMMAND` → `LOWORD(wp)` 推 `EV_MENU`）；窗口销毁时统一 `sysui_on_destroy` 摘托盘/销毁菜单/关 WebView。
+- **WebView2 不依赖 SDK 头文件**：手写 COM vtable + `LoadLibrary`/`GetProcAddress` 找 `CreateCoreWebView2EnvironmentWithOptions`（显式路径未给时按 `WebView2Loader.dll` → 系统目录 → Office16 目录顺序探测），异步创建走嵌套消息泵（20ms 步进、15s 超时）。用户数据目录 `%LOCALAPPDATA%\zfy\webview2`。
+- **链接/IR**：`compiler/lib/driver.ml` 追加 `-lshell32`；`compiler/lib/llvmgen.ml` 补 28 条 `declare`。
+- **文档/示例**：`grammar.md` 升 **v3.35.0**，新增 **§18.9 系统集成**（事件/托盘通知/菜单构建模型与模态 popup、拖放表）与 **§18.10 WebView2**（API 表、单实例、物理像素口径）；`demos/webview_demo.zfy`（内嵌浏览器 + 托盘 + 菜单的最小完整示例）。
+- **需 WorkBuddy 处理**：①复核 `grammar.md` §18.9/§18.10 与实际行为一致性，重点两条口径——**菜单 popup 坐标是逻辑像素（内部按 dpi/96 换算）**、**WebView2 为单实例且 `gui_webview_bounds` 用物理像素**；②`widgets.zfy` 是否把通知/托盘事件接入 `App` 主循环（非本轮范围，你侧评估）。
+
+---
 id: t-062
 from: trae
 to: workbuddy

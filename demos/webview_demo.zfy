@@ -1,0 +1,84 @@
+// demos/webview_demo.zfy —— WebView2 内嵌浏览器演示（v3.35）
+//
+// 用法：webview_demo.exe [LoaderDLL] [URL]
+//   LoaderDLL 为空 = 自动探测（WebView2Loader.dll / ShellExperiences / Office16）
+//   URL 默认 https://www.bing.com/
+// 控制：托盘左单击 显示/隐藏 WebView · 菜单"退出"或关闭窗口退出
+// 说明：本机需装有 WebView2 Runtime（Win10/11 一般自带）；缺 Loader 时
+//       程序会打印提示并退出，不影响其它模块。
+mod gui
+
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_poll, gui_frame_sleep,
+          gui_tray_add, gui_menu_begin, gui_menu_sub, gui_menu_item, gui_menu_end,
+          gui_menu_apply,
+          gui_webview_loader, gui_webview_create, gui_webview_bounds, gui_webview_show,
+          gui_webview_navigate, gui_webview_destroy, gui_web_take,
+          Event, EV_MENU, EV_TRAY, EV_SIZE, EV_WEB}
+
+fn main()
+    let string[] argv = os_args()
+    let string loader = ""
+    let string url = "https://www.bing.com/"
+    if length(argv) >= 2
+        loader = argv[1]
+    if length(argv) >= 3
+        url = argv[2]
+
+    if gui_webview_loader(loader) != 0
+        output("未找到 WebView2Loader.dll（可用参数指定路径，或安装 WebView2 Runtime）\n")
+        return 1
+
+    if gui_open(900, 600, "zfy WebView2 demo") != 0
+        output("无法创建窗口\n")
+        return 1
+
+    let i32 rc = gui_webview_create(0, 0, gui_w(), gui_h())
+    if rc != 0
+        output("WebView2 创建失败 rc=", rc, "\n")
+        gui_close()
+        return 1
+
+    let i32 nav = gui_webview_navigate(url)
+    if nav != 0
+        output("导航失败: ", url, "\n")
+
+    // 托盘 + 菜单（失败不阻塞演示）
+    let i32 ta = gui_tray_add("", "zfy WebView2 demo")
+    if ta != 0
+        output("提示：当前桌面会话无法添加托盘图标\n")
+    let i32 mb = gui_menu_begin()
+    if mb == 0
+        let i32 s1 = gui_menu_sub("文件")
+        let i32 i1 = gui_menu_item(1, "退出", 0)
+        gui_menu_end()
+        let i32 a1 = gui_menu_apply()
+        if a1 != 0
+            output("菜单安装失败\n")
+
+    let bool shown = true
+    while gui_alive()
+        let Event e = Event()
+        let bool stop = false
+        while gui_poll(ref e) and not stop
+            if e.is(EV_MENU) and e.key == 1
+                stop = true
+            if e.is(EV_TRAY) and e.key == 0
+                shown = not shown
+                let i32 vis = 0
+                if shown
+                    vis = 1
+                if gui_webview_show(vis) != 0
+                    output("WebView2 显示切换失败\n")
+            // 窗口尺寸变化时同步 WebView2 边界
+            if e.is(EV_SIZE)
+                gui_webview_bounds(0, 0, gui_w(), gui_h())
+            if e.is(EV_WEB)
+                output("web 消息: ", gui_web_take(), "\n")
+        if stop
+            break
+        gui_frame_sleep(tick_ms())
+
+    gui_webview_destroy()
+    gui_close()
+    output("webview demo exit\n")
+    return 0

@@ -1,0 +1,210 @@
+// examples/sysui_test.zfy —— 系统集成（v3.35）API 面
+// 回归安全：托盘/通知在无交互桌面可能失败（不视为失败），菜单只构建不弹出，
+// WebView2 只测失败路径与未初始化安全（不真的起浏览器）。
+mod gui
+
+use gui::{gui_open, gui_close, gui_alive,
+          gui_tray_add, gui_tray_tip, gui_tray_present, gui_tray_remove, gui_notify,
+          gui_menu_begin, gui_menu_sub, gui_menu_item, gui_menu_end, gui_menu_apply,
+          gui_menu_free, gui_menu_check, gui_menu_enable,
+          gui_drop_enable, gui_drop_count, gui_drop_path, gui_drop_clear,
+          gui_webview_loader, gui_webview_create, gui_webview_ready, gui_webview_bounds,
+          gui_webview_show, gui_webview_navigate, gui_webview_html, gui_webview_post,
+          gui_web_take, gui_webview_destroy,
+          EV_TRAY, EV_MENU, EV_DROP, EV_WEB, MENU_GRAYED, MENU_CHECKED, MENU_SEPARATOR}
+
+fn main()
+    let i32 fails = 0
+
+    // ===== 1) 事件常量与源码 C 侧一致 =====
+    if EV_TRAY != 12 or EV_MENU != 13 or EV_DROP != 14 or EV_WEB != 15
+        output("FAIL event constants\n")
+        fails++
+    if MENU_GRAYED != 1 or MENU_CHECKED != 2 or MENU_SEPARATOR != 4
+        output("FAIL menu flag constants\n")
+        fails++
+
+    // ===== 2) 无窗口：全部能力安全失败 =====
+    if gui_tray_add("", "tip") != -1
+        output("FAIL tray_add without window\n")
+        fails++
+    if gui_tray_tip("tip") != -1
+        output("FAIL tray_tip without window\n")
+        fails++
+    if gui_tray_present()
+        output("FAIL tray_present without window\n")
+        fails++
+    gui_tray_remove()
+    if gui_notify("t", "s", 0) != -1
+        output("FAIL notify without window\n")
+        fails++
+    if gui_drop_enable(1) != -1
+        output("FAIL drop_enable without window\n")
+        fails++
+    if gui_drop_count() != 0
+        output("FAIL drop_count without window\n")
+        fails++
+    if gui_drop_path(0) != ""
+        output("FAIL drop_path without window\n")
+        fails++
+    // 菜单构建本身不需要窗口；apply 需要
+    if gui_menu_begin() != 0
+        output("FAIL menu_begin without window\n")
+        fails++
+    if gui_menu_item(1, "打开", 0) != 0
+        output("FAIL menu_item without window\n")
+        fails++
+    if gui_menu_apply() != -1
+        output("FAIL menu_apply without window\n")
+        fails++
+    gui_menu_free()
+
+    // WebView2：不存在的 Loader 必须明确失败
+    if gui_webview_loader("zfy_no_such_webview2_loader_9c3f.dll") != -1
+        output("FAIL webview_loader missing dll\n")
+        fails++
+    if gui_webview_create(0, 0, 100, 100) != -1
+        output("FAIL webview_create without window\n")
+        fails++
+    if gui_webview_ready()
+        output("FAIL webview_ready without create\n")
+        fails++
+    if gui_webview_show(1) != -1
+        output("FAIL webview_show without create\n")
+        fails++
+    if gui_webview_navigate("https://example.com") != -1
+        output("FAIL webview_navigate without create\n")
+        fails++
+    if gui_webview_html("<p>x</p>") != -1
+        output("FAIL webview_html without create\n")
+        fails++
+    if gui_webview_post("{}") != -1
+        output("FAIL webview_post without create\n")
+        fails++
+    if gui_web_take() != ""
+        output("FAIL web_take without message\n")
+        fails++
+    gui_webview_bounds(0, 0, 100, 100)
+    gui_webview_destroy()
+
+    // ===== 3) 开窗后：托盘 / 通知 / 菜单 / 拖放 =====
+    if gui_open(360, 240, "zfy sysui test") != 0
+        output("FAIL gui_open\n")
+        return 1
+
+    // 托盘：加入成功与否取决于当前桌面会话（无交互桌面可能被策略禁用），
+    // 但 present 必须与 add 结果一致，且移除后必须为假
+    let i32 ta = gui_tray_add("", "zfy sysui")
+    if gui_tray_present() != (ta == 0)
+        output("FAIL tray_present mismatch add=", ta)
+        fails++
+    if ta == 0
+        if gui_tray_tip("zfy sysui 2") != 0
+            output("FAIL tray_tip\n")
+            fails++
+        if gui_notify("zfy", "通知测试", 0) != 0
+            output("FAIL notify\n")
+            fails++
+    gui_tray_remove()
+    if gui_tray_present()
+        output("FAIL tray_present after remove\n")
+        fails++
+
+    // 菜单：begin → 文件(退出) + 视图(勾选项/分隔线) → apply
+    if gui_menu_begin() != 0
+        output("FAIL menu_begin\n")
+        fails++
+    if gui_menu_sub("文件") != 0
+        output("FAIL menu_sub\n")
+        fails++
+    if gui_menu_item(1, "退出", 0) != 0
+        output("FAIL menu_item exit\n")
+        fails++
+    gui_menu_end()
+    if gui_menu_sub("视图") != 0
+        output("FAIL menu_sub 2\n")
+        fails++
+    if gui_menu_item(2, "状态栏", MENU_CHECKED) != 0
+        output("FAIL menu_item checked\n")
+        fails++
+    if gui_menu_item(3, "", MENU_SEPARATOR) != 0
+        output("FAIL menu_item separator\n")
+        fails++
+    if gui_menu_item(4, "禁用项", MENU_GRAYED) != 0
+        output("FAIL menu_item grayed\n")
+        fails++
+    gui_menu_end()
+    if gui_menu_apply() != 0
+        output("FAIL menu_apply\n")
+        fails++
+    // 装栏后仍可按 id 改勾选/启用状态
+    if gui_menu_check(2, 0) != 0
+        output("FAIL menu_check off\n")
+        fails++
+    if gui_menu_check(2, 1) != 0
+        output("FAIL menu_check on\n")
+        fails++
+    if gui_menu_enable(4, 1) != 0
+        output("FAIL menu_enable on\n")
+        fails++
+    if gui_menu_enable(4, 0) != 0
+        output("FAIL menu_enable off\n")
+        fails++
+    // 不存在的命令 id 必须失败
+    if gui_menu_check(99, 1) != -1
+        output("FAIL menu_check missing id\n")
+        fails++
+    if gui_menu_enable(99, 0) != -1
+        output("FAIL menu_enable missing id\n")
+        fails++
+
+    // 拖放：启用后本帧无投放（count=0），越界 idx 返回空串
+    if gui_drop_enable(1) != 0
+        output("FAIL drop_enable\n")
+        fails++
+    if gui_drop_count() != 0
+        output("FAIL drop_count should be 0\n")
+        fails++
+    if gui_drop_path(0) != ""
+        output("FAIL drop_path empty\n")
+        fails++
+    if gui_drop_path(-1) != ""
+        output("FAIL drop_path negative\n")
+        fails++
+    gui_drop_clear()
+    if gui_drop_enable(0) != 0
+        output("FAIL drop_disable\n")
+        fails++
+
+    // WebView2：未创建时其余调用仍须安全（真实创建留给 demos/webview_demo.zfy）
+    if gui_webview_ready()
+        output("FAIL webview_ready before create\n")
+        fails++
+    if gui_webview_show(1) != -1
+        output("FAIL webview_show before create\n")
+        fails++
+    if gui_webview_navigate("https://example.com") != -1
+        output("FAIL webview_navigate before create\n")
+        fails++
+    if gui_webview_html("<p>x</p>") != -1
+        output("FAIL webview_html before create\n")
+        fails++
+    if gui_webview_post("{}") != -1
+        output("FAIL webview_post before create\n")
+        fails++
+    if gui_web_take() != ""
+        output("FAIL web_take before create\n")
+        fails++
+    gui_webview_destroy()
+
+    // 收尾：关闭窗口（托盘/菜单随窗口销毁，不崩溃）
+    gui_close()
+    if gui_alive()
+        output("FAIL alive after close\n")
+        fails++
+
+    if fails != 0
+        output("sysui test FAIL: ", fails)
+        return 1
+    output("sysui test PASS")
+    return 0

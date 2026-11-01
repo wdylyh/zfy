@@ -4194,6 +4194,7 @@ void zfy_time_sleep_f(double sec) {
    BSTR/SAFEARRAY（SysAllocString/SafeArrayCreate 走 oleaut32）。 */
 #include <uiautomation.h>
 #include <oleauto.h>
+#include <shellapi.h>                  /* 系统托盘/通知/文件拖放（v3.35） */
 
 /* mingw 的 IDWriteFactory IID 未进导入库，本地定义一份 */
 static const GUID gui_iid_dwrite = { 0xb859ee5a, 0xd838, 0x4b5b,
@@ -4211,6 +4212,11 @@ typedef struct { int64_t t, x, y, k; } gui_ev;
 #define GUI_EV_KEY   6
 #define GUI_EV_WHEEL 7
 #define GUI_EV_SIZE  8
+/* 系统集成（v3.35）：托盘 / 原生菜单 / 文件拖放 / WebView2 消息 */
+#define GUI_EV_TRAY  12   /* k：0 左单击 / 1 右单击 / 2 左双击 */
+#define GUI_EV_MENU  13   /* k：菜单命令 id（WM_COMMAND） */
+#define GUI_EV_DROP  14   /* x,y = 投放点；k = 文件数（路径用 drop_path 取） */
+#define GUI_EV_WEB   15   /* k = 1：WebView2 收到一条消息（用 gui_web_take 取） */
 
 /* EV_KEY 的 k 值分区（避免与 WM_CHAR 码元 <0x110000 冲突）：
  *   GUI_KEY_EXT  | VK   —— 方向键/Delete/Home/End 等（WM_KEYDOWN）
@@ -4388,6 +4394,14 @@ static void gui_push_ev(gui_win *w, int64_t t, int64_t x, int64_t y, int64_t k) 
 #define GUI_WM_A11Y_INVOKE (WM_APP + 401)
 #define GUI_WM_A11Y_VALUE  (WM_APP + 402)
 #define GUI_WM_A11Y_FOCUS  (WM_APP + 403)
+
+/* 系统托盘回调消息（NOTIFYICONDATAW.uCallbackMessage）：lParam 低字是鼠标事件 */
+#define GUI_WM_TRAY        (WM_APP + 100)
+
+/* 系统集成段（实现在 GUI 段末尾）的前置声明：wndproc 需要 */
+static void sysui_on_destroy(gui_win *w, HWND hw);
+static void sysui_tray_msg(gui_win *w, LPARAM lp);
+static void sysui_drop_files(gui_win *w, WPARAM wp);
 
 /* 节点状态位（与 zfy 侧 A11Y_* 的映射在 a11y_states_to_c） */
 #define A11Y_ST_DISABLED 1
@@ -6508,6 +6522,16 @@ static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             gui_push_ev(w, GUI_EV_KEY, 0, 0, (int64_t)u8[i]);
         return 0;
     }
+    /* 系统集成（v3.35）：托盘回调 / 原生菜单命令 / 文件拖放 */
+    case GUI_WM_TRAY:
+        sysui_tray_msg(w, lp);
+        return 0;
+    case WM_COMMAND:
+        gui_push_ev(w, GUI_EV_MENU, 0, 0, (int64_t)LOWORD(wp));
+        return 0;
+    case WM_DROPFILES:
+        sysui_drop_files(w, wp);
+        return 0;
     case WM_CLOSE:
         w->should_close = 1;
         DestroyWindow(hw);
@@ -6516,6 +6540,7 @@ static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         w->alive = 0;
         w->used = 0;
         w->hwnd = NULL;
+        sysui_on_destroy(w, hw);           /* 托盘/菜单/WebView2 随窗口销毁 */
         gui_rt_release(w);
         return 0;
     /* UIA 动作回投：UIA 线程只 PostMessage，这里在 UI 线程翻译成 EV_A11Y_* */
@@ -7411,9 +7436,756 @@ int64_t zfy_gui_image_from_rgba(void *px, int32_t wpx, int32_t hpx, int32_t stri
     return h;
 }
 
+/* ==================================================================
+ * 系统集成（v3.35）：系统托盘 / 原生菜单 / 文件拖放 / 气泡通知 / WebView2
+ *
+ * 风格与 GUI 核心层一致：直接调 Win32（user32/shell32），zfy 侧由
+ * stdlib/gui.zfy 做 extern 薄绑定。全部能力可"缺依赖优雅降级"：
+ *  - 托盘/通知：Shell_NotifyIconW 失败返回 -1，不影响窗口与绘制；
+ *  - 菜单：标准 Win32 菜单，每窗口最多一条菜单栏（换装时销毁旧栏）；
+ *  - 拖放：DragAcceptFiles 是窗口属性，未启用时永不产生 EV_DROP；
+ *  - WebView2：Loader 动态加载（缺 DLL 返回 -3）；COM 接口按 vtable 手工
+ *    调用（不引入 2.6MB 的 WebView2.h，也不产生链接期依赖）。
+ * ================================================================== */
+
+/* WebView2 段（本段末尾）的前置声明 */
+static int zfy_webview_host(void);
+void zfy_webview_destroy(void);
+
+/* ---------- 托盘 ---------- */
+typedef struct {
+    int added;        /* 1 = 图标已加入通知区 */
+    int own_icon;     /* 1 = 本段创建的 HICON，移除时需 DestroyIcon */
+    HICON icon;
+} sys_tray_slot;
+static sys_tray_slot g_tray[GUI_MAXWIN];
+
+static int sys_win_id(gui_win *w) {
+    for (int i = 0; i < GUI_MAXWIN; i++)
+        if (w == &g_wins[i]) return i;
+    return -1;
+}
+
+static void sys_wcopy(wchar_t *dst, size_t cap, const wchar_t *src) {
+    size_t i = 0;
+    if (!cap) return;
+    if (src) for (; src[i] && i + 1 < cap; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
+
+/* 移除指定窗口的托盘图标（hw 由调用方给：WM_DESTROY 时 w->hwnd 已清空） */
+static void sys_tray_remove_at(int id, HWND hw) {
+    if (id < 0 || id >= GUI_MAXWIN) return;
+    sys_tray_slot *t = &g_tray[id];
+    if (t->added && hw) {
+        NOTIFYICONDATAW nid;
+        memset(&nid, 0, sizeof(nid));
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = hw;
+        nid.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+    if (t->own_icon && t->icon) DestroyIcon(t->icon);
+    memset(t, 0, sizeof(*t));
+}
+
+int32_t zfy_sys_tray_add(char *icon_utf8, char *tip_utf8) {
+    gui_win *w = g_cur;
+    if (!w || !w->hwnd) return -1;
+    int id = sys_win_id(w);
+    if (id < 0) return -1;
+    sys_tray_slot *t = &g_tray[id];
+    HICON icon = NULL;
+    int own = 0;
+    if (icon_utf8 && icon_utf8[0]) {
+        wchar_t *wp = gui_utf8_to_wide(icon_utf8);
+        icon = (HICON)LoadImageW(NULL, wp, IMAGE_ICON, 0, 0,
+                                 LR_LOADFROMFILE | LR_DEFAULTSIZE);
+        free(wp);
+        own = 1;
+    }
+    if (!icon) {
+        /* 退窗口图标（gui_set_icon 设过）→ 系统默认；这两者不归本段释放 */
+        icon = (HICON)(INT_PTR)SendMessageW(w->hwnd, WM_GETICON, ICON_SMALL, 0);
+        if (!icon) icon = (HICON)(INT_PTR)SendMessageW(w->hwnd, WM_GETICON, ICON_BIG, 0);
+        own = 0;
+    }
+    if (!icon) icon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+
+    NOTIFYICONDATAW nid;
+    memset(&nid, 0, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = w->hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = GUI_WM_TRAY;
+    nid.hIcon = icon;
+    if (tip_utf8 && tip_utf8[0]) {
+        wchar_t *wt = gui_utf8_to_wide(tip_utf8);
+        sys_wcopy(nid.szTip, 64, wt);
+        free(wt);
+    } else {
+        GetWindowTextW(w->hwnd, nid.szTip, 64);
+    }
+    BOOL ok = Shell_NotifyIconW(t->added ? NIM_MODIFY : NIM_ADD, &nid);
+    if (!ok) {
+        if (own && icon) DestroyIcon(icon);
+        return -1;
+    }
+    /* 换图标：先释放旧的自有图标 */
+    if (t->own_icon && t->icon && t->icon != icon) DestroyIcon(t->icon);
+    t->added = 1;
+    t->icon = icon;
+    t->own_icon = own;
+    return 0;
+}
+
+int32_t zfy_sys_tray_tip(char *tip_utf8) {
+    gui_win *w = g_cur;
+    if (!w || !w->hwnd) return -1;
+    int id = sys_win_id(w);
+    if (id < 0 || !g_tray[id].added) return -1;
+    NOTIFYICONDATAW nid;
+    memset(&nid, 0, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = w->hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_TIP;
+    if (tip_utf8 && tip_utf8[0]) {
+        wchar_t *wt = gui_utf8_to_wide(tip_utf8);
+        sys_wcopy(nid.szTip, 64, wt);
+        free(wt);
+    }
+    return Shell_NotifyIconW(NIM_MODIFY, &nid) ? 0 : -1;
+}
+
+int32_t zfy_sys_tray_present(void) {
+    gui_win *w = g_cur;
+    if (!w) return 0;
+    int id = sys_win_id(w);
+    return (id >= 0 && g_tray[id].added) ? 1 : 0;
+}
+
+void zfy_sys_tray_remove(void) {
+    gui_win *w = g_cur;
+    if (!w) return;
+    int id = sys_win_id(w);
+    sys_tray_remove_at(id, w->hwnd);
+}
+
+/* ---------- 气泡通知（依赖托盘图标，先 tray_add） ---------- */
+int32_t zfy_sys_notify(char *title_utf8, char *text_utf8, int32_t level) {
+    gui_win *w = g_cur;
+    if (!w || !w->hwnd) return -1;
+    int id = sys_win_id(w);
+    if (id < 0 || !g_tray[id].added) return -1;
+    NOTIFYICONDATAW nid;
+    memset(&nid, 0, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = w->hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = (level == 1) ? NIIF_WARNING
+                   : (level == 2) ? NIIF_ERROR : NIIF_INFO;
+    if (title_utf8) {
+        wchar_t *wt = gui_utf8_to_wide(title_utf8);
+        sys_wcopy(nid.szInfoTitle, 64, wt);
+        free(wt);
+    }
+    if (text_utf8) {
+        wchar_t *wt = gui_utf8_to_wide(text_utf8);
+        sys_wcopy(nid.szInfo, 256, wt);
+        free(wt);
+    }
+    return Shell_NotifyIconW(NIM_MODIFY, &nid) ? 0 : -1;
+}
+
+/* ---------- 原生菜单 ----------
+ * 构建模型：begin 建"构建根"弹出菜单；sub/item 往当前层追加；
+ * end 退回上一层；apply 把构建根装成当前窗口菜单栏（所有权转移）。
+ * popup 用构建根做右键上下文菜单，返回 TrackPopupMenu 的命令 id（0=未选）。 */
+#define SYS_MENU_DEPTH 8
+static HMENU g_menu_root = NULL;
+static HMENU g_menu_stack[SYS_MENU_DEPTH];
+static int g_menu_depth = 0;
+static HMENU g_menu_bars[GUI_MAXWIN];      /* 每窗口已应用的菜单栏 */
+
+static HMENU sys_menu_parent(void) {
+    return g_menu_depth > 0 ? g_menu_stack[g_menu_depth - 1] : g_menu_root;
+}
+
+static void sys_menu_reset_build(void) {
+    if (g_menu_root) DestroyMenu(g_menu_root);
+    g_menu_root = NULL;
+    g_menu_depth = 0;
+}
+
+int32_t zfy_sys_menu_begin(void) {
+    sys_menu_reset_build();
+    g_menu_root = CreatePopupMenu();
+    if (!g_menu_root) return -1;
+    g_menu_stack[0] = g_menu_root;
+    g_menu_depth = 1;
+    return 0;
+}
+
+int32_t zfy_sys_menu_sub(char *text_utf8) {
+    HMENU parent = sys_menu_parent();
+    if (!parent || g_menu_depth >= SYS_MENU_DEPTH) return -1;
+    HMENU sub = CreatePopupMenu();
+    if (!sub) return -1;
+    wchar_t *wt = gui_utf8_to_wide(text_utf8 ? text_utf8 : "");
+    int ok = AppendMenuW(parent, MF_POPUP | MF_STRING, (UINT_PTR)sub, wt);
+    free(wt);
+    if (!ok) { DestroyMenu(sub); return -1; }
+    g_menu_stack[g_menu_depth++] = sub;
+    return 0;
+}
+
+void zfy_sys_menu_end(void) {
+    if (g_menu_depth > 1) g_menu_depth--;
+}
+
+int32_t zfy_sys_menu_item(int32_t id, char *text_utf8, int32_t flags) {
+    HMENU parent = sys_menu_parent();
+    if (!parent) return -1;
+    UINT f = 0;
+    if (flags & 1) f |= MF_GRAYED;
+    if (flags & 2) f |= MF_CHECKED;
+    if (flags & 4) f |= MF_SEPARATOR;
+    wchar_t *wt = NULL;
+    if (!(flags & 4)) {
+        wt = gui_utf8_to_wide(text_utf8 ? text_utf8 : "");
+        f |= MF_STRING;
+    }
+    int ok = AppendMenuW(parent, f, (flags & 4) ? 0 : (UINT)id, wt);
+    if (wt) free(wt);
+    return ok ? 0 : -1;
+}
+
+int32_t zfy_sys_menu_apply(void) {
+    gui_win *w = g_cur;
+    if (!w || !w->hwnd || !g_menu_root) return -1;
+    int id = sys_win_id(w);
+    if (id < 0) return -1;
+    HMENU root = g_menu_root;
+    /* 先解除旧栏再销毁（SetMenu(NULL) 后才能安全 DestroyMenu） */
+    SetMenu(w->hwnd, NULL);
+    if (g_menu_bars[id]) DestroyMenu(g_menu_bars[id]);
+    g_menu_bars[id] = root;
+    g_menu_root = NULL;                    /* 所有权转移 */
+    g_menu_depth = 0;
+    SetMenu(w->hwnd, root);
+    DrawMenuBar(w->hwnd);
+    return 0;
+}
+
+int32_t zfy_sys_menu_popup(int32_t x, int32_t y) {
+    gui_win *w = g_cur;
+    if (!w || !w->hwnd || !g_menu_root) return 0;
+    int dpi = w->dpi > 0 ? w->dpi : 96;
+    POINT pt;
+    pt.x = x * dpi / 96;
+    pt.y = y * dpi / 96;
+    ClientToScreen(w->hwnd, &pt);
+    SetForegroundWindow(w->hwnd);          /* 让弹出菜单能正常收起（MSDN 要求） */
+    UINT cmd = (UINT)TrackPopupMenu(g_menu_root,
+                                    TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+                                    pt.x, pt.y, 0, w->hwnd, NULL);
+    return (int32_t)cmd;
+}
+
+void zfy_sys_menu_free(void) {
+    sys_menu_reset_build();
+}
+
+/* 递归找命令 id 所在父菜单与位置 */
+static HMENU sys_menu_locate(HMENU root, UINT id, int *pos) {
+    if (!root) return NULL;
+    int n = GetMenuItemCount(root);
+    for (int i = 0; i < n; i++) {
+        UINT mid = GetMenuItemID(root, i);
+        if (mid == id) { *pos = i; return root; }
+        if (mid == (UINT)-1) {
+            HMENU r = sys_menu_locate(GetSubMenu(root, i), id, pos);
+            if (r) return r;
+        }
+    }
+    return NULL;
+}
+
+/* 当前生效的菜单树：构建根优先，否则当前窗口菜单栏 */
+static HMENU sys_menu_active(void) {
+    if (g_menu_root) return g_menu_root;
+    int id = g_cur ? sys_win_id(g_cur) : -1;
+    return (id >= 0) ? g_menu_bars[id] : NULL;
+}
+
+int32_t zfy_sys_menu_check(int32_t id, int32_t on) {
+    HMENU root = sys_menu_active();
+    int pos = 0;
+    HMENU parent = sys_menu_locate(root, (UINT)id, &pos);
+    if (!parent) return -1;
+    CheckMenuItem(parent, (UINT)pos, MF_BYPOSITION | (on ? MF_CHECKED : MF_UNCHECKED));
+    return 0;
+}
+
+int32_t zfy_sys_menu_enable(int32_t id, int32_t on) {
+    HMENU root = sys_menu_active();
+    int pos = 0;
+    HMENU parent = sys_menu_locate(root, (UINT)id, &pos);
+    if (!parent) return -1;
+    EnableMenuItem(parent, (UINT)pos, MF_BYPOSITION | (on ? MF_ENABLED : MF_GRAYED));
+    return 0;
+}
+
+/* ---------- 文件拖放 ---------- */
+static char **g_drop = NULL;
+static int g_drop_n = 0;
+
+void zfy_sys_drop_clear(void) {
+    for (int i = 0; i < g_drop_n; i++) free(g_drop[i]);
+    free(g_drop);
+    g_drop = NULL;
+    g_drop_n = 0;
+}
+
+int32_t zfy_sys_drop_enable(int32_t on) {
+    gui_win *w = g_cur;
+    if (!w || !w->hwnd) return -1;
+    DragAcceptFiles(w->hwnd, on ? TRUE : FALSE);
+    return 0;
+}
+
+int32_t zfy_sys_drop_count(void) { return g_drop_n; }
+
+int32_t zfy_sys_drop_path(int32_t idx, char *buf, int32_t cap) {
+    if (idx < 0 || idx >= g_drop_n || !buf || cap <= 0) return -1;
+    int n = (int)strlen(g_drop[idx]);
+    if (n > cap) return -2;
+    memcpy(buf, g_drop[idx], (size_t)n);
+    return n;
+}
+
+static void sysui_drop_files(gui_win *w, WPARAM wp) {
+    HDROP hd = (HDROP)wp;
+    zfy_sys_drop_clear();
+    int n = (int)DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
+    POINT pt;
+    DragQueryPoint(hd, &pt);
+    if (n > 0) {
+        g_drop = (char **)calloc((size_t)n, sizeof(char *));
+        if (g_drop) {
+            for (int i = 0; i < n; i++) {
+                int wn = (int)DragQueryFileW(hd, (UINT)i, NULL, 0);
+                if (wn <= 0) continue;
+                wchar_t *wide = (wchar_t *)malloc(((size_t)wn + 1) * sizeof(wchar_t));
+                if (!wide) continue;
+                DragQueryFileW(hd, (UINT)i, wide, (UINT)(wn + 1));
+                int un = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+                if (un > 0) {
+                    g_drop[g_drop_n] = (char *)malloc((size_t)un);
+                    if (g_drop[g_drop_n]) {
+                        WideCharToMultiByte(CP_UTF8, 0, wide, -1, g_drop[g_drop_n], un, NULL, NULL);
+                        g_drop_n++;
+                    }
+                }
+                free(wide);
+            }
+        }
+    }
+    DragFinish(hd);
+    gui_push_ev(w, GUI_EV_DROP, pt.x, pt.y, g_drop_n);
+}
+
+/* ---------- 托盘/拖放/window 销毁回调 ---------- */
+static void sysui_tray_msg(gui_win *w, LPARAM lp) {
+    UINT ev = (UINT)LOWORD(lp);
+    int64_t k;
+    if (ev == WM_LBUTTONUP) k = 0;
+    else if (ev == WM_RBUTTONUP) k = 1;
+    else if (ev == WM_LBUTTONDBLCLK) k = 2;
+    else return;
+    gui_push_ev(w, GUI_EV_TRAY, 0, 0, k);
+}
+
+static void sysui_on_destroy(gui_win *w, HWND hw) {
+    int id = sys_win_id(w);
+    if (id < 0) return;
+    sys_tray_remove_at(id, hw);
+    if (g_menu_bars[id]) {
+        SetMenu(hw, NULL);
+        DestroyMenu(g_menu_bars[id]);
+        g_menu_bars[id] = NULL;
+    }
+    if (zfy_webview_host() == id) zfy_webview_destroy();
+}
+
+/* ==================================================================
+ * WebView2（v3.35）：手工 COM（vtable 下标与 SDK 1.0.2903.40 一致）
+ *
+ * 只用到三个接口：ICoreWebView2Environment（创建控制器）、
+ * ICoreWebView2Controller（尺寸/可见性/Close）、ICoreWebView2（导航与
+ * postMessage）。异步创建靠嵌套消息泵等待完成回调（15s 超时）。
+ * 回调 handler 是静态单例（AddRef/Release 恒返回，永不销毁）。
+ * ================================================================== */
+typedef struct {
+    HRESULT (WINAPI *QueryInterface)(void *self, const GUID *riid, void **ppv);
+    ULONG (WINAPI *AddRef)(void *self);
+    ULONG (WINAPI *Release)(void *self);
+    HRESULT (WINAPI *Invoke)(void *self, HRESULT hr, void *obj);
+} sys_cb_vt;
+
+typedef struct { const sys_cb_vt *lpVtbl; long ref; } sys_cb_obj;
+
+/* 消息回调的 Invoke 签名不同：(sender, args) 无 HRESULT 首参 */
+typedef struct {
+    HRESULT (WINAPI *QueryInterface)(void *self, const GUID *riid, void **ppv);
+    ULONG (WINAPI *AddRef)(void *self);
+    ULONG (WINAPI *Release)(void *self);
+    HRESULT (WINAPI *Invoke)(void *self, void *sender, void *args);
+} sys_msg_cb_vt;
+typedef struct { const sys_msg_cb_vt *lpVtbl; long ref; } sys_msg_cb_obj;
+
+typedef struct {
+    void *qi, *ar, *rel;                                   /* 0..2 */
+    HRESULT (WINAPI *CreateCoreWebView2Controller)(void *self, HWND parent,
+                                                   void *handler, void **ctl);
+} sys_env_vt;
+
+typedef struct {
+    void *qi, *ar, *rel;                                   /* 0..2 */
+    HRESULT (WINAPI *get_IsVisible)(void *self, int *v);   /* 3 */
+    HRESULT (WINAPI *put_IsVisible)(void *self, int v);    /* 4 */
+    void *get_Bounds;                                      /* 5 */
+    HRESULT (WINAPI *put_Bounds)(void *self, RECT r);      /* 6 */
+    void *p7, *p8, *p9, *p10, *p11, *p12;                  /* 7..12 */
+    void *p13, *p14, *p15, *p16, *p17, *p18, *p19, *p20;    /* 13..20 */
+    void *get_ParentWindow, *put_ParentWindow;             /* 21..22 */
+    void *NotifyParentWindowPositionChanged;               /* 23 */
+    HRESULT (WINAPI *Close)(void *self);                   /* 24 */
+    HRESULT (WINAPI *get_CoreWebView2)(void *self, void **web); /* 25 */
+} sys_ctl_vt;
+
+typedef struct {
+    void *qi, *ar, *rel;                                   /* 0..2 */
+    void *get_Settings;                                    /* 3 */
+    void *get_Source;                                      /* 4 */
+    HRESULT (WINAPI *Navigate)(void *self, const wchar_t *uri);        /* 5 */
+    HRESULT (WINAPI *NavigateToString)(void *self, const wchar_t *html);/* 6 */
+    void *p7, *p8, *p9, *p10, *p11, *p12, *p13, *p14, *p15, *p16;
+    void *p17, *p18, *p19, *p20, *p21, *p22, *p23, *p24, *p25, *p26;
+    void *p27, *p28, *p29, *p30, *p31;                     /* 7..31 */
+    HRESULT (WINAPI *PostWebMessageAsJson)(void *self, const wchar_t *json);   /* 32 */
+    HRESULT (WINAPI *PostWebMessageAsString)(void *self, const wchar_t *str);  /* 33 */
+    HRESULT (WINAPI *add_WebMessageReceived)(void *self, void *handler, void **token); /* 34 */
+    void *remove_WebMessageReceived;                        /* 35 */
+} sys_web_vt;
+
+typedef struct {
+    void *qi, *ar, *rel;                                   /* 0..2 */
+    void *get_Source;                                      /* 3 */
+    HRESULT (WINAPI *get_WebMessageAsJson)(void *self, wchar_t **json);       /* 4 */
+    HRESULT (WINAPI *TryGetWebMessageAsString)(void *self, wchar_t **str);    /* 5 */
+} sys_msgargs_vt;
+
+typedef struct {
+    HMODULE loader;
+    HRESULT (WINAPI *create_env)(const wchar_t *browser_folder,
+                                 const wchar_t *user_data_folder,
+                                 void *options, void *handler);
+    void *env;
+    void *ctl;
+    void *web;
+    int ready;
+    int win_id;                 /* 宿主窗口下标（EV_WEB 投递用） */
+    HRESULT hr;
+    volatile int done;
+    char msg[4096];             /* 最近一条 postMessage（UTF-8） */
+    int msg_len;
+} sys_wv_state;
+static sys_wv_state g_wv = { NULL, NULL, NULL, NULL, NULL, 0, -1, S_OK, 0, "", 0 };
+
+static const GUID sys_iid_unknown = { 0x00000000, 0x0000, 0x0000,
+                                      { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+
+static HRESULT WINAPI sys_cb_qi(void *self, const GUID *riid, void **ppv) {
+    if (!ppv) return E_POINTER;
+    *ppv = NULL;
+    if (!riid) return E_INVALIDARG;
+    if (memcmp(riid, &sys_iid_unknown, sizeof(GUID)) != 0) return E_NOINTERFACE;
+    *ppv = self;
+    return S_OK;
+}
+static ULONG WINAPI sys_cb_addref(void *self) { (void)self; return 2; }
+static ULONG WINAPI sys_cb_release(void *self) { (void)self; return 1; }
+
+static HRESULT WINAPI sys_env_invoke(void *self, HRESULT hr, void *env) {
+    (void)self;
+    g_wv.hr = hr;
+    if (SUCCEEDED(hr) && env) g_wv.env = env;
+    g_wv.done = 1;
+    return S_OK;
+}
+static HRESULT WINAPI sys_ctl_invoke(void *self, HRESULT hr, void *ctl) {
+    (void)self;
+    g_wv.hr = hr;
+    if (SUCCEEDED(hr) && ctl) g_wv.ctl = ctl;
+    g_wv.done = 1;
+    return S_OK;
+}
+static HRESULT WINAPI sys_msg_invoke(void *self, void *sender, void *args) {
+    (void)self; (void)sender;
+    if (!args) return S_OK;
+    const sys_msgargs_vt *vt = *(const sys_msgargs_vt *const *)args;
+    if (!vt) return S_OK;
+    wchar_t *ws = NULL;
+    if (vt->TryGetWebMessageAsString
+        && SUCCEEDED(vt->TryGetWebMessageAsString(args, &ws)) && ws) {
+        /* 字符串消息：直接取 */
+    } else if (vt->get_WebMessageAsJson
+               && SUCCEEDED(vt->get_WebMessageAsJson(args, &ws)) && ws) {
+        /* 非字符串：取 JSON 文本 */
+    }
+    if (!ws) return S_OK;
+    int n = WideCharToMultiByte(CP_UTF8, 0, ws, -1, g_wv.msg, (int)sizeof(g_wv.msg),
+                                NULL, NULL);
+    g_wv.msg_len = (n > 0) ? n - 1 : 0;
+    CoTaskMemFree(ws);
+    int id = g_wv.win_id;
+    if (id >= 0 && id < GUI_MAXWIN && g_wins[id].hwnd)
+        gui_push_ev(&g_wins[id], GUI_EV_WEB, 0, 0, 1);
+    return S_OK;
+}
+
+static const sys_cb_vt g_env_cb_vtbl = { sys_cb_qi, sys_cb_addref, sys_cb_release, sys_env_invoke };
+static const sys_cb_vt g_ctl_cb_vtbl = { sys_cb_qi, sys_cb_addref, sys_cb_release, sys_ctl_invoke };
+static const sys_msg_cb_vt g_msg_cb_vtbl = { sys_cb_qi, sys_cb_addref, sys_cb_release, sys_msg_invoke };
+static sys_cb_obj g_env_handler = { &g_env_cb_vtbl, 1 };
+static sys_cb_obj g_ctl_handler = { &g_ctl_cb_vtbl, 1 };
+static sys_msg_cb_obj g_msg_handler = { &g_msg_cb_vtbl, 1 };
+
+/* 等待异步完成回调：嵌套消息泵（最多 timeout_ms） */
+static void sys_pump_until(volatile int *flag, int timeout_ms) {
+    DWORD t0 = GetTickCount();
+    MSG msg;
+    while (!*flag && (int)(GetTickCount() - t0) < timeout_ms) {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 20, QS_ALLINPUT);
+    }
+}
+
+/* 逐级建目录（失败忽略：已存在/无权限时交给 WebView2 自行判断） */
+static void sys_make_dirs(const char *utf8_path) {
+    wchar_t *wp = gui_utf8_to_wide(utf8_path);
+    for (wchar_t *p = wp + 1; *p; p++) {
+        if (*p == L'\\' || *p == L'/') {
+            wchar_t c = *p;
+            *p = 0;
+            CreateDirectoryW(wp, NULL);
+            *p = c;
+        }
+    }
+    CreateDirectoryW(wp, NULL);
+    free(wp);
+}
+
+int32_t zfy_webview_loader(char *path_utf8) {
+    if (g_wv.loader) return 0;
+    const wchar_t *cands[3];
+    int n = 0;
+    wchar_t *owned = NULL;
+    if (path_utf8 && path_utf8[0]) {
+        owned = gui_utf8_to_wide(path_utf8);
+        cands[n++] = owned;
+    } else {
+        cands[n++] = L"WebView2Loader.dll";
+        cands[n++] = L"C:\\Windows\\ShellExperiences\\WebView2Loader.dll";
+        cands[n++] = L"C:\\Program Files (x86)\\Microsoft\\Office\\root\\Office16\\WebView2Loader.dll";
+    }
+    for (int i = 0; i < n && !g_wv.loader; i++) {
+        HMODULE m = LoadLibraryW(cands[i]);
+        if (!m) continue;
+        void *fn = (void *)GetProcAddress(m, "CreateCoreWebView2EnvironmentWithOptions");
+        if (fn) {
+            g_wv.loader = m;
+            g_wv.create_env = (HRESULT (WINAPI *)(const wchar_t *, const wchar_t *, void *, void *))fn;
+        } else {
+            FreeLibrary(m);
+        }
+    }
+    if (owned) free(owned);
+    return g_wv.loader ? 0 : -1;
+}
+
+/* 宿主窗口（WebView 所属）的窗口下标 */
+static int zfy_webview_host(void) { return g_wv.win_id; }
+
+int32_t zfy_webview_create(int32_t x, int32_t y, int32_t wid, int32_t hgt) {
+    gui_win *w = g_cur;
+    if (!w || !w->hwnd) return -1;
+    if (g_wv.ctl) return -2;
+    if (zfy_webview_loader(NULL) != 0) return -3;
+    int id = sys_win_id(w);
+    if (id < 0) return -1;
+
+    /* userDataFolder：%LOCALAPPDATA%\zfy\webview2（无则退进程当前目录） */
+    char ud[MAX_PATH * 2];
+    const char *la = getenv("LOCALAPPDATA");
+    if (la && la[0]) snprintf(ud, sizeof(ud), "%s\\zfy\\webview2", la);
+    else snprintf(ud, sizeof(ud), "zfy_webview2");
+    sys_make_dirs(ud);
+    wchar_t *wud = gui_utf8_to_wide(ud);
+
+    g_wv.done = 0;
+    g_wv.hr = E_FAIL;
+    HRESULT hr = g_wv.create_env(NULL, wud, NULL, (void *)&g_env_handler);
+    free(wud);
+    if (FAILED(hr)) return -4;
+    sys_pump_until(&g_wv.done, 15000);
+    if (!g_wv.env) return -4;
+
+    /* 创建控制器（异步），等待完成 */
+    const sys_env_vt *evt = *(const sys_env_vt *const *)g_wv.env;
+    g_wv.done = 0;
+    g_wv.hr = E_FAIL;
+    hr = evt->CreateCoreWebView2Controller(g_wv.env, w->hwnd,
+                                           (void *)&g_ctl_handler, &g_wv.ctl);
+    if (FAILED(hr)) return -5;
+    sys_pump_until(&g_wv.done, 15000);
+    if (!g_wv.ctl) return -5;
+
+    RECT rc;
+    rc.left = x; rc.top = y; rc.right = x + wid; rc.bottom = y + hgt;
+    const sys_ctl_vt *cvt = *(const sys_ctl_vt *const *)g_wv.ctl;
+    if (cvt->put_Bounds) cvt->put_Bounds(g_wv.ctl, rc);
+
+    /* 取 ICoreWebView2（导航/postMessage 用） */
+    if (cvt->get_CoreWebView2) cvt->get_CoreWebView2(g_wv.ctl, &g_wv.web);
+
+    g_wv.win_id = id;
+    g_wv.ready = 1;
+    g_wv.msg_len = 0;
+
+    /* 消息接收：把 web 侧 postMessage 转成 EV_WEB 事件 */
+    if (g_wv.web) {
+        const sys_web_vt *wvt = *(const sys_web_vt *const *)g_wv.web;
+        if (wvt->add_WebMessageReceived) {
+            void *token = NULL;
+            wvt->add_WebMessageReceived(g_wv.web, (void *)&g_msg_handler, &token);
+        }
+    }
+    return 0;
+}
+
+int32_t zfy_webview_ready(void) { return g_wv.ready ? 1 : 0; }
+
+void zfy_webview_bounds(int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (!g_wv.ctl) return;
+    const sys_ctl_vt *vt = *(const sys_ctl_vt *const *)g_wv.ctl;
+    if (!vt->put_Bounds) return;
+    RECT rc;
+    rc.left = x; rc.top = y; rc.right = x + w; rc.bottom = y + h;
+    vt->put_Bounds(g_wv.ctl, rc);
+}
+
+int32_t zfy_webview_show(int32_t on) {
+    if (!g_wv.ctl) return -1;
+    const sys_ctl_vt *vt = *(const sys_ctl_vt *const *)g_wv.ctl;
+    if (!vt->put_IsVisible) return -1;
+    vt->put_IsVisible(g_wv.ctl, on ? 1 : 0);
+    return 0;
+}
+
+int32_t zfy_webview_navigate(char *url_utf8) {
+    if (!g_wv.web || !url_utf8) return -1;
+    const sys_web_vt *vt = *(const sys_web_vt *const *)g_wv.web;
+    if (!vt->Navigate) return -1;
+    wchar_t *wt = gui_utf8_to_wide(url_utf8);
+    HRESULT hr = vt->Navigate(g_wv.web, wt);
+    free(wt);
+    return SUCCEEDED(hr) ? 0 : -1;
+}
+
+int32_t zfy_webview_html(char *html_utf8) {
+    if (!g_wv.web || !html_utf8) return -1;
+    const sys_web_vt *vt = *(const sys_web_vt *const *)g_wv.web;
+    if (!vt->NavigateToString) return -1;
+    wchar_t *wt = gui_utf8_to_wide(html_utf8);
+    HRESULT hr = vt->NavigateToString(g_wv.web, wt);
+    free(wt);
+    return SUCCEEDED(hr) ? 0 : -1;
+}
+
+int32_t zfy_webview_post(char *json_utf8) {
+    if (!g_wv.web || !json_utf8) return -1;
+    const sys_web_vt *vt = *(const sys_web_vt *const *)g_wv.web;
+    if (!vt->PostWebMessageAsJson) return -1;
+    wchar_t *wt = gui_utf8_to_wide(json_utf8);
+    HRESULT hr = vt->PostWebMessageAsJson(g_wv.web, wt);
+    free(wt);
+    return SUCCEEDED(hr) ? 0 : -1;
+}
+
+/* 取最近一条 web 消息：0=无；-2=缓冲不足（保留待取）；否则字节数 */
+int32_t zfy_webview_take(char *buf, int32_t cap) {
+    if (g_wv.msg_len <= 0) return 0;
+    if (!buf || cap <= 0 || g_wv.msg_len > cap) return -2;
+    memcpy(buf, g_wv.msg, (size_t)g_wv.msg_len);
+    int n = g_wv.msg_len;
+    g_wv.msg_len = 0;
+    return n;
+}
+
+void zfy_webview_destroy(void) {
+    if (g_wv.web) { REL(g_wv.web); g_wv.web = NULL; }
+    if (g_wv.ctl) {
+        const sys_ctl_vt *vt = *(const sys_ctl_vt *const *)g_wv.ctl;
+        if (vt && vt->Close) vt->Close(g_wv.ctl);
+        REL(g_wv.ctl);
+        g_wv.ctl = NULL;
+    }
+    if (g_wv.env) { REL(g_wv.env); g_wv.env = NULL; }
+    g_wv.ready = 0;
+    g_wv.win_id = -1;
+    g_wv.msg_len = 0;
+}
+
 #else
 /* 非 Windows：桩实现（返回失败，UI 程序可优雅降级为 TUI） */
 int32_t zfy_gui_open(int32_t w, int32_t h, char *t) { (void)w; (void)h; (void)t; return -1; }
+/* 系统集成（v3.35）：非 Windows 全部桩化（zfy 侧可无差别调用） */
+int32_t zfy_sys_tray_add(char *i, char *t) { (void)i; (void)t; return -1; }
+int32_t zfy_sys_tray_tip(char *t) { (void)t; return -1; }
+int32_t zfy_sys_tray_present(void) { return 0; }
+void zfy_sys_tray_remove(void) {}
+int32_t zfy_sys_notify(char *t, char *s, int32_t l) { (void)t; (void)s; (void)l; return -1; }
+int32_t zfy_sys_menu_begin(void) { return -1; }
+int32_t zfy_sys_menu_sub(char *t) { (void)t; return -1; }
+void zfy_sys_menu_end(void) {}
+int32_t zfy_sys_menu_item(int32_t id, char *t, int32_t f) { (void)id; (void)t; (void)f; return -1; }
+int32_t zfy_sys_menu_apply(void) { return -1; }
+int32_t zfy_sys_menu_popup(int32_t x, int32_t y) { (void)x; (void)y; return 0; }
+void zfy_sys_menu_free(void) {}
+int32_t zfy_sys_menu_check(int32_t id, int32_t on) { (void)id; (void)on; return -1; }
+int32_t zfy_sys_menu_enable(int32_t id, int32_t on) { (void)id; (void)on; return -1; }
+int32_t zfy_sys_drop_enable(int32_t on) { (void)on; return -1; }
+int32_t zfy_sys_drop_count(void) { return 0; }
+int32_t zfy_sys_drop_path(int32_t i, char *b, int32_t c) { (void)i; (void)b; (void)c; return -1; }
+void zfy_sys_drop_clear(void) {}
+int32_t zfy_webview_loader(char *p) { (void)p; return -1; }
+int32_t zfy_webview_create(int32_t x, int32_t y, int32_t w, int32_t h) { (void)x; (void)y; (void)w; (void)h; return -1; }
+int32_t zfy_webview_ready(void) { return 0; }
+void zfy_webview_bounds(int32_t x, int32_t y, int32_t w, int32_t h) { (void)x; (void)y; (void)w; (void)h; }
+int32_t zfy_webview_show(int32_t on) { (void)on; return -1; }
+int32_t zfy_webview_navigate(char *u) { (void)u; return -1; }
+int32_t zfy_webview_html(char *h) { (void)h; return -1; }
+int32_t zfy_webview_post(char *j) { (void)j; return -1; }
+int32_t zfy_webview_take(char *b, int32_t c) { (void)b; (void)c; return 0; }
+void zfy_webview_destroy(void) {}
 /* 无障碍（UIA）在非 Windows 上不可用：全部桩化，zfy 侧可无差别调用 */
 void zfy_a11y_begin(int64_t win) { (void)win; }
 void zfy_a11y_push_node(int64_t win, int64_t idx, char *name, char *role, char *value,

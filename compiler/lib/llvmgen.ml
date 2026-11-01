@@ -4452,6 +4452,35 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_a11y_set_focus(i64)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_a11y_hit(i32, i32)\n";
   Buffer.add_string g.mbuf "declare i32 @zfy_gui_a11y_take_value(i64, ptr, i32)\n";
+  (* 系统集成（v3.35）：托盘 / 原生菜单 / 文件拖放 / 通知 / WebView2 *)
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_tray_add(ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_tray_tip(ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_tray_present()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_sys_tray_remove()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_notify(ptr, ptr, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_menu_begin()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_menu_sub(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_sys_menu_end()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_menu_item(i32, ptr, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_menu_apply()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_menu_popup(i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_sys_menu_free()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_menu_check(i32, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_menu_enable(i32, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_drop_enable(i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_drop_count()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_sys_drop_path(i32, ptr, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_sys_drop_clear()\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_webview_loader(ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_webview_create(i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_webview_ready()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_webview_bounds(i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_webview_show(i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_webview_navigate(ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_webview_html(ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_webview_post(ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_webview_take(ptr, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_webview_destroy()\n";
   (* 音视频（v3.34）：Media Foundation 解码 + waveOut 音频（stdlib/media.zfy） *)
   Buffer.add_string g.mbuf "declare i32 @zfy_media_init()\n";
   Buffer.add_string g.mbuf "declare void @zfy_media_uninit()\n";

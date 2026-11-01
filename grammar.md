@@ -1,4 +1,4 @@
-# zfy 语言规范（v3.34.0，2026-11-01）
+# zfy 语言规范（v3.35.0，2026-11-01）
 
 > 本规范只描述当前语法。旧语法一律删除、不再保留历史版本描述。
 > 适用编译器：`compiler/_build/zfyc.exe` 当前构建。
@@ -1442,6 +1442,95 @@ fn main()
   所有查询/控制安全、重复 `release`、裸句柄 0 操作、`uninit` 后重新
   `init`）；示例程序：`demos/media_play.zfy`（窗口播放器，空格暂停、
   ←/→ 快进快退、↑/↓ 音量、进度条）。
+
+### 18.9 系统集成（托盘 / 原生菜单 / 文件拖放 / 通知）
+
+系统集合同样**不引入新语法**：`stdlib/gui.zfy` 内追加一段 `extern "C"`
+薄声明 + `pub fn` 包装（v3.35），底层在 runtime.c 直接调用 Win32
+（user32 / shell32）。全部能力都是**可缺依赖降级**的：失败返回 `-1`，
+事件永不出现，调用方无需条件编译；非 Windows 平台全部桩化。
+
+新增事件（每窗口各自队列，与 `EV_MOVE` 等并列）：
+
+| 事件 | 含义 |
+| --- | --- |
+| `EV_TRAY = 12` | 托盘图标回调。`key`：`0` 左键单击 / `1` 右键单击 / `2` 左键双击 |
+| `EV_MENU = 13` | 原生菜单命令（`WM_COMMAND`）。`key` = 菜单项 id |
+| `EV_DROP = 14` | 文件拖放。`x,y` = 投放点（客户区），`key` = 文件数 |
+| `EV_WEB = 15` | WebView2 收到一条 `postMessage`（`key = 1`，内容用 `gui_web_take()` 取） |
+
+**系统托盘与通知**
+
+| 函数 | 说明 |
+| --- | --- |
+| `i32 gui_tray_add(string icon, string tip)` | 加入通知区图标；`icon` 为空串时取窗口图标再退系统默认；`0` = 成功，`-1` = 失败 |
+| `i32 gui_tray_tip(string tip)` | 更新悬停提示 |
+| `bool gui_tray_present()` | 当前窗口是否已有托盘图标 |
+| `void gui_tray_remove()` | 移除（窗口销毁时也会自动移除） |
+| `i32 gui_notify(string title, string text, i32 level)` | 气泡通知；`level`：`0` 信息 / `1` 警告 / `2` 错误；需先加托盘图标 |
+
+每个窗口独立一个托盘槽（最多 `GUI_MAXWIN = 8` 个窗口），回调经
+`WM_APP + 100` 投递到该窗口的事件队列；窗口销毁（`WM_DESTROY`）时
+自动 `NIM_DELETE` 并释放本段创建的图标。
+
+**原生菜单（构建 → 安装 / 弹出）**
+
+```zfy
+gui_menu_begin()                    // 新建构建根（自动销毁上次未应用的构建）
+gui_menu_sub("文件")
+gui_menu_item(1, "退出", 0)          // flags：MENU_GRAYED=1 灰显 / MENU_CHECKED=2 勾选 / MENU_SEPARATOR=4 分隔线
+gui_menu_end()                      // 退回上一层
+gui_menu_apply()                    // 装成当前窗口菜单栏（旧菜单栏自动销毁）
+```
+
+| 函数 | 说明 |
+| --- | --- |
+| `i32 gui_menu_begin()` / `i32 gui_menu_sub(string)` / `i32 gui_menu_item(i32 id, string text, i32 flags)` / `void gui_menu_end()` | 构建（层深上限 8） |
+| `i32 gui_menu_apply()` | 安装为菜单栏（所有权转移，构建根清空） |
+| `i32 gui_menu_popup(i32 x, i32 y)` | 用构建根做右键上下文菜单（**模态**，会阻塞到用户选择）；返回命令 id，`0` = 未选 |
+| `void gui_menu_free()` | 丢弃未应用的构建结果 |
+| `i32 gui_menu_check(i32 id, i32 on)` / `i32 gui_menu_enable(i32 id, i32 on)` | 改勾选 / 启用状态（按命令 id 递归查找父菜单与位置） |
+
+菜单命令统一以 `EV_MENU` 事件上报（`key` = 命令 id）。注意 `WM_COMMAND`
+只携带低 16 位，菜单项 id 请 ≤ 65535。
+
+**文件拖放**
+
+| 函数 | 说明 |
+| --- | --- |
+| `i32 gui_drop_enable(i32 on)` | `DragAcceptFiles` 开关（窗口属性，默认关闭） |
+| `i32 gui_drop_count()` | 最近一次投放的文件数（`EV_DROP` 的 `key` 同值） |
+| `string gui_drop_path(i32 idx)` | 第 `idx` 个文件路径（UTF-8；内部倍增缓冲；越界返回 `""`） |
+| `void gui_drop_clear()` | 清空投放记录（下一次投放自动覆盖） |
+
+### 18.10 WebView2（内嵌浏览器）
+
+WebView2 走**手工 COM**（runtime.c 内按 vtable 下标直调，不引入
+WebView2.h、无链接期依赖）：`WebView2Loader.dll` 动态加载，环境与控制器
+异步创建靠嵌套消息泵等待（15s 超时），失败逐级返回负码。
+
+| 函数 | 说明 |
+| --- | --- |
+| `i32 gui_webview_loader(string path)` | 指定 Loader DLL 路径（空串 = 自动探测系统常见位置）；`0` = 成功，`-1` = 未找到 |
+| `i32 gui_webview_create(i32 x, i32 y, i32 w, i32 h)` | 在当前窗口内创建；`0` 成功 / `-1` 无窗口 / `-2` 已存在 / `-3` 无 Loader / `-4` 环境失败 / `-5` 控制器失败 |
+| `bool gui_webview_ready()` | 是否已创建成功 |
+| `void gui_webview_bounds(i32 x, i32 y, i32 w, i32 h)` | 调整边界（物理像素；窗口 `EV_SIZE` 后需自行同步） |
+| `i32 gui_webview_show(i32 on)` | 显示 / 隐藏 |
+| `i32 gui_webview_navigate(string url)` | 导航到 URL（http/https/file 等） |
+| `i32 gui_webview_html(string html)` | 直接载入 HTML 文本 |
+| `i32 gui_webview_post(string json)` | 向页面 `postMessage`（JSON） |
+| `string gui_web_take()` | 取最近一条 web 消息（`EV_WEB` 后调用；无消息返回 `""`） |
+| `void gui_webview_destroy()` | 销毁（窗口销毁时自动清理） |
+
+约定：整进程**同一时间只能有一个 WebView2**（创建时若已存在返回
+`-2`）；`userDataFolder` 固定为 `%LOCALAPPDATA%\zfy\webview2`；
+web → 宿主的消息优先按字符串取，非字符串消息取 JSON 文本；
+边界与坐标均为物理像素（逻辑值须自行 ×`gui_dpi()/96`）。
+
+- 用例：`examples/sysui_test.zfy`（无窗口失败路径、常量一致、托盘
+  add/present/remove 一致性、菜单构建/安装/改状态、拖放空投放、
+  WebView2 未初始化安全）；示例程序：`demos/webview_demo.zfy`
+  （浏览器窗口 + 托盘显示切换 + 菜单退出）。
 
 ## 19. 内建容器 map / set 与 for-in
 

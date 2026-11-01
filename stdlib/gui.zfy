@@ -38,6 +38,16 @@ pub let i32 const EV_SIZE = 8      // x,y = 新客户区宽高（resize/DPI 变�
 pub let i32 const EV_A11Y_INVOKE = 9    // x = 节点下标（UIA Invoke/Toggle/Select 请求）
 pub let i32 const EV_A11Y_VALUE = 10    // x = 节点下标；key>0 为数值（key-1），key==0 为文本（gui_a11y_take_value 取）
 pub let i32 const EV_A11Y_FOCUS = 11    // x = 节点下标（UIA SetFocus 请求）
+// 系统集成（v3.35，Windows；非 Windows 上对应 API 返回失败，事件永不出现）
+pub let i32 const EV_TRAY = 12     // k：0 左键单击 / 1 右键单击 / 2 左键双击
+pub let i32 const EV_MENU = 13     // k = 菜单命令 id（WM_COMMAND）
+pub let i32 const EV_DROP = 14     // x,y = 投放点（客户区）；k = 文件数（路径用 gui_drop_path 取）
+pub let i32 const EV_WEB = 15      // k = 1：WebView2 收到一条 postMessage（用 gui_web_take 取）
+
+// 菜单项标志（gui_menu_item 的 flags 位组合）
+pub let i32 const MENU_GRAYED = 1      // 灰显（不可点）
+pub let i32 const MENU_CHECKED = 2     // 勾选
+pub let i32 const MENU_SEPARATOR = 4   // 分隔线（忽略 id/text）
 
 // 混合模式（gui_set_blend）
 pub let i32 const BLEND_SRCOVER  = 0   // 默认：源覆盖（D2D 原生）
@@ -412,3 +422,167 @@ pub fn void gui_frame_sleep(let i64 frame_start_ms)
     let i64 el = tick_ms() - frame_start_ms
     if el < 16
         sleep_ms(16 - el)
+
+// =====================================================================
+// 系统集成（v3.35）：系统托盘 / 原生菜单 / 文件拖放 / 气泡通知 / WebView2
+//
+// 全部为 runtime.c「系统集成」段的 extern 薄绑定。非 Windows 平台上这些
+// 函数返回失败（-1/0），事件永不产生，调用方无需条件编译。
+// =====================================================================
+
+extern "C"
+    // ---- 系统托盘（每个窗口一个托盘槽；icon 为空则取窗口图标再退系统默认）----
+    i32 zfy_sys_tray_add(let string icon, let string tip)
+    i32 zfy_sys_tray_tip(let string tip)
+    i32 zfy_sys_tray_present()
+    void zfy_sys_tray_remove()
+    // ---- 气泡通知（需先 tray_add；level：0 信息 / 1 警告 / 2 错误）----
+    i32 zfy_sys_notify(let string title, let string text, let i32 level)
+    // ---- 原生菜单（构建 → apply 装成菜单栏 / popup 作上下文菜单）----
+    i32 zfy_sys_menu_begin()
+    i32 zfy_sys_menu_sub(let string text)
+    void zfy_sys_menu_end()
+    i32 zfy_sys_menu_item(let i32 id, let string text, let i32 flags)
+    i32 zfy_sys_menu_apply()
+    i32 zfy_sys_menu_popup(let i32 x, let i32 y)
+    void zfy_sys_menu_free()
+    i32 zfy_sys_menu_check(let i32 id, let i32 on)
+    i32 zfy_sys_menu_enable(let i32 id, let i32 on)
+    // ---- 文件拖放（EV_DROP 后用 drop_count/drop_path 取路径）----
+    i32 zfy_sys_drop_enable(let i32 on)
+    i32 zfy_sys_drop_count()
+    i32 zfy_sys_drop_path(let i32 idx, let string buf, let i32 cap)
+    void zfy_sys_drop_clear()
+    // ---- WebView2 ----
+    i32 zfy_webview_loader(let string path)
+    i32 zfy_webview_create(let i32 x, let i32 y, let i32 w, let i32 h)
+    i32 zfy_webview_ready()
+    void zfy_webview_bounds(let i32 x, let i32 y, let i32 w, let i32 h)
+    i32 zfy_webview_show(let i32 on)
+    i32 zfy_webview_navigate(let string url)
+    i32 zfy_webview_html(let string html)
+    i32 zfy_webview_post(let string json)
+    i32 zfy_webview_take(let string buf, let i32 cap)
+    void zfy_webview_destroy()
+
+// ===== 系统托盘 =====
+// 加入通知区图标：icon 为 .ico 路径（空串=用窗口图标/系统默认）；0=成功，-1=失败
+pub fn i32 gui_tray_add(let string icon, let string tip)
+    return zfy_sys_tray_add(icon, tip)
+
+// 更新托盘悬停提示
+pub fn i32 gui_tray_tip(let string tip)
+    return zfy_sys_tray_tip(tip)
+
+// 当前窗口是否已有托盘图标
+pub fn bool gui_tray_present()
+    return zfy_sys_tray_present() == 1
+
+pub fn void gui_tray_remove()
+    zfy_sys_tray_remove()
+
+// 气泡通知：level 0=信息 1=警告 2=错误
+pub fn i32 gui_notify(let string title, let string text, let i32 level)
+    return zfy_sys_notify(title, text, level)
+
+// ===== 原生菜单 =====
+// 开始构建：gui_menu_begin() → gui_menu_sub/item... → gui_menu_apply()
+pub fn i32 gui_menu_begin()
+    return zfy_sys_menu_begin()
+
+pub fn i32 gui_menu_sub(let string text)
+    return zfy_sys_menu_sub(text)
+
+pub fn void gui_menu_end()
+    zfy_sys_menu_end()
+
+// 追加命令项；flags 见 MENU_GRAYED / MENU_CHECKED / MENU_SEPARATOR
+pub fn i32 gui_menu_item(let i32 id, let string text, let i32 flags)
+    return zfy_sys_menu_item(id, text, flags)
+
+// 把构建好的菜单装成当前窗口的菜单栏（旧菜单栏自动销毁）
+pub fn i32 gui_menu_apply()
+    return zfy_sys_menu_apply()
+
+// 右键上下文菜单：返回所选命令 id（0=未选择）
+pub fn i32 gui_menu_popup(let i32 x, let i32 y)
+    return zfy_sys_menu_popup(x, y)
+
+// 丢弃未应用的构建结果
+pub fn void gui_menu_free()
+    zfy_sys_menu_free()
+
+// 勾选/取消勾选命令项
+pub fn i32 gui_menu_check(let i32 id, let i32 on)
+    return zfy_sys_menu_check(id, on)
+
+// 启用/灰显命令项
+pub fn i32 gui_menu_enable(let i32 id, let i32 on)
+    return zfy_sys_menu_enable(id, on)
+
+// ===== 文件拖放 =====
+// 允许把文件拖进当前窗口（收到 EV_DROP 后读路径）
+pub fn i32 gui_drop_enable(let i32 on)
+    return zfy_sys_drop_enable(on)
+
+pub fn i32 gui_drop_count()
+    return zfy_sys_drop_count()
+
+// 第 idx 个投放文件的路径（内部按倍增造缓冲；越界/失败返回 ""）
+pub fn string gui_drop_path(let i32 idx)
+    let string buf = "                    "     // 20 空格起步
+    while length(buf) < 65536
+        buf = buf + buf
+    let i32 n = zfy_sys_drop_path(idx, buf, length(buf))
+    if n <= 0
+        return ""
+    return buf[0, n - 1]
+
+// 清空本次投放记录
+pub fn void gui_drop_clear()
+    zfy_sys_drop_clear()
+
+// ===== WebView2 =====
+// 指定 Loader DLL 路径（空串=自动探测）；0=成功，-1=未找到
+pub fn i32 gui_webview_loader(let string path)
+    return zfy_webview_loader(path)
+
+// 在当前窗口内创建 WebView2（bounds 为物理像素）：0=成功
+// -1 无窗口 / -2 已存在 / -3 无 Loader / -4 环境失败 / -5 控制器失败
+pub fn i32 gui_webview_create(let i32 x, let i32 y, let i32 w, let i32 h)
+    return zfy_webview_create(x, y, w, h)
+
+pub fn bool gui_webview_ready()
+    return zfy_webview_ready() == 1
+
+pub fn void gui_webview_bounds(let i32 x, let i32 y, let i32 w, let i32 h)
+    zfy_webview_bounds(x, y, w, h)
+
+pub fn i32 gui_webview_show(let i32 on)
+    return zfy_webview_show(on)
+
+// 导航到 URL（http/https/file 等）
+pub fn i32 gui_webview_navigate(let string url)
+    return zfy_webview_navigate(url)
+
+// 直接载入 HTML 文本
+pub fn i32 gui_webview_html(let string html)
+    return zfy_webview_html(html)
+
+// 向页面 postMessage（JSON 文本）
+pub fn i32 gui_webview_post(let string json)
+    return zfy_webview_post(json)
+
+// 取最近一条 web 消息（内部按倍增造缓冲；无消息返回 ""）
+pub fn string gui_web_take()
+    let string buf = "                    "     // 20 空格起步
+    while length(buf) < 4096
+        buf = buf + buf
+    let i32 n = zfy_webview_take(buf, length(buf))
+    if n <= 0
+        return ""
+    return buf[0, n - 1]
+
+// 销毁 WebView2（窗口销毁时也会自动清理）
+pub fn void gui_webview_destroy()
+    zfy_webview_destroy()
