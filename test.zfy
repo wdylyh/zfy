@@ -1,37 +1,306 @@
-mod gui;
-mod widgets;
-use widgets::{App, UI}
-use theme::{Theme, get_theme}
-use gui::{gui_frame_sleep}
+use gui::{
+    gui_open, gui_close, gui_alive, gui_poll, gui_present, gui_frame_sleep,
+    gui_w, gui_h, gui_fill_rect, gui_round_rect, gui_fill_grad,
+    gui_fill_circle, gui_stroke_circle, gui_line_w, gui_arc,
+    gui_font, gui_draw_text, gui_text_w,
+    gui_set_alpha, gui_reset_alpha, gui_set_blend,
+    gui_title,
+    Event, EV_MOVE, EV_LDOWN, EV_SIZE
+}
+
+// 顶层常量：zfy 顶层无 const 关键字，用 let ... const
+let u32 const C_BG1     = 0xFF1B2A5A
+let u32 const C_BG2     = 0xFF3A1B5A
+let u32 const C_ACCENT  = 0xFF4FD1FF
+let u32 const C_ACCENT2 = 0xFFFF5FA2
+let u32 const C_GOLD    = 0xFFFFD166
+let u32 const C_TEXT    = 0xFFEAF2FF
+let u32 const C_MUTED   = 0xFF8AA0C8
+let u32 const C_GLOW    = 0x334FD1FF
+let i32 const NP        = 160
+
+// 伪随机
+let u32 rng_state = 0x9E3779B9
+
+fn u32 rnd()
+    rng_state = rng_state xor (rng_state << 13)
+    rng_state = rng_state xor (rng_state >> 17)
+    rng_state = rng_state xor (rng_state << 5)
+    return rng_state
+
+fn f64 frnd()
+    return cast(cast(rnd() & 0xFFFF, i32), f64) / 65535.0
+
+struct Particle
+    f64 x = 0.0
+    f64 y = 0.0
+    f64 vx = 0.0
+    f64 vy = 0.0
+    f64 r = 0.0
+    u32 c = 0xFFFFFFFF
+    f64 life = 1.0
+
+fn void particle_spawn(ref let Particle p, let f64 w, let f64 h)
+    p.x = frnd() * w
+    p.y = frnd() * h
+    p.vx = (frnd() - 0.5) * 24.0
+    p.vy = (frnd() - 0.5) * 24.0
+    p.r = 0.6 + frnd() * 2.4
+    let u32 pick = rnd() % 3
+    if pick == 0
+        p.c = C_ACCENT
+    else if pick == 1
+        p.c = C_ACCENT2
+    else
+        p.c = C_GOLD
+    p.life = 0.35 + frnd() * 0.65
+
+fn void particle_step(ref let Particle p, let f64 w, let f64 h, let f64 dt)
+    p.x += p.vx * dt
+    p.y += p.vy * dt
+    p.vy += 6.0 * dt
+    if p.x < 0.0
+        p.x = w
+    else if p.x > w
+        p.x = 0.0
+    if p.y < 0.0
+        p.y = h
+    else if p.y > h
+        p.y = 0.0
+
+fn f64 pulse(let f64 t)
+    return 0.5 + 0.5 * sin(t * 2.0)
+
+fn f64 ease_in_out(let f64 t)
+    return 0.5 - 0.5 * cos(3.14159265 * t)
+
+fn u32 lerp_color(let u32 a, let u32 b, let f64 t)
+    let f64 tt = t
+    if tt < 0.0
+        tt = 0.0
+    if tt > 1.0
+        tt = 1.0
+    let u32 ar = (a >> 16) & 0xFF
+    let u32 ag = (a >> 8) & 0xFF
+    let u32 ab = a & 0xFF
+    let u32 br = (b >> 16) & 0xFF
+    let u32 bg = (b >> 8) & 0xFF
+    let u32 bb = b & 0xFF
+    let u32 r = cast(cast(ar, f64) + (cast(br, f64) - cast(ar, f64)) * tt, u32)
+    let u32 g = cast(cast(ag, f64) + (cast(bg, f64) - cast(ag, f64)) * tt, u32)
+    let u32 bl = cast(cast(ab, f64) + (cast(bb, f64) - cast(ab, f64)) * tt, u32)
+    return 0xFF000000 | (r << 16) | (g << 8) | bl
+
+fn void draw_backdrop(let i32 W, let i32 H, let f64 t)
+    gui_fill_grad(0, 0, W, H, C_BG1, C_BG2, 0)
+    let f64 p = pulse(t * 0.6)
+    let u32 band = lerp_color(0x000B1020, 0x660B1020, p)
+    gui_fill_rect(0, 0, W, cast(cast(H, f64) * 0.28, i32), band)
+
+fn void draw_glow_orb(let i32 cx, let i32 cy, let f64 base, let f64 t, let u32 c)
+    let i32 layers = 8
+    let i32 i = layers
+    while i > 0
+        let f64 k = cast(i, f64) / cast(layers, f64)
+        let f64 pr = base * (0.35 + 0.85 * k) * (0.9 + 0.1 * pulse(t * 1.3 + k))
+        let u32 a = cast(160.0 * (1.0 - k) * k, u32)
+        gui_set_alpha(cast(a, i32))
+        gui_fill_circle(cx, cy, cast(pr, i32), c)
+        i = i - 1
+    gui_reset_alpha()
+
+fn void draw_rings(let i32 cx, let i32 cy, let f64 t, let i32 W)
+    let f64 R0 = cast(W, f64) * 0.16
+    let i32 n = 3
+    let i32 i = 0
+    while i < n
+        let f64 phase = t * 0.7 + cast(i, f64) * 1.9
+        let f64 rr = R0 * (1.0 + 0.12 * cast(i, f64)) + 8.0 * sin(phase)
+        let f64 spin = t * (0.5 + 0.25 * cast(i, f64)) + cast(i, f64) * 2.2
+        let u32 col = C_ACCENT
+        if i == 1
+            col = C_ACCENT2
+        else if i == 2
+            col = C_GOLD
+        // 用短线段拼 5 段弧，避开 gui_arc
+        let i32 seg = 0
+        while seg < 5
+            let f64 a0 = spin + cast(seg, f64) * 72.0 + 18.0
+            let f64 a1 = a0 + 34.0 + 10.0 * sin(phase + cast(seg, f64))
+            let i32 steps = 10
+            let i32 s = 0
+            let f64 prev_x = cast(cx, f64) + rr * cos(a0 * 3.14159265 / 180.0)
+            let f64 prev_y = cast(cy, f64) + rr * sin(a0 * 3.14159265 / 180.0)
+            while s < steps
+                let f64 aa = a0 + (a1 - a0) * (cast(s + 1, f64) / cast(steps, f64))
+                let f64 nx = cast(cx, f64) + rr * cos(aa * 3.14159265 / 180.0)
+                let f64 ny = cast(cy, f64) + rr * sin(aa * 3.14159265 / 180.0)
+                gui_line_w(cast(prev_x, i32), cast(prev_y, i32),
+                           cast(nx, i32), cast(ny, i32), col, 2)
+                prev_x = nx
+                prev_y = ny
+                s = s + 1
+            seg = seg + 1
+        i = i + 1
+
+fn void draw_orbit_dots(let i32 cx, let i32 cy, let f64 t, let i32 W)
+    let f64 R = cast(W, f64) * 0.16
+    let i32 n = 14
+    let i32 i = 0
+    while i < n
+        let f64 a = t * 0.9 + cast(i, f64) * (6.2831853 / cast(n, f64))
+        let f64 rr = R * (1.05 + 0.05 * sin(t * 1.7 + cast(i, f64)))
+        let i32 x = cx + cast(rr * cos(a), i32)
+        let i32 y = cy + cast(rr * sin(a), i32)
+        let u32 c = C_ACCENT
+        if i % 3 == 1
+            c = C_ACCENT2
+        else if i % 3 == 2
+            c = C_GOLD
+        gui_fill_circle(x, y, 3, c)
+        gui_set_alpha(70)
+        gui_fill_circle(x, y, 7, c)
+        gui_reset_alpha()
+        i = i + 1
+
+fn void draw_waves(let i32 W, let i32 H, let f64 t)
+    let i32 layers = 2
+    let i32 L = 0
+    while L < layers
+        let f64 amp = 18.0 + 10.0 * cast(L, f64)
+        let f64 freq = 0.012 + 0.004 * cast(L, f64)
+        let f64 speed = 1.2 - 0.35 * cast(L, f64)
+        let i32 baseY = H - 40 - L * 26
+        let u32 col = 0x661B2A5A
+        if L == 1
+            col = 0x884FD1FF
+        let i32 x = 0
+        let i32 step = 6
+        while x < W
+            let f64 fx = cast(x, f64)
+            let f64 yy = cast(baseY, f64) + amp * sin(fx * freq + t * speed)
+            let i32 top = cast(yy, i32)
+            gui_fill_rect(x, top, step, H - top, col)
+            x = x + step
+        L = L + 1
+
+fn void draw_particles(let Particle ps[], let i32 W, let i32 H, let f64 dt)
+    let i32 n = length(ps)
+    let i32 i = 0
+    while i < n
+        particle_step(ref ps[i], cast(W, f64), cast(H, f64), dt)
+        let i32 a = cast(120.0 + 135.0 * ps[i].life, i32)
+        gui_set_alpha(a)
+        gui_fill_circle(cast(ps[i].x, i32), cast(ps[i].y, i32),
+                        cast(ps[i].r, i32) + 1, ps[i].c)
+        gui_reset_alpha()
+        i = i + 1
+
+fn void draw_hud(let i32 W, let i32 H, let f64 t, let i32 mx, let i32 my)
+    // 字重传数值：700 粗 / 400 常规
+    gui_font(34, 700)
+    let string title = "ZFY  ·  AURORA"
+    let i32 tw = cast(gui_text_w(title), i32)
+    let i32 tx = (W - tw) / 2
+    // 标题双色偏移光晕
+    gui_set_alpha(60)
+    gui_font(34, 700)
+    gui_draw_text(tx + 2, 42, title, C_ACCENT)
+    gui_draw_text(tx - 2, 38, title, C_ACCENT2)
+    gui_reset_alpha()
+    gui_draw_text(tx, 40, title, C_TEXT)
+
+    // 副标题
+    gui_font(15, 400)
+    let string sub = "gradient · glow · orbit · particles · waves"
+    let i32 sw = cast(gui_text_w(sub), i32)
+    gui_draw_text((W - sw) / 2, 84, sub, C_MUTED)
+
+    // 底部脉冲进度条
+    let i32 barW = cast(cast(W, f64) * 0.42, i32)
+    let i32 barX = (W - barW) / 2
+    let i32 barY = H - 64
+    gui_round_rect(barX, barY, barW, 10, 5, 0x33FFFFFF, 0)
+    let f64 p = ease_in_out(pulse(t * 0.45))
+    let i32 fillW = cast(cast(barW, f64) * (0.15 + 0.85 * p), i32)
+    gui_round_rect(barX, barY, fillW, 10, 5, lerp_color(C_ACCENT, C_ACCENT2, p), 0)
+
+    // 鼠标跟随准星
+    gui_stroke_circle(mx, my, 14, 0x88FFFFFF, 1)
+    gui_stroke_circle(mx, my, 4, 0xCCFFFFFF, 1)
+    gui_line_w(mx - 22, my, mx - 10, my, 0x88FFFFFF, 1)
+    gui_line_w(mx + 10, my, mx + 22, my, 0x88FFFFFF, 1)
+    gui_line_w(mx, my - 22, mx, my - 10, 0x88FFFFFF, 1)
+    gui_line_w(mx, my + 10, mx, my + 22, 0x88FFFFFF, 1)
 
 fn main()
-    let App app = App()
-    if app.open(320, 220, "zfy 计数器") != 0
+    if gui_open(960, 600, "zfy 华丽演示") != 0
         return 1
-    let Theme th = get_theme()
+    gui_title("zfy  ·  Aurora Demo")
 
-    // 标签元素
-    let UI title = UI("label")
-    title.pos(20, 20)
-    title.size(280, 24)
-    title.text("计数 0")
-    let i32 kt = app.add(title)
+    // 初始化粒子
+    let Particle ps[]
+    let i32 i = 0
+    while i < NP
+        let Particle p = Particle()
+        particle_spawn(ref p, 960.0, 600.0)
+        ps = push(ps, p)
+        i = i + 1
 
-    // 按钮元素
-    let UI btn = UI("button")
-    btn.pos(20, 70)
-    btn.size(140, 44)
-    btn.text("点我 +1")
-    btn.color(th.accent)
-    btn.radius(8)
-    let i32 kb = app.add(btn)
+    let Event e = Event()
+    let i64 t0 = tick_ms()
+    let i64 tprev = t0
+    let i32 mx = 480
+    let i32 my = 300
 
-    let i32 prev = 0
-    while app.alive()
-        app.step()
-        if app.uis[kb].clicks != prev        // 差值 = 新点击
-            prev = app.uis[kb].clicks
-            app.set_text(kt, "计数 " + to_str(prev))
-        gui_frame_sleep(tick_ms())
-    app.close()
-    return
+    while gui_alive()
+        // 事件泵
+        while gui_poll(ref e)
+            if e.is(EV_MOVE)
+                mx = cast(e.x, i32)
+                my = cast(e.y, i32)
+            else if e.is(EV_LDOWN)
+                // 点击处爆一小簇粒子
+                let i32 k = 0
+                while k < 12
+                    let Particle q = Particle()
+                    particle_spawn(ref q, 960.0, 600.0)
+                    q.x = cast(e.x, f64) + (frnd() - 0.5) * 40.0
+                    q.y = cast(e.y, f64) + (frnd() - 0.5) * 40.0
+                    q.vx = (frnd() - 0.5) * 120.0
+                    q.vy = (frnd() - 0.5) * 120.0
+                    ps = push(ps, q)
+                    k = k + 1
+                // 限制粒子总数（丢弃 remove 返回值）
+                while length(ps) > NP + 120
+                    let Particle dropped = remove(ps, 0)
+
+        let i64 now = tick_ms()
+        let f64 t = cast(now - t0, f64) / 1000.0
+        let f64 dt = cast(now - tprev, f64) / 1000.0
+        if dt > 0.1
+            dt = 0.1
+        tprev = now
+
+        let i32 W = gui_w()
+        let i32 H = gui_h()
+        let i32 cx = W / 2
+        let i32 cy = H / 2 - 20
+
+        // 逐层绘制
+        draw_backdrop(W, H, t)
+        gui_set_blend(0)   // SRCOVER
+        draw_glow_orb(cx, cy, cast(W, f64) * 0.10, t, C_GLOW)
+        draw_glow_orb(cx - W / 5, cy + H / 6, cast(W, f64) * 0.06, t + 1.7, 0x33FF5FA2)
+        draw_glow_orb(cx + W / 5, cy - H / 8, cast(W, f64) * 0.05, t + 3.1, 0x33FFD166)
+        draw_rings(cx, cy, t, W)
+        draw_orbit_dots(cx, cy, t, W)
+        draw_waves(W, H, t)
+        draw_particles(ps, W, H, dt)
+        draw_hud(W, H, t, mx, my)
+
+        gui_present()
+        gui_frame_sleep(cast(now, i32))
+
+    gui_close()
+    return 0
