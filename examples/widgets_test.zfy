@@ -2,7 +2,7 @@
 // 断言：组件状态机（悬停/点击/聚焦/输入/拖动/滚动/选中）+ 渲染冒烟 + damage 计数
 mod gui;
 mod widgets;
-use widgets::{App, Label, Button, InputBox, TextArea, Slider, ProgressBar, ListBox, C_BG, C_OK}
+use widgets::{App, Label, Button, InputBox, TextArea, Slider, ProgressBar, ListBox}
 use gui::{KEY_CTRL, KEY_EXT}
 use gui::{gui_frame_sleep}
 

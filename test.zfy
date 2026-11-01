@@ -1,12 +1,14 @@
 mod gui;
 mod widgets;
-use widgets::{App, UI, C_ACCENT}
+use widgets::{App, UI}
+use theme::{Theme, get_theme}
 use gui::{gui_frame_sleep}
 
 fn main()
     let App app = App()
     if app.open(320, 220, "zfy 计数器") != 0
         return 1
+    let Theme th = get_theme()
 
     // 标签元素
     let UI title = UI("label")
@@ -20,7 +22,7 @@ fn main()
     btn.pos(20, 70)
     btn.size(140, 44)
     btn.text("点我 +1")
-    btn.color(C_ACCENT)
+    btn.color(th.accent)
     btn.radius(8)
     let i32 kb = app.add(btn)
 

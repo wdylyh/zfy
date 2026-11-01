@@ -121,6 +121,8 @@ extern "C"
     void zfy_gui_set_alpha(let i32 alpha)
     void zfy_gui_reset_alpha()
     void zfy_gui_set_blend(let i32 mode)
+    // 阅读方向：1=右到左（RTL），0=左到右。影响 DirectWrite 文本排版
+    void zfy_gui_set_rtl(let i32 on)
     // 裁剪 / 变换栈
     void zfy_gui_push_clip(let i32 x, let i32 y, let i32 w, let i32 h)
     void zfy_gui_pop_clip()
@@ -297,6 +299,11 @@ pub fn void gui_reset_alpha()
 
 pub fn void gui_set_blend(let i32 mode)
     zfy_gui_set_blend(mode)
+
+// 阅读方向：1=右到左（RTL，DirectWrite DWRITE_READING_DIRECTION_RIGHT_TO_LEFT）
+// 0=左到右。与布局镜像（theme.set_layout_dir）相互独立。
+pub fn void gui_set_rtl(let i32 on)
+    zfy_gui_set_rtl(on)
 
 // 裁剪 / 变换栈
 pub fn void gui_push_clip(let i32 x, let i32 y, let i32 w, let i32 h)

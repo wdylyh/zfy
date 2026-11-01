@@ -1,0 +1,285 @@
+// examples/widgets2_test.zfy —— L2 组件库二期（29 种 Comp）状态机 + 布局 + 无障碍
+// 自动开关窗，frames < 40，可入回归
+mod gui
+mod widgets
+use widgets::{App, Comp,
+              COMP_RADIO, COMP_RADIOGROUP, COMP_TOGGLE, COMP_TEXTBOX, COMP_SPINBOX, COMP_COMBO,
+              COMP_MULTILIST, COMP_TREE, COMP_TABLE, COMP_TABBAR, COMP_PANEL, COMP_SPLITTER,
+              COMP_SCROLLVIEW, COMP_ACCORDION, COMP_PROGRESS, COMP_SEPARATOR,
+              LAYOUT_VERT, LAYOUT_HORZ, ALIGN_CENTER, ALIGN_START,
+              Rect, LayoutBox, LayoutCursor, comp_layout, comp_slot,
+              focus_register, focus_set, focus_get, focus_next, focus_count,
+              a11y_count, a11y_get, a11y_hit, A11yNode, ROLE_RADIO, ROLE_EDIT, ROLE_TAB, ROLE_TABLE,
+              A11Y_SELECTED, a11y_has_state}
+use gui::{Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_WHEEL, EV_KEY, KEY_EXT, gui_frame_sleep}
+
+fn main()
+    let i32 fails = 0
+
+    // ===== 1) 单选按钮：按下即选中 =====
+    let Comp r1 = Comp(kind=COMP_RADIO, x=10, y=10, w=120, h=30)
+    let Event p1 = Event(typ=EV_LDOWN, x=30, y=20, key=0)
+    let bool u1 = r1.on_event(p1)
+    if not u1 or not r1.checked or r1.clicks != 1
+        output("FAIL radio press")
+        fails++
+    let Event u1e = Event(typ=EV_LUP, x=30, y=20, key=0)
+    let bool u2 = r1.on_event(u1e)
+    if not u2 or r1.pressed
+        output("FAIL radio release")
+        fails++
+
+    // ===== 2) 单选组：按 y 选行 =====
+    let Comp rg = Comp(kind=COMP_RADIOGROUP, x=10, y=10, w=160, h=90)
+    rg.items = push(rg.items, "A")
+    rg.items = push(rg.items, "B")
+    rg.items = push(rg.items, "C")
+    let Event rgp = Event(typ=EV_LDOWN, x=40, y=41, key=0)   // 第 1 行
+    let bool u3 = rg.on_event(rgp)
+    if not u3 or rg.sel != 1 or rg.clicks != 1
+        output("FAIL radiogroup row select sel=", rg.sel)
+        fails++
+
+    // ===== 3) 开关：翻转 =====
+    let Comp tg = Comp(kind=COMP_TOGGLE, x=10, y=10, w=60, h=28)
+    let Event tgp = Event(typ=EV_LDOWN, x=30, y=20, key=0)
+    let bool u4 = tg.on_event(tgp)
+    if not tg.checked or tg.clicks != 1
+        output("FAIL toggle on")
+        fails++
+    let bool u5 = tg.on_event(tgp)
+    if tg.checked
+        output("FAIL toggle off")
+        fails++
+
+    // ===== 4) 文本框：光标 / Backspace / Delete / 只读 / 只读忽略 =====
+    let Comp tb = Comp(kind=COMP_TEXTBOX, x=10, y=10, w=200, h=30)
+    tb.text = "abc"
+    tb.value = 3                    // 光标在末尾
+    tb.id = 5001
+    focus_register(5001)
+    focus_set(5001)
+    let Event tk = Event(typ=EV_KEY, x=0, y=0, key=88)      // 'X'
+    let bool u6 = tb.on_event(tk)
+    if not u6 or tb.text != "abcX" or tb.value != 4
+        output("FAIL textbox append: ", tb.text)
+        fails++
+    let Event bk = Event(typ=EV_KEY, x=0, y=0, key=8)       // Backspace
+    let bool u7 = tb.on_event(bk)
+    if not u7 or tb.text != "abc"
+        output("FAIL textbox backspace: ", tb.text)
+        fails++
+    let Event dl = Event(typ=EV_KEY, x=0, y=0, key=KEY_EXT + 0x2E)
+    tb.value = 1
+    let bool u8d = tb.on_event(dl)
+    if not u8d or tb.text != "ac"
+        output("FAIL textbox delete: ", tb.text)
+        fails++
+    tb.value2 = 1                   // 只读
+    let bool u9 = tb.on_event(tk)
+    if u9
+        output("FAIL textbox readonly should ignore keys")
+        fails++
+    tb.value2 = 0
+
+    // ===== 5) 步进框：左右按钮 ±step =====
+    let Comp sp = Comp(kind=COMP_SPINBOX, x=100, y=10, w=120, h=30)
+    sp.value = 10
+    sp.value2 = 2
+    let Event spl = Event(typ=EV_LDOWN, x=105, y=20, key=0)
+    let bool u10 = sp.on_event(spl)
+    if sp.value != 8 or sp.clicks != 1
+        output("FAIL spin minus value=", sp.value)
+        fails++
+    let Event spr = Event(typ=EV_LDOWN, x=215, y=20, key=0)
+    let bool u11 = sp.on_event(spr)
+    if sp.value != 10
+        output("FAIL spin plus value=", sp.value)
+        fails++
+
+    // ===== 6) 下拉框：展开 / Esc 收起 =====
+    let Comp cb = Comp(kind=COMP_COMBO, x=10, y=10, w=180, h=30)
+    let Event cbp = Event(typ=EV_LDOWN, x=30, y=20, key=0)
+    let bool u12 = cb.on_event(cbp)
+    if not cb.flag2
+        output("FAIL combo expand")
+        fails++
+    cb.id = 5002
+    focus_register(5002)
+    focus_set(5002)
+    let Event esc = Event(typ=EV_KEY, x=0, y=0, key=KEY_EXT + 0x1B)
+    let bool u13 = cb.on_event(esc)
+    if not u13 or cb.flag2
+        output("FAIL combo esc collapse")
+        fails++
+
+    // ===== 7) 多选列表：点击切换集合 =====
+    let Comp ml = Comp(kind=COMP_MULTILIST, x=10, y=10, w=160, h=100)
+    ml.items = push(ml.items, "x")
+    ml.items = push(ml.items, "y")
+    ml.items = push(ml.items, "z")
+    let Event mlp = Event(typ=EV_LDOWN, x=40, y=41, key=0)   // 第 1 行
+    let bool u14 = ml.on_event(mlp)
+    if not ml.multi_selected(1) or ml.sel != 1
+        output("FAIL multilist select")
+        fails++
+    let bool u15 = ml.on_event(mlp)
+    if ml.multi_selected(1)
+        output("FAIL multilist toggle off")
+        fails++
+
+    // ===== 8) 树：点击切换展开 =====
+    let Comp tr = Comp(kind=COMP_TREE, x=10, y=10, w=180, h=120)
+    tr.items = push(tr.items, "root")
+    tr.items = push(tr.items, "  child")
+    let Event trp = Event(typ=EV_LDOWN, x=40, y=20, key=0)   // 第 0 行
+    let bool u16t = tr.on_event(trp)
+    if not tr.tree_expanded(0) or tr.sel != 0
+        output("FAIL tree expand")
+        fails++
+    let bool u17 = tr.on_event(trp)
+    if tr.tree_expanded(0)
+        output("FAIL tree collapse")
+        fails++
+
+    // ===== 9) 表格：表头以下按行选中 =====
+    let Comp tbv = Comp(kind=COMP_TABLE, x=10, y=10, w=200, h=90)
+    tbv.items = push(tbv.items, "名称|值")
+    tbv.rows = push(tbv.rows, "a|1")
+    tbv.rows = push(tbv.rows, "b|2")
+    let i32 hy = 10 + 4 + 22 + 5                            // 首数据行中心
+    let Event tp = Event(typ=EV_LDOWN, x=40, y=hy, key=0)
+    let bool u18 = tbv.on_event(tp)
+    if not u18 or tbv.sel != 0 or tbv.clicks != 1
+        output("FAIL table row select sel=", tbv.sel)
+        fails++
+
+    // ===== 10) 折叠面板：点击翻转 =====
+    let Comp ac = Comp(kind=COMP_ACCORDION, x=10, y=10, w=200, h=40)
+    let Event acp = Event(typ=EV_LDOWN, x=30, y=20, key=0)
+    let bool u19 = ac.on_event(acp)
+    if not ac.flag2
+        output("FAIL accordion expand")
+        fails++
+    let bool u20 = ac.on_event(acp)
+    if ac.flag2
+        output("FAIL accordion collapse")
+        fails++
+
+    // ===== 11) 滚动视图：滚轮 + 上下界夹取 =====
+    let Comp sc = Comp(kind=COMP_SCROLLVIEW, x=10, y=10, w=200, h=100)
+    sc.value2 = 200                 // 内容高
+    let Event whe = Event(typ=EV_WHEEL, x=100, y=50, key=-1)
+    let bool u21 = sc.on_event(whe)
+    if sc.value != 22
+        output("FAIL scroll wheel value=", sc.value)
+        fails++
+    let Event whe2 = Event(typ=EV_WHEEL, x=100, y=50, key=5)
+    let bool u22 = sc.on_event(whe2)
+    if sc.value != 0
+        output("FAIL scroll wheel clamp")
+        fails++
+
+    // ===== 12) 测量与容器布局（measure/layout 助手复用） =====
+    let Comp pn = Comp(kind=COMP_PANEL, x=10, y=10, w=200, h=100, dir=LAYOUT_VERT,
+                       gap=8, pad=8, cols=1)
+    let Rect s0 = comp_slot(pn, 0, 50, 20)
+    let Rect s1 = comp_slot(pn, 1, 50, 20)
+    if s0.x != 85 or s0.y != 18
+        output("FAIL comp_slot0 x=", s0.x, " y=", s0.y)
+        fails++
+    if s1.y != 46
+        output("FAIL comp_slot1 y=", s1.y)
+        fails++
+    if pn.measure(Rect(x=0, y=0, w=200, h=100)) != 100
+        output("FAIL panel measure explicit h")
+        fails++
+    let Comp sepv = Comp(kind=COMP_SEPARATOR, x=10, y=10, w=200)
+    sepv.value = 10
+    if sepv.measure(Rect(x=0, y=0, w=200, h=0)) != 10
+        output("FAIL separator measure")
+        fails++
+
+    // ===== 13) 焦点链：注册 → Tab 顺序 → 回绕 =====
+    if focus_count() < 2
+        output("FAIL focus chain count")
+        fails++
+    let i64 f0 = focus_get()
+    let bool fn1 = focus_next()
+    let i64 f1 = focus_get()
+    if not fn1 or f1 == 0
+        output("FAIL focus next")
+        fails++
+    let i32 nf = focus_count()
+    let i32 k = 0
+    while k < nf
+        let bool fnx = focus_next()
+        k++
+    if focus_get() != f1
+        output("FAIL focus wrap back")
+        fails++
+
+    // ===== 14) 窗口：多种组件绘制 + 无障碍快照 =====
+    let App app = App()
+    if app.open(420, 320, "zfy widgets2_test") != 0
+        output("FAIL open")
+        return 1
+    let Comp cr = Comp(kind=COMP_RADIO, x=20, y=20, w=140, h=28, text="单选")
+    let i32 k1 = app.add_comp(cr)
+    let Comp ct = Comp(kind=COMP_TOGGLE, x=20, y=56, w=120, h=28, text="开关")
+    let i32 k2 = app.add_comp(ct)
+    let Comp cx = Comp(kind=COMP_TEXTBOX, x=20, y=92, w=200, h=30, text="文本")
+    let i32 k3 = app.add_comp(cx)
+    let Comp cs = Comp(kind=COMP_SPINBOX, x=20, y=130, w=120, h=30, value=5, value2=1)
+    let i32 k4 = app.add_comp(cs)
+    let Comp cp = Comp(kind=COMP_PROGRESS, x=20, y=168, w=200, h=8, value=60)
+    let i32 k5 = app.add_comp(cp)
+    let Comp cbar = Comp(kind=COMP_TABBAR, x=20, y=190, w=260, h=32)
+    cbar.items = push(cbar.items, "一")
+    cbar.items = push(cbar.items, "二")
+    cbar.items = push(cbar.items, "三")
+    let i32 k6 = app.add_comp(cbar)
+    let Comp csp = Comp(kind=COMP_SPLITTER, x=20, y=232, w=260, h=8)
+    let i32 k7 = app.add_comp(csp)
+    let Comp card = Comp(kind=COMP_PANEL, x=20, y=252, w=260, h=50, dir=LAYOUT_HORZ,
+                         gap=8, pad=8, cols=1)
+    let i32 k8 = app.add_comp(card)
+
+    let i32 f = 0
+    while f < 40 and app.alive()
+        app.step()
+        gui_frame_sleep(app.t0)
+        f++
+    if f != 40
+        output("FAIL frames=", f)
+        fails++
+    if a11y_count() < 8
+        output("FAIL a11y count=", a11y_count())
+        fails++
+    let i32 hr = a11y_hit(30, 30)
+    if hr < 0
+        output("FAIL a11y_hit radio")
+        fails++
+    else
+        let A11yNode hnode = a11y_get(hr)
+        if hnode.role != ROLE_RADIO
+            output("FAIL a11y role radio=", hnode.role)
+            fails++
+    // 选中的多选列表带 SELECTED 状态
+    app.comps[k2].checked = true
+    app.step()
+    let i32 hi = a11y_hit(30, 60)
+    if hi < 0
+        output("FAIL a11y_hit toggle")
+        fails++
+    else
+        if not a11y_has_state(hi, A11Y_SELECTED)
+            output("FAIL a11y selected state")
+            fails++
+    app.close()
+
+    if fails == 0
+        output("widgets2_test: all PASS")
+        return 0
+    output(fails, " failures")
+    return 1

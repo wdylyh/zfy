@@ -1212,6 +1212,97 @@ fn main()
   改容器内组件时读 `app.buttons[i]`（元素字段复合赋值
   `app.buttons[i].x = 5`、`app.buttons[i].clicks++` 均支持）。
 
+### 18.7 L2 组件层（theme 令牌 / 29 种 Comp / 插件注册 / RTL / 无障碍）
+
+stdlib 的 L2 组件层由三个模块组成：`theme`（设计令牌与样式覆盖）、
+`widgets`（内置组件与容器）、`gui`（L1 绘制原语）。三者不引入新语法，
+全部为纯 zfy 库代码。
+
+**令牌化主题（`stdlib/theme.zfy`）**
+
+```
+use theme::{Theme, get_theme, set_theme, theme_light, theme_dark, theme_high_contrast}
+set_theme(theme_light())            // 切换后下一帧自动整体重绘
+let Theme th = get_theme()          // 每次返回全新构造，可自由持有
+gui_fill_rect(0, 0, w, h, th.bg)
+```
+
+- 令牌分组：颜色 `bg/surface/surfaceAlt/border/borderFocus/text/textMuted/
+  accent/accentHover/accentPressed/danger/success/warning/disabled/overlay`；
+  字体 `fontFamily/fontSizeBase/fontSizeSmall/fontSizeLarge/fontScale`；
+  间距 `spaceXs/Sm/Md/Lg/Xl`；圆角 `radiusSm/Md/Lg/Full`；描边
+  `strokeWidth/focusWidth`；动效 `animFast/Normal/Slow`。
+- `theme_dark()`（默认）/`theme_light()`/`theme_high_contrast()` 为预置主题；
+  `is_dark()` 与 `theme.mode` 判定当前主题身份。
+- **组件级样式覆盖**：`Style` 每字段配 `hasX` 标志位，只覆盖 set 过的字段，
+  其余随主题变化；`widget_set_style(id, s)` / `widget_clear_style(id)` /
+  `widget_clear_all_styles()`。组件绘制入口统一 `theme_for(id)`（主题 + 覆盖）。
+- `theme_revision()` = 主题版本 + 样式版本；`App.step` 每帧比对，变化即
+  `invalidate_all()` 并重绘整帧。
+
+**内置组件（`widgets` 的 `Comp` 单模型）**
+
+29 种 kind（`COMP_*`）：`RADIO / RADIOGROUP / TOGGLE / TEXTBOX / SPINBOX /
+COMBO / MULTILIST / TREE / TABLE / TABBAR / PANEL / CARD / SPLITTER /
+SCROLLVIEW / MODAL / TOOLTIP / POPUP / PROGRESS / SPINNER / BADGE / TOAST /
+ALERT / ICONBUTTON / IMAGE / SEPARATOR / TOOLBAR / BREADCRUMB / ACCORDION`。
+
+```
+let Comp c = Comp(kind=COMP_TEXTBOX, x=10, y=10, w=200, h=30, text="标题")
+let i32 k = app.add_comp(c)         // App 统一派发/重绘/无障碍
+app.comps[k].checked                // 业务读写容器内状态
+```
+
+布局助手：`Rect` + `comp_layout(c)`（主轴/交叉轴对齐、gap、pad）+
+`comp_slot(c, idx, cw, ch)`；`measure(avail)` 给首选尺寸；`on_event(e)` 命中
+测试 + 键盘交互；`draw()` 绘制。四类助手（measure/layout/paint/hit）跨组件
+复用，不按 kind 复制实现。
+
+**插件式组件注册（不改 stdlib 即可扩展）**
+
+```
+pub interface WidgetKind
+    fn i32 kind_id()
+    fn i32 measure(let Rect avail)
+    fn void paint(let PaintCtx c)
+    fn bool on_event(let Event e)
+    fn string a11y_name()
+    fn string a11y_role()
+    fn string a11y_value()
+```
+
+- 实现接口后 `register_widget_named("mine", WidgetKind(MyKind()))`；`App` 的
+  `UI("mine")` / 容器按注册表查 kind（未命中回落到内置组件或空实现哨兵）。
+- 接口值不能作 struct 字段，实现体装在泛型槽 `WidgetSlot<T>`（
+  `find_widget(id) -> WidgetSlot<WidgetKind>`）；重复注册覆盖并打印告警。
+- `PaintCtx` 携带 `x/y/w/h`、有效主题 `th`、组件 id 与裁剪栈
+  （`push_clip/pop_clips`），并提供 `fill/frame/border/draw_text/focus_ring`；
+  位置与裁剪由宿主提供，插件只做自绘。
+
+**RTL（布局方向与文本方向独立）**
+
+```
+set_layout_dir(DIR_RTL)     // 容器主轴镜像、文本右对齐、图标镜像
+set_text_dir(DIR_RTL)       // DirectWrite 阅读方向（gui_set_rtl → DWRITE RTL）
+```
+
+- 默认两者都是 LTR；`is_rtl()/is_rtl_text()` 分别判定。
+- 助手：`rtl_x(px,pw,x,w)`、`rtl_rect(r,px,pw)`、`text_x(x,w,tw)`、
+  `mirror_x(x,w,span)`；LTR 时全部原样返回（调用处无需分支）。
+
+**无障碍语义与焦点链**
+
+- 每个组件实例在 `App.step` 中发布一条 `A11yNode{id,name,role,value,states,x,y,w,h}`
+  到当前帧快照：`a11y_begin()` 开帧、`a11y_count()`/`a11y_get(i)`、
+  `a11y_hit(x,y)`（坐标命中）、`a11y_find(id)`、`a11y_has_state(i, bit)`。
+- 角色常量 `ROLE_NONE/BUTTON/CHECKBOX/RADIO/SLIDER/EDIT/LIST/TABLE/TAB/
+  GROUP/IMAGE/TEXT/PROGRESS/WINDOW`；状态位 `A11Y_DISABLED/FOCUSED/
+  CHECKED/EXPANDED/SELECTED/HOT/PRESSED`。
+- 焦点链为全局有序表：`focus_register/focus_unregister/focus_set/focus_get/
+  focus_next/focus_prev/focus_count/focus_has`；`App.step` 收到 Tab /
+  Shift+Tab 自动 `focus_next/focus_prev`（回绕）。焦点环统一
+  `draw_focus_ring(th, id, x, y, w, h)`，取 `th.focusWidth` 与 `th.borderFocus`。
+
 ## 19. 内建容器 map / set 与 for-in
 
 ### 19.1 map<K, V>

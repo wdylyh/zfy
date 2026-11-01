@@ -3,7 +3,7 @@
 // 列表选中 / 添加项目。关闭窗口即退出。
 mod gui;
 mod widgets;
-use widgets::{App, Label, Button, InputBox, Slider, ProgressBar, ListBox, C_OK}
+use widgets::{App, Label, Button, InputBox, Slider, ProgressBar, ListBox}
 use gui::{gui_text_w, gui_frame_sleep}
 
 fn main()

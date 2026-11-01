@@ -282,10 +282,13 @@ let resolve (main : program) (main_dir : string)
       List.iter (fun fn -> add_local modt fn.ename pub "extern" fn.epos) e.funcs;
       modt.raw <- modt.raw @ [ it ]
     | IDecl (SDecl (_, _, _, _, n, _, _, p), _) when modt.mpath <> [] ->
-      (* 模块内：只允许 const 标量（root 顶层全局变量合法，原样放行） *)
-      add_local modt n pub "const" p; modt.raw <- modt.raw @ [ it ]
-    | IDecl (_, p) when modt.mpath <> [] ->
-      collect RDriver p "top-level declarations in modules must be const scalars"
+      (* 模块内顶层 let（v4）：标量/struct/接口值全局均可（初始化由
+         zfy.globals 统一执行，与 root 顶层同语义） *)
+      add_local modt n pub "var" p; modt.raw <- modt.raw @ [ it ]
+    | IDecl (SSeqDecl (_, _, _, _, n, _, _, _, _, p), _) when modt.mpath <> [] ->
+      (* 模块内顶层数组/列表全局（v4）：stdlib 需要无障碍快照/焦点链/
+         插件注册表等可变容器；此前仅允许 const 标量导致 stdlib 无法持有状态 *)
+      add_local modt n pub "var" p; modt.raw <- modt.raw @ [ it ]
     | IDecl _ -> modt.raw <- modt.raw @ [ it ]
     | IUse _ | IUseP _ -> modt.raw <- modt.raw @ [ it ]
     | IMod _ | IModFile _ -> assert false
@@ -721,10 +724,17 @@ let resolve (main : program) (main_dir : string)
                             ty = rw_ty m a.ty; pos = a.pos } :: !out
       | IExtern e -> out := IExtern e :: !out   (* C 符号名不改 *)
       | IDecl (SDecl (a, b, c, sh, n, t, ie, p), pd) ->
-        (* 顶层 const：名字也要扁平化（与引用处的 resolve_name 对齐） *)
+        (* 顶层全局标量/struct：名字也要扁平化（与引用处的 resolve_name 对齐） *)
         out := IDecl
                  (SDecl (a, b, c, sh, flat_prefix m.mpath ^ n, Option.map (rw_ty m) t,
                          Option.map (rw_expr m) ie, p),
+                 pd) :: !out
+      | IDecl (SSeqDecl (a, b, c, sh, n, et, len, isl, inits, p), pd) ->
+        (* 顶层全局数组/列表（v4）：声明名同样扁平化，否则函数体内按
+           模块限定名引用时查不到（E3011 undefined variable） *)
+        out := IDecl
+                 (SSeqDecl (a, b, c, sh, flat_prefix m.mpath ^ n, rw_ty m et, len, isl,
+                            List.map (rw_expr m) inits, p),
                  pd) :: !out
       | IDecl (d, p) -> out := IDecl (rw_stmt m d, p) :: !out
       | IUse _ | IUseP _ | IMod _ | IModFile _ | IPub _ -> ()

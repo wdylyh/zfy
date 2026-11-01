@@ -10,7 +10,8 @@ mod widgets;
 use model::{Video, lib_add, lib_remove_at, lib_rate, lib_play, lib_sort}
 use store::{load, save}
 use ui::{refresh_list, show_detail, entry_valid, entry_take, btn_texts, sort_names}
-use widgets::{App, Label, Button, InputBox, ListBox, TextArea, SC, LH, C_BG, C_ACCENT}
+use widgets::{App, Label, Button, InputBox, ListBox, TextArea, SC, LH}
+use theme::{Theme, get_theme}
 use gui::{gui_w, gui_h, gui_fill_rect, gui_fill_grad, gui_line, gui_frame_sleep}
 
 fn main()
@@ -98,7 +99,8 @@ fn main()
             let i32 g = 8 * u / 100
             let i32 lh = LH()
             let i32 ih = lh + 8 * u / 100      // InputBox 高
-            gui_fill_rect(0, 0, W, H, C_BG)
+            let Theme th = get_theme()
+            gui_fill_rect(0, 0, W, H, th.bg)
             // 顶栏：WinUI 扁平——大标题居左，搜索框右上，无渐变
             let i32 hb = 46 * u / 100
             let i32 ih2 = lh + 8 * u / 100

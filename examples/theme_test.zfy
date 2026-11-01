@@ -1,0 +1,148 @@
+// examples/theme_test.zfy —— 令牌化主题 / 样式覆盖 / 主题切换重绘 / 方向开关
+// 自动开关窗，frames < 40，可入回归（全程断言，失败打印 FAIL）
+mod gui
+mod widgets
+use theme::{Theme, get_theme, set_theme, theme_for, theme_light, theme_dark, theme_high_contrast, is_dark,
+             Style, widget_set_style, widget_clear_style, widget_style_count, theme_revision,
+             set_layout_dir, get_layout_dir, set_text_dir, get_text_dir, is_rtl, is_rtl_text,
+             DIR_LTR, DIR_RTL}
+use widgets::{App, Button}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let i32 fails = 0
+
+    // ===== 1) 预置主题令牌 =====
+    // 默认 = 深色（WinUI3 基底）
+    let Theme d = get_theme()
+    if d.mode != 0 or not is_dark()
+        output("FAIL default should be dark")
+        fails++
+    if d.bg != 0xFF202020 or d.surface != 0xFF2C2C2C or d.text != 0xFFFFFFFF
+        output("FAIL dark tokens bg/surface/text")
+        fails++
+    if d.accent != 0xFF4CC2FF or d.borderFocus != 0xFF4CC2FF
+        output("FAIL dark accent/borderFocus")
+        fails++
+    if d.fontSizeBase != 16 or d.spaceMd != 12 or d.radiusMd != 6
+        output("FAIL dark font/space/radius")
+        fails++
+    if d.strokeWidth != 1 or d.focusWidth != 2
+        output("FAIL dark stroke/focus width")
+        fails++
+    if d.animFast != 100 or d.animNormal != 200 or d.animSlow != 350
+        output("FAIL dark anim tokens")
+        fails++
+
+    let Theme lt = theme_light()
+    if lt.mode != 1 or lt.bg != 0xFFF3F3F3 or lt.text != 0xFF1A1A1A or lt.accent != 0xFF0067C0
+        output("FAIL light tokens")
+        fails++
+    let Theme hc = theme_high_contrast()
+    if hc.mode != 2 or hc.bg != 0xFF000000 or hc.borderFocus != 0xFFFFFF00
+        output("FAIL high contrast tokens")
+        fails++
+
+    // ===== 2) set_theme / get_theme / 版本号 =====
+    let i32 rev0 = theme_revision()
+    set_theme(theme_light())
+    if is_dark()
+        output("FAIL is_dark after light")
+        fails++
+    if get_theme().mode != 1
+        output("FAIL light not applied")
+        fails++
+    let i32 rev1 = theme_revision()
+    if rev1 <= rev0
+        output("FAIL theme_revision should increase")
+        fails++
+
+    // ===== 3) 组件级 Style 覆盖（hasX 标志） =====
+    let Style st = Style()
+    st.set_bg(0xFF112233)
+    st.set_font_size(18)
+    if not st.hasBg or not st.hasFontSize or st.hasText
+        output("FAIL style has flags")
+        fails++
+    widget_set_style(4242, st)
+    if widget_style_count() != 1
+        output("FAIL style count")
+        fails++
+    let Theme tv = theme_for(4242)
+    if tv.bg != 0xFF112233 or tv.fontSizeBase != 18
+        output("FAIL style override not applied")
+        fails++
+    if tv.accent != get_theme().accent
+        output("FAIL style should keep untouched tokens")
+        fails++
+    // 切主题后覆盖仍在，未覆盖字段跟随新主题
+    set_theme(theme_high_contrast())
+    let Theme tv2 = theme_for(4242)
+    if tv2.bg != 0xFF112233 or tv2.accent != 0xFFFFFF00
+        output("FAIL style override across theme switch")
+        fails++
+    widget_clear_style(4242)
+    if widget_style_count() != 0
+        output("FAIL style clear")
+        fails++
+    set_theme(theme_dark())
+
+    // ===== 4) 布局/文本方向（默认 LTR，独立可设） =====
+    if get_layout_dir() != DIR_LTR or is_rtl()
+        output("FAIL default layout dir")
+        fails++
+    if get_text_dir() != DIR_LTR or is_rtl_text()
+        output("FAIL default text dir")
+        fails++
+    set_layout_dir(DIR_RTL)
+    if not is_rtl() or get_layout_dir() != DIR_RTL
+        output("FAIL set_layout_dir rtl")
+        fails++
+    if is_rtl_text()
+        output("FAIL layout dir must not affect text dir")
+        fails++
+    set_text_dir(DIR_RTL)
+    if not is_rtl_text()
+        output("FAIL set_text_dir rtl")
+        fails++
+    set_layout_dir(DIR_LTR)
+    set_text_dir(DIR_LTR)
+    if is_rtl() or is_rtl_text()
+        output("FAIL reset dirs to ltr")
+        fails++
+
+    // ===== 5) 窗口内：主题切换后下一帧自动整体重绘 =====
+    let App app = App()
+    if app.open(360, 240, "zfy theme_test") != 0
+        output("FAIL open")
+        return 1
+    let Button b = Button(x=30, y=30, w=140, h=40, text="主题按钮")
+    let i32 kb = app.add_button(b)
+    // 首帧：主题版本不同 → 整体重绘
+    app.step()
+    if app.buttons[0].dirty or not app.any_dirty
+        output("FAIL first frame should repaint all")
+        fails++
+    // 切主题：下一帧自动重绘（无需业务手动 invalidate）
+    set_theme(theme_high_contrast())
+    app.step()
+    if app.buttons[0].dirty
+        output("FAIL theme switch frame should repaint and clear dirty")
+        fails++
+    if not app.any_dirty
+        output("FAIL theme switch should set any_dirty")
+        fails++
+
+    // 渲染有限帧后自动关窗（可无头/不阻塞）
+    let i32 f = 0
+    while f < 20 and app.alive()
+        app.step()
+        gui_frame_sleep(app.t0)
+        f++
+    app.close()
+
+    if fails == 0
+        output("theme_test: all PASS")
+        return 0
+    output(fails, " failures")
+    return 1

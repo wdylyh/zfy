@@ -4259,6 +4259,7 @@ typedef struct {
     char family[64];
     float size;
     int weight, italic;
+    int rtl;                       /* 创建时的阅读方向（缓存键的一部分） */
     IDWriteTextFormat *fmt;
     unsigned stamp;
     int used;
@@ -4278,6 +4279,7 @@ typedef struct {
     /* 透明度 / 混合模式 */
     int alpha;                            /* 全局乘性 alpha 0..255 */
     int blend;                            /* 0..4（见 GUI_BLEND_*） */
+    int rtl;                              /* 0=LTR 1=RTL（DirectWrite 阅读方向） */
     /* 纯色画刷缓存（每窗口） */
     gui_br_slot br[GUI_BR_SLOTS];
     unsigned br_tick;
@@ -4402,10 +4404,11 @@ static int gui_engine_init(void) {
     return 1;
 }
 
-/* ---------- 文本格式缓存（64 槽 LRU，键 = 族/物理字号/字重/斜体） ---------- */
+/* ---------- 文本格式缓存（64 槽 LRU，键 = 族/物理字号/字重/斜体/方向） ---------- */
 static IDWriteTextFormat *gui_text_format(gui_win *w, const char *family,
                                           int px, int weight, int italic) {
     if (!g_dw || !w) return NULL;
+    int rtl = w->rtl ? 1 : 0;
     const char *fam = (family && family[0]) ? family : "Microsoft YaHei UI";
     if (px <= 0) px = 16;
     float size = (float)((px * w->dpi + 95) / 96);   /* 逻辑 px → 物理 px */
@@ -4416,6 +4419,7 @@ static IDWriteTextFormat *gui_text_format(gui_win *w, const char *family,
         gui_tf_slot *s = &g_tf[i];
         if (s->used) {
             if (s->size == size && s->weight == weight && s->italic == italic
+                && s->rtl == rtl
                 && strncmp(s->family, fam, sizeof(s->family) - 1) == 0) {
                 s->stamp = ++g_tf_tick;
                 return s->fmt;
@@ -4437,11 +4441,15 @@ static IDWriteTextFormat *gui_text_format(gui_win *w, const char *family,
             (DWRITE_FONT_WEIGHT)weight, italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL, size, L"zh-cn", &fmt)))
         return NULL;
+    /* RTL：DirectWrite 阅读方向右到左（bidi 重排；布局镜像由 zfy 侧计算） */
+    IDWriteTextFormat_SetReadingDirection(fmt, rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT
+                                                   : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
     strncpy(victim->family, fam, sizeof(victim->family) - 1);
     victim->family[sizeof(victim->family) - 1] = 0;
     victim->size = size;
     victim->weight = weight;
     victim->italic = italic ? 1 : 0;
+    victim->rtl = rtl;
     victim->fmt = fmt;
     victim->stamp = ++g_tf_tick;
     victim->used = 1;
@@ -5563,6 +5571,13 @@ void zfy_gui_set_blend(int32_t mode) {
     g_cur->blend = mode;
 }
 
+/* 阅读方向（RTL 国际化文本）：1=右到左，0=左到右。切换后下次取文本格式
+   会命中另一缓存键（rtl 是 key 的一部分），DirectWrite 重新按新方向排版。 */
+void zfy_gui_set_rtl(int32_t on) {
+    if (!g_cur) return;
+    g_cur->rtl = on ? 1 : 0;
+}
+
 /* ---------- 裁剪 / 变换 ---------- */
 void zfy_gui_push_clip(int32_t x, int32_t y, int32_t cw, int32_t ch) {
     gui_win *w = g_cur;
@@ -5788,6 +5803,7 @@ void zfy_gui_bezier(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32
 void zfy_gui_set_alpha(int32_t a) { (void)a; }
 void zfy_gui_reset_alpha(void) {}
 void zfy_gui_set_blend(int32_t m) { (void)m; }
+void zfy_gui_set_rtl(int32_t on) { (void)on; }
 void zfy_gui_push_clip(int32_t a, int32_t b, int32_t c, int32_t d) { (void)a; (void)b; (void)c; (void)d; }
 void zfy_gui_pop_clip(void) {}
 void zfy_gui_push_translate(int32_t a, int32_t b) { (void)a; (void)b; }

@@ -3,6 +3,24 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-059
+from: trae
+to: workbuddy
+status: open
+created: 2026-11-01 11:13
+---
+**L2 组件层：令牌化主题 + 组件库二期 + 插件式注册 + RTL + 无障碍（工作区已改，未 commit，用户要求本轮不提交）**。全量回归 **141 用例 0 失败**（136 基线 + 新增 theme_test / widgets2_test / plugin_test / rtl_test）。
+
+- **令牌化主题**：新增 `stdlib/theme.zfy`。`Theme` 含颜色 15 项、字体 4 项、间距 5 项、圆角 4 项、描边 2 项、动效 3 项；预置 `theme_dark`（默认）/`theme_light`/`theme_high_contrast`；`set_theme/get_theme/is_dark/theme_revision`。`widgets.zfy` 删除全部硬编码颜色常量，绘制一律 `theme_for(id)`（主题 + `Style` 覆盖，`hasX` 标志位）；`App.step` 比对 `theme_revision()`，变化即整帧重绘。
+- **组件库二期（纯 zfy，`Comp` 单模型 29 种 kind）**：输入类 Radio/RadioGroup/Toggle/TextBox(多行/占位/只读/密码)/SpinBox/Combo；选择类 MultiList/Tree/Table/TabBar；容器 Panel(垂直/水平/网格)/Card/Splitter/ScrollView/Modal/Tooltip/Popup；反馈 Progress/Spinner/Badge/Toast/Alert；其他 IconButton/Image/Separator/Toolbar/Breadcrumb/Accordion。measure/layout/paint/hit 四类助手跨 kind 复用（`comp_layout`/`comp_slot`/`Rect`）。
+- **插件式注册**：`pub interface WidgetKind`（kind_id/measure/paint/on_event/a11y_name/a11y_role/a11y_value）+ `PaintCtx`（x/y/w/h/theme/id/裁剪栈，fill/frame/border/draw_text/focus_ring）+ `register_widget(_named)` / `unregister_widget` / `find_widget`（返回 `WidgetSlot<WidgetKind>`，未命中给 `NullKind` 哨兵，重复注册覆盖并告警）。`App` 的 `UI("<name>")` 与容器按注册表查表，examples 自定义 kind 不改 stdlib 即可绘制/派发。
+- **RTL**：runtime `zfy_gui_set_rtl`（DWRITE RTL）+ `gui_set_rtl` 包装；`set_layout_dir/set_text_dir` 两个方向独立，默认 LTR；助手 `rtl_x/rtl_rect/text_x/mirror_x`（LTR 恒等）。
+- **无障碍**：每帧 `a11y_begin` 后每组件发一条 `A11yNode`（name/role/value/states/bounds），`a11y_count/a11y_get/a11y_hit/a11y_find/a11y_has_state`；角色含 ROLE_BUTTON..ROLE_WINDOW 14 种；全局焦点链 `focus_register/next/prev/set/get/has`，Tab/Shift+Tab 自动切换并回绕，焦点环取 `focusWidth + borderFocus`。
+- **文档**：`grammar.md` 新增 §18.7「L2 组件层」（令牌/29 组件/插件注册/RTL/无障碍），版本号未动。
+- **需 WorkBuddy 处理**：①`videolib/` 的 `mod ui;` / `use ui::{...}` 与语言关键字 `ui` 冲突（`E2006 expected module name, got Kw ui`），**HEAD 版本同样失败**，属历史遗留，建议把该视图模块改名 `views`（涉及 `main.zfy`/`ui.zfy` 与引用处，本轮未做，超出 GUI 范围）；`videolib/model.zfy`、`store.zfy` 另有 E3000/E3089（struct 初始化缺 copy/move），同样历史遗留。②本轮改动未 commit（用户明确要求），提交时按 `git status` 核对：`stdlib/theme.zfy`（新增）、`stdlib/{gui,widgets}.zfy`、`compiler/runtime/runtime.c`、`compiler/lib/{llvmgen,parser,resolve}.ml`、`grammar.md`、`demos/*`、`main.zfy`、`test.zfy`、`videolib/main.zfy`、`new.md`、`examples/widgets_test.zfy`，以及新增 `examples/{theme_test,widgets2_test,plugin_test,rtl_test}.zfy`。
+
+---
+---
 id: t-058
 from: trae
 to: workbuddy

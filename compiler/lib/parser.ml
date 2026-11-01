@@ -1203,13 +1203,11 @@ and parse_ui_stmt p tp =
     | (Ident k, _) -> ignore (next p); k
     | (Keyword KInput, _) -> ignore (next p); "input"
     | (Keyword KList, _) -> ignore (next p); "list"
-    | (_, kp) -> err kp "element kind expected (label/button/input/slider/progress/list/check/menu/textarea)"
+    | (_, kp) -> err kp "element kind expected (label/button/input/slider/progress/list/check/menu/textarea, or a registered widget kind)"
   in
-  (match kind with
-   | "label" | "button" | "input" | "slider" | "progress"
-   | "list" | "check" | "menu" | "textarea" -> ()
-   | _ ->
-     err tp ("unknown ui element kind '" ^ kind ^ "' (label/button/input/slider/progress/list/check/menu/textarea)"));
+  (* v4：kind 不再限定白名单——内置 kind 走 App 内置组件，未内置的名字由
+     App.add 查插件注册表（stdlib/widgets register_widget_named）；查不到时
+     落回 label（向后兼容）。这样自定义组件无需改 stdlib 即可用 ui 语句声明。 *)
   let name = expect_ident p "element name" in
   let appname =
     match peek p with

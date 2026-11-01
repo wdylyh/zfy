@@ -1,0 +1,119 @@
+// examples/rtl_test.zfy —— RTL 支持：布局方向 / 文本方向 / 镜像助手 / 窗口内绘制
+// 自动开关窗，frames < 40，可入回归
+mod gui
+mod widgets
+use theme::{set_layout_dir, get_layout_dir, is_rtl, set_text_dir, get_text_dir, is_rtl_text,
+             DIR_LTR, DIR_RTL}
+use widgets::{rtl_x, rtl_rect, text_x, mirror_x, Rect, App, Comp,
+              COMP_TEXTBOX, COMP_COMBO, COMP_TABBAR, COMP_PANEL, LAYOUT_HORZ,
+              a11y_count}
+use gui::{gui_frame_sleep}
+
+fn main()
+    let i32 fails = 0
+
+    // ===== 1) 默认：布局与文本方向都是 LTR =====
+    if get_layout_dir() != DIR_LTR or is_rtl()
+        output("FAIL default layout dir")
+        fails++
+    if get_text_dir() != DIR_LTR or is_rtl_text()
+        output("FAIL default text dir")
+        fails++
+    // LTR 下助手不镜像
+    if rtl_x(0, 200, 10, 40) != 10
+        output("FAIL ltr rtl_x")
+        fails++
+    if text_x(0, 200, 50) != 0
+        output("FAIL ltr text_x")
+        fails++
+    if mirror_x(10, 20, 200) != 10
+        output("FAIL ltr mirror_x")
+        fails++
+
+    // ===== 2) 切到 RTL：主轴镜像 =====
+    set_layout_dir(DIR_RTL)
+    if get_layout_dir() != DIR_RTL or not is_rtl()
+        output("FAIL set layout rtl")
+        fails++
+    if rtl_x(0, 200, 10, 40) != 150
+        output("FAIL rtl rtl_x=", rtl_x(0, 200, 10, 40))
+        fails++
+    let Rect rr = rtl_rect(Rect(x=10, y=5, w=40, h=20), 0, 200)
+    if rr.x != 150 or rr.y != 5 or rr.w != 40 or rr.h != 20
+        output("FAIL rtl_rect x=", rr.x)
+        fails++
+    // 文本右对齐
+    if text_x(0, 200, 50) != 150
+        output("FAIL rtl text_x=", text_x(0, 200, 50))
+        fails++
+    // 图标镜像
+    if mirror_x(10, 20, 200) != 170
+        output("FAIL rtl mirror_x=", mirror_x(10, 20, 200))
+        fails++
+
+    // ===== 3) 文本方向与布局方向独立 =====
+    set_text_dir(DIR_RTL)
+    if get_text_dir() != DIR_RTL or not is_rtl_text()
+        output("FAIL set text rtl")
+        fails++
+    if get_layout_dir() != DIR_RTL
+        output("FAIL layout dir must stay rtl")
+        fails++
+    // 只把布局切回 LTR：文本方向仍保持 RTL
+    set_layout_dir(DIR_LTR)
+    if get_layout_dir() != DIR_LTR or is_rtl()
+        output("FAIL layout back to ltr")
+        fails++
+    if get_text_dir() != DIR_RTL
+        output("FAIL text dir must stay rtl (independent)")
+        fails++
+    if rtl_x(0, 200, 10, 40) != 10
+        output("FAIL ltr after switch rtl_x")
+        fails++
+    // 反向：文本回 LTR 但布局设 RTL
+    set_text_dir(DIR_LTR)
+    set_layout_dir(DIR_RTL)
+
+    // ===== 4) 窗口内以 RTL 绘制（布局镜像 + 文本方向都生效） =====
+    let App app = App()
+    if app.open(400, 300, "zfy rtl_test") != 0
+        output("FAIL open")
+        return 1
+    set_layout_dir(DIR_RTL)
+    set_text_dir(DIR_RTL)
+    let Comp c1 = Comp(kind=COMP_TEXTBOX, x=20, y=20, w=200, h=30, text="hello", ph="نص")
+    let i32 k1 = app.add_comp(c1)
+    let Comp c2 = Comp(kind=COMP_COMBO, x=20, y=58, w=180, h=30, text="combo")
+    let i32 k2 = app.add_comp(c2)
+    let Comp c3 = Comp(kind=COMP_TABBAR, x=20, y=96, w=240, h=32)
+    c3.items = push(c3.items, "一")
+    c3.items = push(c3.items, "二")
+    let i32 k3 = app.add_comp(c3)
+    let Comp c4 = Comp(kind=COMP_PANEL, x=20, y=140, w=240, h=80, dir=LAYOUT_HORZ, gap=8, pad=8, cols=1)
+    let i32 k4 = app.add_comp(c4)
+
+    let i32 f = 0
+    while f < 40 and app.alive()
+        app.step()
+        gui_frame_sleep(app.t0)
+        f++
+    if f != 40
+        output("FAIL frames=", f)
+        fails++
+    if a11y_count() < 4
+        output("FAIL rtl a11y count=", a11y_count())
+        fails++
+    app.close()
+
+    // ===== 5) 恢复默认（回归顺序无关） =====
+    set_text_dir(DIR_LTR)
+    set_layout_dir(DIR_LTR)
+    if is_rtl() or is_rtl_text()
+        output("FAIL restore default dirs")
+        fails++
+
+    if fails == 0
+        output("rtl_test: all PASS")
+        return 0
+    output(fails, " failures")
+    return 1

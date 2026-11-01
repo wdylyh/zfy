@@ -4430,6 +4430,8 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_gui_set_alpha(i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_reset_alpha()\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_set_blend(i32)\n";
+  (* v4 RTL：阅读方向（DirectWrite DWRITE_READING_DIRECTION_RIGHT_TO_LEFT） *)
+  Buffer.add_string g.mbuf "declare void @zfy_gui_set_rtl(i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_push_clip(i32, i32, i32, i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_pop_clip()\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_push_translate(i32, i32)\n";

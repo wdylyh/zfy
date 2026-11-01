@@ -21,21 +21,47 @@
 //       app.close()
 
 
-use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_fill_rect, gui_rect, gui_draw_text, gui_text_w, gui_present, gui_poll, gui_frame_sleep, gui_font, gui_round_rect, gui_line, Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_KEY, EV_WHEEL, KEY_EXT, KEY_CTRL, KEY_SHIFT, gui_clip_get, gui_clip_set}
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_fill_rect, gui_rect, gui_draw_text,
+          gui_text_w, gui_text_h, gui_present, gui_poll, gui_frame_sleep, gui_font, gui_font_ex, gui_round_rect,
+          gui_line, gui_line_w, gui_stroke_rect, gui_fill_circle, gui_stroke_circle, gui_fill_grad,
+          gui_push_clip, gui_pop_clip, gui_draw_image, gui_image_load, gui_image_w, gui_image_h,
+          Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_RDOWN, EV_RUP, EV_KEY, EV_WHEEL, KEY_EXT, KEY_CTRL, KEY_SHIFT,
+          gui_clip_get, gui_clip_set}
+use theme::{Theme, Style, get_theme, set_theme, theme_for, theme_dark, theme_light, theme_high_contrast,
+            is_dark, widget_set_style, widget_clear_style, widget_style, widget_has_style,
+            set_layout_dir, get_layout_dir, set_text_dir, get_text_dir, is_rtl, is_rtl_text,
+            theme_revision, DIR_LTR, DIR_RTL}
 
-// ===== 主题配色（WinUI3 深色风：扁平卡片 + subtle 边框 + 焦点下划线） =====
-pub let u32 const C_BG      = 0x202020   // 窗口背景（WinUI Layer）
-pub let u32 const C_PANEL   = 0x2C2C2C   // 卡片/控件面（Card）
-pub let u32 const C_PANELH  = 0x383838   // 卡片悬停/按下亮面
-pub let u32 const C_PANDOWN = 0x242424   // 按下暗面
-pub let u32 const C_BORDER  = 0x3A3A3A   // subtle 边框
-pub let u32 const C_TEXT    = 0xFFFFFF   // 主文本
-pub let u32 const C_SUB     = 0xA0A0A0   // 次级文本
-pub let u32 const C_ACCENT  = 0x4CC2FF   // 强调（WinUI 深色 accent light2）
-pub let u32 const C_ACCENTD = 0x0C3B5E   // 强调低亮度（选中行底）
-pub let u32 const C_HOT     = 0x383838   // 悬停
-pub let u32 const C_DOWN    = 0x242424   // 按下
-pub let u32 const C_OK      = 0x6CCB5F   // 绿（Fluent success）
+// ===== 主题：颜色一律来自 theme 令牌（v4 令牌化；组件内不再硬编码配色） =====
+// 组件绘制入口统一走 theme_for(id)：当前主题 + 该组件 Style 覆盖。
+// 快捷调暗/调亮（悬停/按下反馈色由 surface 派生，不额外占令牌位）。
+
+// c 的 RGB 各通道按 pct 百分比缩放（pct=60 变暗 40%，pct=120 变亮 20%）
+pub fn u32 shade(let u32 c, let i32 pct)
+    let i32 a = cast((c >> 24) & 0xFF, i32)
+    let i32 r = cast((c >> 16) & 0xFF, i32)
+    let i32 g = cast((c >> 8) & 0xFF, i32)
+    let i32 b = cast(c & 0xFF, i32)
+    r = r * pct / 100
+    g = g * pct / 100
+    b = b * pct / 100
+    if r > 255
+        r = 255
+    if g > 255
+        g = 255
+    if b > 255
+        b = 255
+    if r < 0
+        r = 0
+    if g < 0
+        g = 0
+    if b < 0
+        b = 0
+    return cast(a, u32) << 24 | cast(r, u32) << 16 | cast(g, u32) << 8 | cast(b, u32)
+
+// 按下态面（主题 surface 调暗）
+fn u32 pressed_face(let Theme th)
+    return shade(th.surface, 62)
 
 // 界面缩放：96dpi=100。组件内部尺寸一律 逻辑值 * SC() / 100
 pub fn i32 SC()
@@ -50,7 +76,7 @@ pub struct Label
     i32 x
     i32 y
     string text
-    u32 color = C_TEXT
+    u32 color = 0        // 0=主题 text 令牌（非 0 覆盖）
     i32 bg_w = 0         // 清屏宽度：0=按当前文本宽度；文本会变短时设大可防残影
     i32 fs = 16          // 字号（逻辑 px）
     bool bold = false
@@ -59,8 +85,10 @@ pub struct Label
     bool visible = true
     bool enable = true
     bool dirty = true
+    i64 id = 0           // 组件 id（Style 覆盖 / 无障碍索引用）
 
     fn void draw()
+        let Theme th = theme_for(self.id)
         let i32 b = 0
         if self.bold
             b = 1
@@ -75,10 +103,16 @@ pub struct Label
         if cw <= 0
             cw = tw + 4
         if not self.nobg
-            gui_fill_rect(self.x - 2, self.y - 2, cw + 2, self.fs * SC() / 100 + 6, C_BG)
-        gui_draw_text(self.x, self.y, self.text, self.color)
+            gui_fill_rect(self.x - 2, self.y - 2, cw + 2, self.fs * SC() / 100 + 6, th.bg)
+        gui_draw_text(self.x, self.y, self.text, self.color_eff(th))
         gui_font(16, 0)
         self.dirty = false
+
+    // 有效文本色（0=主题令牌）
+    fn u32 color_eff(let Theme th)
+        if self.color != 0
+            return self.color
+        return th.text
 
 // ===== Button：点击计数按钮 =====
 pub struct Button
@@ -93,9 +127,10 @@ pub struct Button
     bool visible = true
     bool enable = true
     bool dirty = true
-    u32 color = 0         // 自定义面色（0=主题 C_PANEL；按下仍 C_PANDOWN）
-    u32 tcolor = 0        // 自定义文本色（0=主题 C_TEXT）
+    u32 color = 0         // 自定义面色（0=主题 surface；按下仍取派生暗面）
+    u32 tcolor = 0        // 自定义文本色（0=主题 text）
     i32 radius = 6        // 圆角（逻辑 px，UI 标签可覆盖）
+    i64 id = 0
 
     fn bool hit(let i32 mx, let i32 my)
         return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + self.h
@@ -105,29 +140,31 @@ pub struct Button
         self.dirty = true
 
     fn void draw()
+        let Theme th = theme_for(self.id)
         let i32 u = SC()
-        let u32 fill = C_PANEL
+        let u32 fill = th.surface
         if self.color != 0
             // 自定义面色：保留按下反馈，悬停不覆盖自定义色
             fill = self.color
             if self.pressed
-                fill = C_PANDOWN
+                fill = pressed_face(th)
         else
             if self.pressed
-                fill = C_PANDOWN
+                fill = pressed_face(th)
             else
                 if self.hot
-                    fill = C_PANELH
+                    fill = th.surfaceAlt
         // 扁平卡片：同色细边框（视觉上无边框），WinUI 标准圆角 6
         gui_round_rect(self.x, self.y, self.w, self.h, self.radius * u / 100, fill, fill)
         gui_font(13, 0)
-        let u32 tc = C_TEXT
+        let u32 tc = th.text
         if self.tcolor != 0
             tc = self.tcolor
         let i32 tw = gui_text_w(self.text)
-        let i32 th = 13 * u / 100
-        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - th) / 2, self.text, tc)
+        let i32 tjh = 13 * u / 100
+        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - tjh) / 2, self.text, tc)
         gui_font(16, 0)
+        draw_focus_ring(th, self.id, self.x, self.y, self.w, self.h)
         self.dirty = false
 
 // ===== InputBox：单行文本框（点击聚焦；鼠标拖选；Ctrl+A/C/X/V、方向键、Home/End） =====
@@ -144,6 +181,7 @@ pub struct InputBox
     i32 sel_a = 0         // 选区锚点（字节）；cx==sel_a 即无选区
     bool dragging = false
     string ph = ""        // placeholder：text 为空时显示的灰色提示（不参与文本/选中）
+    i64 id = 0
 
     fn bool hit(let i32 mx, let i32 my)
         return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + LH() + 8 * SC() / 100
@@ -325,15 +363,16 @@ pub struct InputBox
 
     fn void draw()
         gui_font(16, 0)     // 本组件一律 16 号（测量/绘制/命中三处一致）
+        let Theme th = theme_for(self.id)
         let i32 u = SC()
         let i32 hh = LH() + 8 * u / 100
-        gui_round_rect(self.x, self.y, self.w, hh, 4 * u / 100, C_PANEL, C_BORDER)
+        gui_round_rect(self.x, self.y, self.w, hh, 4 * u / 100, th.surface, th.border)
         if length(self.text) == 0 and length(self.ph) > 0
             // placeholder：灰字提示，仅视觉——不是文本内容、不可选中、text_out 仍为空
-            gui_draw_text(self.x + 8 * u / 100, self.y + 5 * u / 100, self.ph, C_SUB)
+            gui_draw_text(self.x + 8 * u / 100, self.y + 5 * u / 100, self.ph, th.textMuted)
             if self.focus
-                gui_fill_rect(self.x + 1, self.y + hh - 2 * u / 100, self.w - 2, 2 * u / 100, C_ACCENT)
-                gui_fill_rect(self.x + 8 * u / 100, self.y + 5 * u / 100, 2 * u / 100, LH() - 4 * u / 100, C_TEXT)
+                gui_fill_rect(self.x + 1, self.y + hh - 2 * u / 100, self.w - 2, 2 * u / 100, th.accent)
+                gui_fill_rect(self.x + 8 * u / 100, self.y + 5 * u / 100, 2 * u / 100, LH() - 4 * u / 100, th.text)
             self.dirty = false
             gui_font(16, 0)
             return
@@ -344,14 +383,15 @@ pub struct InputBox
             if lo != hi
                 let i32 x1 = self.x + 8 * u / 100 + gui_text_w(prefix(self.text, lo))
                 let i32 x2 = self.x + 8 * u / 100 + gui_text_w(prefix(self.text, hi))
-                gui_fill_rect(x1, self.y + 4 * u / 100, x2 - x1, LH(), C_ACCENTD)
-            gui_draw_text(self.x + 8 * u / 100, self.y + 5 * u / 100, self.text, C_TEXT)
+                gui_fill_rect(x1, self.y + 4 * u / 100, x2 - x1, LH(), th.accentPressed)
+            gui_draw_text(self.x + 8 * u / 100, self.y + 5 * u / 100, self.text, th.text)
             // 焦点下划线 + 光标（cx 可在文本中间）
-            gui_fill_rect(self.x + 1, self.y + hh - 2 * u / 100, self.w - 2, 2 * u / 100, C_ACCENT)
+            gui_fill_rect(self.x + 1, self.y + hh - 2 * u / 100, self.w - 2, 2 * u / 100, th.accent)
             let i32 cw = gui_text_w(prefix(self.text, self.cx))
-            gui_fill_rect(self.x + 8 * u / 100 + cw, self.y + 5 * u / 100, 2 * u / 100, LH() - 4 * u / 100, C_TEXT)
+            gui_fill_rect(self.x + 8 * u / 100 + cw, self.y + 5 * u / 100, 2 * u / 100, LH() - 4 * u / 100, th.text)
         else
-            gui_draw_text(self.x + 8 * u / 100, self.y + 5 * u / 100, self.text, C_TEXT)
+            gui_draw_text(self.x + 8 * u / 100, self.y + 5 * u / 100, self.text, th.text)
+        draw_focus_ring(th, self.id, self.x, self.y, self.w, LH() + 8 * u / 100)
         self.dirty = false
 
 // ===== Slider：拖动滑块，value 0..100 =====
@@ -364,6 +404,7 @@ pub struct Slider
     bool visible = true
     bool enable = true
     bool dirty = true
+    i64 id = 0
 
     fn void set_value(let i32 v)
         let i32 vv = v
@@ -380,28 +421,33 @@ pub struct Slider
         return mx >= self.x and mx < self.x + self.w and my >= self.y - 6 * SC() / 100 and my < self.y + 26 * SC() / 100
 
     fn void draw()
+        let Theme th = theme_for(self.id)
         let i32 u = SC()
-        gui_fill_rect(self.x, self.y + 8 * u / 100, self.w, 4 * u / 100, C_PANEL)
-        gui_rect(self.x, self.y + 8 * u / 100, self.w, 4 * u / 100, C_BORDER)
+        gui_fill_rect(self.x, self.y + 8 * u / 100, self.w, 4 * u / 100, th.surface)
+        gui_rect(self.x, self.y + 8 * u / 100, self.w, 4 * u / 100, th.border)
         let i32 fx = self.x + (self.w - 2 * u / 100) * self.value / 100
         if fx > self.x
-            gui_fill_rect(self.x, self.y + 8 * u / 100, fx - self.x, 4 * u / 100, C_ACCENT)
+            gui_fill_rect(self.x, self.y + 8 * u / 100, fx - self.x, 4 * u / 100, th.accent)
         if self.dragging
-            gui_fill_rect(fx - 5 * u / 100, self.y, 10 * u / 100, 20 * u / 100, C_HOT)
+            gui_fill_rect(fx - 5 * u / 100, self.y, 10 * u / 100, 20 * u / 100, th.surfaceAlt)
         else
-            gui_fill_rect(fx - 5 * u / 100, self.y, 10 * u / 100, 20 * u / 100, C_ACCENT)
+            gui_fill_rect(fx - 5 * u / 100, self.y, 10 * u / 100, 20 * u / 100, th.accent)
+        draw_focus_ring(th, self.id, self.x, self.y, self.w, 20 * u / 100)
         self.dirty = false
 
-// ===== ProgressBar：进度条 =====
+// ===== ProgressBar：进度条（value 确定 / indeterminate 不确定） =====
 pub struct ProgressBar
     i32 x
     i32 y
     i32 w
     i32 value = 0
-    u32 color = C_OK
+    bool indeterminate = false   // true=不确定态（滑块往复，value 忽略）
+    i32 phase = 0                // 不确定态动画相位（0..99）
+    u32 color = 0                // 0=主题 success 令牌
     bool visible = true
     bool enable = true
     bool dirty = true
+    i64 id = 0
 
     fn void set_value(let i32 v)
         let i32 vv = v
@@ -413,13 +459,37 @@ pub struct ProgressBar
             self.value = vv
             self.dirty = true
 
+    fn void set_indeterminate(let bool b)
+        if self.indeterminate != b
+            self.indeterminate = b
+            self.dirty = true
+
+    // 不确定态动画：每帧调用推进相位
+    fn void tick()
+        if self.indeterminate
+            self.phase = (self.phase + 4) % 100
+            self.dirty = true
+
+    fn u32 color_eff(let Theme th)
+        if self.color != 0
+            return self.color
+        return th.success
+
     fn void draw()
+        let Theme th = theme_for(self.id)
         let i32 u = SC()
-        gui_fill_rect(self.x, self.y, self.w, 18 * u / 100, C_PANEL)
-        gui_rect(self.x, self.y, self.w, 18 * u / 100, C_BORDER)
-        let i32 fw = (self.w - 4 * u / 100) * self.value / 100
-        if fw > 0
-            gui_fill_rect(self.x + 2 * u / 100, self.y + 2 * u / 100, fw, 14 * u / 100, self.color)
+        gui_fill_rect(self.x, self.y, self.w, 18 * u / 100, th.surface)
+        gui_rect(self.x, self.y, self.w, 18 * u / 100, th.border)
+        if self.indeterminate
+            // 不确定态：宽度 30% 的滑块按 phase 往复
+            let i32 span = self.w - 6 * u / 100
+            let i32 sw = self.w * 30 / 100
+            let i32 fx = self.x + 2 * u / 100 + (span - sw) * self.phase / 100
+            gui_fill_rect(fx, self.y + 2 * u / 100, sw, 14 * u / 100, self.color_eff(th))
+        else
+            let i32 fw = (self.w - 4 * u / 100) * self.value / 100
+            if fw > 0
+                gui_fill_rect(self.x + 2 * u / 100, self.y + 2 * u / 100, fw, 14 * u / 100, self.color_eff(th))
         self.dirty = false
 
 // ===== ListBox：字符串列表（滚轮滚动，点击选中） =====
@@ -438,6 +508,51 @@ pub struct ListBox
     bool visible = true
     bool enable = true
     bool dirty = true
+    bool multi = false       // 多选模式（Ctrl+点击切换）
+    i32[] selected          // 多选模式的选中行集合
+    i64 id = 0
+
+    // 多选：该行是否选中
+    fn bool is_selected(let i32 row)
+        if not self.multi
+            return row == self.sel
+        let i32 i = 0
+        while i < length(self.selected)
+            if self.selected[i] == row
+                return true
+            i++
+        return false
+
+    // 多选：切换行列选中态（Ctrl 点击入口）
+    fn void toggle_row(let i32 row, let bool ctrl)
+        if not self.multi
+            self.sel = row
+            self.dirty = true
+            return
+        if not ctrl
+            self.selected = self.selected[0, -1]
+            self.sel = row
+            self.selected = push(self.selected, row)
+            self.dirty = true
+            return
+        let i32 i = 0
+        let i32 hit = -1
+        while i < length(self.selected)
+            if self.selected[i] == row
+                hit = i
+            i++
+        if hit < 0
+            self.selected = push(self.selected, row)
+        else
+            let i32[] out
+            i = 0
+            while i < length(self.selected)
+                if i != hit
+                    out = push(out, self.selected[i])
+                i++
+            self.selected = out
+        self.sel = row
+        self.dirty = true
 
     fn void clear()
         self.items = self.items[0, -1]
@@ -464,9 +579,10 @@ pub struct ListBox
             self.dirty = true
 
     fn void draw()
+        let Theme th = theme_for(self.id)
         let i32 u = SC()
         let i32 hgt = self.rows * LH() + 8 * u / 100
-        gui_round_rect(self.x, self.y, self.w, hgt, 6 * u / 100, C_PANEL, C_BORDER)
+        gui_round_rect(self.x, self.y, self.w, hgt, 6 * u / 100, th.surface, th.border)
         let i32 n = length(self.items)
         let i32 last = self.top + self.rows
         if last > n
@@ -475,16 +591,17 @@ pub struct ListBox
         while i < last
             let i32 row = i - self.top
             let i32 ry = self.y + 4 * u / 100 + row * LH()
-            if i == self.sel
-                // WinUI 选中行：accent 暗底 + 左侧强调条
-                gui_fill_rect(self.x + 2 * u / 100, ry - 1, self.w - 4 * u / 100, LH(), C_ACCENTD)
-                gui_draw_text(self.x + 8 * u / 100 + 4 * u / 100, ry, self.items[i], C_TEXT)
-                gui_fill_rect(self.x + 2 * u / 100, ry - 1, 3 * u / 100, LH(), C_ACCENT)
+            if self.is_selected(i)
+                // 选中行：accent 暗底 + 左侧强调条
+                gui_fill_rect(self.x + 2 * u / 100, ry - 1, self.w - 4 * u / 100, LH(), th.accentPressed)
+                gui_draw_text(self.x + 8 * u / 100 + 4 * u / 100, ry, self.items[i], th.text)
+                gui_fill_rect(self.x + 2 * u / 100, ry - 1, 3 * u / 100, LH(), th.accent)
             else
-                gui_draw_text(self.x + 8 * u / 100 + 4 * u / 100, ry, self.items[i], C_TEXT)
+                gui_draw_text(self.x + 8 * u / 100 + 4 * u / 100, ry, self.items[i], th.text)
                 if row > 0
-                    gui_line(self.x + 2 * u / 100, ry - 1, self.x + self.w - 2 * u / 100, ry - 1, 0x303030)
+                    gui_line(self.x + 2 * u / 100, ry - 1, self.x + self.w - 2 * u / 100, ry - 1, th.border)
             i++
+        draw_focus_ring(th, self.id, self.x, self.y, self.w, self.rows * LH() + 8 * u / 100)
         self.dirty = false
 
 // ===== App：应用容器 + 事件循环骨架 =====
@@ -499,6 +616,8 @@ pub struct App
     Checkbox[] checks
     Menu[] menus
     UI[] uis
+    Comp[] comps          // L2 二期内置组件（29 种，按 kind 分派）
+    PluginHost plugins    // 插件式注册组件实例
     bool menu_dirty = false
     i32 mx = -1
     i32 my = -1
@@ -507,12 +626,14 @@ pub struct App
     bool quit = false
     bool any_dirty = false
     i64 t0 = 0           // 帧起点（gui_frame_sleep 用）
+    i32 theme_rev = -1   // 上次重绘时的主题版本（不同即整体重绘）
 
     fn i32 open(let i32 w, let i32 h, let string title)
         let i32 r = gui_open(w, h, title)
         if r != 0
             return r
-        gui_fill_rect(0, 0, gui_w(), gui_h(), C_BG)
+        let Theme th = get_theme()
+        gui_fill_rect(0, 0, gui_w(), gui_h(), th.bg)
         gui_present()
         self.t0 = tick_ms()
         return 0
@@ -525,37 +646,69 @@ pub struct App
 
     // add_* 返回组件索引（v3.5 DX）：App 为值语义容器——add 进去的是副本，
     // 之后业务读写一律走 app.xxx[idx].field，不要读局部变量
+    // 交互组件自动分配组件 id 并注册焦点链（Tab 顺序 = 添加顺序）
     fn i32 add_label(let Label l)
         self.labels = push(self.labels, l)
         return length(self.labels) - 1
 
     fn i32 add_button(let Button b)
+        if b.id == 0
+            b.id = next_widget_id()
+        focus_register(b.id)
         self.buttons = push(self.buttons, b)
         return length(self.buttons) - 1
 
     fn i32 add_input(let InputBox ib)
+        if ib.id == 0
+            ib.id = next_widget_id()
+        focus_register(ib.id)
         self.inputs = push(self.inputs, ib)
         return length(self.inputs) - 1
 
     fn i32 add_slider(let Slider s)
+        if s.id == 0
+            s.id = next_widget_id()
+        focus_register(s.id)
         self.sliders = push(self.sliders, s)
         return length(self.sliders) - 1
 
     fn i32 add_bar(let ProgressBar p)
+        if p.id == 0
+            p.id = next_widget_id()
         self.bars = push(self.bars, p)
         return length(self.bars) - 1
 
     fn i32 add_list(let ListBox lb)
+        if lb.id == 0
+            lb.id = next_widget_id()
+        focus_register(lb.id)
         self.lists = push(self.lists, lb)
         return length(self.lists) - 1
 
     fn i32 add_text(let TextArea t)
+        if t.id == 0
+            t.id = next_widget_id()
+        focus_register(t.id)
         self.texts = push(self.texts, t)
         return length(self.texts) - 1
 
     fn i32 add_checkbox(let Checkbox c)
+        if c.id == 0
+            c.id = next_widget_id()
+        focus_register(c.id)
         self.checks = push(self.checks, c)
         return length(self.checks) - 1
+
+    // L2 二期：加入一个内置组件（Comp）；返回下标
+    fn i32 add_comp(let Comp c)
+        let Comp w = copy(c)
+        if w.id == 0
+            w.id = next_widget_id()
+        if comp_focusable(w.kind)
+            focus_register(w.id)
+        w.dirty = true
+        self.comps = push(self.comps, w)
+        return length(self.comps) - 1
 
     fn i32 add_menu(let Menu m)
         self.menus = push(self.menus, m)
@@ -577,12 +730,21 @@ pub struct App
         let UI e = copy(u)
         e.which = kind_of(e.kind)
         if e.which == 0
-            let Label w = Label(x=e.x, y=e.y, text=e.text)
-            if e.tcolor != 0
-                w.color = e.tcolor
-            w.visible = e.visible
-            w.enable = e.enable
-            e.idx = self.add_label(w)
+            // 未内置 kind：交给插件注册表（name → kind_id）
+            let i32 pk = kind_id_of_name(e.kind)
+            if e.kind != "label" and pk > 0 and has_widget(pk)
+                let PluginHost ph = copy(self.plugins)
+                ph.add(pk, e.x, e.y, e.w, e.h, e.text)
+                self.plugins = move ph
+                e.which = 999
+                e.idx = length(self.plugins.nodes) - 1
+            else
+                let Label w = Label(x=e.x, y=e.y, text=e.text)
+                if e.tcolor != 0
+                    w.color = e.tcolor
+                w.visible = e.visible
+                w.enable = e.enable
+                e.idx = self.add_label(w)
         if e.which == 1
             let i32 rr = e.radius
             if rr <= 0
@@ -648,6 +810,23 @@ pub struct App
             w.visible = e.visible
             w.enable = e.enable
             e.idx = self.add_text(w)
+        if e.which >= 100 and e.which < 999
+            let i32 ck = e.which - 100
+            let i32 cw = e.w
+            if cw <= 0
+                cw = 160 * SC() / 100
+            let Comp w = Comp(kind=ck, x=e.x, y=e.y, w=cw, h=e.h)
+            w.text = e.text
+            w.ph = e.ph
+            w.items = e.items
+            w.value = e.value
+            w.value2 = e.rows
+            w.checked = e.checked
+            w.color = e.color
+            w.visible = e.visible
+            w.enable = e.enable
+            w.dirty = true
+            e.idx = self.add_comp(w)
         self.uis = push(self.uis, e)
         return length(self.uis) - 1
 
@@ -689,6 +868,34 @@ pub struct App
                 e.text_out = self.texts[ix].text()
                 e.changed = e.text_out != e.cache_s
                 e.cache_s = e.text_out
+            if e.which >= 100 and e.which < 999
+                let Comp cp = copy(self.comps[ix])
+                e.clicks = cp.clicks
+                e.value = cp.value
+                e.sel = cp.sel
+                e.checked = cp.checked
+                if cp.kind == COMP_TEXTBOX
+                    e.text_out = cp.text
+                    e.changed = e.text_out != e.cache_s
+                    e.cache_s = e.text_out
+                if cp.kind == COMP_SPINBOX
+                    e.changed = e.value != e.cache_i
+                    e.cache_i = e.value
+                if cp.kind == COMP_PROGRESS or cp.kind == COMP_BADGE
+                    e.changed = e.value != e.cache_i
+                    e.cache_i = e.value
+                if cp.kind == COMP_RADIOGROUP or cp.kind == COMP_COMBO or cp.kind == COMP_MULTILIST
+                    e.changed = e.sel != e.cache_i
+                    e.cache_i = e.sel
+                    if e.sel >= 0
+                        if e.sel < length(cp.items)
+                            e.text_out = cp.items[e.sel]
+                if cp.kind == COMP_TREE or cp.kind == COMP_TABBAR or cp.kind == COMP_TABLE
+                    e.changed = e.sel != e.cache_i
+                    e.cache_i = e.sel
+                    if e.sel >= 0
+                        if e.sel < length(cp.items)
+                            e.text_out = cp.items[e.sel]
             self.uis[k] = e
             k++
 
@@ -712,6 +919,9 @@ pub struct App
             self.layout_menus()
         if e.which == 8
             self.texts[ix].set_text(s)
+        if e.which >= 100 and e.which < 999
+            self.comps[ix].text = s
+            self.comps[ix].dirty = true
         self.uis[k] = e
 
     // 输入框 placeholder（运行期改）：k = add 返回的元素下标
@@ -721,6 +931,9 @@ pub struct App
         if e.which == 2
             self.inputs[e.idx].ph = s
             self.inputs[e.idx].dirty = true
+        if e.which >= 100 and e.which < 999
+            self.comps[e.idx].ph = s
+            self.comps[e.idx].dirty = true
         self.uis[k] = e
 
     fn void set_pos(let i32 k, let i32 px, let i32 py)
@@ -760,6 +973,14 @@ pub struct App
             self.texts[ix].x = px
             self.texts[ix].y = py
             self.texts[ix].dirty = true
+        if e.which >= 100 and e.which < 999
+            self.comps[ix].x = px
+            self.comps[ix].y = py
+            self.comps[ix].dirty = true
+        if e.which == 999
+            self.plugins.nodes[ix].x = px
+            self.plugins.nodes[ix].y = py
+            self.plugins.nodes[ix].dirty = true
         self.uis[k] = e
 
     fn void set_size(let i32 k, let i32 pw, let i32 ph)
@@ -792,6 +1013,14 @@ pub struct App
             self.texts[ix].w = pw
             self.texts[ix].h = ph
             self.texts[ix].dirty = true
+        if e.which >= 100 and e.which < 999
+            self.comps[ix].w = pw
+            self.comps[ix].h = ph
+            self.comps[ix].dirty = true
+        if e.which == 999
+            self.plugins.nodes[ix].w = pw
+            self.plugins.nodes[ix].h = ph
+            self.plugins.nodes[ix].dirty = true
         self.uis[k] = e
 
     fn void set_color(let i32 k, let u32 c)
@@ -807,6 +1036,9 @@ pub struct App
         if e.which == 4
             self.bars[ix].color = c
             self.bars[ix].dirty = true
+        if e.which >= 100 and e.which < 999
+            self.comps[ix].color = c
+            self.comps[ix].dirty = true
         self.uis[k] = e
 
     fn void set_text_color(let i32 k, let u32 c)
@@ -829,6 +1061,11 @@ pub struct App
             self.sliders[ix].set_value(v)
         if e.which == 4
             self.bars[ix].set_value(v)
+        if e.which >= 100 and e.which < 999
+            self.comps[ix].value = v
+            self.comps[ix].dirty = true
+        if e.which == 999
+            self.plugins.nodes[ix].dirty = true
         self.uis[k] = e
 
     fn void set_checked(let i32 k, let bool b)
@@ -838,6 +1075,9 @@ pub struct App
         if e.which == 6
             self.checks[ix].checked = b
             self.checks[ix].dirty = true
+        if e.which >= 100 and e.which < 999
+            self.comps[ix].checked = b
+            self.comps[ix].dirty = true
         self.uis[k] = e
 
     fn void set_visible(let i32 k, let bool b)
@@ -871,6 +1111,12 @@ pub struct App
         if e.which == 8
             self.texts[ix].visible = b
             self.texts[ix].dirty = true
+        if e.which >= 100 and e.which < 999
+            self.comps[ix].visible = b
+            self.comps[ix].dirty = true
+        if e.which == 999
+            self.plugins.nodes[ix].visible = b
+            self.plugins.nodes[ix].dirty = true
         self.uis[k] = e
 
     fn void set_enable(let i32 k, let bool b)
@@ -900,6 +1146,9 @@ pub struct App
             self.menus[ix].enable = b
         if e.which == 8
             self.texts[ix].enable = b
+        if e.which >= 100 and e.which < 999
+            self.comps[ix].enable = b
+            self.comps[ix].dirty = true
         self.uis[k] = e
 
     fn void add_item(let i32 k, let string s)
@@ -913,6 +1162,11 @@ pub struct App
             mm.dirty = true
             self.menus[ix] = mm
             self.menu_dirty = true
+        if e.which >= 100 and e.which < 999
+            let Comp cp = copy(self.comps[ix])
+            cp.items = push(cp.items, s)
+            cp.dirty = true
+            self.comps[ix] = move cp
         e.items = push(e.items, s)
         self.uis[k] = e
 
@@ -965,17 +1219,36 @@ pub struct App
         while i < length(self.checks)
             self.checks[i].dirty = true
             i++
+        i = 0
+        while i < length(self.comps)
+            self.comps[i].dirty = true
+            i++
+        i = 0
+        while i < length(self.plugins.nodes)
+            self.plugins.nodes[i].dirty = true
+            i++
         self.menu_dirty = true
 
     // 一帧：泵事件 → 更新 → 脏区重绘 → 按需 present
     fn void step()
         self.t0 = tick_ms()                // 帧起点（gui_frame_sleep 依赖每帧刷新）
         self.any_dirty = false
+        // 主题/样式版本变化 → 整体重绘（切换主题后下一帧自动生效）
+        let i32 rev = theme_revision()
+        if rev != self.theme_rev
+            self.theme_rev = rev
+            let Theme th0 = get_theme()
+            gui_fill_rect(0, 0, gui_w(), gui_h(), th0.bg)
+            self.any_dirty = true
+            self.invalidate_all()
+        // 无障碍快照每帧重建
+        a11y_begin()
         let Event e = Event()
         while gui_poll(ref e)
             if e.typ == EV_MOVE
                 self.mx = cast(e.x, i32)
                 self.my = cast(e.y, i32)
+                comp_set_hover(self.my)
                 self.on_hover()
                 let i32 mi = 0
                 while mi < length(self.menus)
@@ -1002,6 +1275,13 @@ pub struct App
                     i++
             if e.typ == EV_KEY
                 self.on_key(cast(e.key, i64))
+            // L2 组件与插件：同一事件再派发一轮（顶层优先）
+            let bool uc = self.dispatch_comps(e)
+            let PluginHost ph = copy(self.plugins)
+            let bool pu = ph.dispatch(e)
+            self.plugins = move ph
+            if pu
+                self.any_dirty = true
         // 拖动持续更新（按住不放也跟随）
         let i32 si = 0
         while si < length(self.sliders)
@@ -1013,10 +1293,148 @@ pub struct App
         self.ldown_prev = self.ldown
         // 输出标签刷新（uis[k].clicks/value/sel/text_out/changed）
         self.sync_outputs()
+        // 无障碍快照（旧组件 + L2 组件 + 插件）
+        self.sync_a11y()
         // 重绘脏组件
         self.flush_dirty()
         if self.any_dirty
             gui_present()
+
+    // L2 组件事件派发：MOVE 派发全部（维护 hot），其余派发到命中的顶层（逆向）
+    fn bool dispatch_comps(let Event e)
+        let bool used = false
+        let i32 i = length(self.comps) - 1
+        while i >= 0
+            if self.comps[i].on_event(e)
+                used = true
+                if e.typ != EV_MOVE
+                    i = -1
+                    break
+            if self.comps[i].dirty
+                self.any_dirty = true
+            i--
+        return used
+
+    // 无障碍快照：旧组件按 kind 取角色/值，L2 组件走 Comp.publish_a11y
+    fn void sync_a11y()
+        let i32 i = 0
+        while i < length(self.labels)
+            let Label l = copy(self.labels[i])
+            if l.visible
+                let i32 st = 0
+                if not l.enable
+                    st = st | A11Y_DISABLED
+                let i32 ww = l.last_w
+                if ww <= 0
+                    ww = LH() + 4
+                a11y_add(l.id, l.text, ROLE_TEXT, l.text, st, l.x, l.y, ww, LH())
+            i++
+        i = 0
+        while i < length(self.buttons)
+            let Button b = copy(self.buttons[i])
+            if b.visible
+                let i32 st2 = 0
+                if not b.enable
+                    st2 = st2 | A11Y_DISABLED
+                if focus_has(b.id)
+                    st2 = st2 | A11Y_FOCUSED
+                if b.hot
+                    st2 = st2 | A11Y_HOT
+                if b.pressed
+                    st2 = st2 | A11Y_PRESSED
+                a11y_add(b.id, b.text, ROLE_BUTTON, cast(b.clicks, string), st2, b.x, b.y, b.w, b.h)
+            i++
+        i = 0
+        while i < length(self.inputs)
+            let InputBox ib = copy(self.inputs[i])
+            if ib.visible
+                let i32 st3 = 0
+                if not ib.enable
+                    st3 = st3 | A11Y_DISABLED
+                if focus_has(ib.id)
+                    st3 = st3 | A11Y_FOCUSED
+                a11y_add(ib.id, ib.ph, ROLE_EDIT, ib.text, st3, ib.x, ib.y, ib.w, LH() + 8)
+            i++
+        i = 0
+        while i < length(self.sliders)
+            let Slider s = copy(self.sliders[i])
+            if s.visible
+                let i32 st4 = 0
+                if not s.enable
+                    st4 = st4 | A11Y_DISABLED
+                if focus_has(s.id)
+                    st4 = st4 | A11Y_FOCUSED
+                a11y_add(s.id, "slider", ROLE_SLIDER, cast(s.value, string), st4, s.x, s.y, s.w, LH())
+            i++
+        i = 0
+        while i < length(self.bars)
+            let ProgressBar pb = copy(self.bars[i])
+            if pb.visible
+                if pb.indeterminate
+                    a11y_add(pb.id, "progress", ROLE_PROGRESS, "indeterminate", 0, pb.x, pb.y, pb.w, LH())
+                else
+                    a11y_add(pb.id, "progress", ROLE_PROGRESS, cast(pb.value, string), 0, pb.x, pb.y, pb.w, LH())
+            i++
+        i = 0
+        while i < length(self.lists)
+            let ListBox lb = copy(self.lists[i])
+            if lb.visible
+                let i32 st5 = 0
+                if not lb.enable
+                    st5 = st5 | A11Y_DISABLED
+                if focus_has(lb.id)
+                    st5 = st5 | A11Y_FOCUSED
+                if lb.sel >= 0
+                    st5 = st5 | A11Y_SELECTED
+                let string vv = ""
+                if lb.sel >= 0 and lb.sel < length(lb.items)
+                    vv = lb.items[lb.sel]
+                a11y_add(lb.id, "list", ROLE_LIST, vv, st5, lb.x, lb.y, lb.w, lb.rows * LH() + 8)
+            i++
+        i = 0
+        while i < length(self.texts)
+            let TextArea t = copy(self.texts[i])
+            if t.visible
+                let i32 st6 = 0
+                if not t.enable
+                    st6 = st6 | A11Y_DISABLED
+                if focus_has(t.id)
+                    st6 = st6 | A11Y_FOCUSED
+                a11y_add(t.id, t.text(), ROLE_EDIT, t.text(), st6, t.x, t.y, t.w, t.h)
+            i++
+        i = 0
+        while i < length(self.checks)
+            let Checkbox c = copy(self.checks[i])
+            if c.visible
+                let i32 st7 = 0
+                if not c.enable
+                    st7 = st7 | A11Y_DISABLED
+                if focus_has(c.id)
+                    st7 = st7 | A11Y_FOCUSED
+                if c.checked
+                    st7 = st7 | A11Y_CHECKED
+                let string cv = "off"
+                if c.checked
+                    cv = "on"
+                a11y_add(c.id, c.text, ROLE_CHECKBOX, cv, st7, c.x, c.y, LH(), LH())
+            i++
+        i = 0
+        while i < length(self.menus)
+            let Menu mn = copy(self.menus[i])
+            if mn.visible
+                let i32 st8 = 0
+                if mn.open
+                    st8 = st8 | A11Y_EXPANDED
+                a11y_add(0, mn.title, ROLE_LIST, mn.title, st8, mn.x, 0, mn.tw, LH())
+            i++
+        // L2 组件：后添加的在上层，故逆序发布（a11y_hit 命中顶层）
+        i = length(self.comps) - 1
+        while i >= 0
+            self.comps[i].publish_a11y()
+            i--
+        let PluginHost ph2 = copy(self.plugins)
+        ph2.publish_a11y()
+        self.plugins = move ph2
 
     fn void on_hover()
         // 输入框拖选：聚焦且按住左键时移动即扩展选区
@@ -1191,6 +1609,20 @@ pub struct App
         self.ldown_prev = self.ldown
 
     fn void on_key(let i64 k)
+        // Tab / Shift+Tab：焦点链自动流转（焦点环由各组件 draw 读取 focus_has）
+        if handle_tab_key(k)
+            let i64 fid = focus_get()
+            let i32 fi = 0
+            while fi < length(self.inputs)
+                self.inputs[fi].set_focus(fid == self.inputs[fi].id)
+                fi++
+            fi = 0
+            while fi < length(self.texts)
+                self.texts[fi].set_focus(fid == self.texts[fi].id)
+                fi++
+            self.invalidate_all()
+            self.any_dirty = true
+            return
         let i32 i = 0
         while i < length(self.inputs)
             if self.inputs[i].focus and self.inputs[i].enable
@@ -1245,6 +1677,7 @@ pub struct App
         self.menu_dirty = true
 
     fn void draw_menu_bar()
+        let Theme th = get_theme()
         let i32 u = SC()
         let i32 mbh = LH() + 6 * u / 100
         if length(self.menus) == 0
@@ -1264,18 +1697,18 @@ pub struct App
                 nopen++
             i++
         if self.menu_dirty or nopen > 0
-            gui_fill_rect(0, 0, gui_w(), mbh, C_PANEL)
-            gui_fill_rect(0, mbh - 1, gui_w(), 1, C_BORDER)
+            gui_fill_rect(0, 0, gui_w(), mbh, th.surface)
+            gui_fill_rect(0, mbh - 1, gui_w(), 1, th.border)
             i = 0
             while i < length(self.menus)
                 let Menu m = copy(self.menus[i])
                 let bool hot = self.my < mbh and self.mx >= m.x and self.mx < m.x + m.tw
                 if m.open
-                    gui_fill_rect(m.x, 0, m.tw, mbh, C_HOT)
+                    gui_fill_rect(m.x, 0, m.tw, mbh, th.surfaceAlt)
                 else
                     if hot
-                        gui_fill_rect(m.x, 0, m.tw, mbh, C_PANEL)
-                gui_draw_text(m.x + 8 * u / 100, 4 * u / 100, m.title, C_TEXT)
+                        gui_fill_rect(m.x, 0, m.tw, mbh, th.surface)
+                gui_draw_text(m.x + 8 * u / 100, 4 * u / 100, m.title, th.text)
                 i++
             // 下拉面板（打开时覆盖在内容之上，最后画）
             i = 0
@@ -1284,16 +1717,16 @@ pub struct App
                     let i32 iw = self.menu_item_w(i)
                     let i32 ih = LH() + 4 * u / 100
                     let i32 n = length(self.menus[i].items)
-                    gui_fill_rect(self.menus[i].x, mbh, iw, n * ih + 4 * u / 100, C_PANEL)
-                    gui_rect(self.menus[i].x, mbh, iw, n * ih + 4 * u / 100, C_BORDER)
+                    gui_fill_rect(self.menus[i].x, mbh, iw, n * ih + 4 * u / 100, th.surface)
+                    gui_rect(self.menus[i].x, mbh, iw, n * ih + 4 * u / 100, th.border)
                     let i32 j = 0
                     while j < n
                         let i32 iy = mbh + j * ih
                         let bool hov = self.mx >= self.menus[i].x and self.mx < self.menus[i].x + iw and self.my >= iy and self.my < iy + ih
                         if hov
-                            gui_fill_rect(self.menus[i].x + 1, iy, iw - 2, ih, C_HOT)
+                            gui_fill_rect(self.menus[i].x + 1, iy, iw - 2, ih, th.surfaceAlt)
                         gui_draw_text(self.menus[i].x + 12 * u / 100, iy + 2 * u / 100,
-                                      self.menus[i].items[j], C_TEXT)
+                                      self.menus[i].items[j], th.text)
                         j++
                 i++
             self.menu_dirty = false
@@ -1348,6 +1781,19 @@ pub struct App
                 self.checks[i].draw()
                 self.any_dirty = true
             i++
+        // L2 内置组件（按添加顺序绘制，后添加者在上层）
+        i = 0
+        while i < length(self.comps)
+            if self.comps[i].dirty and self.comps[i].visible
+                self.comps[i].draw()
+                self.any_dirty = true
+            i++
+        // 插件组件（只画脏的实例）
+        let PluginHost ph3 = copy(self.plugins)
+        let bool pp = ph3.paint_all()
+        self.plugins = move ph3
+        if pp
+            self.any_dirty = true
 
 
 // ===== 字符串辅助（TextArea 用；按 UTF-8 字节索引，闭区间切片） =====
@@ -1422,34 +1868,37 @@ pub struct Checkbox
     bool visible = true
     bool enable = true
     bool dirty = true
+    i64 id = 0
 
     fn i32 box_size()
         return 16 * SC() / 100
 
     fn bool hit(let i32 mx, let i32 my)
         let i32 bs = self.box_size()
-        let i32 tw = gui_text_w(self.text)
-        let i32 wfull = bs + 6 * SC() / 100 + tw
+        let i32 tw2 = gui_text_w(self.text)
+        let i32 wfull = bs + 6 * SC() / 100 + tw2
         let i32 hfull = bs
         if bs < LH()
             hfull = LH()
         return mx >= self.x and mx < self.x + wfull and my >= self.y and my < self.y + hfull
 
     fn void draw()
+        let Theme th = theme_for(self.id)
         let i32 u = SC()
         let i32 bs = self.box_size()
-        let u32 fill = C_PANEL
+        let u32 fill = th.surface
         if self.pressed
-            fill = C_DOWN
+            fill = pressed_face(th)
         else
             if self.hot
-                fill = C_HOT
+                fill = th.surfaceAlt
         gui_fill_rect(self.x, self.y, bs, bs, fill)
-        gui_rect(self.x, self.y, bs, bs, C_BORDER)
+        gui_rect(self.x, self.y, bs, bs, th.border)
         if self.checked
-            gui_draw_text(self.x + 2 * u / 100, self.y - 2 * u / 100, "✓", C_OK)
+            gui_draw_text(self.x + 2 * u / 100, self.y - 2 * u / 100, "✓", th.success)
         let i32 ty = self.y + (bs - LH()) / 2
-        gui_draw_text(self.x + bs + 6 * u / 100, ty, self.text, C_TEXT)
+        gui_draw_text(self.x + bs + 6 * u / 100, ty, self.text, th.text)
+        draw_focus_ring(th, self.id, self.x, self.y, bs + 6 * u / 100 + gui_text_w(self.text), bs)
         self.dirty = false
 
 // ===== TextArea：多行文本编辑 =====
@@ -1472,6 +1921,7 @@ pub struct TextArea
     bool visible = true
     bool enable = true
     bool dirty = true
+    i64 id = 0
 
     fn i32 vis_rows()
         let i32 vr = (self.h - 8 * SC() / 100) / LH()
@@ -1811,12 +2261,13 @@ pub struct TextArea
         return false
 
     fn void draw()
+        let Theme th = theme_for(self.id)
         let i32 u = SC()
         let i32 pad = 4 * u / 100
-        let u32 border = C_BORDER
+        let u32 border = th.border
         if self.focus
-            border = C_ACCENT
-        gui_round_rect(self.x, self.y, self.w, self.h, 6 * u / 100, C_PANEL, border)
+            border = th.accent
+        gui_round_rect(self.x, self.y, self.w, self.h, 6 * u / 100, th.surface, border)
         let i32 vr = self.vis_rows()
         let i32 nl = length(self.lines)
         let i32 last = self.top + vr
@@ -1861,7 +2312,7 @@ pub struct TextArea
                 if xs >= 0 and xe > xs
                     let i32 x1 = self.x + pad + gui_text_w(prefix(lnh, xs))
                     let i32 x2 = self.x + pad + gui_text_w(prefix(lnh, xe))
-                    gui_fill_rect(x1, ry2, x2 - x1, LH(), C_ACCENTD)
+                    gui_fill_rect(x1, ry2, x2 - x1, LH(), th.accentPressed)
                 li++
         let i32 i = self.top
         while i < last
@@ -1872,14 +2323,15 @@ pub struct TextArea
             while cnt > 0 and gui_text_w(prefix(ln, cnt)) > avail
                 cnt = align_back(ln, cnt - 1)
             if cnt > 0
-                gui_draw_text(self.x + pad, ry, prefix(ln, cnt), C_TEXT)
+                gui_draw_text(self.x + pad, ry, prefix(ln, cnt), th.text)
             i++
         // 光标
         if self.focus
             if self.cy >= self.top and self.cy < last
                 let string ln2 = self.lines[self.cy]
                 let i32 cxx = gui_text_w(prefix(ln2, self.cx))
-                gui_fill_rect(self.x + pad + cxx, self.y + pad + (self.cy - self.top) * LH(), 2 * u / 100, LH(), C_TEXT)
+                gui_fill_rect(self.x + pad + cxx, self.y + pad + (self.cy - self.top) * LH(), 2 * u / 100, LH(), th.text)
+        draw_focus_ring(th, self.id, self.x, self.y, self.w, self.h)
         self.dirty = false
 
 // ===== UI：统一元素（new2.md「元素+标签」模型，v3.17） =====
@@ -1906,6 +2358,10 @@ pub fn i32 kind_of(let string k)
         return 7
     if k == "textarea"
         return 8
+    // L2 二期内置组件：100 + COMP_*（避免与旧 kind 编号冲突）
+    let i32 ck = comp_kind_of(k)
+    if ck != COMP_NONE
+        return 100 + ck
     return 0
 
 pub struct UI
@@ -1917,7 +2373,7 @@ pub struct UI
     i32 h = 0
     string text = ""
     u32 color = 0        // 面色/填充（0=各 kind 主题默认）
-    u32 tcolor = 0       // 文本色（0=主题 C_TEXT）
+    u32 tcolor = 0       // 文本色（0=主题 th.text）
     i32 radius = 0       // 圆角（0=各 kind 默认；button 生效）
     bool visible = true  // 可见性（flush 跳过绘制）
     bool enable = true   // 可用性（事件忽略）
@@ -1992,3 +2448,2145 @@ pub struct UI
 
     fn void add_item(let string s)
         self.items = push(self.items, s)
+
+// ==========================================================================
+// L2 v4 公共基础设施：矩形 / 布局 / 绘制上下文 / 无障碍 / 焦点链 / 插件注册表
+// 内置组件与插件组件共用 measure（LayoutCursor）、layout（LayoutBox）、
+// paint（PaintCtx）、hit（rect_hit）四类助手，避免每个组件重复造轮子。
+// ==========================================================================
+
+// ===== 矩形 =====
+pub struct Rect
+    i32 x = 0
+    i32 y = 0
+    i32 w = 0
+    i32 h = 0
+
+    fn bool contains(let i32 mx, let i32 my)
+        return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + self.h
+
+    fn bool empty()
+        return self.w <= 0 or self.h <= 0
+
+    // 内缩（用于 padding）
+    fn Rect inset(let i32 d)
+        return Rect(x=self.x + d, y=self.y + d, w=self.w - 2 * d, h=self.h - 2 * d)
+
+// 命中测试（组件 on_event / a11y_hit 共用）
+pub fn bool rect_hit(let Rect r, let i32 mx, let i32 my)
+    return mx >= r.x and mx < r.x + r.w and my >= r.y and my < r.y + r.h
+
+// ===== RTL 镜像助手 =====
+// 父容器 [px, px+pw) 内的矩形水平翻转（RTL 主轴镜像）
+pub fn i32 rtl_x(let i32 px, let i32 pw, let i32 x, let i32 w)
+    if not is_rtl()
+        return x
+    return px + pw - (x - px) - w
+
+pub fn Rect rtl_rect(let Rect r, let i32 px, let i32 pw)
+    if not is_rtl()
+        return r
+    return Rect(x=px + pw - (r.x - px) - r.w, y=r.y, w=r.w, h=r.h)
+
+// 文本起点：RTL 布局下文本右对齐到 [x, x+w)
+pub fn i32 text_x(let i32 x, let i32 w, let i32 tw)
+    if is_rtl()
+        return x + w - tw
+    return x
+
+// 图标/箭头镜像：RTL 下把 [0,span) 内的 x 翻转（箭头/展开三角等）
+pub fn i32 mirror_x(let i32 x, let i32 w, let i32 span)
+    if not is_rtl()
+        return x
+    return span - x - w
+
+// ===== 布局：主轴 / 交叉轴对齐 + 间距 + padding =====
+pub let i32 const LAYOUT_VERT = 0
+pub let i32 const LAYOUT_HORZ = 1
+pub let i32 const LAYOUT_GRID = 2
+pub let i32 const ALIGN_START = 0
+pub let i32 const ALIGN_CENTER = 1
+pub let i32 const ALIGN_END = 2
+
+// 交叉轴对齐：base=容器交叉轴起点，span=容器交叉轴尺寸，item=子项尺寸
+fn i32 align_cross(let i32 base, let i32 span, let i32 item, let i32 mode)
+    if mode == ALIGN_CENTER
+        return base + (span - item) / 2
+    if mode == ALIGN_END
+        return base + span - item
+    return base
+
+pub struct LayoutBox
+    i32 x = 0
+    i32 y = 0
+    i32 w = 0
+    i32 h = 0
+    i32 dir = 0          // LAYOUT_VERT/HORZ/GRID
+    i32 cols = 1         // 网格列数
+    i32 align = 0        // 交叉轴对齐
+    i32 gap = 0          // 子项间距
+    i32 pad = 0          // 容器内边距
+    i32 cursor = 0       // 主轴已占用长度
+    i32 row_h = 0        // 网格当前行最大高
+    i32 done_h = 0       // 网格已完成行累计高
+
+pub struct LayoutCursor
+    LayoutBox box
+    i32 count = 0
+
+    // 顺序取下一个子项矩形（自动应用对齐 / 间距 / padding / RTL 镜像）
+    fn Rect next(let i32 iw, let i32 ih)
+        let i32 px = self.box.x + self.box.pad
+        let i32 py = self.box.y + self.box.pad
+        let i32 pw = self.box.w - 2 * self.box.pad
+        let i32 ph = self.box.h - 2 * self.box.pad
+        if self.box.dir == LAYOUT_HORZ
+            let i32 cx = px + self.box.cursor
+            let i32 cy = align_cross(py, ph, ih, self.box.align)
+            self.box.cursor = self.box.cursor + iw + self.box.gap
+            self.count++
+            return rtl_rect(Rect(x=cx, y=cy, w=iw, h=ih), px, pw)
+        if self.box.dir == LAYOUT_GRID
+            let i32 cols = self.box.cols
+            if cols < 1
+                cols = 1
+            let i32 cw = (pw - (cols - 1) * self.box.gap) / cols
+            let i32 col = self.count % cols
+            let i32 row = self.count / cols
+            if col == 0 and row > 0
+                self.box.done_h = self.box.done_h + self.box.row_h + self.box.gap
+                self.box.row_h = 0
+            if ih > self.box.row_h
+                self.box.row_h = ih
+            let i32 gx = px + col * (cw + self.box.gap)
+            let i32 gy = py + self.box.done_h
+            self.count++
+            return rtl_rect(Rect(x=gx, y=gy, w=cw, h=ih), px, pw)
+        // 垂直（默认）
+        let i32 vy = py + self.box.cursor
+        let i32 vx = align_cross(px, pw, iw, self.box.align)
+        self.box.cursor = self.box.cursor + ih + self.box.gap
+        self.count++
+        return rtl_rect(Rect(x=vx, y=vy, w=iw, h=ih), px, pw)
+
+    // 主轴已占用长度（含尾部 gap 的近似值，布局测量用）
+    fn i32 used()
+        return self.box.cursor
+
+// 容器内容区矩形（去掉 padding）
+pub fn Rect layout_area(let LayoutBox b)
+    return Rect(x=b.x + b.pad, y=b.y + b.pad, w=b.w - 2 * b.pad, h=b.h - 2 * b.pad)
+
+// ===== 绘制上下文：主题 + 裁剪栈（插件 paint 的统一入口） =====
+pub struct ClipRect
+    i32 x = 0
+    i32 y = 0
+    i32 w = 0
+    i32 h = 0
+
+pub struct PaintCtx
+    i32 x = 0
+    i32 y = 0
+    i32 w = 0
+    i32 h = 0
+    Theme th
+    i64 id = 0
+    i32 depth = 0        // 已压入的裁剪层数（pop_clips 用）
+
+    fn Rect area()
+        return Rect(x=self.x, y=self.y, w=self.w, h=self.h)
+
+    fn void push_clip(let i32 cx, let i32 cy, let i32 cw, let i32 ch)
+        gui_push_clip(cx, cy, cw, ch)
+        self.depth = self.depth + 1
+
+    fn void pop_clips()
+        let i32 i = 0
+        while i < self.depth
+            gui_pop_clip()
+            i++
+        self.depth = 0
+
+    // 填充矩形
+    fn void fill(let i32 x, let i32 y, let i32 w, let i32 h, let u32 color)
+        if w > 0 and h > 0
+            gui_fill_rect(x, y, w, h, color)
+
+    // 圆角面 + 描边
+    fn void frame(let i32 x, let i32 y, let i32 w, let i32 h, let u32 fillc, let u32 borderc, let i32 radius)
+        if w > 0 and h > 0
+            gui_round_rect(x, y, w, h, radius, fillc, borderc)
+
+    // 任意宽度描边（默认主题描边宽）
+    fn void border(let i32 x, let i32 y, let i32 w, let i32 h, let u32 color)
+        gui_stroke_rect(x, y, w, h, color, self.th.strokeWidth)
+
+    // 文本（RTL 感知右对齐；绘制后恢复主题基准字号）
+    fn void draw_text(let i32 x, let i32 y, let i32 w, let string s, let u32 color, let i32 fs, let i32 bold)
+        gui_font(fs, bold)
+        let i32 tw = gui_text_w(s)
+        gui_draw_text(text_x(x, w, tw), y, s, color)
+        gui_font(self.th.fontSizeBase, 0)
+
+    // 焦点环：主题 focusWidth + borderFocus
+    fn void focus_ring(let i32 x, let i32 y, let i32 w, let i32 h)
+        let i32 fw = self.th.focusWidth
+        gui_stroke_rect(x - fw, y - fw, w + 2 * fw, h + 2 * fw, self.th.borderFocus, fw)
+
+// ===== 无障碍语义 =====
+// 角色常量（对齐常见 AT 语义角色）
+pub let i32 const ROLE_NONE = 0
+pub let i32 const ROLE_BUTTON = 1
+pub let i32 const ROLE_CHECKBOX = 2
+pub let i32 const ROLE_RADIO = 3
+pub let i32 const ROLE_SLIDER = 4
+pub let i32 const ROLE_EDIT = 5
+pub let i32 const ROLE_LIST = 6
+pub let i32 const ROLE_TABLE = 7
+pub let i32 const ROLE_TAB = 8
+pub let i32 const ROLE_GROUP = 9
+pub let i32 const ROLE_IMAGE = 10
+pub let i32 const ROLE_TEXT = 11
+pub let i32 const ROLE_PROGRESS = 12
+pub let i32 const ROLE_WINDOW = 13
+
+// 状态位集
+pub let i32 const A11Y_DISABLED = 1
+pub let i32 const A11Y_FOCUSED = 2
+pub let i32 const A11Y_CHECKED = 4
+pub let i32 const A11Y_EXPANDED = 8
+pub let i32 const A11Y_SELECTED = 16
+pub let i32 const A11Y_HOT = 32
+pub let i32 const A11Y_PRESSED = 64
+
+pub struct A11yNode
+    i64 id = 0
+    string name = ""
+    i32 role = 0
+    string value = ""
+    i32 states = 0
+    i32 x = 0
+    i32 y = 0
+    i32 w = 0
+    i32 h = 0
+
+// 当前帧的无障碍快照（App.step 每帧 a11y_begin 后重填）
+// 直接使用模块级全局列表（避免对全局聚合值整体 copy——那会释放野指针）
+let A11yNode[] g_a11y_nodes
+
+pub fn void a11y_begin()
+    g_a11y_nodes = g_a11y_nodes[0, -1]
+
+pub fn void a11y_add(let i64 id, let string name, let i32 role, let string value, let i32 states,
+                     let i32 x, let i32 y, let i32 w, let i32 h)
+    g_a11y_nodes = push(g_a11y_nodes, A11yNode(id=id, name=name, role=role, value=value,
+                                               states=states, x=x, y=y, w=w, h=h))
+
+pub fn i32 a11y_count()
+    return length(g_a11y_nodes)
+
+pub fn A11yNode a11y_get(let i32 i)
+    if i < 0 or i >= length(g_a11y_nodes)
+        return A11yNode()
+    return copy(g_a11y_nodes[i])
+
+// 命中测试：返回节点下标，-1=未命中
+pub fn i32 a11y_hit(let i32 x, let i32 y)
+    let i32 i = 0
+    while i < length(g_a11y_nodes)
+        if rect_hit(Rect(x=g_a11y_nodes[i].x, y=g_a11y_nodes[i].y,
+                         w=g_a11y_nodes[i].w, h=g_a11y_nodes[i].h), x, y)
+            return i
+        i++
+    return -1
+
+pub fn i32 a11y_find(let i64 id)
+    let i32 i = 0
+    while i < length(g_a11y_nodes)
+        if g_a11y_nodes[i].id == id
+            return i
+        i++
+    return -1
+
+pub fn bool a11y_has_state(let i32 i, let i32 bit)
+    if i < 0 or i >= length(g_a11y_nodes)
+        return false
+    return (g_a11y_nodes[i].states & bit) != 0
+
+pub fn string role_name(let i32 role)
+    if role == ROLE_BUTTON
+        return "button"
+    if role == ROLE_CHECKBOX
+        return "checkbox"
+    if role == ROLE_RADIO
+        return "radio"
+    if role == ROLE_SLIDER
+        return "slider"
+    if role == ROLE_EDIT
+        return "edit"
+    if role == ROLE_LIST
+        return "list"
+    if role == ROLE_TABLE
+        return "table"
+    if role == ROLE_TAB
+        return "tab"
+    if role == ROLE_GROUP
+        return "group"
+    if role == ROLE_IMAGE
+        return "image"
+    if role == ROLE_TEXT
+        return "text"
+    if role == ROLE_PROGRESS
+        return "progress"
+    if role == ROLE_WINDOW
+        return "window"
+    return "none"
+
+// kind 字符串 → 角色（ui 语句与插件注册用）
+pub fn i32 role_of_name(let string k)
+    if k == "button" or k == "iconbutton"
+        return ROLE_BUTTON
+    if k == "check" or k == "checkbox"
+        return ROLE_CHECKBOX
+    if k == "radio" or k == "radiogroup" or k == "toggle"
+        return ROLE_RADIO
+    if k == "slider" or k == "spin"
+        return ROLE_SLIDER
+    if k == "input" or k == "textbox"
+        return ROLE_EDIT
+    if k == "list" or k == "combo" or k == "tree" or k == "menu"
+        return ROLE_LIST
+    if k == "table"
+        return ROLE_TABLE
+    if k == "tab" or k == "tabbar" or k == "accordion"
+        return ROLE_TAB
+    if k == "label"
+        return ROLE_TEXT
+    if k == "image"
+        return ROLE_IMAGE
+    if k == "progress" or k == "spinner"
+        return ROLE_PROGRESS
+    return ROLE_GROUP
+
+// ===== 焦点链（全局索引，Tab 自动流转） =====
+// 全局列表 + 标量下标（不用全局聚合 struct 的 copy，避免释放野指针）
+let i64[] g_focus_ids
+let i32 g_focus_idx = -1
+
+pub fn void focus_clear()
+    g_focus_ids = g_focus_ids[0, -1]
+    g_focus_idx = -1
+
+pub fn void focus_register(let i64 id)
+    if id == 0
+        return
+    let i32 i = 0
+    while i < length(g_focus_ids)
+        if g_focus_ids[i] == id
+            return
+        i++
+    g_focus_ids = push(g_focus_ids, id)
+    if g_focus_idx < 0
+        g_focus_idx = 0
+
+pub fn void focus_unregister(let i64 id)
+    let i64 cur = focus_get()
+    let i64[] out
+    let i32 i = 0
+    while i < length(g_focus_ids)
+        if g_focus_ids[i] != id
+            out = push(out, g_focus_ids[i])
+        i++
+    g_focus_ids = move out
+    if length(g_focus_ids) == 0
+        g_focus_idx = -1
+    else
+        if cur != 0 and cur != id
+            let i32 j = 0
+            let i32 ni = -1
+            while j < length(g_focus_ids)
+                if g_focus_ids[j] == cur
+                    ni = j
+                j++
+            if ni >= 0
+                g_focus_idx = ni
+            else
+                g_focus_idx = 0
+        else
+            g_focus_idx = 0
+
+pub fn void focus_set(let i64 id)
+    let i32 i = 0
+    let i32 hit = -1
+    while i < length(g_focus_ids)
+        if g_focus_ids[i] == id
+            hit = i
+        i++
+    if id == 0
+        g_focus_idx = -1
+    else
+        if hit >= 0
+            g_focus_idx = hit
+    // 未注册的 id 忽略（不制造悬空焦点）
+
+pub fn i64 focus_get()
+    if g_focus_idx < 0 or g_focus_idx >= length(g_focus_ids)
+        return 0
+    return g_focus_ids[g_focus_idx]
+
+pub fn bool focus_has(let i64 id)
+    return id != 0 and focus_get() == id
+
+pub fn i32 focus_count()
+    return length(g_focus_ids)
+
+pub fn bool focus_next()
+    let i32 n = cast(length(g_focus_ids), i32)
+    if n == 0
+        return false
+    let i32 next = g_focus_idx + 1
+    if next >= n
+        next = 0
+    g_focus_idx = next
+    return true
+
+pub fn bool focus_prev()
+    let i32 n = cast(length(g_focus_ids), i32)
+    if n == 0
+        return false
+    let i32 prev = g_focus_idx - 1
+    if prev < 0
+        prev = n - 1
+    g_focus_idx = prev
+    return true
+
+// Tab / Shift+Tab：命中返回 true（App.step 在组件派发之前调用）
+pub fn bool handle_tab_key(let i64 k)
+    if k == KEY_EXT + 0x09 + KEY_SHIFT or k == KEY_SHIFT + 0x09
+        let bool ok1 = focus_prev()
+        return true
+    if k == KEY_EXT + 0x09 or k == 9
+        let bool ok2 = focus_next()
+        return true
+    return false
+
+// 焦点环（theme.focusWidth + borderFocus 令牌）：内置组件与旧组件统一入口
+pub fn void draw_focus_ring(let Theme th, let i64 id, let i32 x, let i32 y, let i32 w, let i32 h)
+    if id != 0 and focus_has(id)
+        let i32 fw = th.focusWidth
+        gui_stroke_rect(x - fw, y - fw, w + 2 * fw, h + 2 * fw, th.borderFocus, fw)
+
+// ===== 插件式组件注册表 =====
+// 自定义组件只需实现本接口并 register_widget，容器/`ui` 语句按 kind_id 查表
+// 调用 measure/paint/on_event，无需修改 stdlib。
+pub interface WidgetKind
+    fn i32 kind_id()
+    fn i32 measure(let Rect avail)
+    fn void paint(let PaintCtx c)
+    fn bool on_event(let Event e)
+    fn string a11y_name()
+    fn string a11y_role()
+    fn string a11y_value()
+
+// 接口值不能直接作 struct 字段（编译器限制），但可放进泛型 struct 的
+// 类型参数位（§27「接口作泛型实参」），故实现体一律装在 WidgetSlot<T> 里。
+pub struct WidgetSlot<T>
+    T v
+
+// 空实现哨兵：查表未命中时返回它（各方法都是安全空操作，不会崩）
+pub struct NullKind
+    fn i32 kind_id()
+        return 0
+
+    fn i32 measure(let Rect avail)
+        return 0
+
+    fn void paint(let PaintCtx c)
+        return
+
+    fn bool on_event(let Event e)
+        return false
+
+    fn string a11y_name()
+        return ""
+
+    fn string a11y_role()
+        return ""
+
+    fn string a11y_value()
+        return ""
+
+pub struct KindEntry
+    i32 id = 0
+    string name = ""
+    i32 slot = -1        // 对应 g_kind_impls 列表下标
+
+// 注册表（按 kind_id 索引；重复注册覆盖旧实现并告警）。
+// 直接使用模块级全局列表（v4 起模块顶层允许 let 全局列表）。
+// entries 与 impls 平行：第 k 条注册的实现体存在 g_kind_impls[k]，
+// 因此重新注册/删除后需要重建两张表（见 unregister_widget）。
+let KindEntry[] g_kind_entries
+let WidgetSlot<WidgetKind>[] g_kind_impls
+
+pub fn void register_widget_named(let string name, let WidgetKind k)
+    let i32 kid = k.kind_id()
+    let i32 i = 0
+    while i < length(g_kind_entries)
+        if g_kind_entries[i].id == kid
+            // 重复注册：覆盖旧实现（保留原槽位，先告警）
+            output("[widget] duplicate kind ", kid, " replaced\n")
+            let i32 sl = g_kind_entries[i].slot
+            if sl >= 0 and sl < length(g_kind_impls)
+                g_kind_impls[sl] = WidgetSlot(v=copy(k))
+            if length(name) > 0
+                g_kind_entries[i].name = name
+            return
+        i++
+    let i32 ni = length(g_kind_entries)
+    g_kind_impls = push(g_kind_impls, WidgetSlot(v=copy(k)))
+    g_kind_entries = push(g_kind_entries, KindEntry(id=kid, name=name, slot=ni))
+
+pub fn void register_widget(let WidgetKind k)
+    register_widget_named("", k)
+
+pub fn void unregister_widget(let i32 kid)
+    let KindEntry[] ne
+    let WidgetSlot<WidgetKind>[] ni
+    let i32 i = 0
+    while i < length(g_kind_entries)
+        if g_kind_entries[i].id != kid
+            let i32 sl = g_kind_entries[i].slot
+            ne = push(ne, KindEntry(id=g_kind_entries[i].id, name=g_kind_entries[i].name,
+                                    slot=length(ne)))
+            if sl >= 0 and sl < length(g_kind_impls)
+                ni = push(ni, copy(g_kind_impls[sl]))
+        i++
+    g_kind_entries = move ne
+    g_kind_impls = move ni
+
+// 查表：未命中返回空槽（配合 has_widget 判定，勿直接调用其 v 的方法）
+pub fn WidgetSlot<WidgetKind> find_widget(let i32 kid)
+    let i32 i = 0
+    while i < length(g_kind_entries)
+        if g_kind_entries[i].id == kid
+            let i32 sl = g_kind_entries[i].slot
+            if sl >= 0 and sl < length(g_kind_impls)
+                return copy(g_kind_impls[sl])
+        i++
+    let WidgetSlot<WidgetKind> empty = WidgetSlot(v=WidgetKind(NullKind()))
+    return move empty
+
+pub fn bool has_widget(let i32 kid)
+    let i32 i = 0
+    while i < length(g_kind_entries)
+        if g_kind_entries[i].id == kid
+            return true
+        i++
+    return false
+
+pub fn i32 kind_count()
+    return length(g_kind_entries)
+
+// kind 名字 → id（未注册返回 -1）
+pub fn i32 kind_id_of_name(let string name)
+    let i32 i = 0
+    while i < length(g_kind_entries)
+        if g_kind_entries[i].name == name and length(name) > 0
+            return g_kind_entries[i].id
+        i++
+    return -1
+
+pub fn string kind_name_at(let i32 i)
+    if i < 0 or i >= length(g_kind_entries)
+        return ""
+    return g_kind_entries[i].name
+
+pub fn i32 kind_id_at(let i32 i)
+    if i < 0 or i >= length(g_kind_entries)
+        return -1
+    return g_kind_entries[i].id
+
+pub fn void kinds_clear()
+    g_kind_entries = g_kind_entries[0, -1]
+    g_kind_impls = g_kind_impls[0, -1]
+
+// ===== 插件组件宿主：容器只需持有 PluginHost =====
+pub struct PluginNode
+    i64 id = 0
+    i32 kind = 0
+    i32 x = 0
+    i32 y = 0
+    i32 w = 0
+    i32 h = 0
+    string name = ""
+    bool visible = true
+    bool dirty = true
+
+pub struct PluginHost
+    PluginNode[] nodes
+
+    // 添加插件组件实例（自动分配组件 id，注册进焦点链）
+    fn void add(let i32 kind, let i32 x, let i32 y, let i32 w, let i32 h, let string name)
+        let i64 nid = next_widget_id()
+        self.nodes = push(self.nodes, PluginNode(id=nid, kind=kind, x=x, y=y, w=w, h=h, name=name))
+        focus_register(nid)
+
+    fn void clear()
+        let i32 i = 0
+        while i < length(self.nodes)
+            focus_unregister(self.nodes[i].id)
+            i++
+        self.nodes = self.nodes[0, -1]
+
+    fn i32 hit_node(let i32 mx, let i32 my)
+        let i32 i = 0
+        while i < length(self.nodes)
+            if self.nodes[i].visible
+                if mx >= self.nodes[i].x and mx < self.nodes[i].x + self.nodes[i].w
+                    if my >= self.nodes[i].y and my < self.nodes[i].y + self.nodes[i].h
+                        return i
+            i++
+        return -1
+
+    // 绘制脏的插件实例（插件 paint 只做自绘，位置/裁剪由宿主给）
+    fn bool paint_all()
+        let bool painted = false
+        let i32 i = 0
+        while i < length(self.nodes)
+            let PluginNode nd = copy(self.nodes[i])
+            if nd.visible and nd.dirty and has_widget(nd.kind)
+                let WidgetSlot<WidgetKind> hk = find_widget(nd.kind)
+                let WidgetKind k = copy(hk.v)
+                let Theme th = theme_for(nd.id)
+                let PaintCtx c = PaintCtx(x=nd.x, y=nd.y, w=nd.w, h=nd.h, th=th, id=nd.id)
+                c.push_clip(nd.x, nd.y, nd.w, nd.h)
+                k.paint(c)
+                c.pop_clips()
+                self.nodes[i].dirty = false
+                painted = true
+            i++
+        return painted
+
+    // 无障碍快照：每帧由 App 调用（与是否重绘无关，保证快照完整）
+    fn void publish_a11y()
+        let i32 i = 0
+        while i < length(self.nodes)
+            let PluginNode nd = copy(self.nodes[i])
+            if nd.visible and has_widget(nd.kind)
+                let WidgetSlot<WidgetKind> hk = find_widget(nd.kind)
+                let WidgetKind k = copy(hk.v)
+                let i32 states = 0
+                if focus_has(nd.id)
+                    states = states | A11Y_FOCUSED
+                a11y_add(nd.id, k.a11y_name(), role_of_name(k.a11y_role()), k.a11y_value(),
+                         states, nd.x, nd.y, nd.w, nd.h)
+            i++
+
+    // 事件派发：命中节点交给插件 on_event，true=已消费
+    fn bool dispatch(let Event e)
+        let i32 hi = self.hit_node(cast(e.x, i32), cast(e.y, i32))
+        if hi < 0
+            return false
+        if not has_widget(self.nodes[hi].kind)
+            return false
+        let WidgetSlot<WidgetKind> hk = find_widget(self.nodes[hi].kind)
+        let WidgetKind k = copy(hk.v)
+        let bool used = k.on_event(e)
+        if used
+            self.nodes[hi].dirty = true
+        return used
+
+// ===== 组件 id 分配 =====
+let i64 g_next_wid = 1000
+
+pub fn i64 next_widget_id()
+    g_next_wid = g_next_wid + 1
+    return g_next_wid
+
+pub fn void reset_widget_ids()
+    g_next_wid = 1000
+
+// ==========================================================================
+// L2 v4 组件库二期：统一组件模型 Comp（29 种内置组件）
+// --------------------------------------------------------------------------
+// 每个组件 = 一条 Comp 记录（kind + 几何 + 通用状态字段），绘制/事件/测量/
+// 无障碍都按 kind 分派到同一组助手（measure/layout/paint/hit 四类复用），
+// 容器只需持有一个 Comp[] 即可容纳全部内置组件（无需为每种组件维护一个
+// 类型数组）。Compose 语义：组件可独立使用（各自 draw/on_event），也可交给
+// App.add_comp 后由 App.step 统一派发事件、刷新无障碍快照。
+// ==========================================================================
+
+pub let i32 const COMP_NONE = 0
+pub let i32 const COMP_RADIO = 1          // 单选按钮
+pub let i32 const COMP_RADIOGROUP = 2     // 单选组（items + sel）
+pub let i32 const COMP_TOGGLE = 3         // 开关
+pub let i32 const COMP_TEXTBOX = 4        // 文本框（多行/占位/只读/密码）
+pub let i32 const COMP_SPINBOX = 5        // 数字步进框
+pub let i32 const COMP_COMBO = 6          // 下拉框
+pub let i32 const COMP_MULTILIST = 7      // 多选列表
+pub let i32 const COMP_TREE = 8           // 树（折叠/展开）
+pub let i32 const COMP_TABLE = 9          // 表格（表头 + 列宽）
+pub let i32 const COMP_TABBAR = 10        // 标签栏
+pub let i32 const COMP_PANEL = 11         // 面板容器（垂直/水平/网格）
+pub let i32 const COMP_CARD = 12          // 卡片容器
+pub let i32 const COMP_SPLITTER = 13      // 可拖拽分隔条
+pub let i32 const COMP_SCROLLVIEW = 14    // 滚动视图（滚动条 + 滚轮）
+pub let i32 const COMP_MODAL = 15         // 模态浮层
+pub let i32 const COMP_TOOLTIP = 16       // 气泡提示
+pub let i32 const COMP_POPUP = 17         // 弹出菜单/浮层
+pub let i32 const COMP_PROGRESS = 18      // 进度条（确定/不确定）
+pub let i32 const COMP_SPINNER = 19       // 旋转指示器
+pub let i32 const COMP_BADGE = 20         // 徽标
+pub let i32 const COMP_TOAST = 21         // 轻提示
+pub let i32 const COMP_ALERT = 22         // 警示条
+pub let i32 const COMP_ICONBUTTON = 23    // 图标按钮
+pub let i32 const COMP_IMAGE = 24         // 位图（Direct2D）
+pub let i32 const COMP_SEPARATOR = 25     // 分隔线
+pub let i32 const COMP_TOOLBAR = 26       // 工具栏（items 为一组按钮）
+pub let i32 const COMP_BREADCRUMB = 27    // 面包屑
+pub let i32 const COMP_ACCORDION = 28     // 折叠面板
+
+// kind 字符串 → Comp 类型（ui 语句 / 容器按名建组件用）
+pub fn i32 comp_kind_of(let string k)
+    if k == "radio"
+        return COMP_RADIO
+    if k == "radiogroup" or k == "radio_group"
+        return COMP_RADIOGROUP
+    if k == "toggle" or k == "switch"
+        return COMP_TOGGLE
+    if k == "textbox" or k == "text_box"
+        return COMP_TEXTBOX
+    if k == "spin" or k == "spinbox"
+        return COMP_SPINBOX
+    if k == "combo" or k == "combobox" or k == "select"
+        return COMP_COMBO
+    if k == "multilist" or k == "listbox"
+        return COMP_MULTILIST
+    if k == "tree" or k == "treeview"
+        return COMP_TREE
+    if k == "table"
+        return COMP_TABLE
+    if k == "tabbar" or k == "tabs"
+        return COMP_TABBAR
+    if k == "panel"
+        return COMP_PANEL
+    if k == "card"
+        return COMP_CARD
+    if k == "splitter"
+        return COMP_SPLITTER
+    if k == "scroll" or k == "scrollview"
+        return COMP_SCROLLVIEW
+    if k == "modal"
+        return COMP_MODAL
+    if k == "tooltip"
+        return COMP_TOOLTIP
+    if k == "popup"
+        return COMP_POPUP
+    if k == "progress2" or k == "progressbar"
+        return COMP_PROGRESS
+    if k == "spinner"
+        return COMP_SPINNER
+    if k == "badge"
+        return COMP_BADGE
+    if k == "toast"
+        return COMP_TOAST
+    if k == "alert"
+        return COMP_ALERT
+    if k == "iconbutton" or k == "icon_button"
+        return COMP_ICONBUTTON
+    if k == "image"
+        return COMP_IMAGE
+    if k == "separator"
+        return COMP_SEPARATOR
+    if k == "toolbar"
+        return COMP_TOOLBAR
+    if k == "breadcrumb"
+        return COMP_BREADCRUMB
+    if k == "accordion"
+        return COMP_ACCORDION
+    return COMP_NONE
+
+// Comp 类型 → a11y 角色
+pub fn i32 comp_role(let i32 kind)
+    if kind == COMP_RADIO or kind == COMP_TOGGLE or kind == COMP_RADIOGROUP
+        return ROLE_RADIO
+    if kind == COMP_TEXTBOX
+        return ROLE_EDIT
+    if kind == COMP_SPINBOX or kind == COMP_SPLITTER or kind == COMP_PROGRESS or kind == COMP_SPINNER
+        return ROLE_SLIDER
+    if kind == COMP_COMBO or kind == COMP_MULTILIST or kind == COMP_TREE or kind == COMP_POPUP
+        return ROLE_LIST
+    if kind == COMP_TABLE
+        return ROLE_TABLE
+    if kind == COMP_TABBAR or kind == COMP_ACCORDION
+        return ROLE_TAB
+    if kind == COMP_BADGE or kind == COMP_TOAST or kind == COMP_ALERT or kind == COMP_TOOLTIP
+        return ROLE_TEXT
+    if kind == COMP_IMAGE
+        return ROLE_IMAGE
+    if kind == COMP_ICONBUTTON
+        return ROLE_BUTTON
+    return ROLE_GROUP
+
+// 是否进入焦点链（纯展示类组件不占 Tab 位）
+pub fn bool comp_focusable(let i32 kind)
+    if kind == COMP_PANEL or kind == COMP_CARD or kind == COMP_TOOLTIP
+        return false
+    if kind == COMP_PROGRESS or kind == COMP_SPINNER or kind == COMP_BADGE
+        return false
+    if kind == COMP_IMAGE or kind == COMP_SEPARATOR
+        return false
+    return true
+
+// ===== 统一组件记录 =====
+pub struct Comp
+    i64 id = 0
+    i32 kind = 0
+    i32 x = 0
+    i32 y = 0
+    i32 w = 0
+    i32 h = 0
+    // 文本与条目
+    string text = ""
+    string ph = ""
+    string[] items
+    string[] rows
+    i32[] nums            // 多选集合 / 树展开集合 / 网格列宽
+    // 数值状态
+    i32 value = 0
+    i32 value2 = 0
+    i32 sel = -1
+    i32 top = 0
+    i32 cols = 1
+    i32 gap = 0
+    i32 pad = 0
+    i32 dir = 0
+    u32 color = 0
+    i64 hdl = 0           // 位图句柄（COMP_IMAGE）
+    // 交互状态
+    bool checked = false
+    bool visible = true
+    bool enable = true
+    bool hot = false
+    bool pressed = false
+    bool focus = false
+    bool dirty = true
+    bool flag1 = false    // 语义位：文本框密码/只读、进度不确定、Toast 计时
+    bool flag2 = false    // 语义位：文本框多行、下拉展开、折叠面板展开
+    i32 clicks = 0
+
+    fn Rect rect()
+        return Rect(x=self.x, y=self.y, w=self.w, h=self.h)
+
+    fn bool hit(let i32 mx, let i32 my)
+        if not self.visible
+            return false
+        return mx >= self.x and mx < self.x + self.w and my >= self.y and my < self.y + self.h
+
+    fn bool has_focus()
+        return focus_has(self.id)
+
+    // 组件默认高（未显式给 h 时）
+    fn i32 default_h()
+        let i32 u = SC()
+        if self.kind == COMP_TABLE
+            return LH() + (length(self.rows) + 1) * LH() + 8 * u / 100
+        if self.kind == COMP_TREE
+            let i32 n = length(self.items)
+            if n <= 0
+                n = 1
+            return n * LH() + 8 * u / 100
+        if self.kind == COMP_SEPARATOR
+            return self.value
+        if self.kind == COMP_PROGRESS or self.kind == COMP_SPINNER
+            return 8 * u / 100
+        if self.kind == COMP_BADGE
+            return LH()
+        if self.kind == COMP_ACCORDION
+            if self.flag2
+                return LH() * 2 + 8 * u / 100
+            return LH() + 8 * u / 100
+        return LH() + 12 * u / 100
+
+    // 测量（measure）：容器按返回高排布子项
+    fn i32 measure(let Rect avail)
+        if self.h > 0
+            return self.h
+        return self.default_h()
+
+    // 组件内的行命中（列表类返回 0..n-1，未命中 -1）
+    fn i32 row_at(let i32 my)
+        let i32 pad = self.pad
+        if pad <= 0
+            pad = 4 * SC() / 100
+        let i32 top = self.y + pad
+        let i32 n = length(self.items)
+        let i32 i = 0
+        while i < n
+            let i32 ry = top + (i - self.top) * LH()
+            if my >= ry and my < ry + LH()
+                return i
+            i++
+        return -1
+
+    // 表格行命中（含表头）
+    fn i32 table_row_at(let i32 my)
+        let i32 u = SC()
+        let i32 hy = self.y + 4 * u / 100 + LH()
+        if my < hy
+            return -1
+        let i32 r = (my - hy) / LH()
+        if r >= length(self.rows)
+            return -1
+        return r
+
+    // 树：第 i 行是否可见（所有祖先均展开）
+    fn bool tree_visible_row(let i32 i)
+        let i32 d = self.tree_depth(i)
+        if d <= 0
+            return true
+        let i32 j = i - 1
+        let i32 need = d - 1
+        while j >= 0
+            let i32 dj = self.tree_depth(j)
+            if dj <= need
+                if not self.tree_expanded(j)
+                    return false
+                need = dj - 1
+                if need < 0
+                    return true
+            j--
+        return true
+
+    // 树行缩进深度（item 前置空格数 / 2）
+    fn i32 tree_depth(let i32 i)
+        if i < 0 or i >= length(self.items)
+            return 0
+        let string s = self.items[i]
+        let i32 k = 0
+        while k < length(s)
+            if s[k] != ' '
+                break
+            k++
+        return k / 2
+
+    fn bool tree_expanded(let i32 i)
+        let i32 k = 0
+        while k < length(self.nums)
+            if self.nums[k] == i
+                return true
+            k++
+        return false
+
+    fn void tree_toggle(let i32 i)
+        let i32 k = 0
+        let i32 hit_i = -1
+        while k < length(self.nums)
+            if self.nums[k] == i
+                hit_i = k
+            k++
+        if hit_i >= 0
+            let i32[] out
+            let i32 j = 0
+            while j < length(self.nums)
+                if j != hit_i
+                    out = push(out, self.nums[j])
+                j++
+            self.nums = out
+            return
+        self.nums = push(self.nums, i)
+
+    // 多选集合：是否选中
+    fn bool multi_selected(let i32 i)
+        let i32 k = 0
+        while k < length(self.nums)
+            if self.nums[k] == i
+                return true
+            k++
+        return false
+
+    fn void multi_toggle(let i32 i)
+        let i32 k = 0
+        let i32 hit_i = -1
+        while k < length(self.nums)
+            if self.nums[k] == i
+                hit_i = k
+            k++
+        if hit_i >= 0
+            let i32[] out
+            let i32 j = 0
+            while j < length(self.nums)
+                if j != hit_i
+                    out = push(out, self.nums[j])
+                j++
+            self.nums = out
+            return
+        self.nums = push(self.nums, i)
+
+    // ===== 绘制 =====
+    fn void draw()
+        if not self.visible
+            return
+        let Theme th = theme_for(self.id)
+        let i32 k = self.kind
+        if k == COMP_RADIO
+            self.draw_radio(th)
+        if k == COMP_RADIOGROUP
+            self.draw_radiogroup(th)
+        if k == COMP_TOGGLE
+            self.draw_toggle(th)
+        if k == COMP_TEXTBOX
+            self.draw_textbox(th)
+        if k == COMP_SPINBOX
+            self.draw_spinbox(th)
+        if k == COMP_COMBO
+            self.draw_combo(th)
+        if k == COMP_MULTILIST or k == COMP_TREE
+            self.draw_listbox(th)
+        if k == COMP_TABLE
+            self.draw_table(th)
+        if k == COMP_TABBAR
+            self.draw_tabbar(th)
+        if k == COMP_PANEL or k == COMP_CARD or k == COMP_SCROLLVIEW
+            self.draw_container(th)
+        if k == COMP_SPLITTER
+            self.draw_splitter(th)
+        if k == COMP_MODAL
+            self.draw_modal(th)
+        if k == COMP_TOOLTIP
+            self.draw_tooltip(th)
+        if k == COMP_POPUP
+            self.draw_popup(th)
+        if k == COMP_PROGRESS
+            self.draw_progress(th)
+        if k == COMP_SPINNER
+            self.draw_spinner(th)
+        if k == COMP_BADGE
+            self.draw_badge(th)
+        if k == COMP_TOAST
+            self.draw_toast(th)
+        if k == COMP_ALERT
+            self.draw_alert(th)
+        if k == COMP_ICONBUTTON
+            self.draw_iconbutton(th)
+        if k == COMP_IMAGE
+            self.draw_image(th)
+        if k == COMP_SEPARATOR
+            self.draw_separator(th)
+        if k == COMP_TOOLBAR
+            self.draw_toolbar(th)
+        if k == COMP_BREADCRUMB
+            self.draw_breadcrumb(th)
+        if k == COMP_ACCORDION
+            self.draw_accordion(th)
+        // 焦点环（主题 focusWidth + borderFocus 令牌）
+        if self.has_focus() and self.enable
+            let i32 fw = th.focusWidth
+            gui_stroke_rect(self.x - fw, self.y - fw, self.w + 2 * fw, self.h + 2 * fw,
+                            th.borderFocus, fw)
+        self.dirty = false
+
+    // 行背景色（选中/悬停）
+    fn u32 row_bg(let Theme th, let i32 i)
+        if self.multi_selected(i) or self.sel == i
+            return th.accentPressed
+        if self.hot and self.row_at_pt() == i
+            return th.surfaceAlt
+        return th.surface
+
+    // 当前悬停行（-1=未悬停）
+    fn i32 row_at_pt()
+        return self.row_at(g_hover_y)
+
+    // 单选按钮
+    fn void draw_radio(let Theme th)
+        let i32 u = SC()
+        let i32 d = 14 * u / 100
+        let i32 cy = self.y + self.h / 2
+        let i32 cx = rtl_x(self.x, self.w, self.x, self.w) + d / 2
+        gui_stroke_circle(cx, cy, d / 2, th.border, th.strokeWidth)
+        if self.checked
+            let i32 r = d / 2 - 4 * u / 100
+            if r > 0
+                gui_fill_circle(cx, cy, r, th.accent)
+        let u32 tc = th.text
+        if not self.enable
+            tc = th.disabled
+        let i32 lw = self.w - d - 8 * u / 100
+        let i32 tw = gui_text_w(self.text)
+        gui_font(th.fontSizeBase, 0)
+        gui_draw_text(text_x(self.x + d + 6 * u / 100, lw, tw), self.y + (self.h - LH()) / 2,
+                      self.text, tc)
+        gui_font(th.fontSizeBase, 0)
+
+    // 单选组：items 每行一个选项，sel 为选中下标
+    fn void draw_radiogroup(let Theme th)
+        let i32 u = SC()
+        let i32 i = 0
+        while i < length(self.items)
+            let i32 d2 = 14 * u / 100
+            let i32 ry = self.y + i * LH()
+            let i32 cx = self.x + d2 / 2
+            gui_stroke_circle(cx, ry + LH() / 2, d2 / 2, th.border, th.strokeWidth)
+            if self.sel == i
+                let i32 r = d2 / 2 - 4 * u / 100
+                if r > 0
+                    gui_fill_circle(cx, ry + LH() / 2, r, th.accent)
+            let u32 tc = th.text
+            if not self.enable
+                tc = th.disabled
+            gui_font(th.fontSizeBase, 0)
+            let i32 tw = gui_text_w(self.items[i])
+            gui_draw_text(text_x(self.x + d2 + 6 * u / 100, self.w - d2 - 6 * u / 100, tw),
+                          ry + 1 * u / 100, self.items[i], tc)
+            i++
+
+    // 开关
+    fn void draw_toggle(let Theme th)
+        let i32 u = SC()
+        let i32 tw = 40 * u / 100
+        let i32 tht = 20 * u / 100
+        let i32 ty = self.y + (self.h - tht) / 2
+        let u32 track = th.surfaceAlt
+        if self.checked
+            track = th.accent
+        if not self.enable
+            track = th.surface
+        gui_round_rect(self.x, ty, tw, tht, tht / 2, track, th.border)
+        let i32 kx = self.x + tht / 2 + 2 * u / 100
+        if self.checked
+            kx = self.x + tw - tht / 2 - 2 * u / 100
+        gui_fill_circle(kx, ty + tht / 2, tht / 2 - 2 * u / 100, th.text)
+        let u32 tc = th.text
+        if not self.enable
+            tc = th.disabled
+        gui_font(th.fontSizeBase, 0)
+        let i32 lw = self.w - tw - 8 * u / 100
+        let i32 ltw = gui_text_w(self.text)
+        gui_draw_text(text_x(self.x + tw + 8 * u / 100, lw, ltw), self.y + (self.h - LH()) / 2,
+                      self.text, tc)
+
+    // 文本框：flag2=多行，flag1=密码，value2=只读（1）/ 光标位置复用 value
+    fn void draw_textbox(let Theme th)
+        let i32 u = SC()
+        let u32 face = th.surface
+        if not self.enable
+            face = th.bg
+        gui_round_rect(self.x, self.y, self.w, self.h, th.radiusSm * u / 100, face, th.border)
+        let string shown = self.text
+        if self.flag1
+            shown = mask_text(self.text)
+        let bool empty = length(shown) == 0
+        let u32 tc = th.text
+        if empty
+            tc = th.textMuted
+        if not self.enable
+            tc = th.disabled
+        gui_push_clip(self.x + 1, self.y + 1, self.w - 2, self.h - 2)
+        if empty and length(self.ph) > 0
+            shown = self.ph
+        if self.flag2
+            let i32 n = line_count(shown)
+            let i32 i = 0
+            while i < self.h - 2 and i < n
+                gui_font(th.fontSizeBase, 0)
+                gui_draw_text(self.x + 8 * u / 100, self.y + 4 * u / 100 + i * LH(),
+                              line_at(shown, i), tc)
+                i++
+        else
+            gui_font(th.fontSizeBase, 0)
+            gui_draw_text(self.x + 8 * u / 100, self.y + (self.h - LH()) / 2, shown, tc)
+        gui_pop_clip()
+        // 只读标记：右下角小锁形虚线
+        if self.value2 == 1
+            gui_fill_rect(self.x + self.w - 8 * u / 100, self.y + self.h - 6 * u / 100,
+                          4 * u / 100, 3 * u / 100, th.textMuted)
+
+    // 数字步进框：左 [-] 右 [+]
+    fn void draw_spinbox(let Theme th)
+        let i32 u = SC()
+        let i32 bw = 20 * u / 100
+        gui_round_rect(self.x, self.y, self.w, self.h, th.radiusSm * u / 100, th.surface, th.border)
+        gui_fill_rect(self.x + 1, self.y + 1, bw - 1, self.h - 2, th.surfaceAlt)
+        gui_fill_rect(self.x + self.w - bw, self.y + 1, bw - 1, self.h - 2, th.surfaceAlt)
+        gui_font(th.fontSizeBase, 1)
+        gui_draw_text(self.x + 6 * u / 100, self.y + (self.h - LH()) / 2, "-", th.textMuted)
+        gui_draw_text(self.x + self.w - bw + 6 * u / 100, self.y + (self.h - LH()) / 2, "+", th.textMuted)
+        gui_font(th.fontSizeBase, 0)
+        let string v = cast(self.value, string)
+        let i32 tw = gui_text_w(v)
+        let i32 lw = self.w - 2 * bw
+        gui_draw_text(text_x(self.x + bw, lw, tw), self.y + (self.h - LH()) / 2, v, th.text)
+
+    // 下拉框：flag2=展开
+    fn void draw_combo(let Theme th)
+        let i32 u = SC()
+        let i32 bw = 20 * u / 100
+        gui_round_rect(self.x, self.y, self.w, self.h, th.radiusSm * u / 100, th.surface, th.border)
+        let string cur = ""
+        if self.sel >= 0 and self.sel < length(self.items)
+            cur = self.items[self.sel]
+        let u32 tc = th.text
+        if length(cur) == 0
+            cur = self.ph
+            tc = th.textMuted
+        gui_font(th.fontSizeBase, 0)
+        gui_draw_text(self.x + 8 * u / 100, self.y + (self.h - LH()) / 2, cur, tc)
+        // 展开箭头（RTL 镜像）
+        let i32 ax = self.x + self.w - bw + 6 * u / 100
+        gui_draw_text(ax, self.y + (self.h - LH()) / 2, "▼", th.textMuted)
+        if self.flag2
+            let i32 n = length(self.items)
+            let i32 ih = LH() + 2 * u / 100
+            gui_fill_rect(self.x, self.y + self.h, self.w, n * ih + 4 * u / 100, th.surfaceAlt)
+            gui_rect(self.x, self.y + self.h, self.w, n * ih + 4 * u / 100, th.border)
+            let i32 i = 0
+            while i < n
+                let i32 iy = self.y + self.h + 2 * u / 100 + i * ih
+                if g_hover_y >= iy and g_hover_y < iy + ih
+                    gui_fill_rect(self.x + 1, iy, self.w - 2, ih, th.accentPressed)
+                gui_font(th.fontSizeBase, 0)
+                gui_draw_text(self.x + 8 * u / 100, iy, self.items[i], th.text)
+                i++
+
+    // 列表 / 树（COMP_MULTILIST、COMP_TREE 共用）
+    fn void draw_listbox(let Theme th)
+        let i32 u = SC()
+        gui_round_rect(self.x, self.y, self.w, self.h, th.radiusSm * u / 100, th.surface, th.border)
+        gui_push_clip(self.x + 1, self.y + 1, self.w - 2, self.h - 2)
+        let i32 i = 0
+        while i < length(self.items)
+            if self.kind != COMP_TREE or self.tree_visible_row(i)
+                let i32 ry = self.y + 4 * u / 100 + (i - self.top) * LH()
+                let string label = self.items[i]
+                let i32 ind = 0
+                if self.kind == COMP_TREE
+                    ind = self.tree_depth(i)
+                    label = trim_lead(label)
+                if ry >= self.y and ry < self.y + self.h
+                    gui_fill_rect(self.x + 1, ry, self.w - 2, LH(), self.row_bg_at(th, i, ry))
+                    gui_font(th.fontSizeBase, 0)
+                    if self.kind == COMP_TREE
+                        let i32 ax = self.x + 6 * u / 100 + ind * 14 * u / 100
+                        let string arrow = "▸"
+                        if self.tree_expanded(i)
+                            arrow = "▾"
+                        gui_draw_text(ax, ry, arrow, th.textMuted)
+                        let i32 ltw = gui_text_w(label)
+                        let i32 lx = text_x(ax + 12 * u / 100, self.w - (ax - self.x) - 16 * u / 100, ltw)
+                        gui_draw_text(lx, ry, label, th.text)
+                    else
+                        let i32 ltw = gui_text_w(label)
+                        gui_draw_text(text_x(self.x + 8 * u / 100, self.w - 16 * u / 100, ltw), ry, label, th.text)
+            i++
+        gui_pop_clip()
+
+    // 行背景（按给定行 y 判定悬停）
+    fn u32 row_bg_at(let Theme th, let i32 i, let i32 ry)
+        if self.multi_selected(i) or self.sel == i
+            return th.accentPressed
+        if g_hover_y >= ry and g_hover_y < ry + LH()
+            return th.surfaceAlt
+        return th.surface
+
+    // 表格：items=表头，rows=数据行（"|" 分隔单元格）
+    fn void draw_table(let Theme th)
+        let i32 u = SC()
+        let i32 nc = length(self.items)
+        if nc < 1
+            nc = 1
+        gui_fill_rect(self.x, self.y, self.w, self.h, th.surface)
+        gui_rect(self.x, self.y, self.w, self.h, th.border)
+        let i32 cw = self.w / nc
+        // 列宽覆盖（nums 非空时按其值作像素宽）
+        let bool custom = length(self.nums) == nc
+        let i32 hy = self.y + 4 * u / 100
+        let i32 i = 0
+        while i < nc
+            let i32 cx = self.x + i * cw
+            if custom
+                let i32 acc = 0
+                let i32 j = 0
+                while j < i
+                    acc = acc + self.nums[j]
+                    j++
+                cx = self.x + acc
+            gui_fill_rect(cx, hy, cw, LH(), th.surfaceAlt)
+            gui_font(th.fontSizeBase, 1)
+            gui_draw_text(cx + 6 * u / 100, hy, self.items[i], th.text)
+            gui_font(th.fontSizeBase, 0)
+            gui_line(cx, hy, cx, hy + LH() * (length(self.rows) + 1), th.border)
+            i++
+        gui_line(self.x, hy, self.x + self.w, hy, th.border)
+        gui_line(self.x, hy + LH(), self.x + self.w, hy + LH(), th.border)
+        let i32 r = 0
+        while r < length(self.rows)
+            let i32 ry = hy + LH() + r * LH()
+            if self.sel == r
+                gui_fill_rect(self.x + 1, ry, self.w - 2, LH(), th.accentPressed)
+            let string[] cells = split_bar(self.rows[r])
+            let i32 c = 0
+            while c < length(cells)
+                if c < nc
+                    let i32 cx2 = self.x + c * cw
+                    gui_font(th.fontSizeBase, 0)
+                    gui_draw_text(cx2 + 6 * u / 100, ry, cells[c], th.text)
+                c++
+            gui_line(self.x, ry + LH(), self.x + self.w, ry + LH(), th.border)
+            r++
+
+    // 标签栏：items=标签名，sel=当前标签
+    fn void draw_tabbar(let Theme th)
+        let i32 u = SC()
+        let i32 n = length(self.items)
+        let i32 iw = 0
+        let i32 i = 0
+        while i < n
+            let i32 tw2 = gui_text_w(self.items[i]) + 24 * u / 100
+            if tw2 > iw
+                iw = tw2
+            i++
+        gui_fill_rect(self.x, self.y, self.w, self.h, th.surface)
+        gui_line(self.x, self.y + self.h - 1, self.x + self.w, self.y + self.h - 1, th.border)
+        i = 0
+        while i < n
+            let i32 tx = self.x + i * iw
+            if self.sel == i
+                gui_fill_rect(tx + 1, self.y + 2, iw - 2, self.h - 3, th.surfaceAlt)
+                gui_fill_rect(tx + 4, self.y + self.h - 3 * u / 100, iw - 8, 2 * u / 100, th.accent)
+            gui_font(th.fontSizeBase, 0)
+            let i32 tw3 = gui_text_w(self.items[i])
+            let u32 tc = th.textMuted
+            if self.sel == i
+                tc = th.text
+            gui_draw_text(tx + (iw - tw3) / 2, self.y + (self.h - LH()) / 2, self.items[i], tc)
+            i++
+
+    // 容器（Panel / Card / ScrollView）：底色 + 边框 + 可选标题
+    fn void draw_container(let Theme th)
+        let i32 u = SC()
+        if self.kind == COMP_PANEL
+            if self.color != 0
+                gui_fill_rect(self.x, self.y, self.w, self.h, self.color)
+        else
+            gui_round_rect(self.x, self.y, self.w, self.h, th.radiusMd * u / 100, th.surface, th.border)
+        if self.kind == COMP_CARD and length(self.text) > 0
+            gui_font(th.fontSizeLarge, 1)
+            gui_draw_text(self.x + 10 * u / 100, self.y + 8 * u / 100, self.text, th.text)
+            gui_font(th.fontSizeBase, 0)
+            gui_line(self.x + 8 * u / 100, self.y + 8 * u / 100 + th.fontSizeLarge + 4 * u / 100,
+                     self.x + self.w - 8 * u / 100, self.y + 8 * u / 100 + th.fontSizeLarge + 4 * u / 100,
+                     th.border)
+        if self.kind == COMP_SCROLLVIEW
+            // 竖向滚动条
+            let i32 sbw = 6 * u / 100
+            if self.value2 > 0
+                gui_fill_rect(self.x + self.w - sbw, self.y, sbw, self.h, th.surfaceAlt)
+                let i32 track = self.h
+                let i32 thumb = track * track / (self.value2 + track)
+                if thumb < 16 * u / 100
+                    thumb = 16 * u / 100
+                let i32 maxv = self.value2
+                let i32 off = 0
+                if maxv > 0
+                    off = (track - thumb) * self.value / maxv
+                gui_fill_rect(self.x + self.w - sbw, self.y + off, sbw, thumb, th.textMuted)
+
+    // 可拖拽分隔条：flag2=竖向，value=分割百分比
+    fn void draw_splitter(let Theme th)
+        let i32 u = SC()
+        if self.flag2
+            gui_fill_rect(self.x + self.w / 2 - 2 * u / 100, self.y, 4 * u / 100, self.h, th.border)
+        else
+            gui_fill_rect(self.x, self.y + self.h / 2 - 2 * u / 100, self.w, 4 * u / 100, th.border)
+        if self.hot or self.pressed
+            if self.flag2
+                gui_fill_rect(self.x + self.w / 2 - 2 * u / 100, self.y, 4 * u / 100, self.h, th.accent)
+            else
+                gui_fill_rect(self.x, self.y + self.h / 2 - 2 * u / 100, self.w, 4 * u / 100, th.accent)
+
+    // 模态浮层：遮罩 + 居中面板 + 标题
+    fn void draw_modal(let Theme th)
+        let i32 u = SC()
+        gui_fill_rect(0, 0, gui_w(), gui_h(), th.overlay)
+        gui_round_rect(self.x, self.y, self.w, self.h, th.radiusLg * u / 100, th.surface, th.border)
+        gui_font(th.fontSizeLarge, 1)
+        gui_draw_text(self.x + 16 * u / 100, self.y + 14 * u / 100, self.text, th.text)
+        gui_font(th.fontSizeBase, 0)
+        gui_line(self.x + 12 * u / 100, self.y + 14 * u / 100 + th.fontSizeLarge + 6 * u / 100,
+                 self.x + self.w - 12 * u / 100, self.y + 14 * u / 100 + th.fontSizeLarge + 6 * u / 100,
+                 th.border)
+
+    // 气泡提示
+    fn void draw_tooltip(let Theme th)
+        let i32 u = SC()
+        gui_round_rect(self.x, self.y, self.w, self.h, th.radiusSm * u / 100, th.surfaceAlt, th.border)
+        gui_font(th.fontSizeSmall, 0)
+        gui_draw_text(self.x + 8 * u / 100, self.y + (self.h - LH()) / 2, self.text, th.text)
+        gui_font(th.fontSizeBase, 0)
+
+    // 弹出菜单（flag2=展开）
+    fn void draw_popup(let Theme th)
+        if not self.flag2
+            return
+        let i32 u = SC()
+        let i32 n = length(self.items)
+        let i32 iw = 0
+        let i32 i = 0
+        while i < n
+            let i32 tw = gui_text_w(self.items[i]) + 24 * u / 100
+            if tw > iw
+                iw = tw
+            i++
+        if iw < self.w
+            iw = self.w
+        let i32 ih = LH() + 4 * u / 100
+        gui_fill_rect(self.x, self.y, iw, n * ih + 4 * u / 100, th.surfaceAlt)
+        gui_rect(self.x, self.y, iw, n * ih + 4 * u / 100, th.border)
+        i = 0
+        while i < n
+            let i32 iy = self.y + 2 * u / 100 + i * ih
+            if g_hover_y >= iy and g_hover_y < iy + ih
+                gui_fill_rect(self.x + 1, iy, iw - 2, ih, th.accentPressed)
+            gui_font(th.fontSizeBase, 0)
+            gui_draw_text(self.x + 10 * u / 100, iy, self.items[i], th.text)
+            i++
+
+    // 进度条（flag1=不确定，用 tick 相位实现来回扫动）
+    fn void draw_progress(let Theme th)
+        let i32 u = SC()
+        let i32 bh = 8 * u / 100
+        let i32 by = self.y + (self.h - bh) / 2
+        if self.h > 16 * u / 100
+            by = self.y + 2 * u / 100
+        gui_round_rect(self.x, by, self.w, bh, bh / 2, th.surfaceAlt, th.border)
+        let u32 fc = th.accent
+        if self.color != 0
+            fc = self.color
+        if not self.enable
+            fc = th.disabled
+        if self.flag1
+            let i32 phase = cast(tick_ms() % 1400, i32)
+            let i32 seg = self.w / 4
+            let i32 px = (self.w + seg) * phase / 1400 - seg
+            let i32 x1 = self.x + px
+            let i32 x2 = x1 + seg
+            if x1 < self.x
+                x1 = self.x
+            if x2 > self.x + self.w
+                x2 = self.x + self.w
+            if x2 > x1
+                gui_fill_rect(x1, by + 1, x2 - x1, bh - 2, fc)
+        else
+            let i32 fw2 = self.w * self.value / 100
+            if fw2 > 0
+                gui_round_rect(self.x, by, fw2, bh, bh / 2, fc, fc)
+
+    // 旋转指示器（8 点圆环 + 相位）
+    fn void draw_spinner(let Theme th)
+        let i32 u = SC()
+        let i32 r = self.h / 2
+        if r < 6 * u / 100
+            r = 8 * u / 100
+        let i32 cx = self.x + r
+        let i32 cy = self.y + self.h / 2
+        let i32 phase = cast((tick_ms() / 120) % 8, i32)
+        let i32 i = 0
+        while i < 8
+            let i32 step = (i + phase) % 8
+            let u32 c = shade(th.accent, 20 + step * 10)
+            let i32 dx = 0
+            let i32 dy = 0
+            if i == 0
+                dy = -r + 3 * u / 100
+            if i == 1
+                dx = r - 3 * u / 100
+                dy = -r + 3 * u / 100
+            if i == 2
+                dx = r - 3 * u / 100
+            if i == 3
+                dx = r - 3 * u / 100
+                dy = r - 3 * u / 100
+            if i == 4
+                dy = r - 3 * u / 100
+            if i == 5
+                dx = -r + 3 * u / 100
+                dy = r - 3 * u / 100
+            if i == 6
+                dx = -r + 3 * u / 100
+            if i == 7
+                dx = -r + 3 * u / 100
+                dy = -r + 3 * u / 100
+            gui_fill_circle(cx + dx, cy + dy, 2 * u / 100, c)
+            i++
+
+    // 徽标（圆角胶囊 + 数字）
+    fn void draw_badge(let Theme th)
+        let i32 u = SC()
+        let string s = cast(self.value, string)
+        let i32 tw = gui_text_w(s)
+        let i32 bw = tw + 10 * u / 100
+        if bw < 18 * u / 100
+            bw = 18 * u / 100
+        let i32 bh = LH()
+        let u32 bg = th.accent
+        if self.color != 0
+            bg = self.color
+        let i32 bx = rtl_x(self.x, self.w, self.x, bw)
+        gui_round_rect(bx, self.y, bw, bh, bh / 2, bg, bg)
+        gui_font(th.fontSizeSmall, 0)
+        gui_draw_text(bx + (bw - tw) / 2, self.y + 1 * u / 100, s, th.bg)
+        gui_font(th.fontSizeBase, 0)
+
+    // 轻提示（value=存活毫秒，value2=起始 tick，到时自动隐藏）
+    fn void draw_toast(let Theme th)
+        let i32 u = SC()
+        if not self.flag1
+            return
+        let i32 now = cast(tick_ms(), i32)
+        if now > self.value2
+            if now - self.value2 > self.value
+                self.flag1 = false
+                return
+        let i32 tw = gui_text_w(self.text)
+        let i32 bw = tw + 24 * u / 100
+        let i32 bh = LH() + 10 * u / 100
+        let i32 bx = (gui_w() - bw) / 2
+        let i32 by = gui_h() - bh - 24 * u / 100
+        gui_round_rect(bx, by, bw, bh, th.radiusMd * u / 100, th.surfaceAlt, th.border)
+        gui_font(th.fontSizeBase, 0)
+        gui_draw_text(bx + 12 * u / 100, by + (bh - LH()) / 2, self.text, th.text)
+
+    // 警示条（左侧色条 + 文本）
+    fn void draw_alert(let Theme th)
+        let i32 u = SC()
+        let u32 sc = th.warning
+        if self.color != 0
+            sc = self.color
+        gui_round_rect(self.x, self.y, self.w, self.h, th.radiusSm * u / 100, th.surface, th.border)
+        gui_fill_rect(self.x + 1, self.y + 1, 4 * u / 100, self.h - 2, sc)
+        gui_font(th.fontSizeBase, 0)
+        let i32 ltw = gui_text_w(self.text)
+        gui_draw_text(text_x(self.x + 12 * u / 100, self.w - 20 * u / 100, ltw),
+                      self.y + (self.h - LH()) / 2, self.text, th.text)
+
+    // 图标按钮：text = 字形（用字符代替图标字体）
+    fn void draw_iconbutton(let Theme th)
+        let i32 u = SC()
+        let u32 face = th.surface
+        if self.pressed
+            face = th.accentPressed
+        else
+            if self.hot
+                face = th.surfaceAlt
+        gui_round_rect(self.x, self.y, self.w, self.h, th.radiusMd * u / 100, face, face)
+        let u32 tc = th.text
+        if not self.enable
+            tc = th.disabled
+        gui_font(th.fontSizeLarge, 0)
+        let i32 tw = gui_text_w(self.text)
+        gui_draw_text(self.x + (self.w - tw) / 2, self.y + (self.h - th.fontSizeLarge) / 2, self.text, tc)
+        gui_font(th.fontSizeBase, 0)
+
+    // 位图（Direct2D WIC 句柄）
+    fn void draw_image(let Theme th)
+        if self.hdl != 0
+            gui_draw_image(self.hdl, self.x, self.y, self.w, self.h, 255)
+        else
+            gui_round_rect(self.x, self.y, self.w, self.h, th.radiusSm * SC() / 100, th.surfaceAlt, th.border)
+            gui_line(self.x, self.y, self.x + self.w, self.y + self.h, th.border)
+            gui_line(self.x + self.w, self.y, self.x, self.y + self.h, th.border)
+
+    // 分隔线（flag2=竖向）
+    fn void draw_separator(let Theme th)
+        if self.flag2
+            gui_fill_rect(self.x + self.w / 2 - 1, self.y, 1, self.h, th.border)
+        else
+            gui_fill_rect(self.x, self.y + self.h / 2 - 1, self.w, 1, th.border)
+
+    // 工具栏：items 为一组按钮，sel 为按下的按钮
+    fn void draw_toolbar(let Theme th)
+        let i32 u = SC()
+        gui_fill_rect(self.x, self.y, self.w, self.h, th.surface)
+        gui_line(self.x, self.y + self.h - 1, self.x + self.w, self.y + self.h - 1, th.border)
+        let i32 bw = 0
+        let i32 i = 0
+        while i < length(self.items)
+            let i32 tw = gui_text_w(self.items[i]) + 20 * u / 100
+            if tw > bw
+                bw = tw
+            i++
+        let i32 x = self.x + 4 * u / 100
+        i = 0
+        while i < length(self.items)
+            let i32 bx = x + i * bw
+            if self.sel == i
+                gui_fill_rect(bx, self.y + 3, bw, self.h - 6, th.accentPressed)
+            gui_font(th.fontSizeBase, 0)
+            let i32 tw2 = gui_text_w(self.items[i])
+            gui_draw_text(bx + (bw - tw2) / 2, self.y + (self.h - LH()) / 2, self.items[i], th.text)
+            i++
+
+    // 面包屑：items 以 "›" 分隔
+    fn void draw_breadcrumb(let Theme th)
+        let i32 u = SC()
+        let i32 ty = self.y + (self.h - LH()) / 2
+        let i32 x = self.x
+        let i32 i = 0
+        while i < length(self.items)
+            let u32 tc = th.accent
+            if i == length(self.items) - 1
+                tc = th.textMuted
+            gui_font(th.fontSizeBase, 0)
+            let i32 tw = gui_text_w(self.items[i])
+            gui_draw_text(x, ty, self.items[i], tc)
+            x = x + tw + 6 * u / 100
+            if i < length(self.items) - 1
+                gui_draw_text(x, ty, "›", th.textMuted)
+                x = x + gui_text_w("›") + 6 * u / 100
+            i++
+
+    // 折叠面板：text=标题，flag2=展开，items[0]=内容
+    fn void draw_accordion(let Theme th)
+        let i32 u = SC()
+        gui_round_rect(self.x, self.y, self.w, self.h, th.radiusSm * u / 100, th.surface, th.border)
+        gui_fill_rect(self.x + 1, self.y + 1, self.w - 2, LH(), th.surfaceAlt)
+        let i32 ay = self.y + 2 * u / 100
+        gui_font(th.fontSizeBase, 0)
+        gui_draw_text(self.x + 8 * u / 100, ay + (LH() - LH()) / 2, self.text, th.text)
+        let string arrow = "▸"
+        if self.flag2
+            arrow = "▾"
+        let i32 aw = gui_text_w(arrow)
+        gui_draw_text(mirror_x(self.x + 8 * u / 100, aw, self.w - 16 * u / 100), ay, arrow, th.textMuted)
+        if self.flag2 and length(self.items) > 0
+            gui_draw_text(self.x + 16 * u / 100, ay + LH() + 2 * u / 100, self.items[0], th.textMuted)
+
+    // ===== 事件 =====
+    fn bool on_event(let Event e)
+        if not self.visible
+            return false
+        let i32 mx = cast(e.x, i32)
+        let i32 my = cast(e.y, i32)
+        if e.typ == EV_MOVE
+            g_hover_y = my
+            let bool h = self.hit(mx, my)
+            if h != self.hot
+                self.hot = h
+                self.dirty = true
+            // 分隔条/滚动条拖动：按住时跟随鼠标
+            if self.pressed and self.kind == COMP_SPLITTER
+                self.drag_to(mx, my)
+                self.dirty = true
+                return true
+            return false
+        if e.typ == EV_LDOWN
+            if self.hit(mx, my) and self.enable
+                self.pressed = true
+                self.dirty = true
+                focus_set(self.id)
+                self.on_press(mx, my)
+                return true
+            return false
+        if e.typ == EV_LUP
+            if self.pressed
+                self.pressed = false
+                self.dirty = true
+                let bool inside = self.hit(mx, my)
+                if inside
+                    self.on_release_click(mx, my)
+                return true
+            return false
+        if e.typ == EV_WHEEL
+            if self.hit(mx, my)
+                self.on_wheel(cast(e.key, i32))
+                self.dirty = true
+                return true
+            return false
+        if e.typ == EV_KEY
+            if self.has_focus() and self.enable
+                if self.on_key(cast(e.key, i64))
+                    self.dirty = true
+                    return true
+            return false
+        return false
+
+    // 分隔条拖动：把鼠标位置换算成百分比
+    fn void drag_to(let i32 mx, let i32 my)
+        if self.flag2
+            let i32 pw = self.w
+            if pw > 0
+                self.value = (mx - self.x) * 100 / pw
+        else
+            let i32 ph = self.h
+            if ph > 0
+                self.value = (my - self.y) * 100 / ph
+        if self.value < 0
+            self.value = 0
+        if self.value > 100
+            self.value = 100
+
+    fn void on_press(let i32 mx, let i32 my)
+        let i32 k = self.kind
+        if k == COMP_RADIO
+            self.checked = true
+            self.clicks++
+        if k == COMP_RADIOGROUP
+            let i32 ri = self.row_at(my)
+            if ri >= 0 and ri < length(self.items)
+                self.sel = ri
+                self.clicks++
+        if k == COMP_TOGGLE
+            self.checked = not self.checked
+            self.clicks++
+        if k == COMP_TEXTBOX
+            self.focus = true
+            if self.value2 != 1
+                self.flag1 = self.flag1
+        if k == COMP_SPINBOX
+            let i32 bw = 20 * SC() / 100
+            let i32 step = self.value2
+            if step <= 0
+                step = 1
+            if mx < self.x + bw
+                self.value = self.value - step
+                self.clicks++
+            else
+                if mx >= self.x + self.w - bw
+                    self.value = self.value + step
+                    self.clicks++
+        if k == COMP_COMBO
+            self.flag2 = not self.flag2
+        if k == COMP_MULTILIST
+            let i32 ri2 = self.row_at(my)
+            if ri2 >= 0
+                self.multi_toggle(ri2)
+                self.sel = ri2
+                self.clicks++
+        if k == COMP_TREE
+            let i32 ri3 = self.row_at(my)
+            if ri3 >= 0
+                self.sel = ri3
+                if length(self.items[ri3]) > 0 or self.tree_depth(ri3) >= 0
+                    self.tree_toggle(ri3)
+        if k == COMP_TABLE
+            let i32 r = self.table_row_at(my)
+            if r >= 0
+                self.sel = r
+                self.clicks++
+        if k == COMP_TABBAR
+            let i32 ti = self.tab_at(mx)
+            if ti >= 0
+                self.sel = ti
+                self.clicks++
+        if k == COMP_POPUP
+            if self.flag2
+                let i32 ih = LH() + 4 * SC() / 100
+                let i32 ri4 = (my - self.y - 2 * SC() / 100) / ih
+                if ri4 >= 0 and ri4 < length(self.items)
+                    self.sel = ri4
+                    self.clicks++
+                    self.flag2 = false
+        if k == COMP_TOOLBAR
+            let i32 bi = self.toolbar_at(mx)
+            if bi >= 0
+                self.sel = bi
+                self.clicks++
+        if k == COMP_BREADCRUMB
+            let i32 ci = self.crumb_at(mx)
+            if ci >= 0
+                self.sel = ci
+                self.clicks++
+        if k == COMP_ACCORDION
+            self.flag2 = not self.flag2
+        if k == COMP_TOAST
+            self.flag1 = false
+        if k == COMP_ALERT
+            self.clicks++
+
+    // 抬起后的点击动作（图标按钮计数）
+    fn void on_release_click(let i32 mx, let i32 my)
+        if self.kind == COMP_ICONBUTTON
+            self.clicks++
+        if self.kind == COMP_MODAL
+            self.clicks++
+        if self.kind == COMP_PANEL
+            self.clicks++
+
+    fn void on_wheel(let i32 delta)
+        let i32 k = self.kind
+        if k == COMP_SCROLLVIEW
+            self.value = self.value - delta * LH()
+            if self.value < 0
+                self.value = 0
+            if self.value > self.value2
+                self.value = self.value2
+        if k == COMP_MULTILIST or k == COMP_TREE
+            self.top = self.top - delta
+            let i32 maxrow = length(self.items) - 1
+            if maxrow < 0
+                maxrow = 0
+            if self.top < 0
+                self.top = 0
+            if self.top > maxrow
+                self.top = maxrow
+
+    fn bool on_key(let i64 k)
+        let i32 kk = self.kind
+        if kk == COMP_TEXTBOX
+            return self.textbox_key(k)
+        if kk == COMP_SPINBOX
+            let i32 step = self.value2
+            if step <= 0
+                step = 1
+            if k == KEY_EXT + 0x26
+                self.value = self.value + step
+                return true
+            if k == KEY_EXT + 0x28
+                self.value = self.value - step
+                return true
+            return false
+        if kk == COMP_MULTILIST or kk == COMP_TREE or kk == COMP_TABBAR
+            let i32 n = length(self.items)
+            if n <= 0
+                return false
+            let i32 cur = self.sel
+            if k == KEY_EXT + 0x26
+                if cur > 0
+                    self.sel = cur - 1
+                return true
+            if k == KEY_EXT + 0x28
+                if cur < n - 1
+                    self.sel = cur + 1
+                return true
+            if k == 13 or k == 32
+                if kk == COMP_TREE and self.sel >= 0
+                    self.tree_toggle(self.sel)
+                if kk == COMP_MULTILIST and self.sel >= 0
+                    self.multi_toggle(self.sel)
+                return true
+            return false
+        if kk == COMP_ACCORDION or kk == COMP_POPUP or kk == COMP_COMBO
+            if k == 13 or k == 32
+                self.flag2 = not self.flag2
+                return true
+            if k == KEY_EXT + 0x1B
+                self.flag2 = false
+                return true
+            return false
+        if kk == COMP_TOAST
+            if k == KEY_EXT + 0x1B
+                self.flag1 = false
+                return true
+            return false
+        return false
+
+    // 文本框编辑键（Backspace/Delete/左右/Home/End/Enter/可打印字符）
+    fn bool textbox_key(let i64 k)
+        if self.value2 == 1
+            return false
+        let i32 n = length(self.text)
+        let i32 cx = self.value
+        if cx < 0
+            cx = 0
+        if cx > n
+            cx = n
+        if k == 8
+            if cx > 0
+                let i32 p = align_back(self.text, cx - 1)
+                self.text = prefix(self.text, p) + suffix(self.text, cx)
+                self.value = p
+                return true
+            return false
+        if k == KEY_EXT + 0x2E
+            if cx < n
+                let i32 p2 = next_cp(self.text, cx)
+                self.text = prefix(self.text, cx) + suffix(self.text, p2)
+                return true
+            return false
+        if k == KEY_EXT + 0x25
+            if cx > 0
+                self.value = align_back(self.text, cx - 1)
+            return true
+        if k == KEY_EXT + 0x27
+            if cx < n
+                self.value = next_cp(self.text, cx)
+            return true
+        if k == KEY_EXT + 0x24
+            self.value = 0
+            return true
+        if k == KEY_EXT + 0x23
+            self.value = n
+            return true
+        if k == 13
+            if self.flag2
+                self.text = prefix(self.text, cx) + "\n" + suffix(self.text, cx)
+                self.value = cx + 1
+                return true
+            return false
+        if k >= 32 and k < KEY_EXT
+            self.text = prefix(self.text, cx) + cast(k, char) + suffix(self.text, cx)
+            self.value = cx + 1
+            return true
+        return false
+
+    // 标签栏：按 x 落在第几个标签（等宽估算，与绘制一致）
+    fn i32 tab_at(let i32 mx)
+        let i32 n = length(self.items)
+        if n <= 0
+            return -1
+        let i32 iw = self.tab_width()
+        let i32 i = (mx - self.x) / iw
+        if i < 0 or i >= n
+            return -1
+        return i
+
+    fn i32 tab_width()
+        let i32 u = SC()
+        let i32 n = length(self.items)
+        if n <= 0
+            return self.w
+        let i32 iw = 0
+        let i32 i = 0
+        while i < n
+            let i32 tw = gui_text_w(self.items[i]) + 24 * u / 100
+            if tw > iw
+                iw = tw
+            i++
+        if iw <= 0
+            return self.w / n
+        return iw
+
+    // 工具栏：按 x 落在第几个按钮
+    fn i32 toolbar_at(let i32 mx)
+        let i32 u = SC()
+        let i32 n = length(self.items)
+        if n <= 0
+            return -1
+        let i32 bw = 0
+        let i32 i = 0
+        while i < n
+            let i32 tw = gui_text_w(self.items[i]) + 20 * u / 100
+            if tw > bw
+                bw = tw
+            i++
+        if bw <= 0
+            return -1
+        let i32 bi = (mx - self.x - 4 * u / 100) / bw
+        if bi < 0 or bi >= n
+            return -1
+        return bi
+
+    // 面包屑：按 x 落在第几段（按各段文本宽度累加）
+    fn i32 crumb_at(let i32 mx)
+        let i32 u = SC()
+        let i32 x = self.x
+        let i32 i = 0
+        while i < length(self.items)
+            let i32 tw = gui_text_w(self.items[i])
+            if mx >= x and mx < x + tw
+                return i
+            x = x + tw + 6 * u / 100 + gui_text_w("›") + 6 * u / 100
+            i++
+        return -1
+
+    // ===== 无障碍：每帧发布本组件的语义节点 =====
+    fn void publish_a11y()
+        if not self.visible
+            return
+        let i32 states = 0
+        if not self.enable
+            states = states | A11Y_DISABLED
+        if self.has_focus()
+            states = states | A11Y_FOCUSED
+        if self.checked or self.sel >= 0
+            states = states | A11Y_SELECTED
+        if self.flag2
+            states = states | A11Y_EXPANDED
+        if self.hot
+            states = states | A11Y_HOT
+        if self.pressed
+            states = states | A11Y_PRESSED
+        let i32 hh = self.h
+        if hh <= 0
+            hh = self.default_h()
+        a11y_add(self.id, self.a11y_name(), comp_role(self.kind), self.a11y_value(), states,
+                 self.x, self.y, self.w, hh)
+
+    fn string a11y_name()
+        if length(self.text) > 0
+            return self.text
+        if self.sel >= 0 and self.sel < length(self.items)
+            return self.items[self.sel]
+        return comp_kind_name(self.kind)
+
+    fn string a11y_value()
+        let i32 k = self.kind
+        if k == COMP_TEXTBOX
+            return self.text
+        if k == COMP_SPINBOX or k == COMP_PROGRESS or k == COMP_BADGE
+            return cast(self.value, string)
+        if k == COMP_COMBO
+            if self.sel >= 0 and self.sel < length(self.items)
+                return self.items[self.sel]
+            return ""
+        if k == COMP_TABBAR or k == COMP_MULTILIST or k == COMP_TREE
+            if self.sel >= 0 and self.sel < length(self.items)
+                return self.items[self.sel]
+            return ""
+        if k == COMP_TOGGLE or k == COMP_RADIO
+            if self.checked
+                return "on"
+            return "off"
+        return ""
+
+// Comp 类型 → 名字（无障碍 name 兜底）
+pub fn string comp_kind_name(let i32 kind)
+    if kind == COMP_RADIO
+        return "radio"
+    if kind == COMP_RADIOGROUP
+        return "radiogroup"
+    if kind == COMP_TOGGLE
+        return "switch"
+    if kind == COMP_TEXTBOX
+        return "textbox"
+    if kind == COMP_SPINBOX
+        return "spinbox"
+    if kind == COMP_COMBO
+        return "combobox"
+    if kind == COMP_MULTILIST
+        return "list"
+    if kind == COMP_TREE
+        return "tree"
+    if kind == COMP_TABLE
+        return "table"
+    if kind == COMP_TABBAR
+        return "tabbar"
+    if kind == COMP_PANEL
+        return "panel"
+    if kind == COMP_CARD
+        return "card"
+    if kind == COMP_SPLITTER
+        return "splitter"
+    if kind == COMP_SCROLLVIEW
+        return "scrollview"
+    if kind == COMP_MODAL
+        return "modal"
+    if kind == COMP_TOOLTIP
+        return "tooltip"
+    if kind == COMP_POPUP
+        return "popup"
+    if kind == COMP_PROGRESS
+        return "progress"
+    if kind == COMP_SPINNER
+        return "spinner"
+    if kind == COMP_BADGE
+        return "badge"
+    if kind == COMP_TOAST
+        return "toast"
+    if kind == COMP_ALERT
+        return "alert"
+    if kind == COMP_ICONBUTTON
+        return "iconbutton"
+    if kind == COMP_IMAGE
+        return "image"
+    if kind == COMP_SEPARATOR
+        return "separator"
+    if kind == COMP_TOOLBAR
+        return "toolbar"
+    if kind == COMP_BREADCRUMB
+        return "breadcrumb"
+    if kind == COMP_ACCORDION
+        return "accordion"
+    return "widget"
+
+// ===== 悬停位置（供 Comp 的悬停/拖动判定；App.step 每帧更新） =====
+let i32 g_hover_y = 0
+
+pub fn void comp_set_hover(let i32 my)
+    g_hover_y = my
+
+// ===== 文本框辅助 =====
+// 密码掩码：每个字节一个 '*'（UTF-8 多字节字符同样按字节掩码，不影响正确性）
+fn string mask_text(let string s)
+    let string out = ""
+    let i32 i = 0
+    while i < length(s)
+        out = out + "*"
+        i++
+    return out
+
+// 行数（以 '\n' 分隔）
+fn i32 line_count(let string s)
+    let i32 n = 1
+    let i32 i = 0
+    while i < length(s)
+        if ord(s[i]) == 10
+            n++
+        i++
+    return n
+
+// 第 idx 行文本
+fn string line_at(let string s, let i32 idx)
+    let string out = ""
+    let i32 line = 0
+    let i32 i = 0
+    while i < length(s)
+        let i32 b = ord(s[i])
+        if b == 10
+            if line == idx
+                return out
+            line++
+            out = ""
+        else
+            if line == idx
+                out = out + s[i]
+        i++
+    if line == idx
+        return out
+    return ""
+
+// 去掉行首空格（树节点标签）
+fn string trim_lead(let string s)
+    let i32 k = 0
+    while k < length(s)
+        if s[k] != ' '
+            break
+        k++
+    if k == 0
+        return s
+    return suffix(s, k)
+
+// 表格行按 '|' 分列
+fn string[] split_bar(let string s)
+    let string[] out
+    let string cur = ""
+    let i32 i = 0
+    while i < length(s)
+        if ord(s[i]) == 124        // '|'
+            out = push(out, cur)
+            cur = ""
+        else
+            cur = cur + s[i]
+        i++
+    out = push(out, cur)
+    return out
+
+// ===== 容器布局：Panel/Card/ScrollView 的子项排布 =====
+// dir/colls/gap/pad 取自容器自身字段；RTL 由 LayoutCursor 自动镜像
+pub fn LayoutCursor comp_layout(let Comp c)
+    let LayoutBox b = LayoutBox(x=c.x, y=c.y, w=c.w, h=c.h, dir=c.dir, cols=c.cols,
+                               gap=c.gap, pad=c.pad, align=ALIGN_CENTER)
+    let LayoutCursor cur = LayoutCursor(box=b)
+    return move cur
+
+// 简化版：按序号取子项矩形（每次调用重建游标，O(n) 也可接受）
+pub fn Rect comp_slot(let Comp c, let i32 idx, let i32 cw, let i32 ch)
+    let LayoutCursor cur = comp_layout(c)
+    let Rect r = Rect()
+    let i32 i = 0
+    while i < idx
+        let Rect skip = cur.next(cw, ch)
+        i++
+    r = cur.next(cw, ch)
+    return r
