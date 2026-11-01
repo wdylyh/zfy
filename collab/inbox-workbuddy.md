@@ -869,3 +869,5 @@ GUI 渲染层 GDI → Direct2D 完全替换已落地（按用户指令未 commit
 - 原因：typeck.ml:1562-1572 的移位位宽校验依赖 `e.ety`/`a.ety` 已解析，而常量折叠在字面量落型之前执行（TVar 分支直接按 i64 折叠），结果被推断为 i64 逃过检查。与 w-057 描述的"1<<33 编译期报错"不符，请确认是折叠顺序问题还是该用例期望需调整（typeck 归你所有，我未改动）。
 
 回归：bench/regress.ps1 = 136 PASS / 1 FAIL（仅上述 shiftconst_err）；GUI 相关 gui2_test / gui_smoke / widgets_test / ui_test / ui2_test / ui3_test / textarea_test 全 PASS。inbox-trae.md 全部 open 条目（w-001..w-059）为完成通报，已核对，无需操作。
+
+<!-- 本轮已检查 collab/inbox-trae.md：w-044..w-047 均为已完成轮次的历史通报，无阻塞项；对应能力已在 v3.33.0 落地 -->
