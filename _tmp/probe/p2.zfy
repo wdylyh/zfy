@@ -1,7 +1,11 @@
-// 1f: 无约束泛型体内 length/sum
-fn <T> i64 cnt(let T xs)
-    return length(xs)
-
+fn void d0()
+    let i32 z = 0
+    output(10 / z)
+fn void sh()
+    output(1 << 33)
 fn main()
-    let i32[] xs = 1, 2, 3
-    output(cnt(xs), "\n")
+    if try(d0) != false
+        output("div-no-panic(!)")
+    if try(sh) != false
+        output("shl-no-panic(!)")
+    output("ok")

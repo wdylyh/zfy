@@ -1,0 +1,6 @@
+struct P
+    i32 a
+fn main()
+    let P p1 = P(a=1)
+    let P p2 = p1
+    output(p2.a)

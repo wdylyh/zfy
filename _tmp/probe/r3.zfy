@@ -1,0 +1,7 @@
+fn u8main()
+    let u8 b = 250
+    output(b + 10)
+fn main()
+    if try(u8main) != false
+        output("no-panic(!)")
+    output("ok")

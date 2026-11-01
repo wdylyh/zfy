@@ -1,0 +1,10 @@
+struct Box<T>
+    T v
+    fn T get()
+        return self.v
+fn main()
+    let Box<frac> bf = Box((7/4))
+    output(bf.get())                     // 7/4 —— frac 作 struct 泛型实参
+    let Box<i32> bi = Box(5)
+    output(bi.get())
+    output("ok")

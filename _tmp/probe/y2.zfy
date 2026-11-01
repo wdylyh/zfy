@@ -1,0 +1,4 @@
+fn <K: hash> i32 hmark(let K k)
+    return 1
+fn main()
+    output(hmark(1.5))

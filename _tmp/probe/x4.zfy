@@ -1,0 +1,5 @@
+fn main()
+    let set<u128> s
+    set_add(s, 18446744073709551616)
+    output(set_len(s))
+    output("ok")

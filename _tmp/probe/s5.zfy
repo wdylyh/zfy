@@ -1,2 +1,5 @@
 fn main()
-    output(sort(5, min), "\n")          // 单标量：编译报错
+    output(9223372036854775807 - 1)
+    output(9223372036854775807 / 2)
+    output((1 << 30) * 4)
+    output("ok")

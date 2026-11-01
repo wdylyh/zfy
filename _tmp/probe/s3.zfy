@@ -1,2 +1,5 @@
-fn main()
-    output(sort(1, 6, 3, max), "\n")
+fn i32main()
+    let i32 a = 2147483647
+    output(a + 1)
+fn void main()
+    output("ok")

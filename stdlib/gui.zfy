@@ -1,7 +1,7 @@
 // stdlib/gui.zfy —— GUI 绑定层（design_gui.md L1，v3.3.7）
 //
-// 底层为 runtime.c 的 GUI 核心层（Win32 + DIB 帧缓冲），本模块只做声明与
-// 薄包装；组件层（L2）与应用框架（L3）在此之上用纯 zfy 构建。
+// 底层为 runtime.c 的 GUI 核心层（Direct2D + DirectWrite + WIC，DXGI 交换链），
+// 本模块只做声明与薄包装；组件层（L2）与应用框架（L3）在此之上用纯 zfy 构建。
 //
 // 用法：
 //   mod gui;
@@ -19,8 +19,11 @@
 //           gui_present()
 //           sleep_ms(16)
 //
-// 颜色：0xRRGGBB（如 0xFF0000 红、0x20A0FF 蓝）
-// 坐标：客户区左上为原点，y 向下
+// 颜色：统一 0xAARRGGBB（如 0xFFFF0000 红、0xFF20A0FF 蓝）；仅给 0x00RRGGBB
+//       时 alpha 视为 0xFF（兼容旧 0xRRGGBB 配色）
+// 坐标：客户区左上为原点，y 向下；所有坐标为物理像素（逻辑值须自行 ×SC）
+// DPI：gui_open 的 w/h 为逻辑尺寸，C 侧按 dpi/96 放大为物理像素；
+//      字体 gui_font(px) 的 px 也是逻辑字号，C 侧同样换算
 //
 // 事件类型（与 runtime.c GUI_EV_* 一致）
 pub let i32 const EV_MOVE = 1      // x,y = 鼠标客户区坐标
@@ -28,9 +31,16 @@ pub let i32 const EV_LDOWN = 2
 pub let i32 const EV_LUP = 3
 pub let i32 const EV_RDOWN = 4
 pub let i32 const EV_RUP = 5
-pub let i32 const EV_KEY = 6       // key = UTF-16 码元（WM_CHAR）
+pub let i32 const EV_KEY = 6       // key = UTF-8 字节 / 扩展键前缀码（见 KEY_*）
 pub let i32 const EV_WHEEL = 7     // key = 滚动增量（正=向上）
 pub let i32 const EV_SIZE = 8      // x,y = 新客户区宽高（resize/DPI 变化）
+
+// 混合模式（gui_set_blend）
+pub let i32 const BLEND_SRCOVER  = 0   // 默认：源覆盖（D2D 原生）
+pub let i32 const BLEND_ADD      = 1   // 加法（D2D 原生 PRIMITIVE_BLEND_ADD）
+pub let i32 const BLEND_MULTIPLY = 2   // 正片叠底（CPU 合成）
+pub let i32 const BLEND_SCREEN   = 3   // 滤色（CPU 合成）
+pub let i32 const BLEND_XOR      = 4   // 差异混合 |src-dst|（CPU 合成）
 
 // 鼠标/键盘事件（gui_poll 填充）
 pub struct Event
@@ -43,10 +53,20 @@ pub struct Event
     fn bool is(let i64 t)
         return self.typ == t
 
+// 富文本 run：每段覆盖文本的一段字节区间（与 zfy 字符串的字节偏移一致）
+// start/len 为 UTF-8 字节偏移与长度；argb=0 表示沿用绘制调用的颜色
+pub struct TextRun
+    i64 start = 0
+    i64 len = 0
+    i64 argb = 0
+    i64 weight = 0     // 0=用当前默认字重；400/700 等按 DWRITE_FONT_WEIGHT
+    i64 italic = 0
+    i64 dpx = 0        // 相对当前字号的增量（逻辑 px，可负）
+
 // ===== runtime.c L0 外部符号 =====
 
 extern "C"
-    // 打开固定尺寸窗口（客户区 w x h），标题 UTF-8。0=成功，负数=失败
+    // 打开窗口（客户区逻辑 w x h），标题 UTF-8。0=成功，负数=失败（-6=D2D 不可用）
     i32 zfy_gui_open(let i32 w, let i32 h, let string title)
     // 泵消息并取一事件（4 个出参指针）。1=取到，0=队列空
     i32 zfy_gui_poll(let i64* t, let i64* x, let i64* y, let i64* k)
@@ -57,14 +77,21 @@ extern "C"
     i32 zfy_gui_dpi()
     void zfy_gui_close()
     void zfy_gui_title(let string title)
-    // 提交整帧（BitBlt）。每帧画完后调用一次
+    // 提交整帧（Flush + Present）。每帧画完后调用一次
     void zfy_gui_present()
-    // 块填充矩形（自动裁剪客户区）。C 侧按行填充，热路径不出 C
-    void zfy_gui_fill_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 rgb)
-    // 绘制 UTF-8 文本（GDI，微软雅黑 16px，左上角对齐，透明背景）
-    void zfy_gui_draw_text(let i32 x, let i32 y, let string s, let u32 rgb)
-    // 文本像素宽度（布局用）
+    // 填充矩形
+    void zfy_gui_fill_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 argb)
+    // 描边矩形（真描边；width<=0 视为 1）
+    void zfy_gui_stroke_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 argb, let i32 width)
+    // 绘制 UTF-8 文本（DirectWrite，默认微软雅黑，左上角对齐，透明背景）
+    void zfy_gui_draw_text(let i32 x, let i32 y, let string s, let u32 argb)
+    // 富文本：runs 指向扁平 i64 数组，每段 6 个 i64 = {起始字节, 字节长, ARGB, 字重, 斜体, 字号增量}
+    void zfy_gui_draw_text_rich(let i32 x, let i32 y, let string s, let i64* runs, let i32 n)
+    // 文本像素宽度/高度（布局用，物理像素）
     i32 zfy_gui_text_w(let string s)
+    i32 zfy_gui_text_h(let string s)
+    // 度量四元组：宽/高/基线以上/基线以下
+    void zfy_gui_text_metrics(let string s, let i32* w, let i32* h, let i32* asc, let i32* desc)
     // 剪贴板：读 UTF-8 到 buf（须可容纳），返回字节数；-1=失败 -2=缓冲不足
     i32 zfy_gui_clip_get(let string buf, let i32 cap)
     // 剪贴板：写入 UTF-8 文本（替换现有内容）
@@ -75,11 +102,40 @@ extern "C"
     void zfy_gui_select(let i64 id)
     // 当前窗口图标（.ico 等文件路径；失败静默）
     void zfy_gui_set_icon(let string path)
-    // UI 打磨原语（v3.4.x）：字号/圆角/线条/渐变
+    // 字体与图元原语
     void zfy_gui_font(let i32 px, let i32 bold)
+    void zfy_gui_font_ex(let string family, let i32 px, let i32 weight, let i32 italic)
     void zfy_gui_round_rect(let i32 x, let i32 y, let i32 w, let i32 h, let i32 r, let u32 fill, let u32 border)
-    void zfy_gui_line(let i32 x0, let i32 y0, let i32 x1, let i32 y1, let u32 rgb)
+    void zfy_gui_line(let i32 x0, let i32 y0, let i32 x1, let i32 y1, let u32 argb, let i32 width)
     void zfy_gui_fill_grad(let i32 x, let i32 y, let i32 w, let i32 h, let u32 c1, let u32 c2, let i32 vertical)
+    void zfy_gui_fill_circle(let i32 cx, let i32 cy, let i32 r, let u32 argb)
+    void zfy_gui_stroke_circle(let i32 cx, let i32 cy, let i32 r, let u32 argb, let i32 width)
+    // 圆弧：角度制，0°=+x 轴，正角度顺时针（屏幕 y 向下）
+    void zfy_gui_arc(let i32 cx, let i32 cy, let i32 r, let f64 a0, let f64 a1, let u32 argb, let i32 width)
+    // 多边形：pts 为 x,y 交错的 i32 数组，n 为点数
+    void zfy_gui_fill_poly(let i32* pts, let i32 n, let u32 argb)
+    void zfy_gui_stroke_poly(let i32* pts, let i32 n, let u32 argb, let i32 width)
+    // 二次贝塞尔（单控制点）
+    void zfy_gui_bezier(let i32 x0, let i32 y0, let i32 cx, let i32 cy, let i32 x1, let i32 y1, let u32 argb, let i32 width)
+    // 透明度 / 混合模式
+    void zfy_gui_set_alpha(let i32 alpha)
+    void zfy_gui_reset_alpha()
+    void zfy_gui_set_blend(let i32 mode)
+    // 裁剪 / 变换栈
+    void zfy_gui_push_clip(let i32 x, let i32 y, let i32 w, let i32 h)
+    void zfy_gui_pop_clip()
+    void zfy_gui_push_translate(let i32 dx, let i32 dy)
+    void zfy_gui_pop_transform()
+    // 位图（WIC 加载 / 内存构建）：句柄 >0，0=失败
+    i64 zfy_gui_image_load(let string path)
+    i32 zfy_gui_image_w(let i64 h)
+    i32 zfy_gui_image_h(let i64 h)
+    void zfy_gui_draw_image(let i64 h, let i32 x, let i32 y, let i32 w, let i32 hh, let i32 alpha)
+    void zfy_gui_draw_image_sub(let i64 h, let i32 sx, let i32 sy, let i32 sw, let i32 sh,
+                                let i32 dx, let i32 dy, let i32 dw, let i32 dh, let i32 alpha)
+    void zfy_gui_image_free(let i64 h)
+    // RGBA（非预乘，4 字节/像素）内存缓冲 → 位图
+    i64 zfy_gui_image_from_rgba(let void* px, let i32 w, let i32 h, let i32 stride)
 
 // ===== 包装（zfy 侧友好形态） =====
 
@@ -102,7 +158,7 @@ pub fn i32 gui_h()
 pub fn i32 gui_dpi()
     return zfy_gui_dpi()
 
-// EV_KEY 的 k 值分区：0..0x10FFFF 为 WM_CHAR 码元；扩展键/Ctrl 组合键加前缀
+// EV_KEY 的 k 值分区：0..0x10FFFF 为 UTF-8 字节；扩展键/Ctrl 组合键加前缀
 pub let i64 const KEY_EXT  = 0x10000000      // | VK：LEFT 0x25 RIGHT 0x27 UP 0x26 DOWN 0x28 DEL 0x2E HOME 0x24 END 0x23
 pub let i64 const KEY_CTRL = 0x20000000      // | 'C' 'V' 'A' 'X'
 pub let i64 const KEY_SHIFT = 0x40000000     // 与 KEY_EXT 叠加：Shift+导航键（扩选）
@@ -145,21 +201,44 @@ pub fn void gui_set_icon(let string path)
 pub fn void gui_present()
     zfy_gui_present()
 
-pub fn void gui_fill_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 rgb)
-    zfy_gui_fill_rect(x, y, w, h, rgb)
+pub fn void gui_fill_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 argb)
+    zfy_gui_fill_rect(x, y, w, h, argb)
 
-// 描边矩形（4 次块填充）
-pub fn void gui_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 rgb)
-    zfy_gui_fill_rect(x, y, w, 1, rgb)
-    zfy_gui_fill_rect(x, y + h - 1, w, 1, rgb)
-    zfy_gui_fill_rect(x, y, 1, h, rgb)
-    zfy_gui_fill_rect(x + w - 1, y, 1, h, rgb)
+// 描边矩形（真描边，1px）
+pub fn void gui_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 argb)
+    zfy_gui_stroke_rect(x, y, w, h, argb, 1)
 
-pub fn void gui_draw_text(let i32 x, let i32 y, let string s, let u32 rgb)
-    zfy_gui_draw_text(x, y, s, rgb)
+// 任意宽度描边矩形
+pub fn void gui_stroke_rect(let i32 x, let i32 y, let i32 w, let i32 h, let u32 argb, let i32 width)
+    zfy_gui_stroke_rect(x, y, w, h, argb, width)
+
+pub fn void gui_draw_text(let i32 x, let i32 y, let string s, let u32 argb)
+    zfy_gui_draw_text(x, y, s, argb)
 
 pub fn i32 gui_text_w(let string s)
     return zfy_gui_text_w(s)
+
+pub fn i32 gui_text_h(let string s)
+    return zfy_gui_text_h(s)
+
+// 度量四元组：宽/高/基线以上/基线以下（物理像素）
+pub struct TextMetrics
+    i32 w = 0
+    i32 h = 0
+    i32 asc = 0
+    i32 desc = 0
+
+pub fn TextMetrics gui_text_metrics(let string s)
+    let i32 w = 0
+    let i32 h = 0
+    let i32 a = 0
+    let i32 d = 0
+    zfy_gui_text_metrics(s, &w, &h, &a, &d)
+    return TextMetrics(w=w, h=h, asc=a, desc=d)
+
+// 富文本：runs 为"每段 6 个 i64"的扁平数组（布局与 TextRun 一致，见上）
+pub fn void gui_text_rich(let i32 x, let i32 y, let string s, let i64* runs, let i32 n)
+    zfy_gui_draw_text_rich(x, y, s, runs, n)
 
 // ===== UI 打磨原语包装（v3.4.x） =====
 
@@ -167,17 +246,98 @@ pub fn i32 gui_text_w(let string s)
 pub fn void gui_font(let i32 px, let i32 bold)
     zfy_gui_font(px, bold)
 
+// 扩展字体：family 空串=微软雅黑；weight 400 常规 / 700 粗；italic 非 0 斜体
+pub fn void gui_font_ex(let string family, let i32 px, let i32 weight, let i32 italic)
+    zfy_gui_font_ex(family, px, weight, italic)
+
 // 圆角矩形：fill=0 只描边，border=0 只填充（r 为圆角半径，逻辑值须自行 ×SC）
 pub fn void gui_round_rect(let i32 x, let i32 y, let i32 w, let i32 h, let i32 r, let u32 fill, let u32 border)
     zfy_gui_round_rect(x, y, w, h, r, fill, border)
 
-// 1px 线段
-pub fn void gui_line(let i32 x0, let i32 y0, let i32 x1, let i32 y1, let u32 rgb)
-    zfy_gui_line(x0, y0, x1, y1, rgb)
+// 1px 线段（保持旧签名）
+pub fn void gui_line(let i32 x0, let i32 y0, let i32 x1, let i32 y1, let u32 argb)
+    zfy_gui_line(x0, y0, x1, y1, argb, 1)
+
+// 任意宽度线段
+pub fn void gui_line_w(let i32 x0, let i32 y0, let i32 x1, let i32 y1, let u32 argb, let i32 width)
+    zfy_gui_line(x0, y0, x1, y1, argb, width)
 
 // 渐变矩形：c1→c2 线性插值，vertical 非 0 纵向
 pub fn void gui_fill_grad(let i32 x, let i32 y, let i32 w, let i32 h, let u32 c1, let u32 c2, let i32 vertical)
     zfy_gui_fill_grad(x, y, w, h, c1, c2, vertical)
+
+// 圆：填充 / 描边
+pub fn void gui_fill_circle(let i32 cx, let i32 cy, let i32 r, let u32 argb)
+    zfy_gui_fill_circle(cx, cy, r, argb)
+
+pub fn void gui_stroke_circle(let i32 cx, let i32 cy, let i32 r, let u32 argb, let i32 width)
+    zfy_gui_stroke_circle(cx, cy, r, argb, width)
+
+// 圆弧（角度制）
+pub fn void gui_arc(let i32 cx, let i32 cy, let i32 r, let f64 a0, let f64 a1, let u32 argb, let i32 width)
+    zfy_gui_arc(cx, cy, r, a0, a1, argb, width)
+
+// 多边形（pts = x,y 交错的 i32 数组首地址，n = 点数）
+pub fn void gui_fill_poly(let i32* pts, let i32 n, let u32 argb)
+    zfy_gui_fill_poly(pts, n, argb)
+
+pub fn void gui_stroke_poly(let i32* pts, let i32 n, let u32 argb, let i32 width)
+    zfy_gui_stroke_poly(pts, n, argb, width)
+
+// 二次贝塞尔曲线
+pub fn void gui_bezier(let i32 x0, let i32 y0, let i32 cx, let i32 cy, let i32 x1, let i32 y1, let u32 argb, let i32 width)
+    zfy_gui_bezier(x0, y0, cx, cy, x1, y1, argb, width)
+
+// 全局乘性透明度（0..255；后续所有绘制的 alpha 再乘 alpha/255）
+pub fn void gui_set_alpha(let i32 alpha)
+    zfy_gui_set_alpha(alpha)
+
+pub fn void gui_reset_alpha()
+    zfy_gui_reset_alpha()
+
+pub fn void gui_set_blend(let i32 mode)
+    zfy_gui_set_blend(mode)
+
+// 裁剪 / 变换栈
+pub fn void gui_push_clip(let i32 x, let i32 y, let i32 w, let i32 h)
+    zfy_gui_push_clip(x, y, w, h)
+
+pub fn void gui_pop_clip()
+    zfy_gui_pop_clip()
+
+pub fn void gui_push_translate(let i32 dx, let i32 dy)
+    zfy_gui_push_translate(dx, dy)
+
+pub fn void gui_pop_transform()
+    zfy_gui_pop_transform()
+
+// ===== 位图 =====
+
+// 加载图片文件（PNG/JPG/BMP/GIF 首帧）→ 句柄；0=失败
+pub fn i64 gui_image_load(let string path)
+    return zfy_gui_image_load(path)
+
+pub fn i32 gui_image_w(let i64 h)
+    return zfy_gui_image_w(h)
+
+pub fn i32 gui_image_h(let i64 h)
+    return zfy_gui_image_h(h)
+
+pub fn void gui_image_free(let i64 h)
+    zfy_gui_image_free(h)
+
+// 缩放绘制到 (x,y,w,h)；alpha 0..255 与全局 alpha 叠加
+pub fn void gui_draw_image(let i64 h, let i32 x, let i32 y, let i32 w, let i32 hh, let i32 alpha)
+    zfy_gui_draw_image(h, x, y, w, hh, alpha)
+
+// 子区域绘制（精灵表）：源矩形 (sx,sy,sw,sh) → 目标 (dx,dy,dw,dh)
+pub fn void gui_draw_image_sub(let i64 h, let i32 sx, let i32 sy, let i32 sw, let i32 sh,
+                               let i32 dx, let i32 dy, let i32 dw, let i32 dh, let i32 alpha)
+    zfy_gui_draw_image_sub(h, sx, sy, sw, sh, dx, dy, dw, dh, alpha)
+
+// 内存 RGBA（非预乘）→ 位图句柄；stride<=0 时按 w*4
+pub fn i64 gui_image_from_rgba(let void* px, let i32 w, let i32 h, let i32 stride)
+    return zfy_gui_image_from_rgba(px, w, h, stride)
 
 // 取一事件；true = e 已填充
 pub fn bool gui_poll(ref let Event e)

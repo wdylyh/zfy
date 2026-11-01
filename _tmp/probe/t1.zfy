@@ -1,8 +1,8 @@
-mod widgets;
-use widgets::{App, UI}
-use gui::{gui_frame_sleep}
-
+// string 边缘：unicode 与转义
 fn main()
-    let App app = App()
-    let i32 fails = 0
-    output("ok", fails, "\n")
+    let string s = "hello\nworld"
+    output(length(s))        // 11（\n 按 1 字节）
+    output(s[5])             // \n char
+    let string u = "中文字符"
+    output(length(u))        // utf-8 字节数 12
+    output("ok")

@@ -1,0 +1,12 @@
+// 接口值与表达式接收者
+interface Draw
+    fn string show()
+struct P
+    i32 v
+impl Draw for P
+    fn string show()
+        return "P"
+fn main()
+    let P p = P(v=1)
+    output(p.show())
+    output("ok")

@@ -1,0 +1,145 @@
+// gui2_test.zfy — Direct2D 扩展内建验证（自动开关窗，可入回归）
+// 覆盖：图形（圆/弧/多边形/贝塞尔/描边矩形）、文本（font_ex / text_h / text_metrics /
+// 富文本）、透明度与混合模式、裁剪与平移变换、WIC 位图与内存 RGBA 位图。
+// 全部断言通过则 exit 0。
+mod gui;
+
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_present, gui_poll, gui_frame_sleep,
+          gui_fill_rect, gui_rect, gui_stroke_rect, gui_line, gui_line_w, gui_draw_text, gui_text_w,
+          gui_text_h, gui_text_metrics, gui_text_rich, gui_font, gui_font_ex, gui_round_rect, gui_fill_grad,
+          gui_fill_circle, gui_stroke_circle, gui_arc, gui_fill_poly, gui_stroke_poly, gui_bezier,
+          gui_set_alpha, gui_reset_alpha, gui_set_blend, gui_push_clip, gui_pop_clip,
+          gui_push_translate, gui_pop_transform, gui_image_from_rgba, gui_image_load, gui_image_w,
+          gui_image_h, gui_image_free, gui_draw_image, gui_draw_image_sub,
+          BLEND_SRCOVER, BLEND_ADD, BLEND_MULTIPLY, BLEND_SCREEN, BLEND_XOR, TextMetrics, Event}
+
+extern "C"
+    void* malloc(let u64 n)
+    void free(let void* p)
+
+fn main()
+    let i32 rc = gui_open(520, 400, "zfy gui2 d2d")
+    if rc != 0
+        output("FAIL open rc=", rc)
+        return 1
+    if gui_w() != 520 * gui_dpi() / 96 or gui_h() != 400 * gui_dpi() / 96
+        output("FAIL size w=", gui_w(), " h=", gui_h(), " dpi=", gui_dpi())
+        return 1
+
+    // ---- 文本度量（DirectWrite）：宽/高/基线以上/基线以下均应为正 ----
+    gui_font(16, 0)
+    let TextMetrics m = gui_text_metrics("Hello 你好 zfy")
+    if m.w <= 0 or m.h <= 0 or m.asc <= 0 or m.desc <= 0
+        output("FAIL metrics w=", m.w, " h=", m.h, " asc=", m.asc, " desc=", m.desc)
+        return 1
+    if gui_text_h("x") <= 0
+        output("FAIL text_h=", gui_text_h("x"))
+        return 1
+    let i32 tw16 = gui_text_w("zfy")
+    // 24 逻辑 px 明显更宽（同族同字重）
+    gui_font(24, 0)
+    let i32 tw24 = gui_text_w("zfy")
+    if tw24 <= tw16
+        output("FAIL font scale 16=", tw16, " 24=", tw24)
+        return 1
+    gui_font(16, 0)
+
+    // ---- 内存 RGBA 位图（8x8 橙色，非预乘）----
+    let void* buf = malloc(256)
+    let u8* px = cast(buf, u8*)
+    unsafe
+        let i32 i = 0
+        while i < 256
+            px[i] = 220
+            i++
+    let i64 img = gui_image_from_rgba(buf, 8, 8, 0)
+    free(buf)
+    if img <= 0
+        output("FAIL image_from_rgba=", img)
+        return 1
+    if gui_image_w(img) != 8 or gui_image_h(img) != 8
+        output("FAIL image size w=", gui_image_w(img), " h=", gui_image_h(img))
+        return 1
+    // 不存在的文件 → 句柄 0
+    if gui_image_load("no_such_picture.png") != 0
+        output("FAIL image_load missing file should be 0")
+        return 1
+
+    // 多边形顶点（x,y 交错）
+    let i32 tri[6] = 300, 120, 360, 120, 330, 180
+
+    let i32 frames = 0
+    while gui_alive() and frames < 40
+        let Event e = Event()
+        while gui_poll(ref e)
+            let i64 _t = e.typ
+        let i64 f0 = tick_ms()
+
+        // 背景渐变 + 描边
+        gui_fill_grad(0, 0, gui_w(), gui_h(), 0x101820, 0x24303C, 1)
+        gui_rect(8, 8, gui_w() - 16, gui_h() - 16, 0x4CC2FF)
+
+        // 圆 / 圆弧 / 描边圆
+        gui_fill_circle(70, 90, 34, 0xFFFF7040)
+        gui_stroke_circle(70, 90, 44, 0xFF80FFC0, 3)
+        gui_arc(70, 90, 56, 200.0, 340.0, 0xFFFFFF80, 2)
+
+        // 多边形（填充 + 描边）
+        gui_fill_poly(&tri[0], 3, 0xFF4CC2FF)
+        gui_stroke_poly(&tri[0], 3, 0xFFFFFFFF, 2)
+
+        // 贝塞尔与线宽
+        gui_bezier(160, 160, 200, 90, 260, 160, 0xFFFFC0FF, 2)
+        gui_line_w(160, 175, 400, 175, 0xFF808080, 1)
+
+        // 圆角矩形 + 描边矩形
+        gui_round_rect(160, 110, 120, 40, 8, 0xFF2C2C2C, 0xFF3A3A3A)
+        gui_stroke_rect(160, 200, 120, 40, 0xFF6CCB5F, 2)
+
+        // 富文本：两段（前 6 字节粗体红，后 6 字节绿色 +4 逻辑 px）
+        let i64 runs[12] = 0, 6, 0xFFFF6060, 700, 0, 0, 6, 6, 0xFF80FF80, 400, 0, 4
+        gui_text_rich(160, 260, "Hello 你好", &runs[0], 2)
+
+        // 透明度：半透明覆盖块
+        gui_set_alpha(110)
+        gui_fill_rect(320, 110, 150, 40, 0xFFFFFFFF)
+        gui_reset_alpha()
+
+        // 混合模式轮转：加法/正片叠底/滤色/差异（每帧换一种，确保每条路径都跑到）
+        let i32 mode = 1 + (frames % 4)
+        gui_set_blend(mode)
+        gui_fill_circle(400, 260, 30, 0xFF66A0FF)
+        gui_set_blend(BLEND_SRCOVER)
+
+        // 位图绘制：整图缩放 + 子区域（精灵表）
+        gui_draw_image(img, 430, 320, 32, 32, 255)
+        gui_draw_image_sub(img, 0, 0, 4, 4, 480, 320, 24, 24, 160)
+
+        // 裁剪 + 平移变换
+        gui_push_clip(8, 300, 240, 90)
+        gui_push_translate(10, 10)
+        gui_fill_rect(0, 290, 220, 80, 0xFF303860)
+        gui_pop_transform()
+        gui_pop_clip()
+
+        gui_font_ex("Microsoft YaHei UI", 14, 400, 0)
+        gui_draw_text(20, 340, "D2D 内建全路径", 0xFFFFFFFF)
+        gui_font(16, 0)
+
+        gui_present()
+        gui_frame_sleep(f0)
+        frames++
+
+    gui_image_free(img)
+    if gui_image_w(img) != 0
+        output("FAIL image handle not cleared after free")
+        return 1
+    gui_close()
+    if frames != 40
+        output("FAIL frames=", frames)
+        return 1
+    if gui_alive()
+        output("FAIL alive after close")
+        return 1
+    output("gui2 PASS: 40 帧, ", m.w, "x", m.h, " asc=", m.asc, " desc=", m.desc)
+    return 0

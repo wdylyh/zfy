@@ -1,0 +1,6 @@
+interface Foo<T>
+
+    fn i32 get()
+
+fn main()
+    output("ok")

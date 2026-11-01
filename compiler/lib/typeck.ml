@@ -1569,6 +1569,12 @@ and const_eval (env : env) (e : texpr) : int64 option =
                terr e.epos
                  "shift count %Ld overflows a %d-bit operand in a constant expression \
                   (runtime shifts panic; split the shift or use a wider type)" y w
+             (* 未定型整数字面量（TVar）按 zfy 默认整型 i32 计宽度：否则
+                `1 << 33` 会被当成 i64 域折叠而逃过检查（v3.33 回归修复） *)
+             | TVar _ when y >= 32L ->
+               terr e.epos
+                 "shift count %Ld overflows a 32-bit operand in a constant expression \
+                  (runtime shifts panic; split the shift or use a wider type)" y 32
              | _ ->
                if y < 0L || y >= 64L then None
                else if shop = BShl then Some (Int64.shift_left x (Int64.to_int y))

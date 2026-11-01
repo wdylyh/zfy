@@ -1,0 +1,15 @@
+fn main()
+    let i32 x = 1
+    output(x)
+
+fn broken(
+    let i32 y = 2
+    output(y)
+
+fn other()
+    let s = SomeStruct(a=1, b=2)
+    output("hi")
+
+fn third()
+    let q = 3 + + 4
+    output(q)

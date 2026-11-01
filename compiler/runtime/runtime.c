@@ -70,6 +70,11 @@ __attribute__((weak)) void *zfy_calloc(size_t cnt, size_t sz) {
 #ifdef _WIN32
 #include <io.h>                      /* _isatty（交互控制台探测） */
 #ifndef ZFY_FREESTANDING
+/* COM 的 C 语言接口形态：d2d1/dwrite/wincodec/dxgi 头文件需要这两个宏
+   才会产出可直接调用的 vtbl 结构与 ID2D1Factory_CreateXxx 之类的宏。
+   必须在任何系统头（windows.h 及其传递包含）之前定义。 */
+#define CINTERFACE
+#define COBJMACROS
 #include <windows.h>                 /* OS 熵源（SystemFunction036 动态加载） */
 #endif
 #else
@@ -4156,19 +4161,38 @@ void zfy_time_sleep_f(double sec) {
 #endif /* !ZFY_FREESTANDING：计时器段结束（依赖 QPC/单调钟/sleep） */
 
 /* ==================== GUI 核心层（v3.3.7 design_gui.md L0） ====================
- * 架构（速度保障）：
- *  - CreateDIBSection 32bpp 帧缓冲：zfy/C 直接写像素内存，无 GDI 逐像素开销
- *  - fill_rect 按行块填充，draw_text 走 GDI（内存 DC 与 DIB 共享，
- *    支持中文/抗锯齿）；present 单次 BitBlt 提交整帧
+ * 渲染引擎（完全替换 GDI DIB → Direct2D + DirectWrite + WIC）：
+ *  - 每窗口一套 ID2D1DeviceContext + DXGI 交换链（Flip 模型，双缓冲），
+ *    后端 D3D11 设备（硬件优先，失败自动退回 WARP 软件光栅，远程会话可用）
+ *  - 抗锯齿：几何 PER_PRIMITIVE，文本 GRAYSCALE（中文/英文均平滑，无 GDI 调色板抖动）
+ *  - 颜色约定：zfy 侧统一 0xAARRGGBB；仅给 0xRRGGBB（高字节为 0 且 RGB 非 0）时
+ *    alpha 缺省为 0xFF（向后兼容旧组件配色）
+ *  - 全局乘性透明度：gui_set_alpha(a) 把后续所有绘制的 alpha 再乘 a/255
+ *  - 混合模式：0=SourceOver（D2D 默认）1=Additive（D2D 原生加法混合）
+ *    2=Multiply 3=Screen 4=Xor 走"源位图 + 目标回读 + CPU 逐像素合成 + 上传"路径
+ *    （Xor 按 abs(dst-src) 逐通道实现，等同差异混合）
+ *  - DPI 语义不变：open 的 w/h 为逻辑尺寸，按 dpi/96 放大为物理像素；渲染目标
+ *    SetDpi(96) 使 1 DIP = 1 物理像素，字体 px 逻辑 → 物理 = px * dpi / 96，
+ *    故 widgets 的 SC() 缩放逻辑无需修改
  *  - 事件：环形队列（WndProc 生产、poll 消费），轮询模型 O(1)
- *  - 单线程模型：poll() 顺带泵消息，用户每帧至少 poll 一次
- *  - 颜色约定：zfy 侧 0xRRGGBB；帧缓冲 dword = 0x00RRGGBB（DIB 32bpp 内存序
- *    为 B,G,R，小端 DWORD 恰好还原 RRGGBB——不做通道交换）
- *  - DPI 感知：Per-Monitor V2（旧系统退回 SetProcessDPIAware），
- *    open 的 w/h 按 dpi 缩放为物理像素，无 DWM 拉伸模糊；gui_dpi() 供布局缩放
- *  - 可调窗口：WM_SIZE 时重建 DIB 并推 EV_SIZE 事件（x=新宽, y=新高） */
+ *  - 单线程模型：poll() 顺带泵消息，用户每帧至少 poll 一次；每帧画完 present() 一次
+ *  - 缓存策略：
+ *      · IDWriteTextFormat：全局 64 槽 LRU，键 = (字体族, 物理字号, 字重, 斜体)
+ *      · 纯色画刷：每窗口 64 槽 LRU，键 = 有效 ARGB（已乘全局 alpha）
+ *      · 位图：全局 64 槽句柄表（句柄 = 槽位 + 1，0 表示非法）
+ *      · 混合合成的临时位图/缓冲区：每窗口单例，按需增长
+ *  - 可调窗口：WM_SIZE 时 ResizeBuffers + 重建目标位图并推 EV_SIZE 事件 */
 #if defined(_WIN32) && !defined(ZFY_FREESTANDING)
 #include <wchar.h>                     /* wcslen（GUI 文本转换） */
+#include <d2d1_1.h>
+#include <d3d11.h>
+#include <dxgi1_3.h>
+#include <dwrite.h>
+#include <wincodec.h>
+
+/* mingw 的 IDWriteFactory IID 未进导入库，本地定义一份 */
+static const GUID gui_iid_dwrite = { 0xb859ee5a, 0xd838, 0x4b5b,
+                                     { 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48 } };
 
 typedef struct { int64_t t, x, y, k; } gui_ev;
 #define GUI_EVQ 256
@@ -4195,20 +4219,104 @@ typedef struct { int64_t t, x, y, k; } gui_ev;
  * 绘制类 API 作用于"当前窗口" g_cur（gui_select 切换）；gui_open 保持
  * 返回 0=成功 的兼容语义，句柄经 zfy_gui_self() 取。 */
 #define GUI_MAXWIN 8
+#define GUI_TF_SLOTS 64
+#define GUI_BR_SLOTS 64
+#define GUI_IMG_SLOTS 64
+#define GUI_XF_STACK 16
+#define GUI_CLIP_STACK 16
+
+/* ---------- D2D 调用宏（mingw 的 d2d1 vtbl 有继承嵌套，路径逐层写死） ---------- */
+#define RT(c)            ((ID2D1RenderTarget *)(c))
+#define RT_V(c, fn, ...) (RT(c)->lpVtbl->fn(RT(c), ##__VA_ARGS__))
+#define DC_V(c, fn, ...) ((c)->lpVtbl->fn(c, ##__VA_ARGS__))
+#define FACT(f, fn, ...) ((f)->lpVtbl->Base.fn((ID2D1Factory *)(f), ##__VA_ARGS__))
+#define FACT1(f, fn, ...) ((f)->lpVtbl->fn((ID2D1Factory1 *)(f), ##__VA_ARGS__))
+#define GEO(g, fn, ...)  (((ID2D1Geometry *)(g))->lpVtbl->fn((ID2D1Geometry *)(g), ##__VA_ARGS__))
+#define PG(g, fn, ...)   ((g)->lpVtbl->fn((ID2D1PathGeometry *)(g), ##__VA_ARGS__))
+#define SINK(s, fn, ...) ((s)->lpVtbl->Base.fn((ID2D1SimplifiedGeometrySink *)(s), ##__VA_ARGS__))
+#define SINK2(s, fn, ...) ((s)->lpVtbl->fn((ID2D1GeometrySink *)(s), ##__VA_ARGS__))
+#define SINK_CLOSE(s)    ((s)->lpVtbl->Base.Close((ID2D1SimplifiedGeometrySink *)(s)))
+#define SB_SETCOLOR(b, c) ((b)->lpVtbl->SetColor((ID2D1SolidColorBrush *)(b), c))
+#define BR_SETOPACITY(b, o) ((b)->lpVtbl->Base.SetOpacity((ID2D1Brush *)(b), o))
+#define BM_V(b, fn, ...) ((b)->lpVtbl->Base.fn((ID2D1Bitmap *)(b), ##__VA_ARGS__))
+#define BM1_V(b, fn, ...) ((b)->lpVtbl->fn((ID2D1Bitmap1 *)(b), ##__VA_ARGS__))
+#define REL(o) do { if (o) { ((IUnknown *)(void *)(o))->lpVtbl->Release((IUnknown *)(void *)(o)); } } while (0)
+
+typedef struct {
+    uint32_t argb;
+    ID2D1SolidColorBrush *br;
+    unsigned stamp;
+    int used;
+} gui_br_slot;
+
+typedef struct {
+    ID2D1Bitmap1 *bmp;
+    int w, h;
+    int used;
+} gui_img;
+
+typedef struct {
+    char family[64];
+    float size;
+    int weight, italic;
+    IDWriteTextFormat *fmt;
+    unsigned stamp;
+    int used;
+} gui_tf_slot;
+
 typedef struct {
     int used;
     HWND hwnd;
-    HDC win_dc, mem;
-    HBITMAP bmp, oldbmp;
-    HFONT font, oldfont;
-    uint32_t *fb;
+    /* D2D/DXGI 渲染资源 */
+    IDXGISwapChain1 *swap;
+    ID2D1DeviceContext *ctx;
+    ID2D1Bitmap1 *target;
     int w, h, dpi;
+    /* 当前默认文本样式（DirectWrite） */
+    char tf_family[64];
+    int tf_px, tf_weight, tf_italic;
+    /* 透明度 / 混合模式 */
+    int alpha;                            /* 全局乘性 alpha 0..255 */
+    int blend;                            /* 0..4（见 GUI_BLEND_*） */
+    /* 纯色画刷缓存（每窗口） */
+    gui_br_slot br[GUI_BR_SLOTS];
+    unsigned br_tick;
+    /* 混合模式合成用临时资源 */
+    ID2D1Bitmap1 *scr_src;                /* 源：图元画在透明底上 */
+    ID2D1Bitmap1 *scr_dst;                /* 目的快照（CPU 可读） */
+    ID2D1Bitmap1 *scr_up;                 /* 合成结果上传位图 */
+    unsigned char *scr_buf;               /* CPU 合成缓冲区 */
+    int scr_w, scr_h;
+    /* 变换 / 裁剪栈 */
+    D2D1_MATRIX_3X2_F xf[GUI_XF_STACK];
+    int xf_n;
+    int clip_n;
     volatile int alive, should_close;
     gui_ev q[GUI_EVQ];
     volatile long qh, qt;
 } gui_win;
 static gui_win g_wins[GUI_MAXWIN];
 static gui_win *g_cur = NULL;
+
+/* 全局单例（COM 与设备级对象） */
+static ID2D1Factory1 *g_d2d_fct = NULL;
+static IDWriteFactory *g_dw = NULL;
+static IWICImagingFactory *g_wic = NULL;
+static ID2D1Device *g_d2d_dev = NULL;
+static ID3D11Device *g_d3d = NULL;
+static IDXGIFactory2 *g_dxgi = NULL;
+static ID2D1StrokeStyle *g_stroke_flat = NULL;
+static int g_com_ready = 0;
+static gui_tf_slot g_tf[GUI_TF_SLOTS];
+static unsigned g_tf_tick = 0;
+static gui_img g_imgs[GUI_IMG_SLOTS];
+
+/* 混合模式取值（与 stdlib/gui.zfy 的 BLEND_* 一致） */
+#define GUI_BLEND_SRCOVER  0
+#define GUI_BLEND_ADD      1
+#define GUI_BLEND_MULTIPLY 2
+#define GUI_BLEND_SCREEN   3
+#define GUI_BLEND_XOR      4
 
 static void gui_push_ev(gui_win *w, int64_t t, int64_t x, int64_t y, int64_t k) {
     /* MOVE 合并：队列尾已有未消费的 MOVE 时直接覆盖坐标（只保留最新位置）。
@@ -4238,30 +4346,447 @@ static void gui_push_ev(gui_win *w, int64_t t, int64_t x, int64_t y, int64_t k) 
     w->qt = nxt;
 }
 
-/* 重建 DIB 帧缓冲（open 首建与 WM_SIZE 缩放共用） */
-static void gui_recreate_surface(gui_win *w, int nw, int nh) {
-    if (!w->mem) return;
-    if (w->bmp) {
-        SelectObject(w->mem, w->oldbmp);
-        DeleteObject(w->bmp);
-        w->bmp = NULL;
+/* ---------- 引擎初始化（首次开窗时懒创建；失败返回 0） ---------- */
+static int gui_engine_init(void) {
+    if (g_d2d_fct) return 1;
+    /* COM 初始化：D2D/DWrite/WIC 均走 COM。已是 MTA 时不致命（RPC_E_CHANGED_MODE） */
+    if (SUCCEEDED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)))
+        g_com_ready = 1;
+
+    D2D1_FACTORY_OPTIONS fopt;
+    memset(&fopt, 0, sizeof(fopt));
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory1,
+                                &fopt, (void **)&g_d2d_fct)))
+        return 0;
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &gui_iid_dwrite,
+                                   (IUnknown **)&g_dw)))
+        return 0;
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IWICImagingFactory, (void **)&g_wic)))
+        return 0;
+
+    /* D3D11 设备：硬件优先，失败退 WARP（远程桌面/无 GPU 环境仍可渲染） */
+    D3D_FEATURE_LEVEL lv[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+                               D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
+    D3D_FEATURE_LEVEL got = 0;
+    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT, lv, 4,
+                                   D3D11_SDK_VERSION, &g_d3d, &got, NULL);
+    if (FAILED(hr) || !g_d3d)
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL,
+                               D3D11_CREATE_DEVICE_BGRA_SUPPORT, lv, 4,
+                               D3D11_SDK_VERSION, &g_d3d, &got, NULL);
+    if (FAILED(hr) || !g_d3d) return 0;
+
+    IDXGIDevice *dxdev = NULL;
+    if (FAILED(ID3D11Device_QueryInterface(g_d3d, &IID_IDXGIDevice, (void **)&dxdev))) return 0;
+    hr = FACT1(g_d2d_fct, CreateDevice, dxdev, &g_d2d_dev);
+    IDXGIAdapter *ad = NULL;
+    if (SUCCEEDED(hr)) IDXGIDevice_GetAdapter(dxdev, &ad);
+    if (ad) {
+        IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&g_dxgi);
+        REL(ad);
     }
-    BITMAPINFO bi;
-    memset(&bi, 0, sizeof(bi));
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = nw;
-    bi.bmiHeader.biHeight = -nh;           /* top-down：原点左上 */
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    w->bmp = CreateDIBSection(w->mem, &bi, DIB_RGB_COLORS, (void **)&w->fb, NULL, 0);
-    w->oldbmp = (HBITMAP)SelectObject(w->mem, w->bmp);
-    w->w = nw; w->h = nh;
-    if (w->fb) memset(w->fb, 0, (size_t)nw * (size_t)nh * 4);
+    REL(dxdev);
+    if (!g_d2d_dev || !g_dxgi) return 0;
+
+    /* 统一描边样式：平头、斜接，抗锯齿由 target 决定 */
+    D2D1_STROKE_STYLE_PROPERTIES sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.startCap = D2D1_CAP_STYLE_FLAT;
+    sp.endCap = D2D1_CAP_STYLE_FLAT;
+    sp.dashCap = D2D1_CAP_STYLE_FLAT;
+    sp.lineJoin = D2D1_LINE_JOIN_MITER;
+    sp.miterLimit = 10.0f;
+    FACT(g_d2d_fct, CreateStrokeStyle, &sp, NULL, 0, &g_stroke_flat);
+    return 1;
+}
+
+/* ---------- 文本格式缓存（64 槽 LRU，键 = 族/物理字号/字重/斜体） ---------- */
+static IDWriteTextFormat *gui_text_format(gui_win *w, const char *family,
+                                          int px, int weight, int italic) {
+    if (!g_dw || !w) return NULL;
+    const char *fam = (family && family[0]) ? family : "Microsoft YaHei UI";
+    if (px <= 0) px = 16;
+    float size = (float)((px * w->dpi + 95) / 96);   /* 逻辑 px → 物理 px */
+    if (size < 1.0f) size = 1.0f;
+
+    gui_tf_slot *victim = &g_tf[0];
+    for (int i = 0; i < GUI_TF_SLOTS; i++) {
+        gui_tf_slot *s = &g_tf[i];
+        if (s->used) {
+            if (s->size == size && s->weight == weight && s->italic == italic
+                && strncmp(s->family, fam, sizeof(s->family) - 1) == 0) {
+                s->stamp = ++g_tf_tick;
+                return s->fmt;
+            }
+            if (s->stamp < victim->stamp || !victim->used) victim = s;
+        } else if (!victim->used) {
+            victim = s;
+        }
+    }
+    /* 淘汰最久未用槽（固定 64 槽，不做动态增长） */
+    REL(victim->fmt);
+    memset(victim, 0, sizeof(*victim));
+
+    wchar_t wfam[64];
+    int n = MultiByteToWideChar(CP_UTF8, 0, fam, -1, wfam, 64);
+    if (n <= 0) { wcscpy(wfam, L"Microsoft YaHei UI"); }
+    IDWriteTextFormat *fmt = NULL;
+    if (FAILED(IDWriteFactory_CreateTextFormat(g_dw, wfam, NULL,
+            (DWRITE_FONT_WEIGHT)weight, italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, size, L"zh-cn", &fmt)))
+        return NULL;
+    strncpy(victim->family, fam, sizeof(victim->family) - 1);
+    victim->family[sizeof(victim->family) - 1] = 0;
+    victim->size = size;
+    victim->weight = weight;
+    victim->italic = italic ? 1 : 0;
+    victim->fmt = fmt;
+    victim->stamp = ++g_tf_tick;
+    victim->used = 1;
+    return fmt;
+}
+
+/* ---------- 颜色：0xAARRGGBB → 乘全局 alpha → D2D1_COLOR_F ---------- */
+static uint32_t gui_argb_eff(gui_win *w, uint32_t c) {
+    uint32_t a = (c >> 24) & 0xFFu;
+    if (a == 0 && (c & 0x00FFFFFFu) != 0) a = 0xFFu;   /* 兼容旧 0xRRGGBB */
+    a = a * (uint32_t)(w->alpha < 0 ? 0 : (w->alpha > 255 ? 255 : w->alpha)) / 255u;
+    return (a << 24) | (c & 0x00FFFFFFu);
+}
+
+static D2D1_COLOR_F gui_color(uint32_t argb) {
+    D2D1_COLOR_F c;
+    c.a = (float)((argb >> 24) & 0xFFu) / 255.0f;
+    c.r = (float)((argb >> 16) & 0xFFu) / 255.0f;
+    c.g = (float)((argb >> 8) & 0xFFu) / 255.0f;
+    c.b = (float)(argb & 0xFFu) / 255.0f;
+    return c;
+}
+
+/* ---------- 纯色画刷缓存（每窗口 64 槽 LRU） ---------- */
+static void gui_br_flush(gui_win *w) {
+    for (int i = 0; i < GUI_BR_SLOTS; i++) {
+        REL(w->br[i].br);
+        w->br[i].br = NULL;
+        w->br[i].used = 0;
+    }
+}
+
+static ID2D1SolidColorBrush *gui_brush(gui_win *w, uint32_t argb) {
+    if (!w || !w->ctx) return NULL;
+    uint32_t eff = gui_argb_eff(w, argb);
+    gui_br_slot *victim = &w->br[0];
+    for (int i = 0; i < GUI_BR_SLOTS; i++) {
+        gui_br_slot *s = &w->br[i];
+        if (s->used) {
+            if (s->argb == eff) {
+                s->stamp = ++w->br_tick;
+                return s->br;
+            }
+            if (!victim->used || s->stamp < victim->stamp) victim = s;
+        } else if (!victim->used) {
+            victim = s;
+        }
+    }
+    REL(victim->br);
+    memset(victim, 0, sizeof(*victim));
+    D2D1_COLOR_F col = gui_color(eff);
+    ID2D1SolidColorBrush *br = NULL;
+    if (FAILED(RT_V(w->ctx, CreateSolidColorBrush, &col, NULL, &br))) return NULL;
+    victim->argb = eff;
+    victim->br = br;
+    victim->stamp = ++w->br_tick;
+    victim->used = 1;
+    return br;
+}
+
+/* ---------- 混合模式：几何绘制统一入口 ---------- */
+static void gui_draw_geo_brush(gui_win *w, ID2D1Geometry *geo, ID2D1Brush *br, float sw);
+
+/* CPU 合成（模式 2/3/4）：把几何画到透明源位图，回读目标区，逐像素混合后上传绘制 */
+static int gui_scr_ensure(gui_win *w, int bw, int bh) {
+    if (bw < 1 || bh < 1) return 0;
+    if (w->scr_w >= bw && w->scr_h >= bh && w->scr_src && w->scr_dst && w->scr_up && w->scr_buf)
+        return 1;
+    int nw = bw > 1 ? ((bw + 31) / 32) * 32 : 32;
+    int nh = bh > 1 ? ((bh + 31) / 32) * 32 : 32;
+    if (w->scr_w >= nw && w->scr_h >= nh) return 1;   /* 已有更大缓存，直接复用 */
+
+    REL(w->scr_src); REL(w->scr_dst); REL(w->scr_up); w->scr_src = w->scr_dst = w->scr_up = NULL;
+    free(w->scr_buf); w->scr_buf = NULL;
+    w->scr_w = w->scr_h = 0;
+
+    D2D1_BITMAP_PROPERTIES1 tp;
+    memset(&tp, 0, sizeof(tp));
+    tp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    tp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    tp.dpiX = 96; tp.dpiY = 96;
+    tp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+    D2D1_SIZE_U sz;
+    sz.width = (UINT32)nw; sz.height = (UINT32)nh;
+    if (FAILED(DC_V(w->ctx, CreateBitmap, sz, NULL, 0, &tp, &w->scr_src))) return 0;
+
+    D2D1_BITMAP_PROPERTIES1 cp;
+    memset(&cp, 0, sizeof(cp));
+    cp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    cp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    cp.dpiX = 96; cp.dpiY = 96;
+    cp.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+    if (FAILED(DC_V(w->ctx, CreateBitmap, sz, NULL, 0, &cp, &w->scr_dst))) {
+        REL(w->scr_src); w->scr_src = NULL;
+        return 0;
+    }
+
+    D2D1_BITMAP_PROPERTIES1 up;
+    memset(&up, 0, sizeof(up));
+    up.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    up.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    up.dpiX = 96; up.dpiY = 96;
+    up.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+    if (FAILED(DC_V(w->ctx, CreateBitmap, sz, NULL, 0, &up, &w->scr_up))) {
+        REL(w->scr_src); REL(w->scr_dst);
+        w->scr_src = w->scr_dst = NULL;
+        return 0;
+    }
+    w->scr_buf = (unsigned char *)malloc((size_t)nw * (size_t)nh * 4);
+    if (!w->scr_buf) {
+        REL(w->scr_src); REL(w->scr_dst); REL(w->scr_up);
+        w->scr_src = w->scr_dst = w->scr_up = NULL;
+        return 0;
+    }
+    w->scr_w = nw; w->scr_h = nh;
+    return 1;
+}
+
+static void gui_blend_composite(gui_win *w, ID2D1Geometry *geo, ID2D1Brush *br,
+                                float sw, int bx, int by, int bw, int bh) {
+    if (!gui_scr_ensure(w, bw, bh)) return;
+    D2D1_MATRIX_3X2_F m;
+    RT_V(w->ctx, GetTransform, &m);
+
+    /* 1) 源：透明底上按"当前变换 + 平移(-bx,-by)"画图元，结果贴在位图左上角 */
+    D2D1_MATRIX_3X2_F lm = m;
+    lm._31 -= (float)bx;
+    lm._32 -= (float)by;
+    DC_V(w->ctx, SetTarget, (ID2D1Image *)w->scr_src);
+    RT_V(w->ctx, Clear, NULL);
+    RT_V(w->ctx, SetTransform, &lm);
+    if (sw > 0.0f) RT_V(w->ctx, DrawGeometry, geo, br, sw, g_stroke_flat);
+    else           RT_V(w->ctx, FillGeometry, geo, br, NULL);
+    RT_V(w->ctx, Flush, NULL, NULL);
+    DC_V(w->ctx, SetTarget, NULL);
+
+    /* 2) 源区快照 → CPU 缓冲（scr_src 不再作目标后才允许回读） */
+    D2D1_POINT_2U dp;
+    dp.x = 0; dp.y = 0;
+    D2D1_RECT_U sr;
+    sr.left = 0; sr.top = 0;
+    sr.right = (UINT32)bw; sr.bottom = (UINT32)bh;
+    D2D1_MAPPED_RECT ms;
+    memset(&ms, 0, sizeof(ms));
+    int src_ok = 0;
+    if (SUCCEEDED(BM_V(w->scr_dst, CopyFromBitmap, &dp, (ID2D1Bitmap *)w->scr_src, &sr))
+        && SUCCEEDED(BM1_V(w->scr_dst, Map, D2D1_MAP_OPTIONS_READ, &ms))) {
+        for (int y = 0; y < bh; y++) {
+            const unsigned char *srow = (const unsigned char *)ms.bits + (size_t)y * ms.pitch;
+            memcpy(w->scr_buf + (size_t)y * (size_t)(bw * 4), srow, (size_t)bw * 4);
+        }
+        BM1_V(w->scr_dst, Unmap);
+        src_ok = 1;
+    }
+
+    /* 3) 目标区快照 → CPU 逐像素合成 → 写回 scr_buf → 上传 */
+    if (src_ok && w->target) {
+        D2D1_BITMAP_PROPERTIES1 cp;
+        memset(&cp, 0, sizeof(cp));
+        cp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        cp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+        cp.dpiX = 96; cp.dpiY = 96;
+        cp.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+        D2D1_SIZE_U dsz;
+        dsz.width = (UINT32)bw; dsz.height = (UINT32)bh;
+        ID2D1Bitmap1 *dstSnap = NULL;
+        if (SUCCEEDED(DC_V(w->ctx, CreateBitmap, dsz, NULL, 0, &cp, &dstSnap)) && dstSnap) {
+            D2D1_RECT_U tr;
+            tr.left = (UINT32)bx; tr.top = (UINT32)by;
+            tr.right = (UINT32)(bx + bw); tr.bottom = (UINT32)(by + bh);
+            D2D1_MAPPED_RECT md;
+            memset(&md, 0, sizeof(md));
+            if (SUCCEEDED(BM_V(dstSnap, CopyFromBitmap, &dp, (ID2D1Bitmap *)w->target, &tr))
+                && SUCCEEDED(BM1_V(dstSnap, Map, D2D1_MAP_OPTIONS_READ, &md))) {
+                int mode = w->blend;
+                for (int y = 0; y < bh; y++) {
+                    unsigned char *srow = w->scr_buf + (size_t)y * (size_t)(bw * 4);
+                    const unsigned char *drow = (const unsigned char *)md.bits + (size_t)y * md.pitch;
+                    for (int x = 0; x < bw; x++) {
+                        /* 预乘存储：通道 = 颜色 × alpha */
+                        float as = (float)srow[x * 4 + 3] / 255.0f;
+                        float ab = (float)drow[x * 4 + 3] / 255.0f;
+                        if (as <= 0.0f) continue;
+                        float ao = as + ab * (1.0f - as);
+                        for (int ch = 0; ch < 3; ch++) {
+                            float sp = (float)srow[x * 4 + ch] / 255.0f;   /* 源，预乘 */
+                            float dpc = (float)drow[x * 4 + ch] / 255.0f;  /* 目标，预乘 */
+                            float cs = sp / as;                            /* 源，去预乘 */
+                            float cb = ab > 0.0f ? dpc / ab : 0.0f;        /* 目标，去预乘 */
+                            float b;
+                            if (mode == GUI_BLEND_MULTIPLY)      b = cs * cb;
+                            else if (mode == GUI_BLEND_SCREEN)   b = 1.0f - (1.0f - cs) * (1.0f - cb);
+                            else {                              /* XOR：按差值合成 */
+                                b = cs > cb ? cs - cb : cb - cs;
+                            }
+                            /* 预乘通用式：co = sp*(1-ab) + as*ab*b + dpc*(1-as) */
+                            float co = sp * (1.0f - ab) + as * ab * b + dpc * (1.0f - as);
+                            if (co < 0.0f) co = 0.0f;
+                            if (co > 1.0f) co = 1.0f;
+                            srow[x * 4 + ch] = (unsigned char)(co * 255.0f + 0.5f);
+                        }
+                        srow[x * 4 + 3] = (unsigned char)(ao * 255.0f + 0.5f);
+                    }
+                }
+                BM1_V(dstSnap, Unmap);
+            }
+            REL(dstSnap);
+        }
+    }
+
+    /* 4) 上传结果并画回目标区（此处用设备坐标，绕开当前变换） */
+    D2D1_RECT_U ur;
+    ur.left = 0; ur.top = 0;
+    ur.right = (UINT32)bw; ur.bottom = (UINT32)bh;
+    if (src_ok && SUCCEEDED(BM_V(w->scr_up, CopyFromMemory, &ur, w->scr_buf, (UINT32)(bw * 4))) && w->target) {
+        D2D1_MATRIX_3X2_F id;
+        memset(&id, 0, sizeof(id));
+        id._11 = 1.0f; id._22 = 1.0f;
+        RT_V(w->ctx, SetTransform, &id);
+        DC_V(w->ctx, SetTarget, (ID2D1Image *)w->target);
+        D2D1_RECT_F dest;
+        dest.left = (float)bx; dest.top = (float)by;
+        dest.right = (float)(bx + bw); dest.bottom = (float)(by + bh);
+        RT_V(w->ctx, DrawBitmap, (ID2D1Bitmap *)w->scr_up, &dest, 1.0f,
+              D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL);
+    } else if (w->target) {
+        DC_V(w->ctx, SetTarget, (ID2D1Image *)w->target);
+    }
+    RT_V(w->ctx, SetTransform, &m);
+}
+static void gui_draw_geo_brush(gui_win *w, ID2D1Geometry *geo, ID2D1Brush *br, float sw) {
+    if (!w || !w->ctx || !geo || !br) return;
+    if (w->blend == GUI_BLEND_SRCOVER) {
+        if (sw > 0.0f) RT_V(w->ctx, DrawGeometry, geo, br, sw, g_stroke_flat);
+        else           RT_V(w->ctx, FillGeometry, geo, br, NULL);
+        return;
+    }
+    if (w->blend == GUI_BLEND_ADD) {
+        DC_V(w->ctx, SetPrimitiveBlend, D2D1_PRIMITIVE_BLEND_ADD);
+        if (sw > 0.0f) RT_V(w->ctx, DrawGeometry, geo, br, sw, g_stroke_flat);
+        else           RT_V(w->ctx, FillGeometry, geo, br, NULL);
+        DC_V(w->ctx, SetPrimitiveBlend, D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+        return;
+    }
+    /* 2=Multiply 3=Screen 4=Xor：包围盒内 CPU 合成 */
+    D2D1_RECT_F bb;
+    if (FAILED(GEO(geo, GetBounds, NULL, &bb))) return;
+    float pad = (sw > 0.0f ? sw : 0.0f) + 2.0f;
+    int bx = (int)(bb.left - pad), by = (int)(bb.top - pad);
+    int bx2 = (int)(bb.right + pad + 0.5f), by2 = (int)(bb.bottom + pad + 0.5f);
+    if (bx < 0) bx = 0;
+    if (by < 0) by = 0;
+    if (bx2 > w->w) bx2 = w->w;
+    if (by2 > w->h) by2 = w->h;
+    int bw = bx2 - bx, bh = by2 - by;
+    if (bw <= 0 || bh <= 0) return;
+    DC_V(w->ctx, SetTarget, (ID2D1Image *)w->target);
+    gui_blend_composite(w, geo, br, sw, bx, by, bw, bh);
+}
+static void gui_draw_geo(gui_win *w, ID2D1Geometry *geo, uint32_t argb, float sw) {
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    gui_draw_geo_brush(w, geo, (ID2D1Brush *)br, sw);
 }
 
 static gui_win *gui_win_of(HWND hw) {
     return (gui_win *)(INT_PTR)GetWindowLongPtrW(hw, GWLP_USERDATA);
+}
+
+/* ---------- 渲染目标（交换链 + 目标位图） ---------- */
+static int gui_rt_bind_target(gui_win *w) {
+    if (!w->ctx || !w->swap) return 0;
+    if (w->target) {
+        w->ctx->lpVtbl->SetTarget(w->ctx, NULL);
+        REL(w->target);
+        w->target = NULL;
+    }
+    IDXGISurface *surf = NULL;
+    if (FAILED(IDXGISwapChain1_GetBuffer(w->swap, 0, &IID_IDXGISurface, (void **)&surf))) return 0;
+    D2D1_BITMAP_PROPERTIES1 bp;
+    memset(&bp, 0, sizeof(bp));
+    bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bp.dpiX = 96; bp.dpiY = 96;
+    bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+    HRESULT hr = DC_V(w->ctx, CreateBitmapFromDxgiSurface, surf, &bp, &w->target);
+    REL(surf);
+    if (FAILED(hr) || !w->target) return 0;
+    w->ctx->lpVtbl->SetTarget(w->ctx, (ID2D1Image *)w->target);
+    return 1;
+}
+
+static void gui_rt_release(gui_win *w) {
+    gui_br_flush(w);
+    REL(w->scr_src); REL(w->scr_dst); REL(w->scr_up);
+    w->scr_src = w->scr_dst = w->scr_up = NULL;
+    free(w->scr_buf);
+    w->scr_buf = NULL;
+    w->scr_w = w->scr_h = 0;
+    if (w->ctx && w->target) w->ctx->lpVtbl->SetTarget(w->ctx, NULL);
+    REL(w->target); w->target = NULL;
+    REL(w->ctx); w->ctx = NULL;
+    REL(w->swap); w->swap = NULL;
+}
+
+static int gui_rt_create(gui_win *w) {
+    DXGI_SWAP_CHAIN_DESC1 sd;
+    memset(&sd, 0, sizeof(sd));
+    sd.Width = (UINT32)(w->w > 0 ? w->w : 1);
+    sd.Height = (UINT32)(w->h > 0 ? w->h : 1);
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    sd.Scaling = DXGI_SCALING_NONE;
+    if (FAILED(IDXGIFactory2_CreateSwapChainForHwnd(g_dxgi, (IUnknown *)g_d3d, w->hwnd,
+                                                   &sd, NULL, NULL, &w->swap)))
+        return 0;
+    IDXGIFactory2_MakeWindowAssociation(g_dxgi, w->hwnd, DXGI_MWA_NO_ALT_ENTER);
+    if (FAILED(g_d2d_dev->lpVtbl->CreateDeviceContext(g_d2d_dev,
+                                                      D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &w->ctx)))
+        return 0;
+    RT_V(w->ctx, SetDpi, 96.0f, 96.0f);
+    RT_V(w->ctx, SetAntialiasMode, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    RT_V(w->ctx, SetTextAntialiasMode, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    if (!gui_rt_bind_target(w)) return 0;
+    return 1;
+}
+
+static void gui_rt_resize(gui_win *w, int nw, int nh) {
+    if (!w->swap || !w->ctx) { w->w = nw; w->h = nh; return; }
+    if (w->target) {
+        w->ctx->lpVtbl->SetTarget(w->ctx, NULL);
+        REL(w->target);
+        w->target = NULL;
+    }
+    if (FAILED(IDXGISwapChain1_ResizeBuffers(w->swap, 0, (UINT32)nw, (UINT32)nh,
+                                             DXGI_FORMAT_UNKNOWN, 0))) {
+        w->w = nw; w->h = nh;
+        return;
+    }
+    w->w = nw; w->h = nh;
+    gui_rt_bind_target(w);
+    /* 临时合成位图尺寸随目标变化，下一次混合绘制会自动重建 */
 }
 
 static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
@@ -4269,20 +4794,19 @@ static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     if (!w) return DefWindowProcW(hw, msg, wp, lp);   /* 创建期消息 */
     switch (msg) {
     case WM_SIZE:
-        /* 最小化不重建；尺寸变化时换新 DIB 并通知业务层重布局 */
+        /* 最小化不重建；尺寸变化时重建交换链缓冲并通知业务层重布局 */
         if (w->alive && wp != SIZE_MINIMIZED) {
             int nw = LOWORD(lp), nh = HIWORD(lp);
             if (nw > 0 && nh > 0 && (nw != w->w || nh != w->h)) {
-                gui_recreate_surface(w, nw, nh);
+                gui_rt_resize(w, nw, nh);
                 gui_push_ev(w, GUI_EV_SIZE, nw, nh, 0);
             }
         }
         return 0;
     case WM_PAINT: {
+        /* 交换链内容自持（Flip 模型），这里只校验更新区防刷屏重绘 */
         PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hw, &ps);
-        if (w->mem)
-            BitBlt(dc, 0, 0, w->w, w->h, w->mem, 0, 0, SRCCOPY);
+        BeginPaint(hw, &ps);
         EndPaint(hw, &ps);
         return 0;
     }
@@ -4345,6 +4869,7 @@ static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         w->alive = 0;
         w->used = 0;
         w->hwnd = NULL;
+        gui_rt_release(w);
         return 0;
     }
     return DefWindowProcW(hw, msg, wp, lp);
@@ -4364,6 +4889,8 @@ int32_t zfy_gui_open(int32_t w, int32_t h, char *title_utf8) {
         if (!g_wins[i].used) { wslot = &g_wins[i]; break; }
     if (!wslot) return -5;                 /* 窗口数达上限 */
     if (w <= 0 || h <= 0) return -2;
+    /* 渲染引擎不可用：返回负数失败（绝不静默退回 GDI） */
+    if (!gui_engine_init()) return -6;
     static int class_registered = 0;
     if (!class_registered) {
         WNDCLASSW wc;
@@ -4407,17 +4934,22 @@ int32_t zfy_gui_open(int32_t w, int32_t h, char *title_utf8) {
     if (!hwnd) return -4;
     memset(wslot, 0, sizeof(*wslot));
     wslot->hwnd = hwnd;
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)wslot);
-    wslot->win_dc = GetDC(hwnd);
-    wslot->mem = CreateCompatibleDC(wslot->win_dc);
-    gui_recreate_surface(wslot, w, h);     /* DIB + w/h */
-    /* 字体：微软雅黑 16 逻辑px × DPI（覆盖中英文）；SetBkMode 在 draw_text 内保持透明 */
-    wslot->font = CreateFontW(-16 * dpi / 96, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-    wslot->oldfont = (HFONT)SelectObject(wslot->mem, wslot->font);
-    SetBkMode(wslot->mem, TRANSPARENT);
+    wslot->w = w;
+    wslot->h = h;
     wslot->dpi = dpi;
+    wslot->alpha = 255;
+    wslot->blend = GUI_BLEND_SRCOVER;
+    strncpy(wslot->tf_family, "Microsoft YaHei UI", sizeof(wslot->tf_family) - 1);
+    wslot->tf_family[sizeof(wslot->tf_family) - 1] = 0;
+    wslot->tf_px = 16;
+    wslot->tf_weight = 400;
+    wslot->tf_italic = 0;
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)wslot);
+    if (!gui_rt_create(wslot)) {
+        DestroyWindow(hwnd);
+        memset(wslot, 0, sizeof(*wslot));
+        return -6;                          /* D2D 交换链创建失败 */
+    }
     wslot->should_close = 0;
     wslot->alive = 1;
     wslot->used = 1;
@@ -4511,7 +5043,7 @@ void zfy_gui_close(void) {
         g_cur->hwnd = NULL;
         g_cur->alive = 0;
         g_cur->used = 0;
-        DestroyWindow(hw);
+        DestroyWindow(hw);                 /* WM_DESTROY 里释放 D2D 资源 */
     }
 }
 
@@ -4536,158 +5068,685 @@ void zfy_gui_set_icon(char *path_utf8) {
     if (small) SendMessageW(g_cur->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small);
 }
 
+/* 提交整帧：Flush + Present（每帧绘制完成后调用一次） */
 void zfy_gui_present(void) {
-    if (g_cur && g_cur->win_dc && g_cur->mem)
-        BitBlt(g_cur->win_dc, 0, 0, g_cur->w, g_cur->h, g_cur->mem, 0, 0, SRCCOPY);
+    gui_win *w = g_cur;
+    if (!w || !w->ctx || !w->swap) return;
+    RT_V(w->ctx, Flush, NULL, NULL);
+    IDXGISwapChain1_Present(w->swap, 1, 0);
 }
 
-void zfy_gui_fill_rect(int32_t rx, int32_t ry, int32_t rw, int32_t rh, uint32_t rgb) {
-    if (!g_cur || !g_cur->fb) return;
-    int gw = g_cur->w, gh = g_cur->h;
-    /* 裁剪到客户区 */
-    int x0 = rx < 0 ? 0 : rx, y0 = ry < 0 ? 0 : ry;
-    int x1 = (rx + rw) > gw ? gw : (rx + rw);
-    int y1 = (ry + rh) > gh ? gh : (ry + rh);
-    if (x0 >= x1 || y0 >= y1) return;
-    /* DIB 32bpp 小端 DWORD 恰为 0x00RRGGBB——直接用，不换通道 */
-    uint32_t pix = 0xFF000000u | rgb;
-    int span = x1 - x0;
-    for (int y = y0; y < y1; y++) {
-        uint32_t *row = g_cur->fb + (size_t)y * gw + x0;
-        for (int x = 0; x < span; x++) row[x] = pix;
+/* ---------- 图元 ---------- */
+
+/* 矩形几何（混合模式路径用） */
+static ID2D1RectangleGeometry *gui_rect_geo(int32_t x, int32_t y, int32_t w, int32_t h) {
+    D2D1_RECT_F r;
+    r.left = (float)x; r.top = (float)y;
+    r.right = (float)(x + w); r.bottom = (float)(y + h);
+    ID2D1RectangleGeometry *g = NULL;
+    if (FAILED(FACT(g_d2d_fct, CreateRectangleGeometry, &r, &g))) return NULL;
+    return g;
+}
+
+void zfy_gui_fill_rect(int32_t rx, int32_t ry, int32_t rw, int32_t rh, uint32_t argb) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    if (rw <= 0 || rh <= 0) return;
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (!br) return;
+    D2D1_RECT_F r;
+    r.left = (float)rx; r.top = (float)ry;
+    r.right = (float)(rx + rw); r.bottom = (float)(ry + rh);
+    if (w->blend == GUI_BLEND_SRCOVER) {
+        RT_V(w->ctx, FillRectangle, &r, (ID2D1Brush *)br);
+    } else if (w->blend == GUI_BLEND_ADD) {
+        DC_V(w->ctx, SetPrimitiveBlend, D2D1_PRIMITIVE_BLEND_ADD);
+        RT_V(w->ctx, FillRectangle, &r, (ID2D1Brush *)br);
+        DC_V(w->ctx, SetPrimitiveBlend, D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+    } else {
+        ID2D1RectangleGeometry *g = gui_rect_geo(rx, ry, rw, rh);
+        if (g) { gui_draw_geo_brush(w, (ID2D1Geometry *)g, (ID2D1Brush *)br, 0.0f); REL(g); }
     }
 }
 
-void zfy_gui_draw_text(int32_t tx, int32_t ty, char *utf8, uint32_t rgb) {
-    if (!g_cur || !g_cur->mem) return;
-    wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
-    /* COLORREF = 0x00BBGGRR：R 在低字节，与 0xRRGGBB 相反，需交换 */
-    COLORREF cr = ((rgb >> 16) & 0xFF) | (rgb & 0xFF00) | ((rgb & 0xFF) << 16);
-    COLORREF old = SetTextColor(g_cur->mem, cr);
-    TextOutW(g_cur->mem, tx, ty, wt, (int)wcslen(wt));
-    SetTextColor(g_cur->mem, old);
-    free(wt);
+/* 描边矩形（真描边，替代旧 4 次填充模拟；width<=0 视为 1） */
+void zfy_gui_stroke_rect(int32_t x, int32_t y, int32_t rw, int32_t rh,
+                         uint32_t argb, int32_t width) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    if (rw <= 0 || rh <= 0) return;
+    float sw = (float)(width > 0 ? width : 1);
+    float half = sw / 2.0f;
+    D2D1_RECT_F r;
+    r.left = (float)x + half; r.top = (float)y + half;
+    r.right = (float)(x + rw) - half; r.bottom = (float)(y + rh) - half;
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (!br) return;
+    RT_V(w->ctx, DrawRectangle, &r, (ID2D1Brush *)br, sw, g_stroke_flat);
 }
 
-int32_t zfy_gui_text_w(char *utf8) {
-    if (!g_cur || !g_cur->mem) return 0;
-    wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
-    SIZE sz;
-    if (!GetTextExtentPoint32W(g_cur->mem, wt, (int)wcslen(wt), &sz)) sz.cx = 0;
-    free(wt);
-    return (int32_t)sz.cx;
-}
-
-/* ---------- UI 打磨原语（v3.4.x：字号/圆角/线条/渐变） ---------- */
-
-static COLORREF gui_rgb(uint32_t rgb) {
-    /* 0xRRGGBB -> COLORREF 0x00BBGGRR */
-    return ((rgb >> 16) & 0xFF) | (rgb & 0xFF00) | ((rgb & 0xFF) << 16);
-}
-
-/* 设置当前字体：px 逻辑像素（内部 ×DPI），bold 非 0 为粗体。
-   影响后续 gui_draw_text / gui_text_w；px<=0 恢复默认 16。
-   按 (px,bold) 缓存 HFONT——组件每帧 draw 都会设置字体，不缓存则每帧 CreateFont。 */
-void zfy_gui_font(int32_t px, int32_t bold) {
-    if (!g_cur || !g_cur->mem) return;
-    if (px <= 0) px = 16;
-    /* 槽位表：每种 (px,bold) 一个 HFONT 常驻，不做单槽淘汰。
-       旧实现"单槽缓存 + DeleteObject(仍选入 DC 的旧字体)"在多字号
-       来回切换时触发 GDI 未定义行为（实测 <16px 渲染缺失/变黑）。 */
-    #define GUI_FONT_SLOTS 16
-    static HFONT fonts[GUI_FONT_SLOTS] = {0};
-    static int fpx[GUI_FONT_SLOTS];
-    static int fbold[GUI_FONT_SLOTS];
-    static int slot_n = 0;
-    int want = (bold != 0);
-    int i;
-    for (i = 0; i < GUI_FONT_SLOTS; i++) {
-        if (fonts[i] && fpx[i] == px && fbold[i] == want) {
-            SelectObject(g_cur->mem, fonts[i]);
-            return;
-        }
-    }
-    HFONT f = CreateFontW(-(int)px * g_cur->dpi / 96, 0, 0, 0,
-                          bold ? FW_SEMIBOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                          CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-    if (!f) return;
-    /* 覆盖循环槽；旧字体可能仍被某窗口 DC 持有——不 DeleteObject，
-       GDI 句柄数量按字号种类计（个位数），无需回收 */
-    int slot = slot_n % GUI_FONT_SLOTS;
-    fonts[slot] = f; fpx[slot] = px; fbold[slot] = want;
-    slot_n++;
-    SelectObject(g_cur->mem, f);
-}
-
-/* 圆角矩形：fill=0 跳过填充，border=0 跳过描边（1px） */
-void zfy_gui_round_rect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r,
+/* 圆角矩形：fill=0 跳过填充，border=0 跳过描边（1px）；r 为逻辑半径 */
+void zfy_gui_round_rect(int32_t x, int32_t y, int32_t rw, int32_t rh, int32_t r,
                         uint32_t fill, uint32_t border) {
-    if (!g_cur || !g_cur->mem) return;
-    if (w <= 0 || h <= 0) return;
-    if (r * 2 > w) r = w / 2;
-    if (r * 2 > h) r = h / 2;
-    if (r < 1) {
-        if (fill) zfy_gui_fill_rect(x, y, w, h, fill);
-        if (border) {
-            zfy_gui_fill_rect(x, y, w, 1, border);
-            zfy_gui_fill_rect(x, y + h - 1, w, 1, border);
-            zfy_gui_fill_rect(x, y, 1, h, border);
-            zfy_gui_fill_rect(x + w - 1, y, 1, h, border);
-        }
-        return;
-    }
-    HRGN rgn = CreateRoundRectRgn(x, y, x + w + 1, y + h + 1, r * 2, r * 2);
-    if (!rgn) return;
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    if (rw <= 0 || rh <= 0) return;
+    if (r * 2 > rw) r = rw / 2;
+    if (r * 2 > rh) r = rh / 2;
+    if (r < 0) r = 0;
+    D2D1_ROUNDED_RECT rr;
+    rr.rect.left = (float)x; rr.rect.top = (float)y;
+    rr.rect.right = (float)(x + rw); rr.rect.bottom = (float)(y + rh);
+    rr.radiusX = (float)r; rr.radiusY = (float)r;
     if (fill) {
-        HBRUSH bf = CreateSolidBrush(gui_rgb(fill));
-        FillRgn(g_cur->mem, rgn, bf);
-        DeleteObject(bf);
+        ID2D1SolidColorBrush *br = gui_brush(w, fill);
+        if (br) {
+            if (w->blend == GUI_BLEND_SRCOVER) {
+                RT_V(w->ctx, FillRoundedRectangle, &rr, (ID2D1Brush *)br);
+            } else {
+                /* 圆角几何走统一混合路径 */
+                ID2D1RoundedRectangleGeometry *g = NULL;
+                if (SUCCEEDED(FACT(g_d2d_fct, CreateRoundedRectangleGeometry, &rr, &g)) && g) {
+                    gui_draw_geo_brush(w, (ID2D1Geometry *)g, (ID2D1Brush *)br, 0.0f);
+                    REL(g);
+                }
+            }
+        }
     }
     if (border) {
-        HBRUSH bb = CreateSolidBrush(gui_rgb(border));
-        FrameRgn(g_cur->mem, rgn, bb, 1, 1);
-        DeleteObject(bb);
+        ID2D1SolidColorBrush *br = gui_brush(w, border);
+        if (br) RT_V(w->ctx, DrawRoundedRectangle, &rr, (ID2D1Brush *)br, 1.0f, g_stroke_flat);
     }
-    DeleteObject(rgn);
 }
 
-/* 线段（GDI 硬边，1px） */
-void zfy_gui_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t rgb) {
-    if (!g_cur || !g_cur->mem) return;
-    HGDIOBJ oldpen = SelectObject(g_cur->mem, GetStockObject(DC_PEN));
-    COLORREF prev = SetDCPenColor(g_cur->mem, gui_rgb(rgb));
-    MoveToEx(g_cur->mem, x0, y0, NULL);
-    LineTo(g_cur->mem, x1, y1);
-    SetDCPenColor(g_cur->mem, prev);
-    SelectObject(g_cur->mem, oldpen);
+/* 线段：width<=0 视为 1 */
+void zfy_gui_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                  uint32_t argb, int32_t width) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (!br) return;
+    float sw = (float)(width > 0 ? width : 1);
+    if (w->blend == GUI_BLEND_SRCOVER) {
+        D2D1_POINT_2F a, b;
+        a.x = (float)x0; a.y = (float)y0; b.x = (float)x1; b.y = (float)y1;
+        RT_V(w->ctx, DrawLine, a, b, (ID2D1Brush *)br, sw, g_stroke_flat);
+        return;
+    }
+    ID2D1PathGeometry *pg = NULL;
+    ID2D1GeometrySink *sink = NULL;
+    if (FAILED(FACT(g_d2d_fct, CreatePathGeometry, &pg))) return;
+    if (FAILED(PG(pg, Open, &sink))) { REL(pg); return; }
+    SINK(sink, BeginFigure, (D2D1_POINT_2F){ (float)x0, (float)y0 }, D2D1_FIGURE_BEGIN_HOLLOW);
+    SINK2(sink, AddLine, (D2D1_POINT_2F){ (float)x1, (float)y1 });
+    SINK(sink, EndFigure, D2D1_FIGURE_END_OPEN);
+    SINK_CLOSE(sink);
+    REL(sink);
+    gui_draw_geo_brush(w, (ID2D1Geometry *)pg, (ID2D1Brush *)br, sw);
+    REL(pg);
 }
 
-/* 渐变矩形：c1->c2 像素线性插值，vertical 非 0 为纵向（DIB 直写，快） */
+/* 渐变矩形：c1→c2 线性插值，vertical 非 0 为纵向（D2D 线性渐变画刷） */
 void zfy_gui_fill_grad(int32_t rx, int32_t ry, int32_t rw, int32_t rh,
                        uint32_t c1, uint32_t c2, int32_t vertical) {
-    if (!g_cur || !g_cur->fb) return;
-    int gw = g_cur->w, gh = g_cur->h;
-    int x0 = rx < 0 ? 0 : rx, y0 = ry < 0 ? 0 : ry;
-    int x1 = (rx + rw) > gw ? gw : (rx + rw);
-    int y1 = (ry + rh) > gh ? gh : (ry + rh);
-    if (x0 >= x1 || y0 >= y1) return;
-    int span = x1 - x0;
-    int steps = vertical ? (y1 - y0) : (x1 - x0);
-    if (steps < 1) steps = 1;
-    for (int y = y0; y < y1; y++) {
-        uint32_t *row = g_cur->fb + (size_t)y * gw + x0;
-        for (int x = x0; x < x1; x++) {
-            int t = vertical ? (y - y0) : (x - x0);
-            uint32_t r = ((c1 >> 16) & 0xFF) * (steps - 1 - t) / (steps - 1)
-                       + ((c2 >> 16) & 0xFF) * t / (steps - 1);
-            uint32_t g = ((c1 >> 8) & 0xFF) * (steps - 1 - t) / (steps - 1)
-                       + ((c2 >> 8) & 0xFF) * t / (steps - 1);
-            uint32_t b = (c1 & 0xFF) * (steps - 1 - t) / (steps - 1)
-                       + (c2 & 0xFF) * t / (steps - 1);
-            row[x - x0] = 0xFF000000u | (r << 16) | (g << 8) | b;
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    if (rw <= 0 || rh <= 0) return;
+    uint32_t e1 = gui_argb_eff(w, c1), e2 = gui_argb_eff(w, c2);
+    D2D1_GRADIENT_STOP stops[2];
+    stops[0].position = 0.0f;  stops[0].color = gui_color(e1);
+    stops[1].position = 1.0f;  stops[1].color = gui_color(e2);
+    ID2D1GradientStopCollection *coll = NULL;
+    if (FAILED(RT_V(w->ctx, CreateGradientStopCollection, stops, 2,
+                    D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &coll)))
+        return;
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES gp;
+    if (vertical) {
+        gp.startPoint.x = (float)rx; gp.startPoint.y = (float)ry;
+        gp.endPoint.x = (float)rx;   gp.endPoint.y = (float)(ry + rh);
+    } else {
+        gp.startPoint.x = (float)rx; gp.startPoint.y = (float)ry;
+        gp.endPoint.x = (float)(rx + rw); gp.endPoint.y = (float)ry;
+    }
+    ID2D1LinearGradientBrush *br = NULL;
+    if (FAILED(RT_V(w->ctx, CreateLinearGradientBrush, &gp, NULL, coll, &br))) {
+        REL(coll);
+        return;
+    }
+    D2D1_RECT_F r;
+    r.left = (float)rx; r.top = (float)ry;
+    r.right = (float)(rx + rw); r.bottom = (float)(ry + rh);
+    if (w->blend == GUI_BLEND_SRCOVER) {
+        RT_V(w->ctx, FillRectangle, &r, (ID2D1Brush *)br);
+    } else {
+        ID2D1RectangleGeometry *g = gui_rect_geo(rx, ry, rw, rh);
+        if (g) { gui_draw_geo_brush(w, (ID2D1Geometry *)g, (ID2D1Brush *)br, 0.0f); REL(g); }
+    }
+    REL(br);
+    REL(coll);
+}
+
+/* 圆：填充 / 描边 */
+void zfy_gui_fill_circle(int32_t cx, int32_t cy, int32_t r, uint32_t argb) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx || r <= 0) return;
+    D2D1_ELLIPSE e;
+    e.point.x = (float)cx; e.point.y = (float)cy;
+    e.radiusX = (float)r; e.radiusY = (float)r;
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (!br) return;
+    if (w->blend == GUI_BLEND_SRCOVER) {
+        RT_V(w->ctx, FillEllipse, &e, (ID2D1Brush *)br);
+        return;
+    }
+    ID2D1EllipseGeometry *g = NULL;
+    if (SUCCEEDED(FACT(g_d2d_fct, CreateEllipseGeometry, &e, &g)) && g) {
+        gui_draw_geo_brush(w, (ID2D1Geometry *)g, (ID2D1Brush *)br, 0.0f);
+        REL(g);
+    }
+}
+
+void zfy_gui_stroke_circle(int32_t cx, int32_t cy, int32_t r, uint32_t argb, int32_t width) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx || r <= 0) return;
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (!br) return;
+    D2D1_ELLIPSE e;
+    float sw = (float)(width > 0 ? width : 1);
+    e.point.x = (float)cx; e.point.y = (float)cy;
+    e.radiusX = (float)r - sw / 2.0f;
+    e.radiusY = (float)r - sw / 2.0f;
+    if (e.radiusX < 0.5f || e.radiusY < 0.5f) return;
+    RT_V(w->ctx, DrawEllipse, &e, (ID2D1Brush *)br, sw, g_stroke_flat);
+}
+
+/* 圆弧：角度制，0°=+x 轴，正角度顺时针（屏幕 y 向下）；a0→a1 */
+void zfy_gui_arc(int32_t cx, int32_t cy, int32_t r, double a0, double a1,
+                 uint32_t argb, int32_t width) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx || r <= 0) return;
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (!br) return;
+    double th0 = a0 * 3.14159265358979323846 / 180.0;  /* 角度 → 弧度（rad0/rad1 与 dlgs.h 宏冲突，避开） */
+    double th1 = a1 * 3.14159265358979323846 / 180.0;
+    double span = a1 - a0;
+    while (span >= 360.0) span -= 360.0;
+    while (span <= -360.0) span += 360.0;
+    if (span == 0.0) return;
+    ID2D1PathGeometry *pg = NULL;
+    ID2D1GeometrySink *sink = NULL;
+    if (FAILED(FACT(g_d2d_fct, CreatePathGeometry, &pg))) return;
+    if (FAILED(PG(pg, Open, &sink))) { REL(pg); return; }
+    D2D1_POINT_2F start;
+    start.x = (float)(cx + r * cos(th0));
+    start.y = (float)(cy + r * sin(th0));
+    SINK(sink, BeginFigure, start, D2D1_FIGURE_BEGIN_HOLLOW);
+    D2D1_ARC_SEGMENT seg;
+    seg.point.x = (float)(cx + r * cos(th1));
+    seg.point.y = (float)(cy + r * sin(th1));
+    seg.size.width = (float)r; seg.size.height = (float)r;
+    seg.rotationAngle = 0.0f;
+    seg.sweepDirection = span > 0.0 ? D2D1_SWEEP_DIRECTION_CLOCKWISE
+                                    : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
+    seg.arcSize = (span > 180.0 || span < -180.0) ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
+    SINK2(sink, AddArc, &seg);
+    SINK(sink, EndFigure, D2D1_FIGURE_END_OPEN);
+    SINK_CLOSE(sink);
+    REL(sink);
+    float sw = (float)(width > 0 ? width : 1);
+    RT_V(w->ctx, DrawGeometry, (ID2D1Geometry *)pg, (ID2D1Brush *)br, sw, g_stroke_flat);
+    REL(pg);
+}
+
+/* 多边形：pts 为 x,y 交错整数数组（物理像素），n 为点数 */
+static ID2D1PathGeometry *gui_poly_geo(int32_t *pts, int32_t n, int closed) {
+    if (!pts || n < 2) return NULL;
+    ID2D1PathGeometry *pg = NULL;
+    ID2D1GeometrySink *sink = NULL;
+    if (FAILED(FACT(g_d2d_fct, CreatePathGeometry, &pg))) return NULL;
+    if (FAILED(PG(pg, Open, &sink))) { REL(pg); return NULL; }
+    SINK(sink, BeginFigure, (D2D1_POINT_2F){ (float)pts[0], (float)pts[1] },
+         closed ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW);
+    for (int i = 1; i < n; i++)
+        SINK2(sink, AddLine, (D2D1_POINT_2F){ (float)pts[i * 2], (float)pts[i * 2 + 1] });
+    SINK(sink, EndFigure, closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+    SINK_CLOSE(sink);
+    REL(sink);
+    return pg;
+}
+
+void zfy_gui_fill_poly(int32_t *pts, int32_t n, uint32_t argb) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    ID2D1PathGeometry *pg = gui_poly_geo(pts, n, 1);
+    if (!pg) return;
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (br) gui_draw_geo_brush(w, (ID2D1Geometry *)pg, (ID2D1Brush *)br, 0.0f);
+    REL(pg);
+}
+
+void zfy_gui_stroke_poly(int32_t *pts, int32_t n, uint32_t argb, int32_t width) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    ID2D1PathGeometry *pg = gui_poly_geo(pts, n, 0);
+    if (!pg) return;
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (br) gui_draw_geo_brush(w, (ID2D1Geometry *)pg, (ID2D1Brush *)br,
+                               (float)(width > 0 ? width : 1));
+    REL(pg);
+}
+
+/* 二次贝塞尔（一个控制点） */
+void zfy_gui_bezier(int32_t x0, int32_t y0, int32_t cx, int32_t cy,
+                    int32_t x1, int32_t y1, uint32_t argb, int32_t width) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    ID2D1PathGeometry *pg = NULL;
+    ID2D1GeometrySink *sink = NULL;
+    if (FAILED(FACT(g_d2d_fct, CreatePathGeometry, &pg))) return;
+    if (FAILED(PG(pg, Open, &sink))) { REL(pg); return; }
+    SINK(sink, BeginFigure, (D2D1_POINT_2F){ (float)x0, (float)y0 }, D2D1_FIGURE_BEGIN_HOLLOW);
+    D2D1_BEZIER_SEGMENT seg;
+    seg.point1.x = (float)cx; seg.point1.y = (float)cy;
+    seg.point2.x = (float)cx; seg.point2.y = (float)cy;
+    seg.point3.x = (float)x1; seg.point3.y = (float)y1;
+    SINK2(sink, AddBezier, &seg);
+    SINK(sink, EndFigure, D2D1_FIGURE_END_OPEN);
+    SINK_CLOSE(sink);
+    REL(sink);
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (br) gui_draw_geo_brush(w, (ID2D1Geometry *)pg, (ID2D1Brush *)br,
+                               (float)(width > 0 ? width : 1));
+    REL(pg);
+}
+
+/* ---------- 文本 ---------- */
+
+static IDWriteTextLayout *gui_make_layout(gui_win *w, const wchar_t *txt, int len,
+                                          IDWriteTextFormat *fmt) {
+    IDWriteTextLayout *lay = NULL;
+    if (!fmt) return NULL;
+    if (FAILED(IDWriteFactory_CreateTextLayout(g_dw, txt, (UINT32)len, fmt,
+                                               100000.0f, 100000.0f, &lay)))
+        return NULL;
+    IDWriteTextLayout_SetWordWrapping(lay, DWRITE_WORD_WRAPPING_NO_WRAP);
+    (void)w;
+    return lay;
+}
+
+/* 设置当前默认文本样式：family 空串 = 微软雅黑；weight 400/700 等；italic 非 0 斜体 */
+void zfy_gui_font_ex(char *family_utf8, int32_t px, int32_t weight, int32_t italic) {
+    gui_win *w = g_cur;
+    if (!w) return;
+    if (px <= 0) px = 16;
+    if (weight < 100) weight = 400;
+    if (weight > 950) weight = 700;
+    if (family_utf8 && family_utf8[0]) {
+        strncpy(w->tf_family, family_utf8, sizeof(w->tf_family) - 1);
+        w->tf_family[sizeof(w->tf_family) - 1] = 0;
+    } else {
+        strncpy(w->tf_family, "Microsoft YaHei UI", sizeof(w->tf_family) - 1);
+        w->tf_family[sizeof(w->tf_family) - 1] = 0;
+    }
+    w->tf_px = px;
+    w->tf_weight = weight;
+    w->tf_italic = italic ? 1 : 0;
+}
+
+/* 兼容旧形态：px 逻辑像素，bold 非 0 → 700 */
+void zfy_gui_font(int32_t px, int32_t bold) {
+    zfy_gui_font_ex(NULL, px, bold ? 700 : 400, 0);
+}
+
+void zfy_gui_draw_text(int32_t tx, int32_t ty, char *utf8, uint32_t argb) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
+    IDWriteTextFormat *fmt = gui_text_format(w, w->tf_family, w->tf_px, w->tf_weight, w->tf_italic);
+    ID2D1SolidColorBrush *br = gui_brush(w, argb);
+    if (fmt && br) {
+        IDWriteTextLayout *lay = gui_make_layout(w, wt, (int)wcslen(wt), fmt);
+        if (lay) {
+            D2D1_POINT_2F po;
+            po.x = (float)tx; po.y = (float)ty;
+            RT_V(w->ctx, DrawTextLayout, po, lay, (ID2D1Brush *)br, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            REL(lay);
         }
     }
+    free(wt);
+}
+
+/* UTF-8 字节偏移 → UTF-16 码元下标（富文本 run 换算用） */
+static int gui_u8_to_u16(const char *s, int off) {
+    int i = 0, n = 0;
+    while (i < off && s[i]) {
+        unsigned char c = (unsigned char)s[i];
+        int step;
+        if (c < 0x80) step = 1;
+        else if ((c & 0xE0) == 0xC0) step = 2;
+        else if ((c & 0xF0) == 0xE0) step = 3;
+        else if ((c & 0xF8) == 0xF0) step = 4;
+        else step = 1;
+        i += step;
+        n++;
+    }
+    return n;
+}
+
+/* 富文本：runs 每段 6 个 i64 = {起始字节偏移, 字节长度, 0xAARRGGBB,
+   字重(0=用当前默认), 斜体(0/1), 字号偏移(逻辑 px，可负)}；未覆盖部分白色 */
+void zfy_gui_draw_text_rich(int32_t tx, int32_t ty, char *utf8,
+                            int64_t *runs, int32_t runs_len) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
+    int wlen = (int)wcslen(wt);
+    IDWriteTextFormat *fmt = gui_text_format(w, w->tf_family, w->tf_px, w->tf_weight, w->tf_italic);
+    if (!fmt || wlen <= 0) { free(wt); return; }
+    IDWriteTextLayout *lay = gui_make_layout(w, wt, wlen, fmt);
+    if (!lay) { free(wt); return; }
+    for (int i = 0; i < runs_len; i++) {
+        int64_t *r = runs + i * 6;
+        int start = gui_u8_to_u16(utf8 ? utf8 : "", (int)r[0]);
+        int len = gui_u8_to_u16(utf8 ? utf8 : "", (int)(r[0] + r[1])) - start;
+        if (start < 0) start = 0;
+        if (start >= wlen || len <= 0) continue;
+        if (start + len > wlen) len = wlen - start;
+        DWRITE_TEXT_RANGE range;
+        range.startPosition = (UINT32)start;
+        range.length = (UINT32)len;
+        if (r[3] >= 100 && r[3] <= 950)
+            IDWriteTextLayout_SetFontWeight(lay, (DWRITE_FONT_WEIGHT)r[3], range);
+        if (r[4])
+            IDWriteTextLayout_SetFontStyle(lay, DWRITE_FONT_STYLE_ITALIC, range);
+        if (r[5] != 0) {
+            float base = (float)(w->tf_px * w->dpi / 96);
+            float sz = base + (float)(r[5] * w->dpi / 96);
+            if (sz < 1.0f) sz = 1.0f;
+            IDWriteTextLayout_SetFontSize(lay, sz, range);
+        }
+        ID2D1SolidColorBrush *br = gui_brush(w, (uint32_t)r[2]);
+        if (br) IDWriteTextLayout_SetDrawingEffect(lay, (IUnknown *)br, range);
+    }
+    ID2D1SolidColorBrush *fallback = gui_brush(w, 0xFFFFFFFF);
+    if (fallback) {
+        D2D1_POINT_2F po;
+        po.x = (float)tx; po.y = (float)ty;
+        RT_V(w->ctx, DrawTextLayout, po, lay, (ID2D1Brush *)fallback, D2D1_DRAW_TEXT_OPTIONS_NONE);
+    }
+    REL(lay);
+    free(wt);
+}
+
+/* 文本像素宽度（DirectWrite 度量，物理像素；无窗口时 0） */
+int32_t zfy_gui_text_w(char *utf8) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return 0;
+    wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
+    IDWriteTextFormat *fmt = gui_text_format(w, w->tf_family, w->tf_px, w->tf_weight, w->tf_italic);
+    IDWriteTextLayout *lay = fmt ? gui_make_layout(w, wt, (int)wcslen(wt), fmt) : NULL;
+    int32_t v = 0;
+    if (lay) {
+        DWRITE_TEXT_METRICS tm;
+        if (SUCCEEDED(IDWriteTextLayout_GetMetrics(lay, &tm)))
+            v = (int32_t)(tm.widthIncludingTrailingWhitespace + 0.999f);
+        REL(lay);
+    }
+    free(wt);
+    return v;
+}
+
+/* 文本像素高度（行高，物理像素） */
+int32_t zfy_gui_text_h(char *utf8) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return 0;
+    wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
+    IDWriteTextFormat *fmt = gui_text_format(w, w->tf_family, w->tf_px, w->tf_weight, w->tf_italic);
+    IDWriteTextLayout *lay = fmt ? gui_make_layout(w, wt, (int)wcslen(wt), fmt) : NULL;
+    int32_t v = 0;
+    if (lay) {
+        DWRITE_TEXT_METRICS tm;
+        if (SUCCEEDED(IDWriteTextLayout_GetMetrics(lay, &tm)))
+            v = (int32_t)(tm.height + 0.999f);
+        REL(lay);
+    }
+    free(wt);
+    return v;
+}
+
+/* 文本度量四元组：宽/高/基线以上/基线以下（物理像素） */
+void zfy_gui_text_metrics(char *utf8, int32_t *pw, int32_t *ph, int32_t *pa, int32_t *pd) {
+    if (pw) *pw = 0;
+    if (ph) *ph = 0;
+    if (pa) *pa = 0;
+    if (pd) *pd = 0;
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    wchar_t *wt = gui_utf8_to_wide(utf8 ? utf8 : "");
+    IDWriteTextFormat *fmt = gui_text_format(w, w->tf_family, w->tf_px, w->tf_weight, w->tf_italic);
+    IDWriteTextLayout *lay = fmt ? gui_make_layout(w, wt, (int)wcslen(wt), fmt) : NULL;
+    if (lay) {
+        DWRITE_TEXT_METRICS tm;
+        DWRITE_LINE_METRICS lm[4];
+        UINT32 got = 0;
+        if (SUCCEEDED(IDWriteTextLayout_GetMetrics(lay, &tm)) && pw) {
+            *pw = (int32_t)(tm.widthIncludingTrailingWhitespace + 0.999f);
+            if (ph) *ph = (int32_t)(tm.height + 0.999f);
+        }
+        if (SUCCEEDED(IDWriteTextLayout_GetLineMetrics(lay, lm, 4, &got)) && got > 0) {
+            /* 行度量只给行高与基线位置：基线以上 = baseline，以下 = height - baseline */
+            if (pa) *pa = (int32_t)(lm[0].baseline + 0.999f);
+            if (pd) *pd = (int32_t)((lm[0].height - lm[0].baseline) + 0.999f);
+        }
+        REL(lay);
+    }
+    free(wt);
+}
+
+/* ---------- 透明度 / 混合模式 ---------- */
+void zfy_gui_set_alpha(int32_t alpha) {
+    if (!g_cur) return;
+    if (alpha < 0) alpha = 0;
+    if (alpha > 255) alpha = 255;
+    g_cur->alpha = alpha;
+    gui_br_flush(g_cur);               /* 画刷键含有效 alpha，需整体失效 */
+}
+void zfy_gui_reset_alpha(void) {
+    if (!g_cur) return;
+    g_cur->alpha = 255;
+    gui_br_flush(g_cur);
+}
+void zfy_gui_set_blend(int32_t mode) {
+    if (!g_cur) return;
+    if (mode < 0 || mode > 4) mode = 0;
+    g_cur->blend = mode;
+}
+
+/* ---------- 裁剪 / 变换 ---------- */
+void zfy_gui_push_clip(int32_t x, int32_t y, int32_t cw, int32_t ch) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return;
+    if (w->clip_n >= GUI_CLIP_STACK - 1) return;
+    D2D1_RECT_F r;
+    r.left = (float)x; r.top = (float)y;
+    r.right = (float)(x + cw); r.bottom = (float)(y + ch);
+    if (r.right < r.left) { float t = r.left; r.left = r.right; r.right = t; }
+    if (r.bottom < r.top) { float t = r.top; r.top = r.bottom; r.bottom = t; }
+    RT_V(w->ctx, PushAxisAlignedClip, &r, D2D1_ANTIALIAS_MODE_ALIASED);
+    w->clip_n++;
+}
+void zfy_gui_pop_clip(void) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx || w->clip_n <= 0) return;
+    RT_V(w->ctx, PopAxisAlignedClip);
+    w->clip_n--;
+}
+void zfy_gui_push_translate(int32_t dx, int32_t dy) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx || w->xf_n >= GUI_XF_STACK - 1) return;
+    /* 读回当前变换，压栈后左乘平移 */
+    D2D1_MATRIX_3X2_F cur;
+    RT_V(w->ctx, GetTransform, &cur);
+    w->xf[w->xf_n] = cur;
+    w->xf_n++;
+    cur._31 += (float)dx;
+    cur._32 += (float)dy;
+    RT_V(w->ctx, SetTransform, &cur);
+}
+void zfy_gui_pop_transform(void) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx || w->xf_n <= 0) return;
+    w->xf_n--;
+    RT_V(w->ctx, SetTransform, &w->xf[w->xf_n]);
+}
+
+/* ---------- 位图（WIC 加载 / 内存构建） ---------- */
+static int64_t gui_img_alloc(ID2D1Bitmap1 *bmp, int w, int h) {
+    for (int i = 0; i < GUI_IMG_SLOTS; i++) {
+        if (!g_imgs[i].used) {
+            g_imgs[i].bmp = bmp;
+            g_imgs[i].w = w;
+            g_imgs[i].h = h;
+            g_imgs[i].used = 1;
+            return (int64_t)(i + 1);
+        }
+    }
+    return 0;
+}
+static gui_img *gui_img_of(int64_t h) {
+    if (h < 1 || h > GUI_IMG_SLOTS) return NULL;
+    gui_img *g = &g_imgs[h - 1];
+    return g->used ? g : NULL;
+}
+
+/* 加载 PNG/JPG/BMP/GIF（首帧）→ 32bppPBGRA 位图；返回句柄 >0，失败 0 */
+int64_t zfy_gui_image_load(char *path_utf8) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx || !g_wic || !path_utf8) return 0;
+    wchar_t *wp = gui_utf8_to_wide(path_utf8);
+    IWICBitmapDecoder *dec = NULL;
+    IWICBitmapFrameDecode *fr = NULL;
+    IWICFormatConverter *conv = NULL;
+    ID2D1Bitmap1 *bmp = NULL;
+    HRESULT hr = IWICImagingFactory_CreateDecoderFromFilename(g_wic, wp, NULL, GENERIC_READ,
+                                                              WICDecodeMetadataCacheOnDemand, &dec);
+    if (SUCCEEDED(hr) && dec) hr = IWICBitmapDecoder_GetFrame(dec, 0, &fr);
+    if (SUCCEEDED(hr) && fr && g_wic) {
+        hr = IWICImagingFactory_CreateFormatConverter(g_wic, &conv);
+        if (SUCCEEDED(hr) && conv)
+            hr = IWICFormatConverter_Initialize(conv, (IWICBitmapSource *)fr,
+                                                &GUID_WICPixelFormat32bppPBGRA,
+                                                WICBitmapDitherTypeNone, NULL, 0.0,
+                                                WICBitmapPaletteTypeCustom);
+    }
+    if (SUCCEEDED(hr) && conv)
+        hr = DC_V(w->ctx, CreateBitmapFromWicBitmap, (IWICBitmapSource *)conv, NULL, &bmp);
+    int iw = 0, ih = 0;
+    if (bmp) {
+        D2D1_SIZE_U ps = BM_V(bmp, GetPixelSize);
+        iw = (int)ps.width; ih = (int)ps.height;
+    }
+    REL(conv);
+    REL(fr);
+    REL(dec);
+    free(wp);
+    if (!bmp) return 0;
+    int64_t h = gui_img_alloc(bmp, iw, ih);
+    if (h == 0) REL(bmp);
+    return h;
+}
+
+int32_t zfy_gui_image_w(int64_t h) {
+    gui_img *g = gui_img_of(h);
+    return g ? g->w : 0;
+}
+int32_t zfy_gui_image_h(int64_t h) {
+    gui_img *g = gui_img_of(h);
+    return g ? g->h : 0;
+}
+
+void zfy_gui_image_free(int64_t h) {
+    gui_img *g = gui_img_of(h);
+    if (!g) return;
+    REL(g->bmp);
+    memset(g, 0, sizeof(*g));
+}
+
+/* 缩放绘制：alpha 0..255 叠加在全局 alpha 之上 */
+void zfy_gui_draw_image(int64_t h, int32_t x, int32_t y, int32_t dw, int32_t dh, int32_t alpha) {
+    gui_win *w = g_cur;
+    gui_img *g = gui_img_of(h);
+    if (!w || !w->ctx || !g) return;
+    if (dw <= 0 || dh <= 0) return;
+    if (alpha < 0) alpha = 0;
+    if (alpha > 255) alpha = 255;
+    float op = (float)alpha / 255.0f * (float)w->alpha / 255.0f;
+    D2D1_RECT_F dest;
+    dest.left = (float)x; dest.top = (float)y;
+    dest.right = (float)(x + dw); dest.bottom = (float)(y + dh);
+    RT_V(w->ctx, DrawBitmap, (ID2D1Bitmap *)g->bmp, &dest, op,
+          D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
+}
+
+/* 子区域绘制（精灵表/九宫格） */
+void zfy_gui_draw_image_sub(int64_t h, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+                            int32_t dx, int32_t dy, int32_t dw, int32_t dh, int32_t alpha) {
+    gui_win *w = g_cur;
+    gui_img *g = gui_img_of(h);
+    if (!w || !w->ctx || !g) return;
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    if (alpha < 0) alpha = 0;
+    if (alpha > 255) alpha = 255;
+    float op = (float)alpha / 255.0f * (float)w->alpha / 255.0f;
+    D2D1_RECT_F dest;
+    dest.left = (float)dx; dest.top = (float)dy;
+    dest.right = (float)(dx + dw); dest.bottom = (float)(dy + dh);
+    D2D1_RECT_F src;
+    src.left = (float)sx; src.top = (float)sy;
+    src.right = (float)(sx + sw); src.bottom = (float)(sy + sh);
+    RT_V(w->ctx, DrawBitmap, (ID2D1Bitmap *)g->bmp, &dest, op,
+          D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src);
+}
+
+/* 从内存 RGBA 缓冲（非预乘，4 字节/像素）构建位图 */
+int64_t zfy_gui_image_from_rgba(void *px, int32_t wpx, int32_t hpx, int32_t stride) {
+    gui_win *w = g_cur;
+    if (!w || !w->ctx || !px || wpx <= 0 || hpx <= 0) return 0;
+    if (stride <= 0) stride = wpx * 4;
+    unsigned char *bg = (unsigned char *)malloc((size_t)wpx * (size_t)hpx * 4);
+    if (!bg) return 0;
+    const unsigned char *src = (const unsigned char *)px;
+    for (int y = 0; y < hpx; y++) {
+        const unsigned char *s = src + (size_t)y * (size_t)stride;
+        unsigned char *d = bg + (size_t)y * (size_t)wpx * 4;
+        for (int x = 0; x < wpx; x++) {
+            unsigned char a = s[x * 4 + 3];
+            /* RGBA(非预乘) → BGRA(预乘)：alpha 乘入各通道 */
+            unsigned int pr = (unsigned int)s[x * 4 + 0] * a / 255u;
+            unsigned int pg = (unsigned int)s[x * 4 + 1] * a / 255u;
+            unsigned int pb = (unsigned int)s[x * 4 + 2] * a / 255u;
+            d[x * 4 + 0] = (unsigned char)pb;
+            d[x * 4 + 1] = (unsigned char)pg;
+            d[x * 4 + 2] = (unsigned char)pr;
+            d[x * 4 + 3] = a;
+        }
+    }
+    D2D1_BITMAP_PROPERTIES1 bp;
+    memset(&bp, 0, sizeof(bp));
+    bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bp.dpiX = 96; bp.dpiY = 96;
+    bp.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+    D2D1_SIZE_U sz;
+    sz.width = (UINT32)wpx; sz.height = (UINT32)hpx;
+    ID2D1Bitmap1 *bmp = NULL;
+    HRESULT hr = DC_V(w->ctx, CreateBitmap, sz, bg, (UINT32)(wpx * 4), &bp, &bmp);
+    free(bg);
+    if (FAILED(hr) || !bmp) return 0;
+    int64_t h = gui_img_alloc(bmp, wpx, hpx);
+    if (h == 0) REL(bmp);
+    return h;
 }
 
 #else
@@ -4704,8 +5763,9 @@ void zfy_gui_clip_set(char *utf8) { (void)utf8; }
 void zfy_gui_close(void) {}
 void zfy_gui_title(char *s) { (void)s; }
 void zfy_gui_font(int32_t a, int32_t b) { (void)a; (void)b; }
+void zfy_gui_font_ex(char *f, int32_t p, int32_t w, int32_t i) { (void)f; (void)p; (void)w; (void)i; }
 void zfy_gui_round_rect(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, uint32_t f, uint32_t g) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; }
-void zfy_gui_line(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e) { (void)a; (void)b; (void)c; (void)d; (void)e; }
+void zfy_gui_line(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e, int32_t w) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)w; }
 void zfy_gui_fill_grad(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e, uint32_t f, int32_t g) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; }
 int32_t zfy_gui_alive_any(void) { return 0; }
 int32_t zfy_gui_self(void) { return 0; }
@@ -4713,8 +5773,32 @@ void zfy_gui_select(int64_t id) { (void)id; }
 void zfy_gui_set_icon(char *s) { (void)s; }
 void zfy_gui_present(void) {}
 void zfy_gui_fill_rect(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e) { (void)a; (void)b; (void)c; (void)d; (void)e; }
+void zfy_gui_stroke_rect(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t e, int32_t w) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)w; }
 void zfy_gui_draw_text(int32_t a, int32_t b, char *s, uint32_t c) { (void)a; (void)b; (void)s; (void)c; }
+void zfy_gui_draw_text_rich(int32_t a, int32_t b, char *s, int64_t *r, int32_t n) { (void)a; (void)b; (void)s; (void)r; (void)n; }
 int32_t zfy_gui_text_w(char *s) { (void)s; return 0; }
+int32_t zfy_gui_text_h(char *s) { (void)s; return 0; }
+void zfy_gui_text_metrics(char *s, int32_t *w, int32_t *h, int32_t *a, int32_t *d) { (void)s; (void)h; (void)a; (void)d; if (w) *w = 0; }
+void zfy_gui_fill_circle(int32_t cx, int32_t cy, int32_t r, uint32_t c) { (void)cx; (void)cy; (void)r; (void)c; }
+void zfy_gui_stroke_circle(int32_t cx, int32_t cy, int32_t r, uint32_t c, int32_t w) { (void)cx; (void)cy; (void)r; (void)c; (void)w; }
+void zfy_gui_arc(int32_t cx, int32_t cy, int32_t r, double a0, double a1, uint32_t c, int32_t w) { (void)cx; (void)cy; (void)r; (void)a0; (void)a1; (void)c; (void)w; }
+void zfy_gui_fill_poly(int32_t *p, int32_t n, uint32_t c) { (void)p; (void)n; (void)c; }
+void zfy_gui_stroke_poly(int32_t *p, int32_t n, uint32_t c, int32_t w) { (void)p; (void)n; (void)c; (void)w; }
+void zfy_gui_bezier(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32_t f, uint32_t g, int32_t h) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; }
+void zfy_gui_set_alpha(int32_t a) { (void)a; }
+void zfy_gui_reset_alpha(void) {}
+void zfy_gui_set_blend(int32_t m) { (void)m; }
+void zfy_gui_push_clip(int32_t a, int32_t b, int32_t c, int32_t d) { (void)a; (void)b; (void)c; (void)d; }
+void zfy_gui_pop_clip(void) {}
+void zfy_gui_push_translate(int32_t a, int32_t b) { (void)a; (void)b; }
+void zfy_gui_pop_transform(void) {}
+int64_t zfy_gui_image_load(char *p) { (void)p; return 0; }
+int32_t zfy_gui_image_w(int64_t h) { (void)h; return 0; }
+int32_t zfy_gui_image_h(int64_t h) { (void)h; return 0; }
+void zfy_gui_draw_image(int64_t h, int32_t a, int32_t b, int32_t c, int32_t d, int32_t e) { (void)h; (void)a; (void)b; (void)c; (void)d; (void)e; }
+void zfy_gui_draw_image_sub(int64_t h, int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32_t f, int32_t g, int32_t i, int32_t j) { (void)h; (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)i; (void)j; }
+void zfy_gui_image_free(int64_t h) { (void)h; }
+int64_t zfy_gui_image_from_rgba(void *p, int32_t w, int32_t h, int32_t s) { (void)p; (void)w; (void)h; (void)s; return 0; }
 #endif
 
 /* ==================================================================

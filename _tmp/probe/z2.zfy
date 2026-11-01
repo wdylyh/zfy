@@ -1,0 +1,11 @@
+interface Foo<T>
+    fn T get()
+
+struct S
+    fn i32 get()
+        return 1
+
+fn main()
+    let Foo<i32> f = Foo(S())
+    output(f.get())
+    output("ok")

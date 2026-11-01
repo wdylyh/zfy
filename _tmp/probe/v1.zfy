@@ -1,0 +1,13 @@
+fn <T> T pick(let T a, let T b, let bool c)
+    if c
+        return a
+    return b
+fn <T2> T2 apply(let T2 f, let i32 x)
+    return f(x)
+fn main()
+    let frac a = (1/2)
+    let frac b = (3/4)
+    output(pick(a, b, false))            // 3/4 —— T=frac 往返
+    let fn(i32) -> i32 dbl = fn(x) => x * 2
+    output(apply(dbl, 21))               // 42 —— T=闭包往返
+    output("ok")

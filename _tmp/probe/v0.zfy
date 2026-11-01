@@ -1,0 +1,4 @@
+fn main()
+    let i32 frac[] fs = (1/2), (3/4)
+    output(fs[1])
+    output("ok")

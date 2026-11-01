@@ -1,0 +1,6 @@
+fn main()
+    let map<i128, string> m
+    let i128 k1 = 123456789012345678901234567890
+    m[k1] = "a"
+    output(m[k1] ?? "miss")
+    output("ok")

@@ -1,0 +1,6 @@
+fn main()
+    let i32 base = 10
+    let fn(i32) -> i32 add = fn(x) => base + x
+    output(add(5))           // 15
+    output((fn(i32 x) => x + 1)(41))   // 42
+    output("ok")

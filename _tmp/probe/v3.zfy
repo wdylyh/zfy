@@ -1,0 +1,10 @@
+fn <T> T pick(let T a, let T b, let bool c)
+    if c
+        return a
+    return b
+fn main()
+    let frac a = (1/2)
+    let frac b = (3/4)
+    output(pick(a, b, false))            // 3/4 —— T=frac 往返
+    output(pick(1, 2, true))             // 1
+    output("ok")

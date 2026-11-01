@@ -1,0 +1,15 @@
+fn main()
+    output("a")
+
+fn f2(
+    let i32 a = 1
+    )
+output(x)
+output(y)
+output(z)
+)
+}
+
+fn f3()
+    let q = 1
+    output(q)

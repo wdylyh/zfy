@@ -1,0 +1,5 @@
+fn main()
+    let i32 g = (1/3) + (2/3)
+    output(g)
+    let f64 h = (1/3) + (2/3)
+    output(h)

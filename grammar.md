@@ -867,11 +867,15 @@ let u8 y = -1            // E3155：负值不在 u8 范围
 
 ## 18. GUI 窗口与组件（stdlib/gui.zfy + stdlib/widgets.zfy）
 
-> 分层：**L0** runtime.c C 渲染核心（DIB 帧缓冲 + 事件环形队列 + GDI
-> 雅黑中文文本 + BitBlt 单次提交）→ **L1** `stdlib/gui.zfy`（纯 extern
-> 薄绑定）→ **L2** `stdlib/widgets.zfy`（统一元素 UI + 9 组件 + App 容器，
-> damage 脏区跟踪，只重绘变化的组件）→ **L3** 应用（examples/demos）。
-> 仅 Windows（Win32 + GDI）；非 Windows 平台 GUI 桩全部返回失败/空。
+> 分层：**L0** runtime.c C 渲染核心（Direct2D + DirectWrite + WIC，
+> 每窗口一套 `ID2D1DeviceContext` + DXGI Flip 交换链，后端 D3D11 设备
+> 硬件优先/失败退 WARP；事件环形队列，`Present` 一次提交整帧）→
+> **L1** `stdlib/gui.zfy`（纯 extern 薄绑定）→ **L2**
+> `stdlib/widgets.zfy`（统一元素 UI + 9 组件 + App 容器，damage 脏区
+> 跟踪，只重绘变化的组件）→ **L3** 应用（examples/demos）。
+> 仅 Windows（Win32 + Direct2D/DirectWrite/WIC + DXGI）；D2D 不可用时
+> `gui_open` 直接返回负数失败（**不静默退回 GDI**）。非 Windows 平台
+> GUI 桩全部返回失败/空。
 
 ### 18.0 ui 语句（元素+标签，最简写法）
 
@@ -1025,15 +1029,61 @@ gui_w()/gui_h() -> i32            // 当前窗口客户区，物理像素
 gui_dpi() -> i32                  // 96=100% 缩放；逻辑转物理 = v*dpi/96
 ```
 
-绘制（作用于当前窗口的帧缓冲，`gui_present()` 后才上屏）：
+绘制（作用于当前窗口的 D2D 渲染目标，`gui_present()` 后才上屏）。
+颜色统一 `0xAARRGGBB`；只给 `0xRRGGBB`（高字节 0 且 RGB 非 0）时 alpha
+按 `0xFF` 处理，旧配色无需改动。坐标为客户区左上原点的物理像素，
+y 向下；`gui_font(px)` 的 px 是逻辑字号（内部按 `dpi/96` 换算成物理）。
 
 ```
-gui_fill_rect(x, y, w, h, 0xRRGGBB)   // 实心矩形（自动裁剪）
-gui_rect(x, y, w, h, 0xRRGGBB)        // 1px 边框
-gui_draw_text(x, y, s, 0xRRGGBB)      // 雅黑 16 逻辑px，UTF-8 中英文
-gui_text_w(s) -> i32                  // 文本像素宽（当前窗口字体度量）
-gui_present()                         // 帧缓冲 → 屏幕（BitBlt 单次提交）
+// 矩形 / 线
+gui_fill_rect(x, y, w, h, argb)          // 实心（自动裁剪）
+gui_rect(x, y, w, h, argb)               // 1px 真描边
+gui_stroke_rect(x, y, w, h, argb, width) // 任意宽度描边
+gui_line(x0, y0, x1, y1, argb)           // 1px 线段
+gui_line_w(x0, y0, x1, y1, argb, width)  // 任意宽度
+gui_round_rect(x, y, w, h, r, fill, border)   // fill=0 只描边，border=0 只填充
+gui_fill_grad(x, y, w, h, c1, c2, vertical)   // 线性渐变，vertical 非 0 纵向
+
+// 曲线与多边形
+gui_fill_circle(cx, cy, r, argb)
+gui_stroke_circle(cx, cy, r, argb, width)
+gui_arc(cx, cy, r, a0, a1, argb, width)  // 角度制，0°=+x，正角顺时针
+gui_fill_poly(&pts[0], n, argb)          // pts = x,y 交错的 i32 数组
+gui_stroke_poly(&pts[0], n, argb, width)
+gui_bezier(x0, y0, cx, cy, x1, y1, argb, width)   // 二次贝塞尔
+
+// 文本（DirectWrite）
+gui_font(px, bold)                       // 逻辑字号 + 是否加粗（700/400）
+gui_font_ex(family, px, weight, italic)  // 族/字重/斜体；family "" = 微软雅黑
+gui_draw_text(x, y, s, argb)             // 单样式，左上角对齐
+gui_text_rich(x, y, s, &runs[0], n)      // 富文本：每段 6 个 i64
+                                         // {起始字节, 字节长, argb, 字重, 斜体, 字号增量}
+gui_text_w(s) -> i32                     // 像素宽（含尾随空白）
+gui_text_h(s) -> i32                     // 行高
+gui_text_metrics(s) -> TextMetrics       // {w, h, asc, desc}（基线以上/以下）
+
+// 透明度 / 混合 / 裁剪 / 变换
+gui_set_alpha(a) / gui_reset_alpha()     // 全局乘性 alpha 0..255
+gui_set_blend(mode)                      // BLEND_SRCOVER/ADD/MULTIPLY/SCREEN/XOR
+gui_push_clip(x, y, w, h) / gui_pop_clip()
+gui_push_translate(dx, dy) / gui_pop_transform()
+
+// 位图（WIC 解码 / 内存 RGBA）
+gui_image_load(path) -> i64              // PNG/JPG/BMP/GIF 首帧；0=失败
+gui_image_from_rgba(ptr, w, h, stride) -> i64   // 非预乘 RGBA，stride<=0 用 w*4
+gui_image_w(h) / gui_image_h(h) / gui_image_free(h)
+gui_draw_image(h, x, y, w, hh, alpha)
+gui_draw_image_sub(h, sx, sy, sw, sh, dx, dy, dw, dh, alpha)
+
+gui_present()                            // Flush + DXGI Present（整帧提交）
 ```
+
+混合模式实现边界：`ADD` 用 D2D 原生加法混合（`SetPrimitiveBlend`）；
+`MULTIPLY/SCREEN/XOR` 走"图元画到透明源位图 → 回读目标区 → CPU 逐像素
+合成（XOR 按 `|src-dst|`)→ 上传回绘"的路径，包围盒外像素不受影响。
+字号与文本格式缓存：`IDWriteTextFormat` 全局 64 槽 LRU（键 = 族/物理字号/
+字重/斜体），纯色画刷每窗口 64 槽 LRU（键 = 已乘全局 alpha 的 ARGB），
+位图句柄全局 64 槽表。
 
 事件轮询与帧率：
 
@@ -1985,7 +2035,7 @@ fn panic_handler(let string msg)
 | 并发 | `spawn`/`join`/`detach`、`mutex_new`/`lock`/`unlock`、`chan_send`/`chan_recv`/`chan_close`/`chan_len` |
 | 时间 | `now`/`tick_ms`/`sleep`/`sleep_ms`/`localtime`/`mktime`、`timer`/`timer.add`/`timer.remove`/`timer.now`/`time.sleep` |
 | 环境 | `os_args`/`os_env`、`try`（依赖 setjmp/longjmp） |
-| GUI | `ui` 关键字及全部窗口/组件内建（依赖 Win32/GDI） |
+| GUI | `ui` 关键字及全部窗口/组件内建（依赖 Win32 + Direct2D/DirectWrite/WIC） |
 
 保留可用：纯计算、字符串/数组/列表/map/set、struct、frac、整数溢出
 检查、`assert_eq`、`rand`（纯算法）、原子/volatile 内建。

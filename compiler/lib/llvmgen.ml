@@ -4413,8 +4413,35 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_gui_set_icon(ptr)\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_font(i32, i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_round_rect(i32, i32, i32, i32, i32, i32, i32)\n";
-  Buffer.add_string g.mbuf "declare void @zfy_gui_line(i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_line(i32, i32, i32, i32, i32, i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_gui_fill_grad(i32, i32, i32, i32, i32, i32, i32)\n";
+  (* v3.3.9 D2D 图形/文本/位图扩展内建 *)
+  Buffer.add_string g.mbuf "declare void @zfy_gui_stroke_rect(i32, i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_font_ex(ptr, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_draw_text_rich(i32, i32, ptr, ptr, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_text_h(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_text_metrics(ptr, ptr, ptr, ptr, ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_fill_circle(i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_stroke_circle(i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_arc(i32, i32, i32, double, double, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_fill_poly(ptr, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_stroke_poly(ptr, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_bezier(i32, i32, i32, i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_set_alpha(i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_reset_alpha()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_set_blend(i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_push_clip(i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_pop_clip()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_push_translate(i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_pop_transform()\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_gui_image_load(ptr)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_image_w(i64)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_image_h(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_image_free(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_gui_draw_image(i64, i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_gui_draw_image_sub(i64, i32, i32, i32, i32, i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_gui_image_from_rgba(ptr, i32, i32, i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n";

@@ -1,0 +1,13 @@
+use:s0
+drop:s0
+use:s1
+drop:s1
+use:s2
+drop:s2
+q=copy<orig>
+p=orig
+m2=m1
+ok
+drop:m1
+drop:copy<orig>
+drop:orig

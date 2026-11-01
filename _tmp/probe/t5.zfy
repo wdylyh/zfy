@@ -1,10 +1,5 @@
-mod widgets;
-use widgets::{App, UI}
-use gui::{gui_frame_sleep}
-
 fn main()
-    let App app = App()
-    if app.open(400, 320, "t") != 0
-        return
-    output("ok\n")
-    app.close()
+    let i32[] a = 1, 2, 3
+    let i32[] b = a[2, 1]
+    output(length(b))
+    output("ok")

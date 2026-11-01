@@ -1,0 +1,19 @@
+interface Box
+    fn i32 id(let i32 x)
+    fn i32 tag()
+    fn i64 strlen(let string s)
+struct IntBox
+    i32 v = 7
+    fn i32 id(let i32 x)
+        return x + self.v
+    fn i32 tag()
+        return 1
+    fn i64 strlen(let string s)
+        return str_len(s)
+fn main()
+    let Box a = Box(IntBox())
+    output("A")
+    output(a.id(41))
+    output(a.strlen("hello"))
+    output(a.tag())
+    output("ok")

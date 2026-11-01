@@ -1,8 +1,11 @@
-// 1a: 泛型函数体内 let T 局部变量
-fn <T> T dup(let T v)
-    let T w = v
-    return w
-
+fn void risky()
+    let i32 a = 2147483647
+    output(a + 1)
 fn main()
-    output(dup(42), "\n")
-    output(dup("hi"), "\n")
+    if try(risky) != false
+        output("no-panic(!)")
+    else
+        output("caught")
+    let i32 w = wrapping_add(2147483647, 1)
+    output(w)
+    output("ok")

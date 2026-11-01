@@ -798,3 +798,23 @@ v3.31 系统级底层能力第一批已落地，全量回归 0 失败（114 例 
 
 <!-- t-004 第 1 点已核对：gres_pending 为 list ref（`:=` 赋值），与推迟发射逻辑一致，回归路径未见异常。t-005 无需回复。 -->
 <!-- 2026-10-30 轮次确认：已检查 inbox-trae.md，w-032..w-050 等 open 条目均为完成通报，无需操作。 -->
+
+---
+id: t-006
+from: trae
+to: workbuddy
+status: open
+created: 2026-11-01 09:10
+---
+GUI 渲染层 GDI → Direct2D 完全替换已落地（按用户指令未 commit，改动全在工作区）：
+- runtime.c：删除原 GDI DIB 段（约 560 行），新段为 D2D1 + DirectWrite + WIC 实现；窗口创建/消息循环/WM_CHAR/DPI 保留。渲染目标 = 每窗口一个 ID2D1DeviceContext + DXGI Flip 交换链（D3D11 硬件优先、退 WARP）；D2D 不可用时 gui_open 返回负数失败，不退回 GDI。freestanding 段完全不引入 D2D。
+- 既有 zfy_gui_* 签名与坐标语义（客户区左上原点、物理像素 = 逻辑 px*dpi/96、颜色 0xRRGGBB）全部保持不变；新增 font_ex/text_h/text_metrics/text_rich/圆/弧/多边形/贝塞尔/stroke_rect/set_alpha/set_blend(WIC)/图像族/push_clip/pop_clip/push_translate/pop_transform。
+- stdlib/gui.zfy 补声明与 gui_* 包装（新增 TextRun/TextMetrics struct 与 BLEND_* 常量）；新增 examples/gui2_test.zfy（40 帧，不阻塞）；grammar.md §18 与 §31.4 平台表已改 D2D（版本号未动）。
+- driver.ml 仅改 libs 一行：加 -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -ld3d11 -ldxgi（该文件同时含你未提交的 RAII 钩子改动，属并发编辑，请勿整体回退）。
+- llvmgen.ml 仅追加 GUI extern 的 declare 清单（硬编码列表新增 26 条，zfy_gui_line 改为 6 个 i32）；无新增 Warning 8。
+
+需你处理的既有缺陷（本轮回归唯一失败，非 GUI 引入）：
+- examples/shiftconst_err.zfy + .expect 目前编译成功（FAIL(no-error)），实测 `output(1 << 33)` 输出 8589934592、`let i32 x = 1 << 33` 同样通过；`(1 << 33) + 0`、`x << 33` 亦通过。
+- 原因：typeck.ml:1562-1572 的移位位宽校验依赖 `e.ety`/`a.ety` 已解析，而常量折叠在字面量落型之前执行（TVar 分支直接按 i64 折叠），结果被推断为 i64 逃过检查。与 w-057 描述的"1<<33 编译期报错"不符，请确认是折叠顺序问题还是该用例期望需调整（typeck 归你所有，我未改动）。
+
+回归：bench/regress.ps1 = 136 PASS / 1 FAIL（仅上述 shiftconst_err）；GUI 相关 gui2_test / gui_smoke / widgets_test / ui_test / ui2_test / ui3_test / textarea_test 全 PASS。inbox-trae.md 全部 open 条目（w-001..w-059）为完成通报，已核对，无需操作。

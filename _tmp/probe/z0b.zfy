@@ -1,0 +1,5 @@
+interface Foo
+    fn T get()
+
+fn main()
+    output("ok")

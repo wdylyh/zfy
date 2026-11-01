@@ -756,14 +756,57 @@ let expand_uses (main : program) (main_dir : string)
    导入文件的方法已在 expand_uses 内脱糖（带 ns 前缀），此处只处理主文件，
    故不重置方法表 *)
 let desugar_main_methods (prog : program) : program =
+  (* RAII 钩子方法（v3.35）签名校验：
+     - drop：fn void drop()（无参，void）
+     - copy_from / move_from：fn void copy_from(ref let S src)（恰好一个
+       ref 参数且为本 struct 类型，void）
+     drop 会被 move 后/未初始化路径以全零字段调用，必须幂等且容忍零值 *)
+  let void_ret (mret : ty option) =
+    match mret with
+    | None -> true
+    | Some (TNamed ("void", _)) -> true
+    | Some _ -> false
+  in
+  let check_raii (sname : string) (mth : smethod) =
+    match mth.mname with
+    | "drop" ->
+      if mth.mparams <> [] || not (void_ret mth.mret) then
+        raise (CompileError (Some mth.mpos,
+          "drop must be 'fn void drop()' (no parameters, void return)"))
+    | ("copy_from" | "move_from") as hook ->
+      let ok =
+        match mth.mparams with
+        | [ pd ] ->
+          pd.pref && void_ret mth.mret
+          && (match pd.pty with TNamed (n, _) -> n = sname | _ -> false)
+        | _ -> false
+      in
+      if not ok then
+        raise (CompileError (Some mth.mpos,
+          Printf.sprintf
+            "%s must be 'fn void %s(ref let %s src)' (exactly one ref parameter of the struct's own type, void return)"
+            hook hook sname))
+    | _ -> ()
+  in
   let out = ref [] in
   List.iter
     (fun it ->
       match it with
-      | IStruct ({ methods; _ } as s) when methods <> [] && s.tparams <> [] ->
+      | IStruct ({ name; methods; _ } as s) when methods <> [] && s.tparams <> [] ->
         (* v3.15：泛型 struct 方法不脱糖——留给 typeck 实例化 *)
+        (* RAII 钩子 v1 仅限具体 struct：泛型的自类型参数无法表达
+           （`ref let T src` 绑定实参类型而非实例自身类型） *)
+        List.iter
+          (fun (mth : smethod) ->
+            if List.mem mth.mname [ "drop"; "copy_from"; "move_from" ] then
+              raise (CompileError (Some mth.mpos,
+                Printf.sprintf
+                  "%s (RAII hook) is not supported on generic struct %s in v1 (define it on a concrete struct)"
+                  mth.mname name)))
+          methods;
         out := IStruct s :: !out
       | IStruct ({ name; methods; _ } as s) when methods <> [] ->
+        List.iter (fun mth -> check_raii name mth) methods;
         out := IStruct { s with methods = [] } :: !out;
         List.iter
           (fun mth ->
@@ -1245,8 +1288,12 @@ let compile path : string =
       Printf.sprintf "%s %s " rt (if !freestanding then "-DZFY_FREESTANDING" else "")
     | None -> ""
   in
-  (* GUI 核心层（v3.3.7）依赖 GDI/User32；freestanding 不链接任何 OS 库 *)
-  let libs = if Sys.win32 && not !freestanding then "-lgdi32 -luser32 " else "" in
+  (* GUI 核心层依赖 User32 + Direct2D/DirectWrite/WIC/DXGI（D3D11）；
+     freestanding 不链接任何 OS 库 *)
+  let libs =
+    if Sys.win32 && not !freestanding then
+      "-lgdi32 -luser32 -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -ld3d11 -ldxgi "
+    else "" in
   (* 链接脚本：-Wl,-T,<path>；仅 ELF 目标（MSVC/Windows 目标不支持） *)
   let ldscript =
     if !linker_script = "" then ""
