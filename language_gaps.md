@@ -238,9 +238,10 @@ JS 模板串；各语言 regex 标配（Go 内建）。
 ## 10. 标准库覆盖面（P1）
 
 **现状**：string 基础操作、随机数（质量不错）、时间、File I/O
-（§14，move-only 句柄）、GUI。**没有**：网络（socket/TCP/HTTP）、
-进程管理（spawn/pipes）、环境变量/命令行参数内建、JSON/CSV/序列化、
-压缩、数据库、单元测试框架（回归靠 PowerShell 对拍 out 文件）。
+（§14，move-only 句柄）、GUI、网络（v3.37：TCP/UDP）。**没有**：
+HTTP 客户端（需在 socket 之上自建）、进程管理（spawn/pipes）、
+环境变量/命令行参数内建、JSON/CSV/序列化、压缩、数据库、
+单元测试框架（回归靠 PowerShell 对拍 out 文件）。
 
 **建议优先序**（对齐"真的能做软件"目标）：
 1. **命令行参数**：`os_args() -> string[]`——目前连 argc/argv 都拿不到
@@ -248,7 +249,8 @@ JS 模板串；各语言 regex 标配（Go 内建）。
 3. **JSON 编解码**（无反射则用"字符串→逐节点遍历"的 DOM 式 API）
 4. **单元测试内建**：`assert_eq(v, want)` + `zfyc test` 收集
    `*_test.zfy` 运行汇总——把回归从 PowerShell 搬进语言
-5. 网络（WinSock 封装 TCP 先行）——P2，工作量大
+5. ~~网络（WinSock 封装 TCP 先行）~~——**v3.37 已完成**：TCP/UDP +
+   超时/非阻塞/poll，缓存 `stdlib/net.zfy`；HTTP/HTTPS 客户端待做
 
 ## 11. 运行期错误恢复（P2）
 

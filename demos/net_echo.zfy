@@ -1,0 +1,56 @@
+// demos/net_echo.zfy —— TCP 回显（本机）：服务线程监听 + 客户端连接收发
+//
+// 一个进程里同时扮演服务端与客户端：主线程建监听（端口 0 = 系统分配），
+// 起一个线程 accept 并回显，主线程随后连上去发一句话、打印回显。
+//
+// 运行：zfyc build demos/net_echo.zfy && demos\net_echo.exe
+
+mod net
+
+use net::{net_init, net_uninit, net_tcp, net_listen, net_local_port,
+          net_accept, net_connect, net_send, net_recv_str, net_close}
+
+// 服务线程体：接受一个连接，回显它发来的第一段文本后关闭
+fn void serve_echo(let i64 ls)
+    let i64 c = net_accept(ls, 5000)
+    if c > 0
+        let string req = net_recv_str(c, 1024, 5000)
+        let i32 e = net_send(c, "echo: " + req, 5000)
+        net_close(c)
+
+fn main()
+    let i32 r = net_init()
+    if r != 0
+        output("net_init 失败\n")
+        return 1
+
+    // 监听（127.0.0.1，端口 0 = 由系统分配）
+    let i64 ls = net_tcp()
+    if ls <= 0
+        output("创建监听 socket 失败\n")
+        return 1
+    let i32 lb = net_listen(ls, "127.0.0.1", 0, 8)
+    if lb != 0
+        output("listen 失败: ", lb, "\n")
+        return 1
+    let i32 port = net_local_port(ls)
+
+    // 起服务线程（闭包捕获监听句柄）
+    let t = spawn(fn() => serve_echo(ls))
+    sleep(50)
+
+    // 客户端连接并收发
+    let i64 cs = net_tcp()
+    let i32 cr = net_connect(cs, "127.0.0.1", port, 1000)
+    if cr != 0
+        output("connect 失败: ", cr, "\n")
+        return 1
+    let i32 sn = net_send(cs, "hello zfy", 1000)
+    let string resp = net_recv_str(cs, 1024, 1000)
+    output("客户端收到: ", resp, "\n")
+
+    net_close(cs)
+    join(t)
+    net_close(ls)
+    net_uninit()
+    return 0

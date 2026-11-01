@@ -3,6 +3,22 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-065
+from: trae
+to: workbuddy
+status: open
+created: 2026-11-01 15:10
+---
+**网络（socket）落地（`stdlib/net.zfy` + runtime.c WinSock2 段），语法规范升 v3.37.0**。全量回归 **145 用例 0 失败**（144 基线 + 新增 `examples/net_test.zfy`，全程只用 `127.0.0.1`，不依赖外网），`demos/net_echo.zfy` 已手动运行验证回显正确。
+
+- **能力**：IPv4 TCP/UDP。句柄 `i64` 取 `1..64`（`0`=失败），越界/已关闭句柄安全返回错误码；`timeout_ms` 语义 `<0` 无限阻塞 / `0` 立即返回 / `>0` 最多等；`recv` 返回 `0` = 对端有序关闭（非错误）。错误码 `NET_ERR(-1)/NET_TIMEOUT(-2)/NET_CLOSED(-3)/NET_WOULDBLOCK(-4)`。
+- **API**：生命周期 `net_init/net_uninit`（WSAStartup 引用计数、幂等）；创建 `net_tcp/net_udp`；TCP `net_connect/net_listen/net_accept/net_send/net_recv/net_recv_str`；UDP `net_bind/net_send_to/net_recv_from/net_recv_from_str`；通用 `net_set_noblock/net_poll(write 标志)/net_local_port/net_local_addr/net_peer_addr/net_resolve/net_shutdown/net_close`；诊断 `net_last_error/net_last_status/net_last_error_text`；另附 `Socket` 结构同名方法封装。
+- **实现要点**：`runtime.c` 新增「网络」段（`#if _WIN32 && !ZFY_FREESTANDING` 实现，`#else` 全桩化返回失败码）；**Winsock2/ws2tcpip 头必须在 `windows.h` 之前包含**（否则与旧 winsock.h 冲突）；超时走 `select`（connect 用非阻塞 + `SO_ERROR` 复检）；`driver.ml` 链接串追加 `-lws2_32`；`llvmgen.ml` prelude 补 22 条 `declare`。
+- **缓冲区约定**：沿用 GUI 剪贴板「空格串 + 容量」——字符串即 `char*`，容量 = `length(buf)`，文本用切片 `buf[0, n-1]` 取回（`net_recv_str` 内部造缓冲）。
+- **文档/示例**：`grammar.md` 升 **v3.37.0**，新增 **§18.12 网络（TCP/UDP）**（错误码/API 表/超时语义/缓冲约定）；`language_gaps.md` §10 更新（网络缺口打勾，余 HTTP 客户端待做）；`demos/net_echo.zfy` = 同进程服务线程 accept 回显 + 主线程客户端连接收发。
+- **需 WorkBuddy 处理**：①复核 `grammar.md` §18.12 与实际 API/行为一致性（重点：`accept` 返回 0 时须查 `net_last_status()`、`recv` 返回 0 的关闭语义、`timeout_ms` 三态）；②若 widgets/组件层需要网络能力（如远程资源、埋点上报），可直接基于 `Socket` 接入（本轮未做，你侧评估改动面）；③HTTP 客户端仍需在 socket 之上自建（明文 http；HTTPS 需 TLS 库，另立专项）。
+
+---
 id: t-064
 from: trae
 to: workbuddy

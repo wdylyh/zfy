@@ -1,0 +1,279 @@
+// stdlib/net.zfy —— 网络（TCP / UDP，v3.37）
+//
+// 底层 runtime.c 的 WinSock2 封装（IPv4 + 超时 / 非阻塞 / select），本模块
+// 只做声明与薄封装。非 Windows 平台全部 API 返回失败码，可优雅降级。
+//
+// 用法（UDP 回环自测，单线程即可完成）：
+//   mod net;
+//   use net::{net_init, net_udp, net_bind, net_local_port,
+//             net_send_to, net_recv_from_str}
+//   fn main()
+//       let i32 r = net_init()
+//       let i64 s = net_udp()
+//       let i32 b = net_bind(s, "127.0.0.1", 0)     // 0 = 由系统分配端口
+//       let i32 p = net_local_port(s)
+//       let i32 t = net_send_to(s, "127.0.0.1", p, "ping")
+//       let string a = "                    "
+//       let string got = net_recv_from_str(s, 256, 200, a)
+//       ...
+//
+// 约定：
+//   - 句柄 1..64（0 = 创建失败）；越界/已关闭句柄安全返回错误码；
+//   - 所有 timeout_ms：<0 无限阻塞、0 立即返回、>0 最多等该毫秒；
+//   - recv 返回 0 表示对端有序关闭（不是错误）；<0 才是错误；
+//   - 接收缓冲区用「空格串 + 容量」约定（同 GUI 剪贴板）：
+//     net_recv(h, buf, timeout) 里容量就是 length(buf)；
+//   - 文本接口（net_recv_str 等）内部按 max_bytes 造缓冲，失败返回 ""，
+//     可用 net_last_status() 区分超时/关闭/错误。
+
+// ===== 错误码 / 关闭方式 =====
+pub let i32 const NET_OK         = 0
+pub let i32 const NET_ERR        = -1
+pub let i32 const NET_TIMEOUT    = -2
+pub let i32 const NET_CLOSED     = -3
+pub let i32 const NET_WOULDBLOCK = -4
+
+pub let i32 const NET_SD_RECV = 0
+pub let i32 const NET_SD_SEND = 1
+pub let i32 const NET_SD_BOTH = 2
+
+// ===== runtime.c L0 外部符号 =====
+
+extern "C"
+    // 生命周期（幂等；0=成功 -1=失败）
+    i32 zfy_net_init()
+    void zfy_net_uninit()
+    // 创建（返回句柄 >0；0=失败）
+    i64 zfy_net_tcp()
+    i64 zfy_net_udp()
+    // TCP
+    i32 zfy_net_connect(let i64 h, let string host, let i32 port, let i32 timeout_ms)
+    i32 zfy_net_listen(let i64 h, let string host, let i32 port, let i32 backlog)
+    i64 zfy_net_accept(let i64 h, let i32 timeout_ms)
+    i32 zfy_net_send(let i64 h, let string data, let i32 len, let i32 timeout_ms)
+    i32 zfy_net_recv(let i64 h, let string buf, let i32 cap, let i32 timeout_ms)
+    // UDP
+    i32 zfy_net_bind(let i64 h, let string host, let i32 port)
+    i32 zfy_net_send_to(let i64 h, let string host, let i32 port,
+                        let string data, let i32 len)
+    i32 zfy_net_recv_from(let i64 h, let string buf, let i32 cap, let i32 timeout_ms,
+                          let string out_addr, let i32 addr_cap)
+    // 通用
+    i32 zfy_net_set_noblock(let i64 h, let i32 on)
+    i32 zfy_net_poll(let i64 h, let i32 timeout_ms, let i32 write)
+    i32 zfy_net_local_port(let i64 h)
+    i32 zfy_net_local_addr(let i64 h, let string buf, let i32 cap)
+    i32 zfy_net_peer_addr(let i64 h, let string buf, let i32 cap)
+    i32 zfy_net_resolve(let string host, let string buf, let i32 cap)
+    i32 zfy_net_shutdown(let i64 h, let i32 how)
+    void zfy_net_close(let i64 h)
+    // 诊断
+    i32 zfy_net_last_error()
+    i32 zfy_net_last_status()
+    i32 zfy_net_last_error_text(let string buf, let i32 cap)
+
+// ===== 内部助手：造一个 n 字节（空格）的可写缓冲 =====
+fn string net_buf(let i32 n)
+    if n <= 0
+        return ""
+    let string s = " "
+    while length(s) < n
+        s = s + s
+    return s[0, n - 1]
+
+// ===== 生命周期 =====
+pub fn i32 net_init()
+    return zfy_net_init()
+
+pub fn void net_uninit()
+    zfy_net_uninit()
+
+// ===== 创建 =====
+pub fn i64 net_tcp()
+    return zfy_net_tcp()
+
+pub fn i64 net_udp()
+    return zfy_net_udp()
+
+// ===== TCP =====
+pub fn i32 net_connect(let i64 h, let string host, let i32 port, let i32 timeout_ms)
+    return zfy_net_connect(h, host, port, timeout_ms)
+
+pub fn i32 net_listen(let i64 h, let string host, let i32 port, let i32 backlog)
+    return zfy_net_listen(h, host, port, backlog)
+
+pub fn i64 net_accept(let i64 h, let i32 timeout_ms)
+    return zfy_net_accept(h, timeout_ms)
+
+// 发送整串（返回实际发出的字节数，或负错误码）
+pub fn i32 net_send(let i64 h, let string data, let i32 timeout_ms)
+    return zfy_net_send(h, data, length(data), timeout_ms)
+
+// 读进调用方缓冲（容量 = length(buf)）；返回字节数（0=对端关闭）或错误码
+pub fn i32 net_recv(let i64 h, let string buf, let i32 timeout_ms)
+    return zfy_net_recv(h, buf, length(buf), timeout_ms)
+
+// 便捷：内部造 max_bytes 缓冲并返回读到的文本（失败/关闭返回 ""）
+pub fn string net_recv_str(let i64 h, let i32 max_bytes, let i32 timeout_ms)
+    let string buf = net_buf(max_bytes)
+    let i32 n = zfy_net_recv(h, buf, length(buf), timeout_ms)
+    if n <= 0
+        return ""
+    return buf[0, n - 1]
+
+// ===== UDP =====
+pub fn i32 net_bind(let i64 h, let string host, let i32 port)
+    return zfy_net_bind(h, host, port)
+
+pub fn i32 net_send_to(let i64 h, let string host, let i32 port, let string data)
+    return zfy_net_send_to(h, host, port, data, length(data))
+
+// 读进调用方缓冲，并把来源写成 "ip:port"（addr_buf 容量 = length(addr_buf)）
+pub fn i32 net_recv_from(let i64 h, let string buf, let i32 timeout_ms,
+                         let string addr_buf)
+    return zfy_net_recv_from(h, buf, length(buf), timeout_ms,
+                             addr_buf, length(addr_buf))
+
+// 便捷：返回读到的文本；来源写进 addr_buf（"ip:port"）
+pub fn string net_recv_from_str(let i64 h, let i32 max_bytes, let i32 timeout_ms,
+                                let string addr_buf)
+    let string buf = net_buf(max_bytes)
+    let i32 n = zfy_net_recv_from(h, buf, length(buf), timeout_ms,
+                                  addr_buf, length(addr_buf))
+    if n <= 0
+        return ""
+    return buf[0, n - 1]
+
+// ===== 通用 =====
+pub fn i32 net_set_noblock(let i64 h, let i32 on)
+    return zfy_net_set_noblock(h, on)
+
+// write=0 等可读 / 1 等可写；返回 1 就绪、0 超时、负错误
+pub fn i32 net_poll(let i64 h, let i32 timeout_ms, let i32 write)
+    return zfy_net_poll(h, timeout_ms, write)
+
+pub fn i32 net_local_port(let i64 h)
+    return zfy_net_local_port(h)
+
+pub fn string net_local_addr(let i64 h)
+    let string b = net_buf(64)
+    let i32 n = zfy_net_local_addr(h, b, length(b))
+    if n <= 0
+        return ""
+    return b[0, n - 1]
+
+pub fn string net_peer_addr(let i64 h)
+    let string b = net_buf(64)
+    let i32 n = zfy_net_peer_addr(h, b, length(b))
+    if n <= 0
+        return ""
+    return b[0, n - 1]
+
+// 域名 → IPv4 文本（失败返回 ""）
+pub fn string net_resolve(let string host)
+    let string b = net_buf(64)
+    let i32 n = zfy_net_resolve(host, b, length(b))
+    if n <= 0
+        return ""
+    return b[0, n - 1]
+
+pub fn i32 net_shutdown(let i64 h, let i32 how)
+    return zfy_net_shutdown(h, how)
+
+pub fn void net_close(let i64 h)
+    zfy_net_close(h)
+
+// ===== 诊断 =====
+pub fn i32 net_last_error()
+    return zfy_net_last_error()
+
+pub fn i32 net_last_status()
+    return zfy_net_last_status()
+
+pub fn string net_last_error_text()
+    let string b = net_buf(128)
+    let i32 n = zfy_net_last_error_text(b, length(b))
+    if n <= 0
+        return ""
+    return b[0, n - 1]
+
+// ===== Socket：面向对象封装（推荐） =====
+
+pub struct Socket
+    i64 h = 0
+
+    // 创建 TCP / UDP；true=成功
+    fn bool tcp()
+        self.h = zfy_net_tcp()
+        return self.h > 0
+
+    fn bool udp()
+        self.h = zfy_net_udp()
+        return self.h > 0
+
+    fn bool ok()
+        return self.h > 0
+
+    // 关闭（可重复调用）
+    fn void close()
+        if self.h > 0
+            zfy_net_close(self.h)
+            self.h = 0
+
+    fn i32 connect(let string host, let i32 port, let i32 timeout_ms)
+        return zfy_net_connect(self.h, host, port, timeout_ms)
+
+    fn i32 listen(let string host, let i32 port, let i32 backlog)
+        return zfy_net_listen(self.h, host, port, backlog)
+
+    fn i64 accept(let i32 timeout_ms)
+        return zfy_net_accept(self.h, timeout_ms)
+
+    fn i32 send(let string data, let i32 timeout_ms)
+        return zfy_net_send(self.h, data, length(data), timeout_ms)
+
+    fn i32 recv(let string buf, let i32 timeout_ms)
+        return zfy_net_recv(self.h, buf, length(buf), timeout_ms)
+
+    fn string recv_str(let i32 max_bytes, let i32 timeout_ms)
+        let string buf = net_buf(max_bytes)
+        let i32 n = zfy_net_recv(self.h, buf, length(buf), timeout_ms)
+        if n <= 0
+            return ""
+        return buf[0, n - 1]
+
+    fn i32 bind(let string host, let i32 port)
+        return zfy_net_bind(self.h, host, port)
+
+    fn i32 send_to(let string host, let i32 port, let string data)
+        return zfy_net_send_to(self.h, host, port, data, length(data))
+
+    fn i32 recv_from(let string buf, let i32 timeout_ms, let string addr_buf)
+        return zfy_net_recv_from(self.h, buf, length(buf), timeout_ms,
+                                 addr_buf, length(addr_buf))
+
+    fn i32 poll(let i32 timeout_ms, let i32 write)
+        return zfy_net_poll(self.h, timeout_ms, write)
+
+    fn i32 set_noblock(let i32 on)
+        return zfy_net_set_noblock(self.h, on)
+
+    fn i32 local_port()
+        return zfy_net_local_port(self.h)
+
+    fn string local_addr()
+        let string b = net_buf(64)
+        let i32 n = zfy_net_local_addr(self.h, b, length(b))
+        if n <= 0
+            return ""
+        return b[0, n - 1]
+
+    fn string peer_addr()
+        let string b = net_buf(64)
+        let i32 n = zfy_net_peer_addr(self.h, b, length(b))
+        if n <= 0
+            return ""
+        return b[0, n - 1]
+
+    fn i32 shutdown(let i32 how)
+        return zfy_net_shutdown(self.h, how)

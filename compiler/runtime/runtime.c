@@ -70,6 +70,10 @@ __attribute__((weak)) void *zfy_calloc(size_t cnt, size_t sz) {
 #ifdef _WIN32
 #include <io.h>                      /* _isatty（交互控制台探测） */
 #ifndef ZFY_FREESTANDING
+/* Winsock2 必须在 windows.h 之前包含（否则 windows.h 会拉入旧的 winsock.h，
+   二者定义冲突）。ws2tcpip.h 提供 getaddrinfo / inet_ntop。 */
+#include <winsock2.h>
+#include <ws2tcpip.h>
 /* COM 的 C 语言接口形态：d2d1/dwrite/wincodec/dxgi 头文件需要这两个宏
    才会产出可直接调用的 vtbl 结构与 ID2D1Factory_CreateXxx 之类的宏。
    必须在任何系统头（windows.h 及其传递包含）之前定义。 */
@@ -8880,6 +8884,493 @@ int32_t zfy_media_volume(int64_t h) { (void)h; return 0; }
 int64_t zfy_media_frame(int64_t h, int64_t p) { (void)h; (void)p; return 0; }
 int64_t zfy_media_frame_pts(int64_t h) { (void)h; return 0; }
 #endif
+
+/* ==================================================================
+ * 网络（v3.37）：TCP / UDP（WinSock2）+ 超时 / 非阻塞 / select
+ *
+ * 约定：
+ *   - 句柄 1..ZFY_NET_MAX（0=创建失败）；越界/已关闭的句柄一律安全返回
+ *     错误码，不崩溃；
+ *   - 所有带 timeout_ms 的操作：<0 无限阻塞、0 立即返回、>0 最多等该毫秒；
+ *   - 返回码：>=0 为成功值；<0 为错误——
+ *       ZFY_NET_ERR(-1)       通用失败
+ *       ZFY_NET_TIMEOUT(-2)   等待超时
+ *       ZFY_NET_CLOSED(-3)    句柄无效 / 对端连接已重置
+ *       ZFY_NET_WOULDBLOCK(-4) 非阻塞模式下暂无数据；
+ *   - recv 返回 0 表示对端**有序关闭**（不是错误）；
+ *   - 最近一次操作的原始系统错误码存 zfy_net_last_error()（WSAGetLastError），
+ *     映射后的语义码存 zfy_net_last_status()；
+ *   - IPv4；非 Windows 平台所有 API 桩化（返回失败码），上层可优雅降级。
+ * ================================================================== */
+#define ZFY_NET_MAX 64
+#define ZFY_NET_ERR        (-1)
+#define ZFY_NET_TIMEOUT    (-2)
+#define ZFY_NET_CLOSED     (-3)
+#define ZFY_NET_WOULDBLOCK (-4)
+
+#if defined(_WIN32) && !defined(ZFY_FREESTANDING)
+
+typedef struct {
+    SOCKET s;
+    int used;
+} zfy_net_slot;
+
+static zfy_net_slot g_net[ZFY_NET_MAX];
+static int g_wsa_started = 0;
+static int g_net_refs = 0;
+static int32_t g_net_last_err = 0;      /* 原始系统错误码 */
+static int32_t g_net_last_status = 0;   /* 映射后的语义码（0=成功） */
+
+static void zfy_net_ensure(void) {
+    if (!g_wsa_started) {
+        WSADATA d;
+        if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_wsa_started = 1;
+    }
+}
+
+/* 原始错误码 → 语义码 */
+static int32_t zfy_net_maperr(int e) {
+    if (e == WSAETIMEDOUT) return ZFY_NET_TIMEOUT;
+    if (e == WSAEWOULDBLOCK) return ZFY_NET_WOULDBLOCK;
+    if (e == WSAECONNRESET || e == WSAENOTCONN || e == WSAENOTSOCK ||
+        e == WSAECONNABORTED || e == WSAECONNREFUSED)
+        return ZFY_NET_CLOSED;
+    return ZFY_NET_ERR;
+}
+
+static int32_t zfy_net_fail(int e) {
+    g_net_last_err = e;
+    g_net_last_status = zfy_net_maperr(e);
+    return g_net_last_status;
+}
+
+static SOCKET zfy_net_of(int64_t h) {
+    if (h < 1 || h > ZFY_NET_MAX) return INVALID_SOCKET;
+    zfy_net_slot *sl = &g_net[h - 1];
+    return sl->used ? sl->s : INVALID_SOCKET;
+}
+
+static int64_t zfy_net_alloc(SOCKET s) {
+    int i;
+    for (i = 0; i < ZFY_NET_MAX; i++) {
+        if (!g_net[i].used) {
+            g_net[i].used = 1;
+            g_net[i].s = s;
+            return (int64_t)(i + 1);
+        }
+    }
+    closesocket(s);
+    g_net_last_status = ZFY_NET_ERR;
+    return 0;
+}
+
+/* 等待 socket 就绪（write=0 读 / 1 写）：1 就绪、0 超时、-1 错误 */
+static int zfy_net_wait(SOCKET s, int write, int32_t timeout_ms) {
+    fd_set fds;
+    struct timeval tv, *ptv = NULL;
+    FD_ZERO(&fds);
+    FD_SET(s, &fds);
+    if (timeout_ms >= 0) {
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        ptv = &tv;
+    }
+    int rc = select(0, write ? NULL : &fds, write ? &fds : NULL, NULL, ptv);
+    if (rc <= 0) return rc;   /* 0 超时 / -1 出错 */
+    return 1;
+}
+
+/* host + port → sockaddr_in（host 为空/`*` 表示 INADDR_ANY；支持域名） */
+static int zfy_net_parse(const char *host, int32_t port, struct sockaddr_in *out) {
+    memset(out, 0, sizeof *out);
+    out->sin_family = AF_INET;
+    out->sin_port = htons((unsigned short)port);
+    if (!host || !host[0] || host[0] == '*') {
+        out->sin_addr.s_addr = 0;
+        return 1;
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return 0;
+    out->sin_addr = ((struct sockaddr_in *)(void *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return 1;
+}
+
+static int32_t zfy_net_fmt_addr(struct sockaddr_in *sa, char *buf, int32_t cap) {
+    char ip[64];
+    if (!buf || cap <= 0) return 0;
+    ip[0] = 0;
+    inet_ntop(AF_INET, &sa->sin_addr, ip, (int)sizeof ip);
+    snprintf(buf, (size_t)cap, "%s:%d", ip, (int)ntohs(sa->sin_port));
+    buf[cap - 1] = '\0';
+    return (int32_t)strlen(buf);
+}
+
+/* ---- 生命周期 ---- */
+int32_t zfy_net_init(void) {
+    zfy_net_ensure();
+    if (!g_wsa_started) return -1;
+    g_net_refs++;
+    return 0;
+}
+
+void zfy_net_uninit(void) {
+    if (g_net_refs > 0) g_net_refs--;
+    if (g_net_refs == 0 && g_wsa_started) {
+        int i;
+        for (i = 0; i < ZFY_NET_MAX; i++) {
+            if (g_net[i].used) {
+                closesocket(g_net[i].s);
+                g_net[i].used = 0;
+                g_net[i].s = INVALID_SOCKET;
+            }
+        }
+        WSACleanup();
+        g_wsa_started = 0;
+    }
+}
+
+/* ---- 创建 ---- */
+int64_t zfy_net_tcp(void) {
+    SOCKET s;
+    zfy_net_ensure();
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) { zfy_net_fail(WSAGetLastError()); return 0; }
+    return zfy_net_alloc(s);
+}
+
+int64_t zfy_net_udp(void) {
+    SOCKET s;
+    zfy_net_ensure();
+    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) { zfy_net_fail(WSAGetLastError()); return 0; }
+    return zfy_net_alloc(s);
+}
+
+/* ---- TCP ---- */
+int32_t zfy_net_connect(int64_t h, char *host, int32_t port, int32_t timeout_ms) {
+    SOCKET s = zfy_net_of(h);
+    struct sockaddr_in sa;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    if (!zfy_net_parse(host, port, &sa)) {
+        g_net_last_status = ZFY_NET_ERR;
+        return ZFY_NET_ERR;
+    }
+    if (timeout_ms < 0) {
+        if (connect(s, (struct sockaddr *)&sa, (int)sizeof sa) == 0) {
+            g_net_last_status = 0;
+            return 0;
+        }
+        return zfy_net_fail(WSAGetLastError());
+    }
+    /* 非阻塞 connect + select 超时 */
+    u_long nb = 1;
+    int rc;
+    ioctlsocket(s, FIONBIO, &nb);
+    rc = connect(s, (struct sockaddr *)&sa, (int)sizeof sa);
+    if (rc != 0) {
+        int e = WSAGetLastError();
+        if (e != WSAEWOULDBLOCK && e != WSAEINPROGRESS) {
+            nb = 0; ioctlsocket(s, FIONBIO, &nb);
+            return zfy_net_fail(e);
+        }
+        int w = zfy_net_wait(s, 1, timeout_ms);
+        if (w <= 0) {
+            nb = 0; ioctlsocket(s, FIONBIO, &nb);
+            return zfy_net_fail(w == 0 ? WSAETIMEDOUT : WSAGetLastError());
+        }
+        {
+            int soerr = 0, slen = (int)sizeof soerr;
+            getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soerr, &slen);
+            nb = 0; ioctlsocket(s, FIONBIO, &nb);
+            if (soerr != 0) return zfy_net_fail(soerr);
+        }
+    } else {
+        nb = 0;
+        ioctlsocket(s, FIONBIO, &nb);
+    }
+    g_net_last_status = 0;
+    return 0;
+}
+
+int32_t zfy_net_listen(int64_t h, char *host, int32_t port, int32_t backlog) {
+    SOCKET s = zfy_net_of(h);
+    struct sockaddr_in sa;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    if (!zfy_net_parse(host, port, &sa)) {
+        g_net_last_status = ZFY_NET_ERR;
+        return ZFY_NET_ERR;
+    }
+    if (bind(s, (struct sockaddr *)&sa, (int)sizeof sa) != 0)
+        return zfy_net_fail(WSAGetLastError());
+    if (listen(s, backlog > 0 ? backlog : 16) != 0)
+        return zfy_net_fail(WSAGetLastError());
+    g_net_last_status = 0;
+    return 0;
+}
+
+int64_t zfy_net_accept(int64_t h, int32_t timeout_ms) {
+    SOCKET s = zfy_net_of(h);
+    SOCKET c;
+    if (s == INVALID_SOCKET) return 0;
+    if (timeout_ms >= 0) {
+        int w = zfy_net_wait(s, 0, timeout_ms);
+        if (w <= 0) {
+            zfy_net_fail(w == 0 ? WSAETIMEDOUT : WSAGetLastError());
+            return 0;
+        }
+    }
+    c = accept(s, NULL, NULL);
+    if (c == INVALID_SOCKET) {
+        zfy_net_fail(WSAGetLastError());
+        return 0;
+    }
+    g_net_last_status = 0;
+    return zfy_net_alloc(c);
+}
+
+int32_t zfy_net_send(int64_t h, char *data, int32_t len, int32_t timeout_ms) {
+    SOCKET s = zfy_net_of(h);
+    int n;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    if (len <= 0) return 0;
+    if (timeout_ms >= 0) {
+        int w = zfy_net_wait(s, 1, timeout_ms);
+        if (w <= 0) return zfy_net_fail(w == 0 ? WSAETIMEDOUT : WSAGetLastError());
+    }
+    n = send(s, data, len, 0);
+    if (n == SOCKET_ERROR) return zfy_net_fail(WSAGetLastError());
+    g_net_last_status = 0;
+    return (int32_t)n;
+}
+
+int32_t zfy_net_recv(int64_t h, char *buf, int32_t cap, int32_t timeout_ms) {
+    SOCKET s = zfy_net_of(h);
+    int n;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    if (cap <= 0) return 0;
+    if (timeout_ms >= 0) {
+        int w = zfy_net_wait(s, 0, timeout_ms);
+        if (w <= 0) return zfy_net_fail(w == 0 ? WSAETIMEDOUT : WSAGetLastError());
+    }
+    n = recv(s, buf, cap, 0);
+    if (n == SOCKET_ERROR) return zfy_net_fail(WSAGetLastError());
+    g_net_last_status = 0;
+    return (int32_t)n;
+}
+
+/* ---- UDP ---- */
+int32_t zfy_net_bind(int64_t h, char *host, int32_t port) {
+    SOCKET s = zfy_net_of(h);
+    struct sockaddr_in sa;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    if (!zfy_net_parse(host, port, &sa)) {
+        g_net_last_status = ZFY_NET_ERR;
+        return ZFY_NET_ERR;
+    }
+    if (bind(s, (struct sockaddr *)&sa, (int)sizeof sa) != 0)
+        return zfy_net_fail(WSAGetLastError());
+    g_net_last_status = 0;
+    return 0;
+}
+
+int32_t zfy_net_send_to(int64_t h, char *host, int32_t port,
+                        char *data, int32_t len) {
+    SOCKET s = zfy_net_of(h);
+    struct sockaddr_in sa;
+    int n;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    if (!zfy_net_parse(host, port, &sa)) {
+        g_net_last_status = ZFY_NET_ERR;
+        return ZFY_NET_ERR;
+    }
+    if (len <= 0) return 0;
+    n = sendto(s, data, len, 0, (struct sockaddr *)&sa, (int)sizeof sa);
+    if (n == SOCKET_ERROR) return zfy_net_fail(WSAGetLastError());
+    g_net_last_status = 0;
+    return (int32_t)n;
+}
+
+int32_t zfy_net_recv_from(int64_t h, char *buf, int32_t cap, int32_t timeout_ms,
+                          char *out_addr, int32_t addr_cap) {
+    SOCKET s = zfy_net_of(h);
+    struct sockaddr_in from;
+    int flen = (int)sizeof from;
+    int n;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    if (cap <= 0) return 0;
+    if (timeout_ms >= 0) {
+        int w = zfy_net_wait(s, 0, timeout_ms);
+        if (w <= 0) return zfy_net_fail(w == 0 ? WSAETIMEDOUT : WSAGetLastError());
+    }
+    memset(&from, 0, sizeof from);
+    n = recvfrom(s, buf, cap, 0, (struct sockaddr *)&from, &flen);
+    if (n == SOCKET_ERROR) return zfy_net_fail(WSAGetLastError());
+    if (out_addr && addr_cap > 0) zfy_net_fmt_addr(&from, out_addr, addr_cap);
+    g_net_last_status = 0;
+    return (int32_t)n;
+}
+
+/* ---- 通用 ---- */
+int32_t zfy_net_set_noblock(int64_t h, int32_t on) {
+    SOCKET s = zfy_net_of(h);
+    u_long nb = on ? 1 : 0;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    if (ioctlsocket(s, FIONBIO, &nb) != 0)
+        return zfy_net_fail(WSAGetLastError());
+    g_net_last_status = 0;
+    return 0;
+}
+
+/* 就绪探测：write=0 等可读 / 1 等可写；返回 1 就绪、0 超时、负=错误 */
+int32_t zfy_net_poll(int64_t h, int32_t timeout_ms, int32_t write) {
+    SOCKET s = zfy_net_of(h);
+    int w;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    w = zfy_net_wait(s, write != 0, timeout_ms);
+    if (w < 0) return zfy_net_fail(WSAGetLastError());
+    g_net_last_status = 0;
+    return w;
+}
+
+int32_t zfy_net_local_port(int64_t h) {
+    SOCKET s = zfy_net_of(h);
+    struct sockaddr_in sa;
+    int len = (int)sizeof sa;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    memset(&sa, 0, sizeof sa);
+    if (getsockname(s, (struct sockaddr *)&sa, &len) != 0)
+        return zfy_net_fail(WSAGetLastError());
+    return (int32_t)ntohs(sa.sin_port);
+}
+
+int32_t zfy_net_local_addr(int64_t h, char *buf, int32_t cap) {
+    SOCKET s = zfy_net_of(h);
+    struct sockaddr_in sa;
+    int len = (int)sizeof sa;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    memset(&sa, 0, sizeof sa);
+    if (getsockname(s, (struct sockaddr *)&sa, &len) != 0)
+        return zfy_net_fail(WSAGetLastError());
+    return zfy_net_fmt_addr(&sa, buf, cap);
+}
+
+int32_t zfy_net_peer_addr(int64_t h, char *buf, int32_t cap) {
+    SOCKET s = zfy_net_of(h);
+    struct sockaddr_in sa;
+    int len = (int)sizeof sa;
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    memset(&sa, 0, sizeof sa);
+    if (getpeername(s, (struct sockaddr *)&sa, &len) != 0)
+        return zfy_net_fail(WSAGetLastError());
+    return zfy_net_fmt_addr(&sa, buf, cap);
+}
+
+/* 域名 → IPv4 文本；返回写入字节数，失败 -1 */
+int32_t zfy_net_resolve(char *host, char *buf, int32_t cap) {
+    struct addrinfo hints, *res = NULL;
+    struct sockaddr_in *in;
+    zfy_net_ensure();
+    if (!host || !host[0] || !buf || cap <= 0) return ZFY_NET_ERR;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+        g_net_last_status = ZFY_NET_ERR;
+        return ZFY_NET_ERR;
+    }
+    in = (struct sockaddr_in *)(void *)res->ai_addr;
+    inet_ntop(AF_INET, &in->sin_addr, buf, (int)cap);
+    freeaddrinfo(res);
+    buf[cap - 1] = '\0';
+    g_net_last_status = 0;
+    return (int32_t)strlen(buf);
+}
+
+int32_t zfy_net_shutdown(int64_t h, int32_t how) {
+    SOCKET s = zfy_net_of(h);
+    if (s == INVALID_SOCKET) return ZFY_NET_CLOSED;
+    if (how < 0 || how > 2) how = 2;   /* 0=读 1=写 2=双向（SD_* 同值） */
+    if (shutdown(s, how) != 0) return zfy_net_fail(WSAGetLastError());
+    g_net_last_status = 0;
+    return 0;
+}
+
+void zfy_net_close(int64_t h) {
+    zfy_net_slot *sl;
+    if (h < 1 || h > ZFY_NET_MAX) return;
+    sl = &g_net[h - 1];
+    if (sl->used) {
+        closesocket(sl->s);
+        sl->used = 0;
+        sl->s = INVALID_SOCKET;
+    }
+}
+
+int32_t zfy_net_last_error(void) { return g_net_last_err; }
+
+int32_t zfy_net_last_status(void) { return g_net_last_status; }
+
+int32_t zfy_net_last_error_text(char *buf, int32_t cap) {
+    const char *t;
+    if (!buf || cap <= 0) return 0;
+    switch (g_net_last_status) {
+    case 0: t = "ok"; break;
+    case ZFY_NET_TIMEOUT: t = "timeout"; break;
+    case ZFY_NET_WOULDBLOCK: t = "would block"; break;
+    case ZFY_NET_CLOSED: t = "closed"; break;
+    default: t = "network error"; break;
+    }
+    if (g_net_last_err) snprintf(buf, (size_t)cap, "%s (%d)", t, (int)g_net_last_err);
+    else snprintf(buf, (size_t)cap, "%s", t);
+    buf[cap - 1] = '\0';
+    return (int32_t)strlen(buf);
+}
+
+#else
+/* 非 Windows / freestanding：网络全部桩化（创建失败、操作返回错误码） */
+int32_t zfy_net_init(void) { return -1; }
+void zfy_net_uninit(void) {}
+int64_t zfy_net_tcp(void) { return 0; }
+int64_t zfy_net_udp(void) { return 0; }
+int32_t zfy_net_connect(int64_t h, char *host, int32_t port, int32_t t) {
+    (void)h; (void)host; (void)port; (void)t; return ZFY_NET_ERR;
+}
+int32_t zfy_net_listen(int64_t h, char *host, int32_t port, int32_t b) {
+    (void)h; (void)host; (void)port; (void)b; return ZFY_NET_ERR;
+}
+int64_t zfy_net_accept(int64_t h, int32_t t) { (void)h; (void)t; return 0; }
+int32_t zfy_net_send(int64_t h, char *d, int32_t n, int32_t t) {
+    (void)h; (void)d; (void)n; (void)t; return ZFY_NET_ERR;
+}
+int32_t zfy_net_recv(int64_t h, char *b, int32_t c, int32_t t) {
+    (void)h; (void)b; (void)c; (void)t; return ZFY_NET_ERR;
+}
+int32_t zfy_net_bind(int64_t h, char *host, int32_t port) {
+    (void)h; (void)host; (void)port; return ZFY_NET_ERR;
+}
+int32_t zfy_net_send_to(int64_t h, char *host, int32_t port, char *d, int32_t n) {
+    (void)h; (void)host; (void)port; (void)d; (void)n; return ZFY_NET_ERR;
+}
+int32_t zfy_net_recv_from(int64_t h, char *b, int32_t c, int32_t t,
+                          char *o, int32_t oc) {
+    (void)h; (void)b; (void)c; (void)t; (void)o; (void)oc; return ZFY_NET_ERR;
+}
+int32_t zfy_net_set_noblock(int64_t h, int32_t on) { (void)h; (void)on; return ZFY_NET_ERR; }
+int32_t zfy_net_poll(int64_t h, int32_t t, int32_t w) { (void)h; (void)t; (void)w; return ZFY_NET_ERR; }
+int32_t zfy_net_local_port(int64_t h) { (void)h; return ZFY_NET_ERR; }
+int32_t zfy_net_local_addr(int64_t h, char *b, int32_t c) { (void)h; (void)b; (void)c; return ZFY_NET_ERR; }
+int32_t zfy_net_peer_addr(int64_t h, char *b, int32_t c) { (void)h; (void)b; (void)c; return ZFY_NET_ERR; }
+int32_t zfy_net_resolve(char *host, char *b, int32_t c) { (void)host; (void)b; (void)c; return ZFY_NET_ERR; }
+int32_t zfy_net_shutdown(int64_t h, int32_t how) { (void)h; (void)how; return ZFY_NET_ERR; }
+void zfy_net_close(int64_t h) { (void)h; }
+int32_t zfy_net_last_error(void) { return 0; }
+int32_t zfy_net_last_status(void) { return ZFY_NET_ERR; }
+int32_t zfy_net_last_error_text(char *b, int32_t c) { (void)b; (void)c; return 0; }
+#endif /* _WIN32 && !ZFY_FREESTANDING */
 
 /* ==================================================================
  * 并发（v3.8.0）：线程 / 互斥锁 / 原子操作 / channel

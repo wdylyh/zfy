@@ -1,0 +1,215 @@
+// examples/net_test.zfy —— 网络（v3.37）API 面
+// 回归安全：全程只用回环（127.0.0.1），不依赖外网/外部服务。
+// 覆盖：常量、错误码、非法句柄安全、UDP 回环往返、UDP 非阻塞 wouldblock、
+//      TCP 监听/连接/收发/poll/shutdown 关闭语义、连接失败路径、
+//      域名解析、Socket 结构封装。
+
+mod net
+
+use net::{NET_OK, NET_ERR, NET_TIMEOUT, NET_CLOSED, NET_WOULDBLOCK, NET_SD_BOTH,
+          net_init, net_uninit, net_tcp, net_udp, net_bind, net_local_port,
+          net_send_to, net_recv_from, net_recv_from_str, net_listen, net_connect,
+          net_accept, net_send, net_recv, net_recv_str, net_poll, net_set_noblock,
+          net_shutdown, net_close, net_resolve, net_last_error, net_last_status,
+          net_last_error_text, Socket}
+
+// 造一个 n 字节（空格）的可写缓冲
+fn string pad(let i32 n)
+    let string s = " "
+    while length(s) < n
+        s = s + s
+    return s[0, n - 1]
+
+fn main()
+    let i32 fails = 0
+
+    // ===== 1) 常量与运行时一致 =====
+    if NET_OK != 0 or NET_ERR != -1 or NET_TIMEOUT != -2
+        output("FAIL error constants\n")
+        fails++
+    if NET_CLOSED != -3 or NET_WOULDBLOCK != -4
+        output("FAIL error constants 2\n")
+        fails++
+
+    // ===== 2) 初始化 =====
+    let i32 ini = net_init()
+    if ini != 0
+        // 无网络栈的构建（非 Windows/受限沙箱）：跳过实际网络用例
+        output("net test SKIP (net_init=", ini, ")")
+        return 0
+
+    // ===== 3) 非法句柄一律安全失败 =====
+    if net_send(0, "x", 100) != NET_CLOSED
+        output("FAIL send invalid handle\n")
+        fails++
+    if net_recv(99, pad(8), 100) != NET_CLOSED
+        output("FAIL recv invalid handle\n")
+        fails++
+    if net_accept(0, 0) != 0
+        output("FAIL accept invalid handle\n")
+        fails++
+    if net_local_port(0) != NET_CLOSED
+        output("FAIL local_port invalid handle\n")
+        fails++
+    net_close(0)
+    net_close(9999)
+
+    // ===== 4) 创建 =====
+    let i64 u = net_udp()
+    if u <= 0
+        output("FAIL udp create\n")
+        return 1
+
+    // ===== 5) UDP 回环往返（端口 0 = 系统分配）=====
+    let i32 ub = net_bind(u, "127.0.0.1", 0)
+    if ub != 0
+        output("FAIL udp bind=", ub, "\n")
+        fails++
+    let i32 up = net_local_port(u)
+    if up <= 0
+        output("FAIL udp local_port=", up, "\n")
+        fails++
+    let i32 us = net_send_to(u, "127.0.0.1", up, "ping")
+    if us != 4
+        output("FAIL udp send_to=", us, "\n")
+        fails++
+    let string abuf = pad(32)
+    let string got = net_recv_from_str(u, 256, 300, abuf)
+    if got != "ping"
+        output("FAIL udp recv_from got=[", got, "]\n")
+        fails++
+
+    // 非阻塞 socket + 阻塞参数路径 → wouldblock（队列已空）
+    let i32 nbo = net_set_noblock(u, 1)
+    if nbo != 0
+        output("FAIL set_noblock on\n")
+        fails++
+    let i32 wb = net_recv_from(u, pad(16), -1, pad(32))
+    if wb != NET_WOULDBLOCK
+        output("FAIL udp wouldblock=", wb, "\n")
+        fails++
+    let i32 nbo0 = net_set_noblock(u, 0)
+    if nbo0 != 0
+        output("FAIL set_noblock off\n")
+        fails++
+
+    // ===== 6) TCP 监听 / 连接 / 收发 / poll / shutdown =====
+    let i64 ls = net_tcp()
+    if ls <= 0
+        output("FAIL tcp create\n")
+        fails++
+    let i32 lb = net_listen(ls, "127.0.0.1", 0, 8)
+    if lb != 0
+        output("FAIL tcp listen=", lb, "\n")
+        fails++
+    let i32 lp = net_local_port(ls)
+    if lp <= 0
+        output("FAIL tcp local_port=", lp, "\n")
+        fails++
+
+    let i64 cs = net_tcp()
+    let i32 cr = net_connect(cs, "127.0.0.1", lp, 1000)
+    if cr != 0
+        output("FAIL tcp connect=", cr, "\n")
+        fails++
+    let i64 ac = net_accept(ls, 500)
+    if ac <= 0
+        output("FAIL tcp accept=", ac, "\n")
+        fails++
+
+    let i32 sn = net_send(cs, "hello", 500)
+    if sn != 5
+        output("FAIL tcp send=", sn, "\n")
+        fails++
+    let i32 po = net_poll(ac, 0, 0)
+    if po != 1
+        output("FAIL tcp poll=", po, "\n")
+        fails++
+    let string h1 = net_recv_str(ac, 256, 500)
+    if h1 != "hello"
+        output("FAIL tcp recv ac=[", h1, "]\n")
+        fails++
+    let i32 sn2 = net_send(ac, "world", 500)
+    if sn2 != 5
+        output("FAIL tcp send back=", sn2, "\n")
+        fails++
+    let string h2 = net_recv_str(cs, 256, 500)
+    if h2 != "world"
+        output("FAIL tcp recv cs=[", h2, "]\n")
+        fails++
+
+    // shutdown 后对端读到 0（有序关闭，不是错误）
+    let i32 sd = net_shutdown(cs, NET_SD_BOTH)
+    if sd != 0
+        output("FAIL shutdown=", sd, "\n")
+        fails++
+    let i32 zz = net_recv(ac, pad(16), 500)
+    if zz != 0
+        output("FAIL recv after close should be 0, got=", zz, "\n")
+        fails++
+    net_close(ac)
+    net_close(cs)
+
+    // ===== 7) 连接失败路径（监听已关闭 → 拒绝）=====
+    net_close(ls)
+    let i64 fs = net_tcp()
+    let i32 fc = net_connect(fs, "127.0.0.1", lp, 500)
+    if fc >= 0
+        output("FAIL connect to closed port should fail, got=", fc, "\n")
+        fails++
+    if net_last_status() >= 0
+        output("FAIL last_status after failure\n")
+        fails++
+    let string et = net_last_error_text()
+    if length(et) < 1
+        output("FAIL last_error_text empty\n")
+        fails++
+    net_close(fs)
+
+    net_close(u)
+
+    // ===== 8) 域名解析（回环地址文本往返）=====
+    let string ip = net_resolve("127.0.0.1")
+    if ip != "127.0.0.1"
+        output("FAIL resolve=[", ip, "]\n")
+        fails++
+
+    // ===== 9) Socket 结构封装 =====
+    let Socket s1 = Socket()
+    if not s1.udp()
+        output("FAIL Socket.udp\n")
+        fails++
+    let i32 s1b = s1.bind("127.0.0.1", 0)
+    if s1b != 0
+        output("FAIL Socket.bind=", s1b, "\n")
+        fails++
+    let i32 s1p = s1.local_port()
+    if s1p <= 0
+        output("FAIL Socket.local_port\n")
+        fails++
+    let string s1a = s1.local_addr()
+    if length(s1a) < 3
+        output("FAIL Socket.local_addr\n")
+        fails++
+    s1.close()
+    if s1.ok()
+        output("FAIL Socket.ok after close\n")
+        fails++
+
+    let Socket s2 = Socket()
+    if not s2.tcp()
+        output("FAIL Socket.tcp\n")
+        fails++
+    let i32 s2c = s2.connect("127.0.0.1", 1, 500)
+    if s2c >= 0
+        output("FAIL Socket.connect should fail, got=", s2c, "\n")
+        fails++
+    s2.close()
+
+    net_uninit()
+
+    if fails > 0
+        output("net test FAIL ", fails, "\n")
+        return 1
+    output("net test PASS")
+    return 0

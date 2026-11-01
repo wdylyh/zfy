@@ -1,4 +1,4 @@
-# zfy 语言规范（v3.36.0，2026-11-01）
+# zfy 语言规范（v3.37.0，2026-11-01）
 
 > 本规范只描述当前语法。旧语法一律删除、不再保留历史版本描述。
 > 适用编译器：`compiler/_build/zfyc.exe` 当前构建。
@@ -1634,6 +1634,103 @@ while gui_alive()
   插值、Tween 延迟/循环/往复/反向/暂停、Spring 收敛与过冲、Stagger 错峰、
   Timeline 乱序插入排序/采样/循环/倍速/seek）；示例程序：
   `demos/anim_demo.zfy`（缓动曲线网格 + 时间线三轨 + 弹簧球 + 错峰方块）。
+
+### 18.12 网络（TCP / UDP，v3.37）
+
+`stdlib/net.zfy` 封装 runtime.c 的 WinSock2 实现（IPv4），不引入任何新语法：
+`mod net` + `use net::{...}` 后按普通函数 / struct 调用。链接期自动追加
+`-lws2_32`；非 Windows 平台所有 API 桩化为失败码，可优雅降级。
+
+```zfy
+mod net
+use net::{net_init, net_udp, net_bind, net_local_port, net_send_to, net_recv_from_str}
+
+fn main()
+    let i32 r = net_init()
+    let i64 s = net_udp()
+    let i32 b = net_bind(s, "127.0.0.1", 0)     // 端口 0 = 系统分配
+    let i32 p = net_local_port(s)
+    let i32 t = net_send_to(s, "127.0.0.1", p, "ping")
+    let string a = "                    "
+    let string got = net_recv_from_str(s, 256, 200, a)
+    net_close(s)
+    net_uninit()
+```
+
+**句柄与错误码**
+
+- 句柄为 `i64`，取值 `1..64`（`0` = 创建失败）；越界/已关闭句柄一律安全
+  返回错误码，不崩溃。
+- 所有 `timeout_ms`：`<0` 无限阻塞、`0` 立即返回、`>0` 最多等该毫秒。
+- 返回码：`>=0` 为成功值，`<0` 为错误；`recv` 返回 `0` 表示对端**有序关闭**
+  （不是错误）。
+
+| 常量 | 值 | 含义 |
+| --- | --- | --- |
+| `NET_OK` | 0 | 成功 |
+| `NET_ERR` | -1 | 通用失败 |
+| `NET_TIMEOUT` | -2 | 等待超时 |
+| `NET_CLOSED` | -3 | 句柄无效 / 连接被拒绝或重置 |
+| `NET_WOULDBLOCK` | -4 | 非阻塞模式下暂无数据 |
+| `NET_SD_RECV / NET_SD_SEND / NET_SD_BOTH` | 0 / 1 / 2 | `net_shutdown` 的方向 |
+
+**生命周期与创建**
+
+| API | 说明 |
+| --- | --- |
+| `i32 net_init()` / `void net_uninit()` | WSAStartup/WSACleanup 引用计数（幂等） |
+| `i64 net_tcp()` / `i64 net_udp()` | 创建 socket 并返回句柄（`0` = 失败） |
+
+**TCP**
+
+| API | 说明 |
+| --- | --- |
+| `i32 net_connect(h, host, port, timeout_ms)` | 域名/IP 均可；超时走非阻塞 connect + select |
+| `i32 net_listen(h, host, port, backlog)` | 绑定并监听（`port=0` 由系统分配） |
+| `i64 net_accept(h, timeout_ms)` | 接受连接，返回新句柄（`0` = 无连接，查 `net_last_status()`） |
+| `i32 net_send(h, data, timeout_ms)` | 发送整串，返回字节数或错误码 |
+| `i32 net_recv(h, buf, timeout_ms)` | 读进调用方缓冲（容量 = `length(buf)`） |
+| `string net_recv_str(h, max_bytes, timeout_ms)` | 内部造缓冲读文本（失败/关闭返回 `""`） |
+
+**UDP**
+
+| API | 说明 |
+| --- | --- |
+| `i32 net_bind(h, host, port)` | 绑定本地地址（`port=0` 由系统分配） |
+| `i32 net_send_to(h, host, port, data)` | 发数据报到目标地址 |
+| `i32 net_recv_from(h, buf, timeout_ms, addr_buf)` | 收报文；来源写成 `"ip:port"` 进 `addr_buf` |
+| `string net_recv_from_str(h, max_bytes, timeout_ms, addr_buf)` | 同上，返回文本 |
+
+**通用与诊断**
+
+| API | 说明 |
+| --- | --- |
+| `i32 net_set_noblock(h, on)` | 切换非阻塞模式（`0` 关 / `1` 开） |
+| `i32 net_poll(h, timeout_ms, write)` | `write=0` 等可读 / `1` 等可写；`1` 就绪、`0` 超时、负错误 |
+| `i32 net_local_port(h)` / `string net_local_addr(h)` | 本地端口 / `"ip:port"` |
+| `string net_peer_addr(h)` | 对端 `"ip:port"`（未连接返回 `""`） |
+| `string net_resolve(host)` | 域名 → IPv4 文本（失败 `""`） |
+| `i32 net_shutdown(h, how)` / `void net_close(h)` | 半关闭 / 关闭（`net_close` 可重复调用） |
+| `i32 net_last_error()` / `i32 net_last_status()` | 最近一次操作的原始系统码 / 映射后的语义码 |
+| `string net_last_error_text()` | 最近错误的可读文本（失败返回 `""`） |
+
+**面向对象封装**
+
+`Socket` 结构（字段 `i64 h`）提供同名方法：`tcp()/udp()`（创建并返回 `bool`）、
+`ok()/close()`、`connect/listen/accept/send/recv/recv_str`、
+`bind/send_to/recv_from`、`poll/set_noblock`、`local_port/local_addr/peer_addr`、
+`shutdown(how)`。
+
+**缓冲区约定**
+
+接收类 API 沿用 GUI 剪贴板的「空格串 + 容量」约定：字符串本身就是 `char*`，
+容量即 `length(buf)`，文本读取用切片 `buf[0, n - 1]` 取回实际字节。也可以
+自行用 `while length(s) < n: s = s + s` 倍增造缓冲后传给 `net_recv`。
+
+- 用例：`examples/net_test.zfy`（常量、非法句柄安全、UDP 回环往返、
+  非阻塞 `wouldblock`、TCP 监听/连接/收发/poll/shutdown 关闭语义、
+  连接失败路径、域名解析、`Socket` 封装；全程只用 `127.0.0.1`，不依赖外网）；
+  示例程序：`demos/net_echo.zfy`（同进程内服务线程 + 客户端回显）。
 
 ## 19. 内建容器 map / set 与 for-in
 

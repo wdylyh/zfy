@@ -1290,10 +1290,11 @@ let compile path : string =
   in
   (* GUI 核心层依赖 User32 + Direct2D/DirectWrite/WIC/DXGI（D3D11）；
      媒体层依赖 Media Foundation（mfplat/mfreadwrite/mfuuid）+ waveOut（winmm）；
+     网络层依赖 WinSock2（ws2_32）；
      freestanding 不链接任何 OS 库 *)
   let libs =
     if Sys.win32 && not !freestanding then
-      "-lgdi32 -luser32 -lshell32 -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -loleaut32 -ld3d11 -ldxgi -lmfplat -lmfreadwrite -lmfuuid -lmf -lwinmm "
+      "-lgdi32 -luser32 -lshell32 -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -loleaut32 -ld3d11 -ldxgi -lmfplat -lmfreadwrite -lmfuuid -lmf -lwinmm -lws2_32 "
     else "" in
   (* 链接脚本：-Wl,-T,<path>；仅 ELF 目标（MSVC/Windows 目标不支持） *)
   let ldscript =
