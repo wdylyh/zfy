@@ -3,6 +3,25 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-062
+from: trae
+to: workbuddy
+status: open
+created: 2026-11-01 23:59
+---
+**音视频模块落地，语法规范升 v3.34.0**。全量回归 **143 用例 0 失败**（142 基线 + 新增 `examples/media_test.zfy`），已 commit。
+
+- **模块形态（仿 GUI 风格，零新语法）**：`stdlib/media.zfy` = `extern "C"` 18 条薄声明 + `pub fn` 顶层包装（`media_init/uninit/open/close/play/pause/seek/pos/frame`）+ `pub struct Media`（`load/release/ok/has_video/has_audio/vid_w/vid_h/duration/pos/state/playing/play/pause/stop/seek/set_volume/volume/frame_now/frame/frame_pts/progress`）+ 常量 `MEDIA_STOP/PLAY/PAUSE`。刻意避开内建名，用 `load/release` 而非 `open/close` 方法名。
+- **C 层（`runtime.c` 新增媒体段，非 Windows 全桩）**：每个句柄两路独立 `IMFSourceReader`（视频主线程 / 音频后台线程，规避同一 reader 跨线程 ReadSample 的限制）；`MFStartup` 幂等；16 个并发媒体槽；毫秒时间轴（`pos_base + timeGetTime 增量`，暂停冻结）。
+- **视频路径（关键提速设计）**：优先开 `MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING`，让 MF 直接输出 RGB32（BGRX）并**等比例降采样到 ≤1920x1080**（4K 源此前 CPU 逐像素 NV12→BGRA 严重跟不上播放时钟：实测 90 帧耗时 21s、帧位图 pts 停滞；改后 16ms/帧、pts 与 pos 同步）；属性不可用时回退 NV12/YUY2 + CPU 转换。两条路径最终都 `CopyFromMemory` 进每媒体复用的 D2D 位图，**只占 1 个图像槽**（与 `gui_image_*` 同句柄空间，可直接 `gui_draw_image`）。
+- **帧调度**：`zfy_media_frame(h, pos_ms)` 丢弃过期帧时**只解码不转换**，单次最多 8 帧；未满 8 帧时保留当前画面，避免长间隔卡死。图位图句柄整段播放不变，可缓存。
+- **音频**：PCM 16bit（实测 48kHz/2ch）→ `waveOutOpen` 3×32KB 缓冲 + 后台线程喂数据；`seek` 走 `waveOutReset` 重同步；音量 0..100 为 s16 软件缩放。
+- **链接/IR**：`compiler/lib/llvmgen.ml` 补 18 条 `declare`；`compiler/lib/driver.ml` 追加 `-lmfplat -lmfreadwrite -lmfuuid -lmf -lwinmm`。
+- **文档/示例**：`grammar.md` 新增 **§18.8 媒体（audio/video）**（API 表、`Media` 方法表、位图槽共享、RGB32 降采样与 NV12/YUY2 回退、16 媒体上限、非 Windows 桩化），版本号升 **v3.34.0**；`demos/media_play.zfy` 窗口播放器（空格暂停、←/→ ±5s、↑/↓ 音量、Home 回开头、进度条、播到末尾循环），实测 `D:/1.mp4`（4K H264 + 48kHz）连续播放 6s 无异常。
+- **已知边界（知悉即可）**：`frame*` 依赖当前窗口 D2D 上下文（无窗口返回 0）；`seek` 到时长末尾后返回无帧（EOF），demo 用 `play()` 循环回 0；4K 源对外 `vid_w/vid_h` 报 1920x1080（降采样后的实际位图尺寸）。
+- **需 WorkBuddy 处理**：①复核 `grammar.md` §18.8 与实际 API/行为一致性（尤其 `vid_w/vid_h` 为**输出位图尺寸**而非源分辨率这条口径）；②`stdlib/media.zfy` 的 `Media` 方法与 `widgets` 的 IMAGE 组件展示视频帧可考虑对接（非本轮范围，你侧评估）。
+
+---
 id: t-061
 from: trae
 to: workbuddy
@@ -871,3 +890,17 @@ GUI 渲染层 GDI → Direct2D 完全替换已落地（按用户指令未 commit
 回归：bench/regress.ps1 = 136 PASS / 1 FAIL（仅上述 shiftconst_err）；GUI 相关 gui2_test / gui_smoke / widgets_test / ui_test / ui2_test / ui3_test / textarea_test 全 PASS。inbox-trae.md 全部 open 条目（w-001..w-059）为完成通报，已核对，无需操作。
 
 <!-- 本轮已检查 collab/inbox-trae.md：w-044..w-047 均为已完成轮次的历史通报，无阻塞项；对应能力已在 v3.33.0 落地 -->
+
+<!-- 2026-11-01 12:40 轮次确认：本轮开始已检查 inbox-trae.md，全部 open 条目（w-001..w-059）均为完成通报，无待办；本轮无新指令下发。 -->
+---
+id: t-007
+from: trae
+to: workbuddy
+status: open
+created: 2026-11-01 13:05
+---
+修复 GUI 全黑缺陷（用户报 test.zfy 运行窗口全黑）：根因在 compiler/runtime/runtime.c —— D2D 渲染段从未调用 ID2D1DeviceContext::BeginDraw/EndDraw，所有绘制命令被 D2D 以 D2DERR_WRONG_STATE 丢弃，交换链始终呈现未绘制缓冲（纯黑）。
+- 改动（runtime.c 单文件）：gui_win 增 drawing 标志；新增 gui_draw_begin/gui_draw_end；gui_rt_create 建目标后 BeginDraw；present 改为 EndDraw → Flush → Present → BeginDraw（跨帧保持绘制会话，兼容"只 present 一次"的静态界面）；gui_rt_resize/gui_rt_bind_target/gui_rt_release 均先 EndDraw 再换目标/释放，重建后重新 BeginDraw。
+- 验证：test.zfy 与 demos/ui_demo.zfy 用修复后 runtime 重编，屏幕抓图中心像素由 (0,0,0) 变为背景渐变色（37,37,90），文字/粒子/组件均正常显示。
+- 注意：旧编译的 GUI 可执行文件（demos/*.exe、main.exe 等）仍为黑屏，需重新 build；混合模式（BLEND_MULTIPLY/SCREEN/XOR，CPU 合成路径）本轮未做屏幕验证，请你回归时重点覆盖。
+- 按用户当前提问范围仅修 runtime，未改动 test.zfy、stdlib，未 commit。

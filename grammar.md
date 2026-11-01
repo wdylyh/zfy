@@ -1,4 +1,4 @@
-# zfy 语言规范（v3.33.0，2026-11-01）
+# zfy 语言规范（v3.34.0，2026-11-01）
 
 > 本规范只描述当前语法。旧语法一律删除、不再保留历史版本描述。
 > 适用编译器：`compiler/_build/zfyc.exe` 当前构建。
@@ -1356,6 +1356,92 @@ Narrator / Inspect.exe 等 UIA 客户端可读取与操作 zfy GUI。
   `A11Y_PASSWORD(256)` 在 C 侧映射为 32/64。
 - 用例：`examples/a11y_test.zfy`（节点数/find/hit/状态位/焦点，以及
   zfy 快照与 C 节点表命中和下标反查的一致性）。
+
+### 18.8 媒体（audio/video，stdlib/media.zfy）
+
+音视频层不引入新语法，形态与 `gui.zfy` 一致：`extern "C"` 薄声明 +
+`pub fn` 顶层包装 + `Media` 结构封装。底层在 C runtime 用 Windows
+Media Foundation 解码、waveOut 播放音频；视频帧解码成 BGRA 后进入
+GUI 的位图表，**句柄与 `gui_image_*` 同一空间，可直接
+`gui_draw_image` 绘制**。
+
+```zfy
+mod gui
+mod media
+use media::{Media, media_init}
+
+fn main()
+    media_init()                       // 幂等；0=成功 -1=失败
+    let Media v = Media()
+    if not v.load("D:/1.mp4")
+        output("无法打开媒体\n")
+        return 1
+    v.play()
+    while gui_alive()
+        gui_fill_rect(0, 0, gui_w(), gui_h(), 0)
+        let i64 f = v.frame_now()      // 0 = 无帧（纯音频/首帧未就绪）
+        if f > 0
+            gui_draw_image(f, 0, 0, v.vid_w(), v.vid_h(), 255)
+        gui_present()
+```
+
+**顶层包装（裸句柄写法）**
+
+| 函数 | 说明 |
+| --- | --- |
+| `i32 media_init()` / `void media_uninit()` | Media Foundation 初始化/反初始化（幂等） |
+| `i64 media_open(string path)` | 打开媒体，返回句柄 `1..16`；`0` = 失败 |
+| `void media_close(i64 h)` | 关闭（可重复调用；非 0 非法句柄安全空操作） |
+| `void media_play(i64)` / `void media_pause(i64)` | 播放（到尾则从头）/ 暂停 |
+| `void media_seek(i64, i64 ms)` | 定位（负值取 0，超过时长取时长） |
+| `i64 media_pos(i64)` | 当前位置（毫秒，播放中按墙钟推进） |
+| `i64 media_frame(i64, i64 pos_ms)` | 取该位置应显示的帧，返回位图句柄；无帧 = 0 |
+
+**`Media` 结构（推荐）**
+
+| 方法 | 说明 |
+| --- | --- |
+| `bool load(string path)` | 打开；重复调用先释放旧的 |
+| `void release()` | 释放（可重复） |
+| `bool ok()` | 是否已打开 |
+| `bool has_video()` / `bool has_audio()` | 流探测（纯音频文件 `has_video()` 为 false） |
+| `i32 vid_w()` / `i32 vid_h()` | 视频输出尺寸（像素；无视频流 = 0） |
+| `i64 duration()` | 时长毫秒（未知 = 0） |
+| `i64 pos()` / `i32 state()` / `bool playing()` | 时间轴与状态（`MEDIA_STOP/PLAY/PAUSE`） |
+| `void play()` / `pause()` / `stop()` | 播放 / 暂停 / 停止（停止 = 暂停并回到 0） |
+| `void seek(i64 ms)` | 定位 |
+| `void set_volume(i32 0..100)` / `i32 volume()` | 音量（软件缩放，立即生效） |
+| `i64 frame_now()` | 取当前播放位置的帧 |
+| `i64 frame(i64 pos_ms)` | 取指定时间的帧 |
+| `i64 frame_pts()` | 当前位图对应的帧时间戳（毫秒） |
+| `i32 progress()` | 0..100 进度（时长未知 = 0） |
+
+**约定与边界**
+
+- **格式**取决于系统自带解码器（Media Foundation）：mp4/mkv/avi/wmv/
+  mp3/wav/flac/aac 等。无解码器时 `open` 返回 0。
+- **视频输出**优先走 SourceReader 高级视频处理（
+  `MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING`），由 MF 直接输出
+  RGB32（BGRX）并**等比例降采样到 ≤1920x1080**（4K 源不会让 CPU 逐像素做
+  色彩转换）。该属性不可用时回退解码器原生 NV12 / YUY2，由运行时 CPU
+  转 BGRA。两条路径对外都只是"一张 BGRA 位图"，`vid_w/vid_h` 即实际
+  位图尺寸（4K 源会报 1920x1080）。
+- **位图复用**：每个媒体只占 1 个图像槽，逐帧原地更新（`CopyFromMemory`）。
+  上层**不要** `gui_image_free` 它，`release()/close` 时随媒体一并释放；
+  同一句柄在整段播放期间保持不变，可直接缓存。
+- **帧拉取需窗口**：`frame*` 依赖当前窗口的 D2D 上下文（无窗口返回 0）。
+  按 `pos()` 丢弃过期帧（单次最多 8 帧），单帧转换只做一次。
+- **音频**在后台线程以 3 个 32KB 缓冲推给 waveOut；`seek` 会
+  `waveOutReset` 重同步；音量 0..100 为 s16 软件缩放。
+- **播放到尾**：`pos` 会越过 `duration`，`play()` 再次调用从头开始
+  （demo 用它做循环播放）。
+- **上限**：一个进程同时最多 16 个媒体；`close` 是幂等且对非法句柄安全。
+- **非 Windows 平台**全部桩化：`init` 返回 -1，`open` 返回 0，查询返回 0，
+  控制调用空操作——上层可优雅降级。
+- 用例：`examples/media_test.zfy`（初始化幂等、打开失败路径、未打开句柄上
+  所有查询/控制安全、重复 `release`、裸句柄 0 操作、`uninit` 后重新
+  `init`）；示例程序：`demos/media_play.zfy`（窗口播放器，空格暂停、
+  ←/→ 快进快退、↑/↓ 音量、进度条）。
 
 ## 19. 内建容器 map / set 与 for-in
 

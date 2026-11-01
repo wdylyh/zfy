@@ -1,0 +1,83 @@
+// examples/media_test.zfy —— 音视频模块 API 面（headless：不依赖外部媒体文件）
+// 回归安全：只测初始化 / 失败路径 / 未打开句柄上的查询与控制，
+// 不做真实解码（解码需要系统解码器与媒体文件，留给 demos/media_play.zfy）
+mod media
+use media::{Media, media_init, media_uninit, media_open, media_close,
+             MEDIA_STOP, MEDIA_PLAY, MEDIA_PAUSE}
+
+fn main()
+    let i32 fails = 0
+
+    // ===== 1) 初始化（幂等） =====
+    if media_init() != 0
+        output("FAIL media_init\n")
+        fails++
+    if media_init() != 0
+        output("FAIL media_init should be idempotent\n")
+        fails++
+
+    // ===== 2) 打开不存在的文件必须失败，Media 保持未打开 =====
+    let Media bad = Media()
+    if bad.load("zfy_no_such_media_9c3f.mp4")
+        output("FAIL open missing file should fail\n")
+        fails++
+    if bad.ok()
+        output("FAIL bad.ok should be false\n")
+        fails++
+    if bad.vid_w() != 0 or bad.vid_h() != 0
+        output("FAIL bad media dims should be 0\n")
+        fails++
+    if bad.has_video() or bad.has_audio()
+        output("FAIL bad media streams should be false\n")
+        fails++
+    if bad.duration() != 0 or bad.pos() != 0
+        output("FAIL bad media time should be 0\n")
+        fails++
+    if bad.state() != MEDIA_STOP or bad.playing()
+        output("FAIL bad media state should be STOP\n")
+        fails++
+    if bad.progress() != 0
+        output("FAIL bad media progress should be 0\n")
+        fails++
+    let i64 f0 = bad.frame(0)
+    if f0 != 0
+        output("FAIL bad media frame should be 0\n")
+        fails++
+
+    // 未打开时的控制调用必须安全（不改状态）
+    bad.play()
+    bad.pause()
+    bad.seek(1234)
+    bad.set_volume(50)
+    bad.stop()
+    if bad.state() != MEDIA_STOP
+        output("FAIL controls on closed media changed state\n")
+        fails++
+    if bad.volume() != 0
+        output("FAIL controls on closed media changed volume\n")
+        fails++
+    bad.release()
+    bad.release()          // 重复释放安全
+
+    // ===== 3) 裸句柄写法：失败返回 0，0 句柄操作安全 =====
+    let i64 raw = media_open("zfy_no_such_media_9c3f.mp4")
+    if raw != 0
+        output("FAIL media_open missing should return 0\n")
+        fails++
+    media_close(raw)
+    media_close(0)
+    let i64 raw2 = raw
+    media_close(raw2)
+
+    media_uninit()
+    // 反初始化后再次 init 仍应可用
+    if media_init() != 0
+        output("FAIL media_init after uninit\n")
+        fails++
+    media_uninit()
+
+    if fails == 0
+        output("media_test ok\n")
+    else
+        output("media_test fails=", fails, "\n")
+    return fails

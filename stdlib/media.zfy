@@ -1,0 +1,187 @@
+// stdlib/media.zfy —— 音视频模块（design_gui.md 媒体层，v3.34）
+//
+// 底层 runtime.c 的媒体核心层（Media Foundation SourceReader 解码 +
+// waveOut 音频输出），本模块只做声明与薄封装。视频帧解码成 BGRA 后
+// 直接进 GUI 的位图表，句柄与 gui_image_* 同一空间、可直接
+// gui_draw_image 绘制。
+//
+// 用法：
+//   mod media;
+//   use media::{Media, media_init}
+//   fn main()
+//       media_init()
+//       let Media v = Media()
+//       if not v.load("D:/1.mp4")
+//           output("无法打开媒体\n")
+//           return 1
+//       v.play()
+//       while gui_alive()
+//           ...
+//           let i64 f = v.frame(v.pos())
+//           if f > 0
+//               gui_draw_image(f, 0, 0, v.vid_w(), v.vid_h(), 255)
+//           gui_present()
+//
+// 约定：
+//   - 支持格式取决于系统解码器（Windows 自带 Media Foundation）：
+//     mp4/mkv/avi/wmv/mp3/wav/flac/aac 等，需系统有对应解码器；
+//   - 纯音频文件 has_video() == false，frame() 恒返回 0；
+//   - 时间单位一律毫秒（i64）；duration()=0 表示未知/无；
+//   - 一个进程最多同时打开 16 个媒体（句柄 1..16，0=失败）；
+//   - 视频帧位图在媒体内复用（同一句柄逐帧更新），上层不要释放它；
+//     释放媒体时（release）随之释放；
+//   - 音频在后台线程推给 waveOut，音量 0..100 走软件缩放；
+//   - 非 Windows 平台全部 API 返回失败/0（可优雅降级）。
+
+// 播放状态（zfy_media_state）
+pub let i32 const MEDIA_STOP  = 0
+pub let i32 const MEDIA_PLAY  = 1
+pub let i32 const MEDIA_PAUSE = 2
+
+// ===== runtime.c L0 外部符号 =====
+
+extern "C"
+    // 初始化 / 反初始化 Media Foundation（幂等；0=成功 -1=失败）
+    i32 zfy_media_init()
+    void zfy_media_uninit()
+    // 打开媒体（路径 UTF-8）。返回句柄 >0；0=失败（列满/无解码器/无流）
+    i64 zfy_media_open(let string path)
+    void zfy_media_close(let i64 m)
+    i32 zfy_media_has_video(let i64 m)
+    i32 zfy_media_has_audio(let i64 m)
+    // 视频原始尺寸（像素；无视频流时 0）
+    i32 zfy_media_w(let i64 m)
+    i32 zfy_media_h(let i64 m)
+    // 时长（毫秒；未知=0）
+    i64 zfy_media_duration(let i64 m)
+    // 当前位置（毫秒）：播放中按墙钟推进，暂停/停止冻结
+    i64 zfy_media_pos(let i64 m)
+    // 状态：MEDIA_STOP / MEDIA_PLAY / MEDIA_PAUSE
+    i32 zfy_media_state(let i64 m)
+    // 播放（从当前位置；已到末尾则从头）/ 暂停 / 定位（毫秒）
+    void zfy_media_play(let i64 m)
+    void zfy_media_pause(let i64 m)
+    void zfy_media_seek(let i64 m, let i64 ms)
+    // 音量 0..100（软件缩放，立即生效）
+    void zfy_media_set_volume(let i64 m, let i32 vol)
+    i32 zfy_media_volume(let i64 m)
+    // 取 pos_ms 处应显示的帧：返回位图句柄（与 gui_image_* 同空间，
+    // 媒体内复用不新增槽）；0=无帧/无窗口/无视频流
+    i64 zfy_media_frame(let i64 m, let i64 pos_ms)
+    // 当前位图对应的帧时间戳（毫秒）
+    i64 zfy_media_frame_pts(let i64 m)
+
+// ===== 顶层薄包装 =====
+
+pub fn i32 media_init()
+    return zfy_media_init()
+
+pub fn void media_uninit()
+    zfy_media_uninit()
+
+// 打开媒体并返回原始句柄（不用 Media 结构时的裸写法；关闭用 media_close）
+pub fn i64 media_open(let string path)
+    return zfy_media_open(path)
+
+pub fn void media_close(let i64 m)
+    zfy_media_close(m)
+
+pub fn void media_play(let i64 m)
+    zfy_media_play(m)
+
+pub fn void media_pause(let i64 m)
+    zfy_media_pause(m)
+
+pub fn void media_seek(let i64 m, let i64 ms)
+    zfy_media_seek(m, ms)
+
+pub fn i64 media_pos(let i64 m)
+    return zfy_media_pos(m)
+
+pub fn i64 media_frame(let i64 m, let i64 pos_ms)
+    return zfy_media_frame(m, pos_ms)
+
+// ===== Media：面向对象封装（推荐） =====
+
+pub struct Media
+    i64 h = 0                  // 媒体句柄（0=未打开）
+
+    // 打开；true=成功。重复调用会先释放旧的
+    fn bool load(let string path)
+        if self.h > 0
+            zfy_media_close(self.h)
+            self.h = 0
+        self.h = zfy_media_open(path)
+        return self.h > 0
+
+    // 释放（可重复调用）
+    fn void release()
+        if self.h > 0
+            zfy_media_close(self.h)
+            self.h = 0
+
+    fn bool ok()
+        return self.h > 0
+
+    fn bool has_video()
+        return zfy_media_has_video(self.h) != 0
+
+    fn bool has_audio()
+        return zfy_media_has_audio(self.h) != 0
+
+    fn i32 vid_w()
+        return zfy_media_w(self.h)
+
+    fn i32 vid_h()
+        return zfy_media_h(self.h)
+
+    fn i64 duration()
+        return zfy_media_duration(self.h)
+
+    fn i64 pos()
+        return zfy_media_pos(self.h)
+
+    fn i32 state()
+        return zfy_media_state(self.h)
+
+    fn bool playing()
+        return zfy_media_state(self.h) == MEDIA_PLAY
+
+    // 播放 / 暂停 / 停止（停止=暂停并回到 0）
+    fn void play()
+        zfy_media_play(self.h)
+
+    fn void pause()
+        zfy_media_pause(self.h)
+
+    fn void stop()
+        zfy_media_seek(self.h, 0)
+        zfy_media_pause(self.h)
+
+    // 定位到毫秒
+    fn void seek(let i64 ms)
+        zfy_media_seek(self.h, ms)
+
+    fn void set_volume(let i32 v)
+        zfy_media_set_volume(self.h, v)
+
+    fn i32 volume()
+        return zfy_media_volume(self.h)
+
+    // 取当前播放位置的帧（常用形态：自动用 pos()）
+    fn i64 frame_now()
+        return zfy_media_frame(self.h, zfy_media_pos(self.h))
+
+    // 取指定时间的帧
+    fn i64 frame(let i64 pos_ms)
+        return zfy_media_frame(self.h, pos_ms)
+
+    fn i64 frame_pts()
+        return zfy_media_frame_pts(self.h)
+
+    // 进度 0..100（duration 未知时 0）
+    fn i32 progress()
+        let i64 d = zfy_media_duration(self.h)
+        if d <= 0
+            return 0
+        return cast(zfy_media_pos(self.h) * 100 / d, i32)

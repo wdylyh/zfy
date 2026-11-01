@@ -1,0 +1,147 @@
+// demos/media_play.zfy —— 音视频播放器演示（gui + media，v3.34）
+//
+// 用法：media_play.exe [媒体文件]     默认 D:/1.mp4
+// 控制：空格 播放/暂停 · ←/→ 快退/快进 5 秒 · ↑/↓ 音量 ±10
+//       Home 回到开头 · Esc 退出
+// 说明：纯音频文件无视频流，窗口只显示控制条（音量/进度照常可用）。
+mod gui
+mod media
+
+use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_fill_rect, gui_draw_text,
+          gui_text_w, gui_present, gui_poll, gui_frame_sleep, gui_draw_image,
+          Event, EV_KEY, KEY_EXT}
+use media::{Media, media_init, media_uninit}
+
+// 毫秒 → "mm:ss"
+fn string fmt_ms(let i64 ms)
+    if ms < 0
+        ms = 0
+    let i64 s = ms / 1000
+    let string t = to_str(s / 60) + ":"
+    let i64 ss = s % 60
+    if ss < 10
+        t = t + "0"
+    return t + to_str(ss)
+
+fn main()
+    if media_init() != 0
+        output("Media Foundation 初始化失败\n")
+        return 1
+    // 媒体路径：默认 D:/1.mp4，可被命令行覆盖
+    let string path = "D:/1.mp4"
+    let string[] argv = os_args()
+    if length(argv) >= 2
+        path = argv[1]
+    let Media v = Media()
+    if not v.load(path)
+        output("无法打开媒体: ", path, "\n")
+        media_uninit()
+        return 1
+
+    // 窗口：视频等比缩放到最长边 960x600，底部 64px 控制条；纯音频用 640x120
+    let i32 vw = v.vid_w()
+    let i32 vh = v.vid_h()
+    let i32 ctrl_h = 64
+    let i32 win_w = 640
+    let i32 win_h = 120 + ctrl_h
+    if vw > 0 and vh > 0
+        let i32 pct_w = 960 * 100 / vw
+        let i32 pct_h = 600 * 100 / vh
+        let i32 pct = pct_w
+        if pct_h < pct_w
+            pct = pct_h
+        if pct > 100
+            pct = 100
+        win_w = vw * pct / 100
+        win_h = vh * pct / 100 + ctrl_h
+    if gui_open(win_w, win_h, "zfy 播放器") != 0
+        output("无法创建窗口\n")
+        v.release()
+        media_uninit()
+        return 1
+
+    let i32 vol = 100
+    v.set_volume(vol)
+    v.play()
+    while gui_alive()
+        let i64 f0 = tick_ms()
+        let Event e = Event()
+        while gui_poll(ref e)
+            if e.is(EV_KEY)
+                let i64 k = e.key
+                if k == 27
+                    gui_close()
+                if k == 32
+                    if v.playing()
+                        v.pause()
+                    else
+                        v.play()
+                if k == KEY_EXT + 0x25
+                    v.seek(v.pos() - 5000)
+                if k == KEY_EXT + 0x27
+                    v.seek(v.pos() + 5000)
+                if k == KEY_EXT + 0x24
+                    v.seek(0)
+                if k == KEY_EXT + 0x26
+                    vol = vol + 10
+                    if vol > 100
+                        vol = 100
+                    v.set_volume(vol)
+                if k == KEY_EXT + 0x28
+                    vol = vol - 10
+                    if vol < 0
+                        vol = 0
+                    v.set_volume(vol)
+
+        let i32 W = gui_w()
+        let i32 H = gui_h()
+        let i32 area_h = H - ctrl_h
+        if area_h < 1
+            area_h = 1
+        gui_fill_rect(0, 0, W, H, 0x000000)
+        // 视频区：等比居中
+        if vw > 0 and vh > 0
+            let i32 dw = W
+            let i32 dh = vh * W / vw
+            if dh > area_h
+                dh = area_h
+                dw = vw * area_h / vh
+            let i32 dx = (W - dw) / 2
+            let i32 dy = (area_h - dh) / 2
+            let i64 f = v.frame_now()
+            if f > 0
+                gui_draw_image(f, dx, dy, dw, dh, 255)
+        // 播到末尾自动从头循环
+        let i64 dur = v.duration()
+        let i64 pos = v.pos()
+        if dur > 0 and pos >= dur
+            v.play()
+
+        // 控制条
+        gui_fill_rect(0, area_h, W, ctrl_h, 0x202028)
+        let string t = fmt_ms(pos) + " / " + fmt_ms(dur)
+        gui_draw_text(16, area_h + 8, t, 0xC8C8D0)
+        let string st = "暂停"
+        if v.playing()
+            st = "播放中"
+        let string right = st + "   音量 " + to_str(vol)
+        let i32 sw = gui_text_w(right)
+        gui_draw_text(W - sw - 16, area_h + 8, right, 0xC8C8D0)
+        // 进度条
+        let i64 bar_w = W - 32
+        let i32 by = area_h + 36
+        gui_fill_rect(16, by, W - 32, 6, 0x3A3A44)
+        if dur > 0
+            let i64 fw = pos * bar_w / dur
+            if fw < 0
+                fw = 0
+            if fw > bar_w
+                fw = bar_w
+            gui_fill_rect(16, by, cast(fw, i32), 6, 0x4CC2FF)
+        gui_present()
+        gui_frame_sleep(f0)
+
+    v.release()
+    media_uninit()
+    gui_close()
+    return 0

@@ -4284,6 +4284,7 @@ typedef struct {
     /* 透明度 / 混合模式 */
     int alpha;                            /* 全局乘性 alpha 0..255 */
     int blend;                            /* 0..4（见 GUI_BLEND_*） */
+    int drawing;                          /* 1=已 BeginDraw，尚未 EndDraw */
     int rtl;                              /* 0=LTR 1=RTL（DirectWrite 阅读方向） */
     /* 纯色画刷缓存（每窗口） */
     gui_br_slot br[GUI_BR_SLOTS];
@@ -6324,8 +6325,25 @@ static gui_win *gui_win_of(HWND hw) {
 }
 
 /* ---------- 渲染目标（交换链 + 目标位图） ---------- */
+
+/* Direct2D 要求所有绘制命令都包在 BeginDraw/EndDraw 之间，否则全部丢弃
+ * （D2DERR_WRONG_STATE）——表现为窗口全黑。这里采用"跨帧保持绘制会话"：
+ * 窗口创建/每次 Present 后 BeginDraw，Present 前 EndDraw 提交本帧。 */
+static void gui_draw_begin(gui_win *w) {
+    if (!w || !w->ctx || w->drawing) return;
+    RT_V(w->ctx, BeginDraw);
+    w->drawing = 1;
+}
+
+static void gui_draw_end(gui_win *w) {
+    if (!w || !w->ctx || !w->drawing) return;
+    w->drawing = 0;
+    RT_V(w->ctx, EndDraw, NULL, NULL);     /* 失败（设备重建）不影响后续绘制 */
+}
+
 static int gui_rt_bind_target(gui_win *w) {
     if (!w->ctx || !w->swap) return 0;
+    gui_draw_end(w);                       /* 换目标前先结束当前绘制会话 */
     if (w->target) {
         w->ctx->lpVtbl->SetTarget(w->ctx, NULL);
         REL(w->target);
@@ -6347,6 +6365,7 @@ static int gui_rt_bind_target(gui_win *w) {
 }
 
 static void gui_rt_release(gui_win *w) {
+    gui_draw_end(w);
     gui_br_flush(w);
     REL(w->scr_src); REL(w->scr_dst); REL(w->scr_up);
     w->scr_src = w->scr_dst = w->scr_up = NULL;
@@ -6382,11 +6401,13 @@ static int gui_rt_create(gui_win *w) {
     RT_V(w->ctx, SetAntialiasMode, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     RT_V(w->ctx, SetTextAntialiasMode, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     if (!gui_rt_bind_target(w)) return 0;
+    gui_draw_begin(w);                     /* 开启首帧绘制会话 */
     return 1;
 }
 
 static void gui_rt_resize(gui_win *w, int nw, int nh) {
     if (!w->swap || !w->ctx) { w->w = nw; w->h = nh; return; }
+    gui_draw_end(w);                       /* 重建缓冲前结束绘制会话 */
     if (w->target) {
         w->ctx->lpVtbl->SetTarget(w->ctx, NULL);
         REL(w->target);
@@ -6395,10 +6416,11 @@ static void gui_rt_resize(gui_win *w, int nw, int nh) {
     if (FAILED(IDXGISwapChain1_ResizeBuffers(w->swap, 0, (UINT32)nw, (UINT32)nh,
                                              DXGI_FORMAT_UNKNOWN, 0))) {
         w->w = nw; w->h = nh;
+        gui_draw_begin(w);
         return;
     }
     w->w = nw; w->h = nh;
-    gui_rt_bind_target(w);
+    if (gui_rt_bind_target(w)) gui_draw_begin(w);
     /* 临时合成位图尺寸随目标变化，下一次混合绘制会自动重建 */
 }
 
@@ -6699,12 +6721,14 @@ void zfy_gui_set_icon(char *path_utf8) {
     if (small) SendMessageW(g_cur->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small);
 }
 
-/* 提交整帧：Flush + Present（每帧绘制完成后调用一次） */
+/* 提交整帧：EndDraw（提交绘制命令）+ Present（每帧绘制完成后调用一次） */
 void zfy_gui_present(void) {
     gui_win *w = g_cur;
     if (!w || !w->ctx || !w->swap) return;
+    gui_draw_end(w);
     RT_V(w->ctx, Flush, NULL, NULL);
     IDXGISwapChain1_Present(w->swap, 1, 0);
+    gui_draw_begin(w);                     /* 开启下一帧绘制会话 */
 }
 
 /* ---------- 图元 ---------- */
@@ -7452,6 +7476,637 @@ void zfy_gui_draw_image(int64_t h, int32_t a, int32_t b, int32_t c, int32_t d, i
 void zfy_gui_draw_image_sub(int64_t h, int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32_t f, int32_t g, int32_t i, int32_t j) { (void)h; (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)i; (void)j; }
 void zfy_gui_image_free(int64_t h) { (void)h; }
 int64_t zfy_gui_image_from_rgba(void *p, int32_t w, int32_t h, int32_t s) { (void)p; (void)w; (void)h; (void)s; return 0; }
+#endif
+
+/* ==================================================================
+ * 媒体（v3.34）：音视频解码与播放（Media Foundation + waveOut）
+ *
+ * 分层与 gui.zfy 同风格：本段为 C 实现（L0），stdlib/media.zfy 为
+ * extern 薄绑定 + Media 结构封装（L1）。
+ *
+ * 设计：
+ *  - 每个媒体句柄（1..MEDIA_MAX）带两路独立 SourceReader：视频流一路
+ *    （主线程按播放位置拉帧）、音频流一路（后台线程喂 waveOut）——
+ *    同一 reader 的 ReadSample 不能跨线程并发，拆开即免锁；
+ *  - 视频优先走 SourceReader 高级视频处理（ENABLE_ADVANCED_VIDEO_PROCESSING）：
+ *    由 Media Foundation 直接输出 RGB32（BGRX），并可等比例降采样到
+ *    ≤1920x1080（4K 源不再让 CPU 逐像素做色彩转换，解码后仅逐行拷贝）。
+ *    该属性不可用（老系统/无视频处理器）时回退解码器原生 NV12/YUY2 +
+ *    CPU 转 BGRA。两条路径最终都 CopyFromMemory 进每媒体复用的 D2D 位图，
+ *    只占 1 个图像槽（与 gui_image_* 同一句柄空间）；
+ *  - 时间轴：pos = 播放起点 + 墙钟增量；暂停冻结。视频按 pos 丢弃过期帧
+ *    （丢弃只解码不转换，单次最多 MEDIA_MAX_DROP 帧，防长间隔卡死）；
+ *  - 纯音频（mp3/wav/flac/…）：has_video=0，play 后只有声音；
+ *  - 句柄 0 = 非法；非 Windows 全部桩化（返回失败/0）。
+ * ================================================================== */
+#if defined(_WIN32) && !defined(ZFY_FREESTANDING)
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mmsystem.h>
+#include <oleauto.h>
+
+#define MEDIA_MAX 16
+#define MEDIA_MAX_DROP 8
+#define MEDIA_MAX_W 1920          /* 视频输出降采样上限（宽） */
+#define MEDIA_MAX_H 1080          /* 视频输出降采样上限（高） */
+#define MEDIA_A_BUFS 3
+#define MEDIA_A_BUF_BYTES (32 * 1024)
+
+#define MEDIA_STOP  0
+#define MEDIA_PLAY  1
+#define MEDIA_PAUSE 2
+
+#define MEDIA_VF_NV12  0
+#define MEDIA_VF_YUY2  1
+#define MEDIA_VF_RGB32 2
+
+typedef struct {
+    WAVEHDR h;
+    short *p;
+} media_abuf;
+
+typedef struct {
+    int used;
+    IMFSourceReader *vr;                  /* 视频 reader（主线程） */
+    IMFSourceReader *ar;                  /* 音频 reader（后台线程） */
+    int has_v, has_a, vfmt;
+    int vw, vh, stride;
+    int64_t dur_ms;
+    volatile int state;                   /* MEDIA_STOP/PLAY/PAUSE */
+    volatile int vol;                     /* 0..100 */
+    int64_t pos_base, wall_base;
+    /* 视频帧 */
+    ID2D1Bitmap1 *vbmp;
+    int64_t vimg;                         /* 复用图像槽句柄 */
+    IMFSample *pending;
+    int64_t pending_pts;
+    int64_t cur_pts;
+    int have_cur, eof;
+    unsigned char *cv;                    /* BGRA 转换缓冲 */
+    int cv_cap;
+    /* 音频 */
+    int arate, ach;
+    HANDLE athr;
+    volatile int astop;
+    HWAVEOUT wave;
+    media_abuf ab[MEDIA_A_BUFS];
+    int abi;
+} media_s;
+static media_s g_media[MEDIA_MAX];
+static int g_mf_ready = 0;
+
+static int64_t media_now_ms(void) { return (int64_t)timeGetTime(); }
+
+static media_s *media_of(int64_t h) {
+    if (h < 1 || h > MEDIA_MAX) return NULL;
+    return g_media[h - 1].used ? &g_media[h - 1] : NULL;
+}
+
+void zfy_media_close(int64_t h);   /* open 失败路径内部自清 */
+
+static wchar_t *media_utf8_to_wide(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    wchar_t *w = (wchar_t *)malloc((n + 1) * sizeof(wchar_t));
+    if (!w) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, w, (int)(n + 1));
+    return w;
+}
+
+/* ---------- NV12 / YUY2 → BGRA（BT.601 有限范围，整数近似） ---------- */
+static void media_nv12_bgra(const unsigned char *y, int ys,
+                            const unsigned char *uv, int uvs,
+                            int w, int h, unsigned char *dst, int ds) {
+    for (int j = 0; j < h; j++) {
+        const unsigned char *yp = y + (size_t)j * (size_t)ys;
+        const unsigned char *up = uv + (size_t)(j / 2) * (size_t)uvs;
+        unsigned char *dp = dst + (size_t)j * (size_t)ds;
+        for (int i = 0; i < w; i += 2) {
+            int u = (int)up[(i / 2) * 2 + 0] - 128;
+            int v = (int)up[(i / 2) * 2 + 1] - 128;
+            for (int k = 0; k < 2 && i + k < w; k++) {
+                int c = (int)yp[i + k] - 16;
+                if (c < 0) c = 0;
+                int r = (298 * c + 409 * v + 128) >> 8;
+                int g = (298 * c - 100 * u - 208 * v + 128) >> 8;
+                int b = (298 * c + 516 * u + 128) >> 8;
+                if (r < 0) r = 0; else if (r > 255) r = 255;
+                if (g < 0) g = 0; else if (g > 255) g = 255;
+                if (b < 0) b = 0; else if (b > 255) b = 255;
+                dp[(i + k) * 4 + 0] = (unsigned char)b;
+                dp[(i + k) * 4 + 1] = (unsigned char)g;
+                dp[(i + k) * 4 + 2] = (unsigned char)r;
+                dp[(i + k) * 4 + 3] = 255;
+            }
+        }
+    }
+}
+
+static void media_yuy2_bgra(const unsigned char *src, int ss, int w, int h,
+                            unsigned char *dst, int ds) {
+    for (int j = 0; j < h; j++) {
+        const unsigned char *sp = src + (size_t)j * (size_t)ss;
+        unsigned char *dp = dst + (size_t)j * (size_t)ds;
+        for (int i = 0; i < w; i += 2) {
+            int y0 = (int)sp[0] - 16, u = (int)sp[1] - 128, y1 = (int)sp[2] - 16, v = (int)sp[3] - 128;
+            if (y0 < 0) y0 = 0;
+            if (y1 < 0) y1 = 0;
+            for (int k = 0; k < 2 && i + k < w; k++) {
+                int c = k == 0 ? y0 : y1;
+                int r = (298 * c + 409 * v + 128) >> 8;
+                int g = (298 * c - 100 * u - 208 * v + 128) >> 8;
+                int b = (298 * c + 516 * u + 128) >> 8;
+                if (r < 0) r = 0; else if (r > 255) r = 255;
+                if (g < 0) g = 0; else if (g > 255) g = 255;
+                if (b < 0) b = 0; else if (b > 255) b = 255;
+                dp[(i + k) * 4 + 0] = (unsigned char)b;
+                dp[(i + k) * 4 + 1] = (unsigned char)g;
+                dp[(i + k) * 4 + 2] = (unsigned char)r;
+                dp[(i + k) * 4 + 3] = 255;
+            }
+            sp += 4;
+        }
+    }
+}
+
+/* ---------- 流配置 ---------- */
+/* 读当前已设置的视频输出类型（尺寸/stride）。回填 w/h/stride，失败返回 0 */
+static int media_video_out(IMFSourceReader *r, int *w, int *h, int *stride) {
+    IMFMediaType *cur = NULL;
+    if (FAILED(IMFSourceReader_GetCurrentMediaType(r, MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)) || !cur)
+        return 0;
+    UINT64 fs = 0;
+    IMFMediaType_GetUINT64(cur, &MF_MT_FRAME_SIZE, &fs);
+    UINT32 s = 0;
+    IMFMediaType_GetUINT32(cur, &MF_MT_DEFAULT_STRIDE, &s);
+    *w = (int)(fs >> 32);
+    *h = (int)(fs & 0xFFFFFFFFULL);
+    *stride = (int)s;
+    IMFMediaType_Release(cur);
+    return (*w > 0 && *h > 0) ? 1 : 0;
+}
+
+/* 源视频原始分辨率（取不到返回 0） */
+static void media_video_native(IMFSourceReader *r, int *w, int *h) {
+    *w = 0; *h = 0;
+    IMFMediaType *nat = NULL;
+    if (FAILED(IMFSourceReader_GetNativeMediaType(r, MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &nat)) || !nat)
+        return;
+    UINT64 fs = 0;
+    IMFMediaType_GetUINT64(nat, &MF_MT_FRAME_SIZE, &fs);
+    *w = (int)(fs >> 32);
+    *h = (int)(fs & 0xFFFFFFFFULL);
+    IMFMediaType_Release(nat);
+}
+
+static int media_cfg_video(IMFSourceReader *r, int *fmt, int *w, int *h, int *stride) {
+    /* ① 高级视频处理：直接要 RGB32，并让 MF 等比例降采样到 ≤1920x1080
+       （4K 源 + CPU 逐像素色彩转换会严重跟不上播放时钟，这是主要提速手段） */
+    int nw = 0, nh = 0;
+    media_video_native(r, &nw, &nh);
+    int tw = nw, th = nh;
+    if (nw > 0 && nh > 0 && (nw > MEDIA_MAX_W || nh > MEDIA_MAX_H)) {
+        int pw = MEDIA_MAX_W * 1000 / nw;
+        int ph = MEDIA_MAX_H * 1000 / nh;
+        int p = pw < ph ? pw : ph;
+        if (p < 1) p = 1;
+        tw = (nw * p / 1000) & ~1;      /* 视频处理器要求偶数宽高 */
+        th = (nh * p / 1000) & ~1;
+        if (tw < 2) tw = 2;
+        if (th < 2) th = 2;
+    }
+    IMFMediaType *mt = NULL;
+    HRESULT hr;
+    MFCreateMediaType(&mt);
+    IMFMediaType_SetGUID(mt, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+    IMFMediaType_SetGUID(mt, &MF_MT_SUBTYPE, &MFVideoFormat_RGB32);
+    if (tw > 0 && th > 0)
+        IMFMediaType_SetUINT64(mt, &MF_MT_FRAME_SIZE, ((UINT64)tw << 32) | (UINT32)th);
+    hr = IMFSourceReader_SetCurrentMediaType(r, MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, mt);
+    REL(mt);
+    if (SUCCEEDED(hr)) {
+        int ow = 0, oh = 0, s = 0;
+        if (media_video_out(r, &ow, &oh, &s)) {
+            *fmt = MEDIA_VF_RGB32;
+            *w = ow; *h = oh;
+            *stride = s != 0 ? s : ow * 4;
+            return 1;
+        }
+    }
+
+    /* ② 回退：解码器原生 NV12 / YUY2（CPU 转 BGRA） */
+    *fmt = MEDIA_VF_NV12;
+    MFCreateMediaType(&mt);
+    IMFMediaType_SetGUID(mt, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+    IMFMediaType_SetGUID(mt, &MF_MT_SUBTYPE, &MFVideoFormat_NV12);
+    hr = IMFSourceReader_SetCurrentMediaType(r, MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, mt);
+    REL(mt);
+    if (FAILED(hr)) {
+        *fmt = MEDIA_VF_YUY2;
+        MFCreateMediaType(&mt);
+        IMFMediaType_SetGUID(mt, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+        IMFMediaType_SetGUID(mt, &MF_MT_SUBTYPE, &MFVideoFormat_YUY2);
+        hr = IMFSourceReader_SetCurrentMediaType(r, MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, mt);
+        REL(mt);
+        if (FAILED(hr)) return 0;
+    }
+    int ow = 0, oh = 0, s = 0;
+    if (!media_video_out(r, &ow, &oh, &s)) return 0;
+    if (s == 0) s = (*fmt == MEDIA_VF_NV12) ? ow : ow * 2;
+    *w = ow; *h = oh; *stride = s;
+    return (*w > 0 && *h > 0) ? 1 : 0;
+}
+
+static int media_cfg_audio(IMFSourceReader *r, int *rate, int *ch) {
+    IMFMediaType *mt = NULL;
+    MFCreateMediaType(&mt);
+    IMFMediaType_SetGUID(mt, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
+    IMFMediaType_SetGUID(mt, &MF_MT_SUBTYPE, &MFAudioFormat_PCM);
+    IMFMediaType_SetUINT32(mt, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+    IMFMediaType_SetUINT32(mt, &MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+    IMFMediaType_SetUINT32(mt, &MF_MT_AUDIO_NUM_CHANNELS, 2);
+    HRESULT hr = IMFSourceReader_SetCurrentMediaType(r, MF_SOURCE_READER_FIRST_AUDIO_STREAM, NULL, mt);
+    REL(mt);
+    if (FAILED(hr)) return 0;
+    IMFMediaType *cur = NULL;
+    if (FAILED(IMFSourceReader_GetCurrentMediaType(r, MF_SOURCE_READER_FIRST_AUDIO_STREAM, &cur)) || !cur)
+        return 0;
+    UINT32 rr = 0, cc = 0;
+    IMFMediaType_GetUINT32(cur, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &rr);
+    IMFMediaType_GetUINT32(cur, &MF_MT_AUDIO_NUM_CHANNELS, &cc);
+    IMFMediaType_Release(cur);
+    *rate = (int)rr; *ch = (int)cc;
+    return (*rate > 0 && *ch > 0) ? 1 : 0;
+}
+
+static int64_t media_duration(IMFSourceReader *r) {
+    if (!r) return 0;
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    IMFSourceReader_GetPresentationAttribute(r, MF_SOURCE_READER_MEDIASOURCE, &MF_PD_DURATION, &pv);
+    int64_t ms = 0;
+    if (pv.vt == VT_UI8 || pv.vt == VT_I8) ms = (int64_t)pv.uhVal.QuadPart / 10000;
+    PropVariantClear(&pv);
+    return ms;
+}
+
+static void media_video_release_pending(media_s *m) {
+    if (m->pending) { IMFSample_Release(m->pending); m->pending = NULL; }
+}
+
+static void media_video_read(media_s *m) {
+    if (!m->vr || m->eof || m->pending) return;
+    DWORD flags = 0;
+    LONGLONG ts = 0;
+    IMFSample *smp = NULL;
+    HRESULT hr = IMFSourceReader_ReadSample(m->vr, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                                            0, NULL, &flags, &ts, &smp);
+    if (flags & MF_SOURCE_READERF_ENDOFSTREAM) m->eof = 1;
+    if (FAILED(hr) || !smp) { if (smp) IMFSample_Release(smp); return; }
+    m->pending = smp;
+    m->pending_pts = (int64_t)(ts / 10000);
+}
+
+/* 把 pending 样本转成位图（失败返回 0） */
+static int media_video_convert(media_s *m) {
+    gui_win *w = g_cur;
+    if (!m->pending || !w || !w->ctx) return 0;
+    IMFMediaBuffer *buf = NULL;
+    if (FAILED(IMFSample_ConvertToContiguousBuffer(m->pending, &buf)) || !buf) return 0;
+    BYTE *p = NULL;
+    DWORD cb = 0;
+    if (FAILED(IMFMediaBuffer_Lock(buf, &p, NULL, &cb)) || !p) {
+        IMFMediaBuffer_Release(buf);
+        return 0;
+    }
+    int need = m->vw * m->vh * 4;
+    if (m->cv_cap < need) {
+        unsigned char *nb = (unsigned char *)realloc(m->cv, (size_t)need);
+        if (!nb) { IMFMediaBuffer_Unlock(buf); IMFMediaBuffer_Release(buf); return 0; }
+        m->cv = nb;
+        m->cv_cap = need;
+    }
+    int stride = m->stride < 0 ? -m->stride : m->stride;
+    if (m->vfmt == MEDIA_VF_RGB32) {
+        /* MF 已输出 BGRX：只需逐行拷贝（stride 为负 = 自底向上，行序翻转） */
+        for (int j = 0; j < m->vh; j++) {
+            int sj = m->stride < 0 ? (m->vh - 1 - j) : j;
+            memcpy(m->cv + (size_t)j * (size_t)(m->vw * 4),
+                   p + (size_t)sj * (size_t)stride, (size_t)(m->vw * 4));
+        }
+    } else if (m->vfmt == MEDIA_VF_NV12)
+        media_nv12_bgra(p, stride, p + (size_t)stride * (size_t)m->vh, stride,
+                        m->vw, m->vh, m->cv, m->vw * 4);
+    else
+        media_yuy2_bgra(p, stride, m->vw, m->vh, m->cv, m->vw * 4);
+    IMFMediaBuffer_Unlock(buf);
+    IMFMediaBuffer_Release(buf);
+
+    if (!m->vbmp) {
+        D2D1_BITMAP_PROPERTIES1 bp;
+        memset(&bp, 0, sizeof(bp));
+        bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+        bp.dpiX = 96; bp.dpiY = 96;
+        bp.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+        D2D1_SIZE_U sz;
+        sz.width = (UINT32)m->vw; sz.height = (UINT32)m->vh;
+        if (FAILED(DC_V(w->ctx, CreateBitmap, sz, NULL, 0, &bp, &m->vbmp)) || !m->vbmp)
+            return 0;
+        if (m->vimg == 0) {
+            m->vimg = gui_img_alloc(m->vbmp, m->vw, m->vh);
+            if (m->vimg == 0) { REL(m->vbmp); m->vbmp = NULL; return 0; }
+        } else {
+            gui_img *g = &g_imgs[m->vimg - 1];
+            g->bmp = m->vbmp; g->w = m->vw; g->h = m->vh; g->used = 1;
+        }
+    }
+    BM_V(m->vbmp, CopyFromMemory, NULL, m->cv, (UINT32)(m->vw * 4));
+    return 1;
+}
+
+/* ---------- 音频线程 ---------- */
+static int media_read_audio(media_s *m, short *dst, int cap) {
+    int n = 0;
+    while (n < cap && !m->astop) {
+        DWORD flags = 0;
+        LONGLONG ts = 0;
+        IMFSample *smp = NULL;
+        HRESULT hr = IMFSourceReader_ReadSample(m->ar, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+                                                0, NULL, &flags, &ts, &smp);
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { if (smp) IMFSample_Release(smp); break; }
+        if (FAILED(hr) || !smp) break;
+        IMFMediaBuffer *buf = NULL;
+        IMFSample_ConvertToContiguousBuffer(smp, &buf);
+        if (buf) {
+            BYTE *p = NULL;
+            DWORD cb = 0;
+            if (SUCCEEDED(IMFMediaBuffer_Lock(buf, &p, NULL, &cb)) && p) {
+                int take = (int)cb;
+                if (n + take > cap) take = cap - n;
+                memcpy(dst + n / 2, p, (size_t)take);
+                n += take;
+                IMFMediaBuffer_Unlock(buf);
+            }
+            IMFMediaBuffer_Release(buf);
+        }
+        IMFSample_Release(smp);
+    }
+    /* 软件音量：s16 样本乘 vol/100 */
+    int v = m->vol;
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    if (v != 100) {
+        int cnt = n / 2;
+        for (int i = 0; i < cnt; i++) dst[i] = (short)((int)dst[i] * v / 100);
+    }
+    return n;
+}
+
+static DWORD WINAPI media_athr(void *arg) {
+    media_s *m = (media_s *)arg;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+    while (!m->astop) {
+        if (m->state != MEDIA_PLAY) { Sleep(4); continue; }
+        media_abuf *b = &m->ab[m->abi];
+        while (!m->astop && (b->h.dwFlags & WHDR_INQUEUE)) Sleep(2);
+        if (m->astop) break;
+        int bytes = media_read_audio(m, b->p, MEDIA_A_BUF_BYTES);
+        if (bytes <= 0) { Sleep(6); continue; }
+        b->h.dwBufferLength = (DWORD)bytes;
+        b->h.dwFlags = 0;
+        if (waveOutWrite(m->wave, &b->h, sizeof(WAVEHDR)) != MMSYSERR_NOERROR) { Sleep(6); continue; }
+        m->abi = (m->abi + 1) % MEDIA_A_BUFS;
+    }
+    CoUninitialize();
+    return 0;
+}
+
+/* ---------- 对外 API ---------- */
+int32_t zfy_media_init(void) {
+    if (g_mf_ready) return 0;
+    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET))) return -1;
+    g_mf_ready = 1;
+    return 0;
+}
+
+void zfy_media_uninit(void) {
+    if (!g_mf_ready) return;
+    MFShutdown();
+    g_mf_ready = 0;
+}
+
+int64_t zfy_media_open(char *path) {
+    if (!path || !g_mf_ready) return 0;
+    int slot = -1;
+    for (int i = 0; i < MEDIA_MAX; i++) if (!g_media[i].used) { slot = i; break; }
+    if (slot < 0) return 0;
+    wchar_t *wp = media_utf8_to_wide(path);
+    if (!wp) return 0;
+
+    IMFSourceReader *vr = NULL;
+    IMFSourceReader *ar = NULL;
+    /* 视频 reader 开高级视频处理：允许 MF 内部把解码输出转成 RGB32 并缩放
+       （缺失该属性时 media_cfg_video 自动回退 NV12/YUY2） */
+    IMFAttributes *vattr = NULL;
+    if (SUCCEEDED(MFCreateAttributes(&vattr, 1)) && vattr)
+        IMFAttributes_SetUINT32(vattr, &MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
+    MFCreateSourceReaderFromURL(wp, vattr, &vr);
+    REL(vattr);
+    MFCreateSourceReaderFromURL(wp, NULL, &ar);
+    free(wp);
+    if (!vr && !ar) { REL(vr); REL(ar); return 0; }
+
+    media_s *m = &g_media[slot];
+    memset(m, 0, sizeof(*m));
+    m->used = 1;
+    m->vol = 100;
+    m->state = MEDIA_STOP;
+    m->vr = vr;
+    m->ar = ar;
+
+    if (vr && media_cfg_video(vr, &m->vfmt, &m->vw, &m->vh, &m->stride)) m->has_v = 1;
+    else { REL(m->vr); m->vr = NULL; }
+
+    if (ar && media_cfg_audio(ar, &m->arate, &m->ach)) {
+        m->has_a = 1;
+        WAVEFORMATEX wf;
+        memset(&wf, 0, sizeof(wf));
+        wf.wFormatTag = WAVE_FORMAT_PCM;
+        wf.nChannels = (WORD)m->ach;
+        wf.nSamplesPerSec = (DWORD)m->arate;
+        wf.wBitsPerSample = 16;
+        wf.nBlockAlign = (WORD)(m->ach * 2);
+        wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+        wf.cbSize = 0;
+        if (waveOutOpen(&m->wave, WAVE_MAPPER, &wf, (DWORD_PTR)0, (DWORD_PTR)0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+            m->wave = NULL;
+            m->has_a = 0;
+        }
+    } else { REL(m->ar); m->ar = NULL; }
+    if (!m->has_v && !m->has_a) { zfy_media_close((int64_t)(slot + 1)); return 0; }
+
+    m->dur_ms = media_duration(m->vr ? m->vr : m->ar);
+
+    if (m->has_a) {
+        for (int i = 0; i < MEDIA_A_BUFS; i++) {
+            m->ab[i].p = (short *)calloc(MEDIA_A_BUF_BYTES / 2, sizeof(short));
+            if (!m->ab[i].p) { zfy_media_close((int64_t)(slot + 1)); return 0; }
+            m->ab[i].h.lpData = (LPSTR)m->ab[i].p;
+            m->ab[i].h.dwBufferLength = MEDIA_A_BUF_BYTES;
+            waveOutPrepareHeader(m->wave, &m->ab[i].h, sizeof(WAVEHDR));
+            m->ab[i].h.dwFlags |= WHDR_DONE;
+        }
+        m->athr = CreateThread(NULL, 0, media_athr, m, 0, NULL);
+    }
+    return (int64_t)(slot + 1);
+}
+
+void zfy_media_close(int64_t h) {
+    media_s *m = media_of(h);
+    if (!m) return;
+    m->astop = 1;
+    if (m->athr) { WaitForSingleObject(m->athr, 500); CloseHandle(m->athr); m->athr = NULL; }
+    if (m->wave) {
+        waveOutReset(m->wave);
+        for (int i = 0; i < MEDIA_A_BUFS; i++)
+            waveOutUnprepareHeader(m->wave, &m->ab[i].h, sizeof(WAVEHDR));
+        waveOutClose(m->wave);
+        m->wave = NULL;
+    }
+    for (int i = 0; i < MEDIA_A_BUFS; i++) { free(m->ab[i].p); m->ab[i].p = NULL; }
+    media_video_release_pending(m);
+    REL(m->vr); REL(m->ar);
+    if (m->vbmp) {
+        if (m->vimg > 0 && m->vimg <= GUI_IMG_SLOTS) {
+            gui_img *g = &g_imgs[m->vimg - 1];
+            g->bmp = NULL; g->w = 0; g->h = 0; g->used = 0;
+        }
+        REL(m->vbmp);
+        m->vbmp = NULL;
+    }
+    free(m->cv);
+    memset(m, 0, sizeof(*m));
+}
+
+int32_t zfy_media_has_video(int64_t h) { media_s *m = media_of(h); return m ? m->has_v : 0; }
+int32_t zfy_media_has_audio(int64_t h) { media_s *m = media_of(h); return m ? m->has_a : 0; }
+int32_t zfy_media_w(int64_t h) { media_s *m = media_of(h); return m ? m->vw : 0; }
+int32_t zfy_media_h(int64_t h) { media_s *m = media_of(h); return m ? m->vh : 0; }
+int64_t zfy_media_duration(int64_t h) { media_s *m = media_of(h); return m ? m->dur_ms : 0; }
+
+int64_t zfy_media_pos(int64_t h) {
+    media_s *m = media_of(h);
+    if (!m) return 0;
+    if (m->state == MEDIA_PLAY) return m->pos_base + (media_now_ms() - m->wall_base);
+    return m->pos_base;
+}
+
+int32_t zfy_media_state(int64_t h) { media_s *m = media_of(h); return m ? m->state : MEDIA_STOP; }
+
+void zfy_media_play(int64_t h) {
+    media_s *m = media_of(h);
+    if (!m) return;
+    m->pos_base = zfy_media_pos(h);
+    if (m->pos_base >= m->dur_ms && m->dur_ms > 0) m->pos_base = 0;
+    m->wall_base = media_now_ms();
+    m->state = MEDIA_PLAY;
+}
+
+void zfy_media_pause(int64_t h) {
+    media_s *m = media_of(h);
+    if (!m) return;
+    m->pos_base = zfy_media_pos(h);
+    m->state = MEDIA_PAUSE;
+}
+
+static void media_seek_reader(IMFSourceReader *r, int64_t ms) {
+    if (!r) return;
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    pv.vt = VT_I8;
+    pv.hVal.QuadPart = ms * 10000;
+    IMFSourceReader_SetCurrentPosition(r, &GUID_NULL, &pv);
+    PropVariantClear(&pv);
+}
+
+void zfy_media_seek(int64_t h, int64_t ms) {
+    media_s *m = media_of(h);
+    if (!m) return;
+    if (ms < 0) ms = 0;
+    if (m->dur_ms > 0 && ms > m->dur_ms) ms = m->dur_ms;
+    media_video_release_pending(m);
+    m->have_cur = 0;
+    m->eof = 0;
+    media_seek_reader(m->vr, ms);
+    if (m->wave) waveOutReset(m->wave);
+    media_seek_reader(m->ar, ms);
+    m->pos_base = ms;
+    m->wall_base = media_now_ms();
+}
+
+void zfy_media_set_volume(int64_t h, int32_t vol) {
+    media_s *m = media_of(h);
+    if (!m) return;
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+    m->vol = vol;
+}
+int32_t zfy_media_volume(int64_t h) { media_s *m = media_of(h); return m ? m->vol : 0; }
+
+/* 取 pos_ms 应显示的帧：丢弃过期帧后返回位图句柄（与 gui_image 同空间）。
+   句柄在所有帧间复用（同一块 D2D 位图），故上层只需缓存一个句柄。 */
+int64_t zfy_media_frame(int64_t h, int64_t pos_ms) {
+    media_s *m = media_of(h);
+    if (!m || !m->has_v) return 0;
+    gui_win *w = g_cur;
+    if (!w || !w->ctx) return 0;
+
+    media_video_read(m);
+    int guard = 0;
+    /* 丢弃过期帧：只解码、不转换（转换是每帧最贵的部分） */
+    while (m->pending && m->pending_pts <= pos_ms && guard++ < MEDIA_MAX_DROP) {
+        media_video_release_pending(m);
+        media_video_read(m);
+    }
+    /* 转换一帧：优先已到位的帧；首帧（无画面）时即使过期也显示 */
+    if (m->pending && (m->pending_pts > pos_ms || !m->have_cur)) {
+        if (media_video_convert(m)) {
+            m->cur_pts = m->pending_pts;
+            m->have_cur = 1;
+            media_video_release_pending(m);
+            media_video_read(m);
+        }
+    }
+    return m->have_cur ? m->vimg : 0;
+}
+
+int64_t zfy_media_frame_pts(int64_t h) {
+    media_s *m = media_of(h);
+    return m ? m->cur_pts : 0;
+}
+
+#else
+/* 非 Windows：媒体全部桩化（打开失败、状态恒为停止，UI 可优雅降级） */
+int32_t zfy_media_init(void) { return -1; }
+void zfy_media_uninit(void) {}
+int64_t zfy_media_open(char *p) { (void)p; return 0; }
+void zfy_media_close(int64_t h) { (void)h; }
+int32_t zfy_media_has_video(int64_t h) { (void)h; return 0; }
+int32_t zfy_media_has_audio(int64_t h) { (void)h; return 0; }
+int32_t zfy_media_w(int64_t h) { (void)h; return 0; }
+int32_t zfy_media_h(int64_t h) { (void)h; return 0; }
+int64_t zfy_media_duration(int64_t h) { (void)h; return 0; }
+int64_t zfy_media_pos(int64_t h) { (void)h; return 0; }
+int32_t zfy_media_state(int64_t h) { (void)h; return 0; }
+void zfy_media_play(int64_t h) { (void)h; }
+void zfy_media_pause(int64_t h) { (void)h; }
+void zfy_media_seek(int64_t h, int64_t ms) { (void)h; (void)ms; }
+void zfy_media_set_volume(int64_t h, int32_t v) { (void)h; (void)v; }
+int32_t zfy_media_volume(int64_t h) { (void)h; return 0; }
+int64_t zfy_media_frame(int64_t h, int64_t p) { (void)h; (void)p; return 0; }
+int64_t zfy_media_frame_pts(int64_t h) { (void)h; return 0; }
 #endif
 
 /* ==================================================================

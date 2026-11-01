@@ -4452,6 +4452,25 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf "declare void @zfy_a11y_set_focus(i64)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_a11y_hit(i32, i32)\n";
   Buffer.add_string g.mbuf "declare i32 @zfy_gui_a11y_take_value(i64, ptr, i32)\n";
+  (* 音视频（v3.34）：Media Foundation 解码 + waveOut 音频（stdlib/media.zfy） *)
+  Buffer.add_string g.mbuf "declare i32 @zfy_media_init()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_media_uninit()\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_media_open(ptr)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_media_close(i64)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_media_has_video(i64)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_media_has_audio(i64)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_media_w(i64)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_media_h(i64)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_media_duration(i64)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_media_pos(i64)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_media_state(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_media_play(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_media_pause(i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_media_seek(i64, i64)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_media_set_volume(i64, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_media_volume(i64)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_media_frame(i64, i64)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_media_frame_pts(i64)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n";
