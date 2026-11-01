@@ -1,4 +1,4 @@
-# zfy 语言规范（v3.32.0，2026-10-30）
+# zfy 语言规范（v3.33.0，2026-11-01）
 
 > 本规范只描述当前语法。旧语法一律删除、不再保留历史版本描述。
 > 适用编译器：`compiler/_build/zfyc.exe` 当前构建。
@@ -872,7 +872,8 @@ let u8 y = -1            // E3155：负值不在 u8 范围
 > 硬件优先/失败退 WARP；事件环形队列，`Present` 一次提交整帧）→
 > **L1** `stdlib/gui.zfy`（纯 extern 薄绑定）→ **L2**
 > `stdlib/widgets.zfy`（统一元素 UI + 9 组件 + App 容器，damage 脏区
-> 跟踪，只重绘变化的组件）→ **L3** 应用（examples/demos）。
+> 跟踪，只重绘变化的组件；另含 §18.7 的 29 种 `Comp`、令牌化主题与
+> `WidgetKind` 插件注册）→ **L3** 应用（examples/demos）。
 > 仅 Windows（Win32 + Direct2D/DirectWrite/WIC + DXGI）；D2D 不可用时
 > `gui_open` 直接返回负数失败（**不静默退回 GDI**）。非 Windows 平台
 > GUI 桩全部返回失败/空。
@@ -1297,11 +1298,64 @@ set_text_dir(DIR_RTL)       // DirectWrite 阅读方向（gui_set_rtl → DWRITE
   `a11y_hit(x,y)`（坐标命中）、`a11y_find(id)`、`a11y_has_state(i, bit)`。
 - 角色常量 `ROLE_NONE/BUTTON/CHECKBOX/RADIO/SLIDER/EDIT/LIST/TABLE/TAB/
   GROUP/IMAGE/TEXT/PROGRESS/WINDOW`；状态位 `A11Y_DISABLED/FOCUSED/
-  CHECKED/EXPANDED/SELECTED/HOT/PRESSED`。
+  CHECKED/EXPANDED/SELECTED/HOT/PRESSED/READONLY/PASSWORD`。
 - 焦点链为全局有序表：`focus_register/focus_unregister/focus_set/focus_get/
   focus_next/focus_prev/focus_count/focus_has`；`App.step` 收到 Tab /
   Shift+Tab 自动 `focus_next/focus_prev`（回绕）。焦点环统一
   `draw_focus_ring(th, id, x, y, w, h)`，取 `th.focusWidth` 与 `th.borderFocus`。
+
+**UI Automation Provider（Windows 真实无障碍桥接）**
+
+zfy 的 `A11yNode` 快照同时被推送到 C runtime 的 UIA 节点表，因此
+Narrator / Inspect.exe 等 UIA 客户端可读取与操作 zfy GUI。
+
+- **zfy 侧 API（`gui` 模块包装）**：`gui_a11y_begin(win)` →
+  对每个节点 `gui_a11y_push_node(win, idx, name, role, value, states,
+  x, y, w, h, parent)` → `gui_a11y_focus(idx)` → `gui_a11y_end()`。
+  `idx` 从 0 连续递增（节点表下标）；坐标为客户区物理像素，C 侧换算
+  屏幕坐标；`parent = -1` 表示直接挂在窗口根元素下。`widgets` 的
+  `a11y_add` 已自动完成全部推送，业务层无需调用。
+- **C 侧 API**：`zfy_a11y_begin/push_node/end/set_focus/hit` 与
+  `zfy_gui_a11y_take_value(idx, buf, cap)`（非 Windows 平台为桩）。
+- **Provider 形态**：手工 C vtable（`CINTERFACE` + 指定初始化器绑定 SDK
+  `Vtbl`），`IID` 为本地标准常量，`UIAutomationCore.dll` 通过
+  `LoadLibrary/GetProcAddress` 动态加载（缺库则无障碍静默禁用）。
+  `WM_GETOBJECT`（`lParam == UiaRootObjectId`）先 `UiaClientsAreListening()`
+  判断，再 `UiaReturnRawElementProvider` 返回窗口根元素。
+- **接口**：`IRawElementProviderSimple`（ProviderOptions_ServerSideProvider|
+  UseComThreading；`get_HostRawElementProvider` 仅根元素）、
+  `IRawElementProviderFragment`（Parent/NextSibling/PreviousSibling/
+  FirstChild/LastChild 按 `parent` 与同级顺序遍历；RuntimeId =
+  `[UiaAppendRuntimeId, node+1]`）、`IRawElementProviderFragmentRoot`。
+- **role → ControlType**：`button/checkbox/radio/slider/edit/list/table/
+  tab/group/image/text/progress/window` 映射到同名 `UIA_*ControlTypeId`，
+  其余 role 落 `Pane`。
+- **Pattern 支持**：button→Invoke；checkbox→Invoke+Toggle；radio→
+  SelectionItem+Toggle；slider/progress→RangeValue（0..100）；edit→
+  Value+Text；list/table/tab→Selection；tree→ExpandCollapse。
+  未列出的 Pattern 返回 NULL（客户端按不可用处理）。
+- **事件**（仅在 `UiaClientsAreListening()` 为真时发送）：焦点变化
+  `UIA_AutomationFocusChangedEventId`；节点数量变化
+  `UiaRaiseStructureChangedEvent(ChildrenInvalidated)`；属性变化
+  `UiaRaiseAutomationPropertyChangedEvent`（Name / ValueValue / IsEnabled /
+  ToggleToggleState）。
+- **UIA 动作回投（线程安全）**：Provider 方法运行在 UIA 的 RPC 线程，
+  绝不直接改绘制状态——只写每窗口"待投递"槽并 `PostMessageW`
+  （`WM_APP+401/402/403`），wndproc 在 UI 线程把它们翻译成事件队列里的
+  `EV_A11Y_INVOKE / EV_A11Y_VALUE / EV_A11Y_FOCUS`；消费者为
+  `App.step` 的轮询循环。节点表读写统一由 `CRITICAL_SECTION` 保护。
+- **zfy 侧事件语义**：`EV_A11Y_INVOKE` 的 `x` 是节点下标 →
+  `a11y_id_of_idx`（按上一帧 id 序列）解析组件 id，按钮/复选框走
+  "点击"语义、L2 组件走 `Comp.a11y_invoke()`；`EV_A11Y_VALUE` 的
+  `key > 0` 表示数值（实际值 = `key-1`，用于滑块/步进/进度），
+  `key == 0` 表示文本设值——调用 `gui_a11y_take_value(idx)` 取 UTF-8 串；
+  `EV_A11Y_FOCUS` 走焦点链。数值与文本用 `key` 区分，因此滑块设 0 与
+  "设空文本"不会混淆。
+- **states 位映射**：zfy 的 `A11Y_DISABLED/FOCUSED/CHECKED/EXPANDED/
+  SELECTED`（1/2/4/8/16）与 C 侧同值；`A11Y_READONLY(128)` /
+  `A11Y_PASSWORD(256)` 在 C 侧映射为 32/64。
+- 用例：`examples/a11y_test.zfy`（节点数/find/hit/状态位/焦点，以及
+  zfy 快照与 C 节点表命中和下标反查的一致性）。
 
 ## 19. 内建容器 map / set 与 for-in
 

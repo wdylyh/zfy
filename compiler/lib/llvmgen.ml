@@ -4444,6 +4444,14 @@ let gen_program (m : mir) : string =
   Buffer.add_string g.mbuf
     "declare void @zfy_gui_draw_image_sub(i64, i32, i32, i32, i32, i32, i32, i32, i32, i32)\n";
   Buffer.add_string g.mbuf "declare i64 @zfy_gui_image_from_rgba(ptr, i32, i32, i32)\n";
+  (* 无障碍（UI Automation Provider）：zfy 侧每帧提交节点表 + 取回投值 *)
+  Buffer.add_string g.mbuf "declare void @zfy_a11y_begin(i64)\n";
+  Buffer.add_string g.mbuf
+    "declare void @zfy_a11y_push_node(i64, i64, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32)\n";
+  Buffer.add_string g.mbuf "declare void @zfy_a11y_end()\n";
+  Buffer.add_string g.mbuf "declare void @zfy_a11y_set_focus(i64)\n";
+  Buffer.add_string g.mbuf "declare i64 @zfy_a11y_hit(i32, i32)\n";
+  Buffer.add_string g.mbuf "declare i32 @zfy_gui_a11y_take_value(i64, ptr, i32)\n";
   Buffer.add_string g.mbuf "declare void @zfy_os_random_u64(ptr)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n";
   Buffer.add_string g.mbuf "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n";

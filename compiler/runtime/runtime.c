@@ -4189,6 +4189,11 @@ void zfy_time_sleep_f(double sec) {
 #include <dxgi1_3.h>
 #include <dwrite.h>
 #include <wincodec.h>
+/* UI Automation Provider：仅用头文件里的接口 vtable/常量，运行期动态加载
+   UIAutomationCore.dll 的函数（避免链接期依赖）。oleauto 提供 VARIANT/
+   BSTR/SAFEARRAY（SysAllocString/SafeArrayCreate 走 oleaut32）。 */
+#include <uiautomation.h>
+#include <oleauto.h>
 
 /* mingw 的 IDWriteFactory IID 未进导入库，本地定义一份 */
 static const GUID gui_iid_dwrite = { 0xb859ee5a, 0xd838, 0x4b5b,
@@ -4346,6 +4351,1606 @@ static void gui_push_ev(gui_win *w, int64_t t, int64_t x, int64_t y, int64_t k) 
     w->q[w->qt].t = t; w->q[w->qt].x = x;
     w->q[w->qt].y = y; w->q[w->qt].k = k;
     w->qt = nxt;
+}
+
+/* ==================================================================
+ * UI Automation Provider（无障碍，v3.33）
+ *
+ * 结构：zfy 侧每帧提交一棵"无障碍节点表"（begin → push_node* → end），
+ * C 侧据此实现 COM 形态的 UIA Provider，供 Narrator / Inspect.exe 等
+ * UIA 客户端读取与操作。
+ *
+ * 线程模型：
+ *   - 节点表由 CRITICAL_SECTION 保护；UIA 客户端在 RPC 线程上回调 Provider
+ *     方法，因此所有读取都先加锁拷贝再使用；
+ *   - UIA 动作（Invoke / SetValue / SetFocus）绝不直接改绘制状态：先写入
+ *     每窗口"待投递"槽，再 PostMessage 回窗口线程（WM_APP+401..403），
+ *     wndproc 把动作翻译成既有事件队列里的 EV_A11Y_*，zfy 在 gui_poll
+ *     里取到后走既有组件路径——不在 UIA 线程碰任何 UI 状态；
+ *   - 事件仅在 UiaClientsAreListening() 为真时发送（无人监听时零开销）。
+ *
+ * 链接：UIAutomationCore 的导出与 IID 都走 LoadLibrary/GetProcAddress 与
+ * 本地标准常量（不依赖导入库，缺库时自动退化为"无障碍静默禁用"）。
+ * ================================================================== */
+
+#define A11Y_MAX_NODES 256
+#define A11Y_NAME_MAX  128
+#define A11Y_ROLE_MAX  24
+#define A11Y_VAL_MAX   256
+
+/* 事件类型（与 stdlib/gui.zfy 的 EV_A11Y_* 一致） */
+#define GUI_EV_A11Y_INVOKE 9      /* x = 节点下标（上一帧），y = 组件 id */
+#define GUI_EV_A11Y_VALUE  10     /* x = 节点下标，key = 数值（edit 文本走 take_value）*/
+#define GUI_EV_A11Y_FOCUS  11     /* x = 节点下标（UIA SetFocus 请求） */
+
+/* UIA 线程 → UI 线程的投递消息（lParam 复用为数值/标志） */
+#define GUI_WM_A11Y_INVOKE (WM_APP + 401)
+#define GUI_WM_A11Y_VALUE  (WM_APP + 402)
+#define GUI_WM_A11Y_FOCUS  (WM_APP + 403)
+
+/* 节点状态位（与 zfy 侧 A11Y_* 的映射在 a11y_states_to_c） */
+#define A11Y_ST_DISABLED 1
+#define A11Y_ST_FOCUSED  2
+#define A11Y_ST_CHECKED  4
+#define A11Y_ST_EXPANDED 8
+#define A11Y_ST_SELECTED 16
+#define A11Y_ST_READONLY 32
+#define A11Y_ST_PASSWORD 64
+
+/* Pattern 支持位（按 role 决定 GetPatternProvider 返回值） */
+#define A11Y_P_INVOKE    0x01
+#define A11Y_P_TOGGLE    0x02
+#define A11Y_P_RANGE     0x04
+#define A11Y_P_SELECTION 0x08
+#define A11Y_P_SELITEM   0x10
+#define A11Y_P_VALUE     0x20
+#define A11Y_P_EXPAND    0x40
+#define A11Y_P_TEXT      0x80
+
+typedef struct {
+    int used;
+    char name[A11Y_NAME_MAX];      /* UTF-8（由 zfy 提供） */
+    char role[A11Y_ROLE_MAX];      /* UTF-8：button/checkbox/... */
+    char value[A11Y_VAL_MAX];      /* UTF-8 */
+    int states;                    /* A11Y_ST_* 位集 */
+    int x, y, w, h;                /* 客户区物理像素（提交时换算成屏幕坐标） */
+    int parent;                    /* 父节点下标；-1 = 窗口根元素 */
+    int id;                        /* zfy 侧组件 id（回投解析用） */
+} a11y_node;
+
+typedef struct {
+    a11y_node stage[A11Y_MAX_NODES];   /* 正在构建的帧 */
+    int stage_n;
+    a11y_node cur[A11Y_MAX_NODES];     /* 已提交的帧（UIA 客户端读这个） */
+    int cur_n;
+    int stage_focus;                   /* 本帧焦点节点 */
+    int focus;                         /* 已提交焦点 */
+    int focus_last;                    /* 已发送焦点事件的节点 */
+    int pend_idx;                      /* 待投递动作的节点下标 */
+    int pend_num;                      /* 待投递数值（RangeValue.SetValue） */
+    char pend_str[A11Y_VAL_MAX];       /* 待投递文本（IValueProvider.SetValue） */
+    int deliv_idx;                     /* 已投递到 UI 线程的文本节点下标 */
+    char deliv_str[A11Y_VAL_MAX];
+    int deliv_ok;
+} a11y_tab;
+
+static a11y_tab g_a11y[GUI_MAXWIN];
+static INIT_ONCE g_a11y_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_a11y_cs;
+
+static BOOL CALLBACK a11y_once_cb(PINIT_ONCE o, PVOID p, PVOID *c) {
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_a11y_cs);
+    return TRUE;
+}
+static void a11y_lock(void) {
+    InitOnceExecuteOnce(&g_a11y_once, a11y_once_cb, NULL, NULL);
+    EnterCriticalSection(&g_a11y_cs);
+}
+static void a11y_unlock(void) { LeaveCriticalSection(&g_a11y_cs); }
+
+/* ---------- UIAutomationCore 动态加载（缺库 = 无障碍静默禁用） ---------- */
+static int g_uia_state = 0;        /* 0=未尝试 1=可用 -1=不可用 */
+static HMODULE g_uia_dll = NULL;
+static LRESULT (WINAPI *g_uia_raw_provider)(HWND, WPARAM, LPARAM, IRawElementProviderSimple *);
+static HRESULT (WINAPI *g_uia_host_from_hwnd)(HWND, IRawElementProviderSimple **);
+static WINBOOL (WINAPI *g_uia_listening)(void);
+static HRESULT (WINAPI *g_uia_raise_event)(IRawElementProviderSimple *, EVENTID);
+static HRESULT (WINAPI *g_uia_raise_prop)(IRawElementProviderSimple *, PROPERTYID, VARIANT, VARIANT);
+static HRESULT (WINAPI *g_uia_raise_struct)(IRawElementProviderSimple *, enum StructureChangeType,
+                                            int *, int);
+
+static void a11y_uia_load(void) {
+    if (g_uia_state != 0) return;
+    g_uia_dll = LoadLibraryW(L"UIAutomationCore.dll");
+    if (!g_uia_dll) { g_uia_state = -1; return; }
+    g_uia_raw_provider = (LRESULT (WINAPI *)(HWND, WPARAM, LPARAM, IRawElementProviderSimple *))
+        (void *)GetProcAddress(g_uia_dll, "UiaReturnRawElementProvider");
+    g_uia_host_from_hwnd = (HRESULT (WINAPI *)(HWND, IRawElementProviderSimple **))
+        (void *)GetProcAddress(g_uia_dll, "UiaHostProviderFromHwnd");
+    g_uia_listening = (WINBOOL (WINAPI *)(void))
+        (void *)GetProcAddress(g_uia_dll, "UiaClientsAreListening");
+    g_uia_raise_event = (HRESULT (WINAPI *)(IRawElementProviderSimple *, EVENTID))
+        (void *)GetProcAddress(g_uia_dll, "UiaRaiseAutomationEvent");
+    g_uia_raise_prop = (HRESULT (WINAPI *)(IRawElementProviderSimple *, PROPERTYID, VARIANT, VARIANT))
+        (void *)GetProcAddress(g_uia_dll, "UiaRaiseAutomationPropertyChangedEvent");
+    g_uia_raise_struct = (HRESULT (WINAPI *)(IRawElementProviderSimple *, enum StructureChangeType, int *, int))
+        (void *)GetProcAddress(g_uia_dll, "UiaRaiseStructureChangedEvent");
+    g_uia_state = (g_uia_raw_provider && g_uia_host_from_hwnd && g_uia_listening
+                   && g_uia_raise_event && g_uia_raise_prop && g_uia_raise_struct) ? 1 : -1;
+}
+
+static int a11y_listening(void) {
+    a11y_uia_load();
+    if (g_uia_state != 1) return 0;
+    return g_uia_listening() ? 1 : 0;
+}
+
+/* ---------- 接口 IID（本地常量，不依赖导入库） ---------- */
+static const GUID a11y_iid_unknown = { 0x00000000, 0x0000, 0x0000,
+                                      { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+static const GUID a11y_iid_simple = { 0xd6dd68d1, 0x86fd, 0x4332,
+                                      { 0x86, 0x66, 0x9a, 0xbe, 0xde, 0xa2, 0xd2, 0x4c } };
+static const GUID a11y_iid_frag = { 0xf7063da8, 0x8359, 0x439c,
+                                    { 0x92, 0x97, 0xbb, 0xc5, 0x29, 0x9a, 0x7d, 0x87 } };
+static const GUID a11y_iid_root = { 0x620ce2a5, 0xab8f, 0x40a9,
+                                    { 0x86, 0xcb, 0xde, 0x3c, 0x75, 0x59, 0x9b, 0x58 } };
+static const GUID a11y_iid_invoke = { 0x54fcb24b, 0xe18e, 0x47a2,
+                                      { 0xb4, 0xd3, 0xec, 0xcb, 0xe7, 0x75, 0x99, 0xa2 } };
+static const GUID a11y_iid_toggle = { 0x56d00bd0, 0xc4f4, 0x433c,
+                                      { 0xa8, 0x36, 0x1a, 0x52, 0xa5, 0x7e, 0x08, 0x92 } };
+static const GUID a11y_iid_range = { 0x36dc7aef, 0x33e6, 0x4691,
+                                     { 0xaf, 0xe1, 0x2b, 0xe7, 0x27, 0x4b, 0x3d, 0x33 } };
+static const GUID a11y_iid_sel = { 0xfb8b03af, 0x3bdf, 0x48d4,
+                                   { 0xbd, 0x36, 0x1a, 0x65, 0x79, 0x3b, 0xe1, 0x68 } };
+static const GUID a11y_iid_selitem = { 0x2acad808, 0xb2d4, 0x452d,
+                                       { 0xa4, 0x07, 0x91, 0xff, 0x1a, 0xd1, 0x67, 0xb2 } };
+static const GUID a11y_iid_value = { 0xc7935180, 0x6fb3, 0x4201,
+                                     { 0xb1, 0x74, 0x7d, 0xf7, 0x3a, 0xdb, 0xf6, 0x4a } };
+static const GUID a11y_iid_expand = { 0xd847d3a5, 0xcab0, 0x4a98,
+                                      { 0x8c, 0x32, 0xec, 0xb4, 0x5c, 0x59, 0xad, 0x24 } };
+static const GUID a11y_iid_text = { 0x3589c92c, 0x63f3, 0x4367,
+                                    { 0x99, 0xbb, 0xad, 0xa6, 0x53, 0xb7, 0x7c, 0xf2 } };
+static const GUID a11y_iid_textrange = { 0x5347ad7b, 0xc355, 0x46f8,
+                                         { 0xaf, 0xf5, 0x90, 0x90, 0x33, 0x58, 0x2f, 0x63 } };
+
+/* ---------- 元素对象（静态池：下标即节点下标，永不复用释放） ---------- */
+typedef struct { const void *lpVtbl; void *e; } a11y_face;
+
+typedef struct a11y_elem {
+    a11y_face simple, frag, root, invoke, toggle, range, sel, selitem, val, expand, text;
+    int win;
+    int node;              /* -1 = 窗口根元素 */
+    LONG refs;
+    int ready;
+} a11y_elem;
+
+typedef struct a11y_trange {
+    a11y_face face;
+    a11y_elem *owner;      /* 所属文本元素（win/node 复用 owner） */
+    int start, end;        /* 文本字节区间 */
+    int ready;
+} a11y_trange;
+
+static a11y_elem g_a11y_elems[GUI_MAXWIN][A11Y_MAX_NODES + 1];
+static a11y_trange g_a11y_ranges[GUI_MAXWIN][A11Y_MAX_NODES + 1];
+
+/* vtable 前置声明（定义在方法实现之后） */
+static const IRawElementProviderSimpleVtbl a11y_vt_simple;
+static const IRawElementProviderFragmentVtbl a11y_vt_frag;
+static const IRawElementProviderFragmentRootVtbl a11y_vt_root;
+static const IInvokeProviderVtbl a11y_vt_invoke;
+static const IToggleProviderVtbl a11y_vt_toggle;
+static const IRangeValueProviderVtbl a11y_vt_range;
+static const ISelectionProviderVtbl a11y_vt_sel;
+static const ISelectionItemProviderVtbl a11y_vt_selitem;
+static const IValueProviderVtbl a11y_vt_val;
+static const IExpandCollapseProviderVtbl a11y_vt_expand;
+static const ITextProviderVtbl a11y_vt_text;
+static const ITextRangeProviderVtbl a11y_vt_textrange;
+
+/* ---------- 节点表辅助 ---------- */
+
+static wchar_t *gui_utf8_to_wide(const char *s);   /* 定义在 wndproc 之后 */
+
+/* win 参数：1..GUI_MAXWIN（与 zfy 的 gui_self() 一致）；0/-1 = 当前窗口 */
+static int a11y_win_idx(int64_t win) {
+    int i = -1;
+    if (win >= 1 && win <= GUI_MAXWIN && g_wins[win - 1].used) i = (int)(win - 1);
+    else if (win >= 0 && win < GUI_MAXWIN && g_wins[win].used) i = (int)win;
+    else if (g_cur) {
+        for (int k = 0; k < GUI_MAXWIN; k++)
+            if (g_cur == &g_wins[k]) { i = k; break; }
+    }
+    return i;
+}
+
+/* 锁内拷贝节点（UIA 线程读）；返回 1=存在 */
+static int a11y_node_copy(int win, int node, a11y_node *out) {
+    int ok = 0;
+    if (win < 0 || win >= GUI_MAXWIN || node < 0) return 0;
+    a11y_lock();
+    if (node < g_a11y[win].cur_n && g_a11y[win].cur[node].used) {
+        *out = g_a11y[win].cur[node];
+        ok = 1;
+    }
+    a11y_unlock();
+    return ok;
+}
+
+/* 节点包围盒（屏幕物理坐标；客户端坐标 + 窗口原点） */
+static void a11y_screen_rect(int win, const a11y_node *nd, struct UiaRect *r) {
+    double left = nd->x, top = nd->y;
+    HWND hw = (win >= 0 && win < GUI_MAXWIN) ? g_wins[win].hwnd : NULL;
+    if (hw) {
+        POINT p;
+        p.x = nd->x; p.y = nd->y;
+        if (ClientToScreen(hw, &p)) { left = p.x; top = p.y; }
+    }
+    r->left = left;
+    r->top = top;
+    r->width = nd->w > 0 ? nd->w : 0;
+    r->height = nd->h > 0 ? nd->h : 0;
+}
+
+/* role → UIA ControlType */
+static int a11y_control_type(const char *role) {
+    if (!strcmp(role, "button"))   return UIA_ButtonControlTypeId;
+    if (!strcmp(role, "checkbox")) return UIA_CheckBoxControlTypeId;
+    if (!strcmp(role, "radio"))    return UIA_RadioButtonControlTypeId;
+    if (!strcmp(role, "slider"))   return UIA_SliderControlTypeId;
+    if (!strcmp(role, "edit"))     return UIA_EditControlTypeId;
+    if (!strcmp(role, "list"))     return UIA_ListControlTypeId;
+    if (!strcmp(role, "table"))    return UIA_TableControlTypeId;
+    if (!strcmp(role, "tab"))      return UIA_TabControlTypeId;
+    if (!strcmp(role, "group"))    return UIA_GroupControlTypeId;
+    if (!strcmp(role, "image"))    return UIA_ImageControlTypeId;
+    if (!strcmp(role, "text"))     return UIA_TextControlTypeId;
+    if (!strcmp(role, "progress")) return UIA_ProgressBarControlTypeId;
+    if (!strcmp(role, "window"))   return UIA_WindowControlTypeId;
+    return UIA_PaneControlTypeId;
+}
+
+/* role → 支持的 Pattern 位集 */
+static int a11y_patterns(const char *role) {
+    if (!strcmp(role, "button"))   return A11Y_P_INVOKE;
+    if (!strcmp(role, "checkbox")) return A11Y_P_INVOKE | A11Y_P_TOGGLE;
+    if (!strcmp(role, "radio"))    return A11Y_P_SELITEM | A11Y_P_TOGGLE;
+    if (!strcmp(role, "slider"))   return A11Y_P_RANGE;
+    if (!strcmp(role, "progress")) return A11Y_P_RANGE;
+    if (!strcmp(role, "edit"))     return A11Y_P_VALUE | A11Y_P_TEXT;
+    if (!strcmp(role, "list"))     return A11Y_P_SELECTION;
+    if (!strcmp(role, "table"))    return A11Y_P_SELECTION;
+    if (!strcmp(role, "tab"))      return A11Y_P_SELECTION;
+    if (!strcmp(role, "tree"))     return A11Y_P_EXPAND;
+    return 0;
+}
+
+/* pattern id → Pattern 位 */
+static int a11y_pattern_bit(PATTERNID id) {
+    switch (id) {
+    case UIA_InvokePatternId:        return A11Y_P_INVOKE;
+    case UIA_TogglePatternId:        return A11Y_P_TOGGLE;
+    case UIA_RangeValuePatternId:    return A11Y_P_RANGE;
+    case UIA_SelectionPatternId:     return A11Y_P_SELECTION;
+    case UIA_SelectionItemPatternId: return A11Y_P_SELITEM;
+    case UIA_ValuePatternId:         return A11Y_P_VALUE;
+    case UIA_ExpandCollapsePatternId:return A11Y_P_EXPAND;
+    case UIA_TextPatternId:          return A11Y_P_TEXT;
+    default: return 0;
+    }
+}
+
+/* 元素取用（懒初始化 face 表；窗口槽位由调用方保证有效） */
+static a11y_elem *a11y_elem_get(int win, int node) {
+    a11y_elem *e;
+    if (win < 0 || win >= GUI_MAXWIN) return NULL;
+    if (node < 0) node = -1;
+    if (node >= A11Y_MAX_NODES) return NULL;
+    e = &g_a11y_elems[win][node + 1];
+    if (!e->ready) {
+        e->win = win;
+        e->node = node;
+        e->refs = 1;
+        e->simple.lpVtbl = (const void *)&a11y_vt_simple;
+        e->simple.e = e;
+        e->frag.lpVtbl = (const void *)&a11y_vt_frag;
+        e->frag.e = e;
+        e->root.lpVtbl = (const void *)&a11y_vt_root;
+        e->root.e = e;
+        e->invoke.lpVtbl = (const void *)&a11y_vt_invoke;
+        e->invoke.e = e;
+        e->toggle.lpVtbl = (const void *)&a11y_vt_toggle;
+        e->toggle.e = e;
+        e->range.lpVtbl = (const void *)&a11y_vt_range;
+        e->range.e = e;
+        e->sel.lpVtbl = (const void *)&a11y_vt_sel;
+        e->sel.e = e;
+        e->selitem.lpVtbl = (const void *)&a11y_vt_selitem;
+        e->selitem.e = e;
+        e->val.lpVtbl = (const void *)&a11y_vt_val;
+        e->val.e = e;
+        e->expand.lpVtbl = (const void *)&a11y_vt_expand;
+        e->expand.e = e;
+        e->text.lpVtbl = (const void *)&a11y_vt_text;
+        e->text.e = e;
+        e->ready = 1;
+    }
+    return e;
+}
+
+static a11y_elem *a11y_elem_of(const void *iface) {
+    if (!iface) return NULL;
+    return (a11y_elem *)((const a11y_face *)iface)->e;
+}
+
+/* 有效 role：根元素固定 window；节点读已提交表；节点不存在时当 pane */
+static void a11y_role_of(int win, int node, char *out, int cap) {
+    a11y_node nd;
+    out[0] = 0;
+    if (node < 0) { strncpy(out, "window", (size_t)cap - 1); return; }
+    if (a11y_node_copy(win, node, &nd)) {
+        strncpy(out, nd.role, (size_t)cap - 1);
+        out[cap - 1] = 0;
+    } else {
+        strncpy(out, "group", (size_t)cap - 1);
+    }
+}
+
+/* UTF-8 → BSTR（UIA 字符串属性） */
+static BSTR a11y_bstr(const char *s) {
+    if (!s) s = "";
+    wchar_t *w = gui_utf8_to_wide(s);   /* 定义在 GUI 段较早处 */
+    BSTR b = SysAllocString(w ? w : L"");
+    free(w);
+    return b;
+}
+
+/* 节点下标 → BSTR（AutomationId） */
+static BSTR a11y_bstr_idx(int idx) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "zfy-%d", idx);
+    return a11y_bstr(buf);
+}
+
+/* UIA 线程投递动作到窗口线程（只写"待投递"槽 + PostMessage，不碰 UI） */
+static void a11y_post(int win, int node, int kind, int num) {
+    HWND hw;
+    if (win < 0 || win >= GUI_MAXWIN || node < 0) return;
+    hw = g_wins[win].hwnd;
+    if (!hw) return;
+    if (kind == 2 || kind == 4) {
+        a11y_lock();
+        g_a11y[win].pend_idx = node;
+        g_a11y[win].pend_num = num;
+        a11y_unlock();
+    }
+    switch (kind) {
+    case 1: PostMessageW(hw, GUI_WM_A11Y_INVOKE, (WPARAM)node, 0); break;
+    /* 数值 +1 入队：EV_A11Y_VALUE 的 key>0 表示数值（key-1），key==0 表示文本走
+       take_value 取串——这样滑块设 0 与"设文本"能区分开 */
+    case 2: PostMessageW(hw, GUI_WM_A11Y_VALUE, (WPARAM)node, (LPARAM)(num + 1)); break;
+    case 3: PostMessageW(hw, GUI_WM_A11Y_FOCUS, (WPARAM)node, 0); break;
+    case 4: PostMessageW(hw, GUI_WM_A11Y_VALUE, (WPARAM)node, 0); break;
+    default: break;
+    }
+}
+
+/* IValueProvider.SetValue 的文本：先落待投递串再 Post */
+static void a11y_post_value_str(int win, int node, const char *s) {
+    if (win < 0 || win >= GUI_MAXWIN || node < 0) return;
+    a11y_lock();
+    g_a11y[win].pend_idx = node;
+    g_a11y[win].pend_str[0] = 0;
+    if (s) {
+        int n = (int)strlen(s);
+        if (n > A11Y_VAL_MAX - 1) n = A11Y_VAL_MAX - 1;
+        memcpy(g_a11y[win].pend_str, s, (size_t)n);
+        g_a11y[win].pend_str[n] = 0;
+    }
+    a11y_unlock();
+    a11y_post(win, node, 4, 0);
+}
+
+/* ---------- IUnknown 三个方法（每个接口一份，签名必须与 SDK vtable 一致） ---------- */
+static HRESULT a11y_qi(a11y_elem *e, REFIID riid, void **out);
+static ULONG a11y_addref(a11y_elem *e);
+static ULONG a11y_release(a11y_elem *e);
+
+#define A11Y_UNKNOWN(IFC, PFX) \
+static HRESULT WINAPI PFX##_QueryInterface(IFC *t, REFIID riid, void **o) \
+{ return a11y_qi(a11y_elem_of((void *)t), riid, o); } \
+static ULONG WINAPI PFX##_AddRef(IFC *t) { return a11y_addref(a11y_elem_of((void *)t)); } \
+static ULONG WINAPI PFX##_Release(IFC *t) { return a11y_release(a11y_elem_of((void *)t)); }
+
+A11Y_UNKNOWN(IRawElementProviderSimple, a11y_simple)
+A11Y_UNKNOWN(IRawElementProviderFragment, a11y_frag)
+A11Y_UNKNOWN(IRawElementProviderFragmentRoot, a11y_root)
+A11Y_UNKNOWN(IInvokeProvider, a11y_invoke)
+A11Y_UNKNOWN(IToggleProvider, a11y_toggle)
+A11Y_UNKNOWN(IRangeValueProvider, a11y_range)
+A11Y_UNKNOWN(ISelectionProvider, a11y_sel)
+A11Y_UNKNOWN(ISelectionItemProvider, a11y_selitem)
+A11Y_UNKNOWN(IValueProvider, a11y_val)
+A11Y_UNKNOWN(IExpandCollapseProvider, a11y_expand)
+A11Y_UNKNOWN(ITextProvider, a11y_text)
+/* 文本区间对象：IUnknown 三方法单独实现（持有 owner 元素的引用） */
+
+/* 引用计数：静态池对象不释放，归零仅表示"客户端不再引用" */
+static ULONG a11y_addref(a11y_elem *e) {
+    if (!e) return 0;
+    return (ULONG)InterlockedIncrement(&e->refs);
+}
+static ULONG a11y_release(a11y_elem *e) {
+    if (!e) return 0;
+    LONG n = InterlockedDecrement(&e->refs);
+    if (n < 0) { InterlockedExchange(&e->refs, 0); n = 0; }
+    return (ULONG)n;
+}
+
+/* QueryInterface：按 IID 返回对应的 face（未支持返回 E_NOINTERFACE） */
+static HRESULT a11y_qi(a11y_elem *e, REFIID riid, void **out) {
+    char role[A11Y_ROLE_MAX];
+    int pats;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e || !riid) return E_POINTER;
+    if (IsEqualGUID(riid, &a11y_iid_unknown) || IsEqualGUID(riid, &a11y_iid_simple)) {
+        *out = (void *)&e->simple;
+        return S_OK;
+    }
+    if (IsEqualGUID(riid, &a11y_iid_frag)) {
+        *out = (void *)&e->frag;
+        return S_OK;
+    }
+    if (e->node < 0) {
+        if (IsEqualGUID(riid, &a11y_iid_root)) { *out = (void *)&e->root; return S_OK; }
+        return E_NOINTERFACE;
+    }
+    a11y_role_of(e->win, e->node, role, (int)sizeof(role));
+    pats = a11y_patterns(role);
+    if ((pats & A11Y_P_INVOKE)    && IsEqualGUID(riid, &a11y_iid_invoke))   { *out = (void *)&e->invoke; return S_OK; }
+    if ((pats & A11Y_P_TOGGLE)    && IsEqualGUID(riid, &a11y_iid_toggle))   { *out = (void *)&e->toggle; return S_OK; }
+    if ((pats & A11Y_P_RANGE)     && IsEqualGUID(riid, &a11y_iid_range))    { *out = (void *)&e->range; return S_OK; }
+    if ((pats & A11Y_P_SELECTION) && IsEqualGUID(riid, &a11y_iid_sel))      { *out = (void *)&e->sel; return S_OK; }
+    if ((pats & A11Y_P_SELITEM)   && IsEqualGUID(riid, &a11y_iid_selitem))  { *out = (void *)&e->selitem; return S_OK; }
+    if ((pats & A11Y_P_VALUE)     && IsEqualGUID(riid, &a11y_iid_value))    { *out = (void *)&e->val; return S_OK; }
+    if ((pats & A11Y_P_EXPAND)    && IsEqualGUID(riid, &a11y_iid_expand))   { *out = (void *)&e->expand; return S_OK; }
+    if ((pats & A11Y_P_TEXT)      && IsEqualGUID(riid, &a11y_iid_text))     { *out = (void *)&e->text; return S_OK; }
+    return E_NOINTERFACE;
+}
+
+/* ---------- IRawElementProviderSimple ---------- */
+static HRESULT WINAPI a11y_simple_get_ProviderOptions(IRawElementProviderSimple *t, enum ProviderOptions *o) {
+    (void)t;
+    if (!o) return E_POINTER;
+    /* 服务端 Provider + 跨线程（节点表加锁，动作经消息回窗口线程） */
+    *o = (enum ProviderOptions)(ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_simple_GetPatternProvider(IRawElementProviderSimple *t, PATTERNID id, IUnknown **o) {
+    a11y_elem *e = a11y_elem_of(t);
+    char role[A11Y_ROLE_MAX];
+    int pats;
+    if (!o) return E_POINTER;
+    *o = NULL;
+    if (!e || e->node < 0) return S_OK;
+    a11y_role_of(e->win, e->node, role, (int)sizeof(role));
+    pats = a11y_patterns(role);
+    if (pats & a11y_pattern_bit(id)) {
+        void *face = NULL;
+        if ((pats & A11Y_P_INVOKE) && id == UIA_InvokePatternId) face = &e->invoke;
+        else if ((pats & A11Y_P_TOGGLE) && id == UIA_TogglePatternId) face = &e->toggle;
+        else if ((pats & A11Y_P_RANGE) && id == UIA_RangeValuePatternId) face = &e->range;
+        else if ((pats & A11Y_P_SELECTION) && id == UIA_SelectionPatternId) face = &e->sel;
+        else if ((pats & A11Y_P_SELITEM) && id == UIA_SelectionItemPatternId) face = &e->selitem;
+        else if ((pats & A11Y_P_VALUE) && id == UIA_ValuePatternId) face = &e->val;
+        else if ((pats & A11Y_P_EXPAND) && id == UIA_ExpandCollapsePatternId) face = &e->expand;
+        else if ((pats & A11Y_P_TEXT) && id == UIA_TextPatternId) face = &e->text;
+        if (face) {
+            a11y_addref(e);
+            *o = (IUnknown *)face;
+        }
+    }
+    return S_OK;
+}
+
+/* 取节点（根元素合成一条 node=-1 的虚拟记录） */
+static int a11y_get_node(int win, int node, a11y_node *nd) {
+    if (node < 0) {
+        HWND hw = (win >= 0 && win < GUI_MAXWIN) ? g_wins[win].hwnd : NULL;
+        RECT rc = { 0, 0, 0, 0 };
+        memset(nd, 0, sizeof(*nd));
+        nd->used = 1;
+        nd->parent = -1;
+        strncpy(nd->role, "window", sizeof(nd->role) - 1);
+        strncpy(nd->name, "zfy", sizeof(nd->name) - 1);
+        if (hw) {
+            wchar_t wt[160];
+            GetClientRect(hw, &rc);
+            nd->w = rc.right - rc.left;
+            nd->h = rc.bottom - rc.top;
+            if (GetWindowTextW(hw, wt, 160) > 0) {
+                char *u8 = (char *)malloc(640);
+                if (u8) {
+                    if (WideCharToMultiByte(CP_UTF8, 0, wt, -1, u8, 640, NULL, NULL) > 0)
+                        strncpy(nd->name, u8, sizeof(nd->name) - 1);
+                    free(u8);
+                }
+            }
+        }
+        return 1;
+    }
+    return a11y_node_copy(win, node, nd);
+}
+
+static void a11y_rect_array(VARIANT *v, const struct UiaRect *r) {
+    SAFEARRAY *sa = SafeArrayCreateVector(VT_R8, 0, 4);
+    double *pd = NULL;
+    if (!sa) return;
+    if (SUCCEEDED(SafeArrayAccessData(sa, (void **)&pd))) {
+        pd[0] = r->left; pd[1] = r->top;
+        pd[2] = r->width; pd[3] = r->height;
+        SafeArrayUnaccessData(sa);
+    }
+    VariantInit(v);
+    v->vt = VT_R8 | VT_ARRAY;
+    v->parray = sa;
+}
+
+/* 可键盘聚焦的角色集合 */
+static int a11y_focusable(const char *role) {
+    return !strcmp(role, "button") || !strcmp(role, "checkbox") || !strcmp(role, "radio")
+        || !strcmp(role, "slider") || !strcmp(role, "edit") || !strcmp(role, "list")
+        || !strcmp(role, "table") || !strcmp(role, "tab") || !strcmp(role, "tree");
+}
+
+static HRESULT WINAPI a11y_simple_GetPropertyValue(IRawElementProviderSimple *t, PROPERTYID id, VARIANT *v) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    char role[A11Y_ROLE_MAX];
+    if (!v) return E_POINTER;
+    VariantInit(v);
+    if (!e || !a11y_get_node(e->win, e->node, &nd)) return S_OK;
+    if (e->node < 0) strncpy(role, "window", sizeof(role) - 1);
+    else { strncpy(role, nd.role, sizeof(role) - 1); role[sizeof(role) - 1] = 0; }
+    switch (id) {
+    case UIA_NamePropertyId:
+        v->vt = VT_BSTR; v->bstrVal = a11y_bstr(nd.name); break;
+    case UIA_AutomationIdPropertyId:
+        v->vt = VT_BSTR; v->bstrVal = a11y_bstr_idx(e->node); break;
+    case UIA_ControlTypePropertyId:
+        v->vt = VT_I4; v->lVal = a11y_control_type(role); break;
+    case UIA_BoundingRectanglePropertyId: {
+        struct UiaRect r;
+        a11y_screen_rect(e->win, &nd, &r);
+        a11y_rect_array(v, &r);
+        break;
+    }
+    case UIA_IsEnabledPropertyId:
+        v->vt = VT_BOOL; v->boolVal = (nd.states & A11Y_ST_DISABLED) ? VARIANT_FALSE : VARIANT_TRUE; break;
+    case UIA_HasKeyboardFocusPropertyId:
+        v->vt = VT_BOOL; v->boolVal = (nd.states & A11Y_ST_FOCUSED) ? VARIANT_TRUE : VARIANT_FALSE; break;
+    case UIA_IsKeyboardFocusablePropertyId:
+        v->vt = VT_BOOL; v->boolVal = a11y_focusable(role) ? VARIANT_TRUE : VARIANT_FALSE; break;
+    case UIA_IsOffscreenPropertyId:
+        v->vt = VT_BOOL; v->boolVal = VARIANT_FALSE; break;
+    case UIA_HelpTextPropertyId:
+        v->vt = VT_BSTR; v->bstrVal = a11y_bstr(nd.value); break;
+    case UIA_ItemStatusPropertyId:
+        v->vt = VT_BSTR; v->bstrVal = a11y_bstr(nd.value); break;
+    case UIA_IsPasswordPropertyId:
+        v->vt = VT_BOOL; v->boolVal = (nd.states & A11Y_ST_PASSWORD) ? VARIANT_TRUE : VARIANT_FALSE; break;
+    case UIA_ToggleToggleStatePropertyId:
+        v->vt = VT_I4;
+        v->lVal = (nd.states & A11Y_ST_CHECKED) ? ToggleState_On : ToggleState_Off;
+        break;
+    case UIA_SelectionItemIsSelectedPropertyId:
+        v->vt = VT_BOOL;
+        v->boolVal = (nd.states & (A11Y_ST_SELECTED | A11Y_ST_CHECKED)) ? VARIANT_TRUE : VARIANT_FALSE;
+        break;
+    case UIA_ValueValuePropertyId:
+        v->vt = VT_BSTR; v->bstrVal = a11y_bstr(nd.value); break;
+    case UIA_ValueIsReadOnlyPropertyId:
+        v->vt = VT_BOOL; v->boolVal = (nd.states & A11Y_ST_READONLY) ? VARIANT_TRUE : VARIANT_FALSE; break;
+    case UIA_RangeValueValuePropertyId:
+        v->vt = VT_R8; v->dblVal = (double)atof(nd.value); break;
+    case UIA_RangeValueMinimumPropertyId:
+        v->vt = VT_R8; v->dblVal = 0.0; break;
+    case UIA_RangeValueMaximumPropertyId:
+        v->vt = VT_R8; v->dblVal = 100.0; break;
+    case UIA_RangeValueSmallChangePropertyId:
+        v->vt = VT_R8; v->dblVal = 1.0; break;
+    case UIA_RangeValueLargeChangePropertyId:
+        v->vt = VT_R8; v->dblVal = 10.0; break;
+    case UIA_RangeValueIsReadOnlyPropertyId:
+        v->vt = VT_BOOL;
+        v->boolVal = ((nd.states & A11Y_ST_READONLY) || !strcmp(role, "progress"))
+                     ? VARIANT_TRUE : VARIANT_FALSE;
+        break;
+    case UIA_ExpandCollapseExpandCollapseStatePropertyId:
+        v->vt = VT_I4;
+        v->lVal = (nd.states & A11Y_ST_EXPANDED) ? ExpandCollapseState_Expanded
+                                                 : ExpandCollapseState_Collapsed;
+        break;
+    default:
+        break;
+    }
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_simple_get_HostRawElementProvider(IRawElementProviderSimple *t, IRawElementProviderSimple **o) {
+    a11y_elem *e = a11y_elem_of(t);
+    if (!o) return E_POINTER;
+    *o = NULL;
+    /* 仅窗口根元素挂宿主（UIA 用 HWND 的默认 Provider 承担客户端区外部分） */
+    if (e && e->node < 0 && e->win >= 0 && e->win < GUI_MAXWIN && g_wins[e->win].hwnd
+        && g_uia_state == 1)
+        return g_uia_host_from_hwnd(g_wins[e->win].hwnd, o);
+    return S_OK;
+}
+
+/* ---------- IRawElementProviderFragment / FragmentRoot ---------- */
+static HRESULT a11y_ret_frag(int win, int node, IRawElementProviderFragment **out) {
+    a11y_elem *e = a11y_elem_get(win, node);
+    if (!e) return S_OK;
+    a11y_addref(e);
+    *out = (IRawElementProviderFragment *)&e->frag;
+    return S_OK;
+}
+
+/* 同父相邻兄弟（dir>0 找下一个，dir<0 找上一个）；-1=没有 */
+static int a11y_sibling(int win, int node, int dir) {
+    a11y_node nd;
+    int res = -1, i, n;
+    if (!a11y_node_copy(win, node, &nd)) return -1;
+    a11y_lock();
+    n = g_a11y[win].cur_n;
+    if (dir > 0) {
+        for (i = node + 1; i < n; i++)
+            if (g_a11y[win].cur[i].used && g_a11y[win].cur[i].parent == nd.parent) { res = i; break; }
+    } else {
+        for (i = node - 1; i >= 0; i--)
+            if (g_a11y[win].cur[i].used && g_a11y[win].cur[i].parent == nd.parent) { res = i; break; }
+    }
+    a11y_unlock();
+    return res;
+}
+
+/* 子节点：parent=-1 时为根元素的孩子；last=1 取最后一个 */
+static int a11y_child(int win, int parent, int last) {
+    int res = -1, i, n;
+    a11y_lock();
+    n = g_a11y[win].cur_n;
+    if (last) {
+        for (i = n - 1; i >= 0; i--)
+            if (g_a11y[win].cur[i].used && g_a11y[win].cur[i].parent == parent) { res = i; break; }
+    } else {
+        for (i = 0; i < n; i++)
+            if (g_a11y[win].cur[i].used && g_a11y[win].cur[i].parent == parent) { res = i; break; }
+    }
+    a11y_unlock();
+    return res;
+}
+
+static HRESULT WINAPI a11y_frag_Navigate(IRawElementProviderFragment *t, enum NavigateDirection dir,
+                                         IRawElementProviderFragment **out) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    int win, node, r;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e) return E_POINTER;
+    win = e->win; node = e->node;
+    switch (dir) {
+    case NavigateDirection_Parent:
+        if (node < 0) return S_OK;
+        if (!a11y_node_copy(win, node, &nd)) return S_OK;
+        r = (nd.parent >= 0) ? nd.parent : -1;
+        return a11y_ret_frag(win, r, out);
+    case NavigateDirection_NextSibling:
+        if (node < 0) return S_OK;
+        r = a11y_sibling(win, node, 1);
+        if (r >= 0) return a11y_ret_frag(win, r, out);
+        return S_OK;
+    case NavigateDirection_PreviousSibling:
+        if (node < 0) return S_OK;
+        r = a11y_sibling(win, node, -1);
+        if (r >= 0) return a11y_ret_frag(win, r, out);
+        return S_OK;
+    case NavigateDirection_FirstChild:
+        r = (node < 0) ? a11y_child(win, -1, 0) : a11y_child(win, node, 0);
+        if (r >= 0) return a11y_ret_frag(win, r, out);
+        return S_OK;
+    case NavigateDirection_LastChild:
+        r = (node < 0) ? a11y_child(win, -1, 1) : a11y_child(win, node, 1);
+        if (r >= 0) return a11y_ret_frag(win, r, out);
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+static HRESULT WINAPI a11y_frag_GetRuntimeId(IRawElementProviderFragment *t, SAFEARRAY **out) {
+    a11y_elem *e = a11y_elem_of(t);
+    SAFEARRAY *sa;
+    int *pi = NULL;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e) return E_POINTER;
+    sa = SafeArrayCreateVector(VT_I4, 0, 2);
+    if (!sa) return E_OUTOFMEMORY;
+    if (SUCCEEDED(SafeArrayAccessData(sa, (void **)&pi))) {
+        pi[0] = UiaAppendRuntimeId;
+        pi[1] = e->node + 1;
+        SafeArrayUnaccessData(sa);
+    }
+    *out = sa;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_frag_get_BoundingRectangle(IRawElementProviderFragment *t, struct UiaRect *r) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    if (!r) return E_POINTER;
+    memset(r, 0, sizeof(*r));
+    if (!e || !a11y_get_node(e->win, e->node, &nd)) return S_OK;
+    a11y_screen_rect(e->win, &nd, r);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_frag_GetEmbeddedFragmentRoots(IRawElementProviderFragment *t, SAFEARRAY **out) {
+    (void)t;
+    if (!out) return E_POINTER;
+    *out = NULL;                       /* 无嵌套 fragment root */
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_frag_SetFocus(IRawElementProviderFragment *t) {
+    a11y_elem *e = a11y_elem_of(t);
+    if (!e || e->node < 0) return S_OK;
+    a11y_post(e->win, e->node, 3, 0);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_frag_get_FragmentRoot(IRawElementProviderFragment *t, IRawElementProviderFragmentRoot **out) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_elem *root;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e) return E_POINTER;
+    root = a11y_elem_get(e->win, -1);
+    if (!root) return S_OK;
+    a11y_addref(root);
+    *out = (IRawElementProviderFragmentRoot *)&root->root;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_root_ElementProviderFromPoint(IRawElementProviderFragmentRoot *t, double x, double y,
+                                                         IRawElementProviderFragment **out) {
+    a11y_elem *e = a11y_elem_of(t);
+    int win, i, hit = -1;
+    POINT p;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e) return E_POINTER;
+    win = e->win;
+    p.x = (LONG)x; p.y = (LONG)y;
+    if (win >= 0 && win < GUI_MAXWIN && g_wins[win].hwnd)
+        ScreenToClient(g_wins[win].hwnd, &p);
+    a11y_lock();
+    for (i = g_a11y[win].cur_n - 1; i >= 0; i--) {
+        a11y_node *n = &g_a11y[win].cur[i];
+        if (!n->used) continue;
+        if (p.x >= n->x && p.x < n->x + n->w && p.y >= n->y && p.y < n->y + n->h) { hit = i; break; }
+    }
+    a11y_unlock();
+    return a11y_ret_frag(win, hit, out);
+}
+
+static HRESULT WINAPI a11y_root_GetFocus(IRawElementProviderFragmentRoot *t, IRawElementProviderFragment **out) {
+    a11y_elem *e = a11y_elem_of(t);
+    int win, foc = -1;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e) return E_POINTER;
+    win = e->win;
+    a11y_lock();
+    foc = g_a11y[win].focus;
+    a11y_unlock();
+    if (foc < 0 || foc >= A11Y_MAX_NODES) return a11y_ret_frag(win, -1, out);
+    return a11y_ret_frag(win, foc, out);
+}
+
+/* ---------- Pattern：Invoke / Toggle / RangeValue ---------- */
+static HRESULT WINAPI a11y_invoke_Invoke(IInvokeProvider *t) {
+    a11y_elem *e = a11y_elem_of(t);
+    if (!e || e->node < 0) return S_OK;
+    a11y_post(e->win, e->node, 1, 0);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_toggle_Toggle(IToggleProvider *t) {
+    a11y_elem *e = a11y_elem_of(t);
+    if (!e || e->node < 0) return S_OK;
+    a11y_post(e->win, e->node, 1, 0);      /* 与 Invoke 同一回投通道（zfy 侧翻转） */
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_toggle_get_ToggleState(IToggleProvider *t, enum ToggleState *st) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    if (!st) return E_POINTER;
+    *st = ToggleState_Off;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    *st = (nd.states & A11Y_ST_CHECKED) ? ToggleState_On : ToggleState_Off;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_range_SetValue(IRangeValueProvider *t, double val) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    int v;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    if ((nd.states & A11Y_ST_READONLY) || !strcmp(nd.role, "progress")) return S_OK;
+    v = (int)val;
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    a11y_post(e->win, e->node, 2, v);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_range_get_Value(IRangeValueProvider *t, double *v) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    if (!v) return E_POINTER;
+    *v = 0.0;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    *v = atof(nd.value);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_range_get_IsReadOnly(IRangeValueProvider *t, WINBOOL *b) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    if (!b) return E_POINTER;
+    *b = 0;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    *b = ((nd.states & A11Y_ST_READONLY) || !strcmp(nd.role, "progress")) ? 1 : 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_range_get_Maximum(IRangeValueProvider *t, double *v) {
+    (void)t;
+    if (!v) return E_POINTER;
+    *v = 100.0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_range_get_Minimum(IRangeValueProvider *t, double *v) {
+    (void)t;
+    if (!v) return E_POINTER;
+    *v = 0.0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_range_get_LargeChange(IRangeValueProvider *t, double *v) {
+    (void)t;
+    if (!v) return E_POINTER;
+    *v = 10.0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_range_get_SmallChange(IRangeValueProvider *t, double *v) {
+    (void)t;
+    if (!v) return E_POINTER;
+    *v = 1.0;
+    return S_OK;
+}
+
+/* ---------- Pattern：Selection / SelectionItem / Value / ExpandCollapse ---------- */
+static void a11y_empty_array(SAFEARRAY **out, VARTYPE vt) {
+    SAFEARRAYBOUND b;
+    b.lLbound = 0;
+    b.cElements = 0;
+    *out = SafeArrayCreate(vt, 1, &b);
+}
+
+static HRESULT WINAPI a11y_sel_GetSelection(ISelectionProvider *t, SAFEARRAY **out) {
+    (void)t;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    /* 列表/表格的选中项尚未作为独立节点发布，故返回空集（仍合法） */
+    a11y_empty_array(out, VT_UNKNOWN);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_sel_get_CanSelectMultiple(ISelectionProvider *t, WINBOOL *b) {
+    (void)t;
+    if (!b) return E_POINTER;
+    *b = 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_sel_get_IsSelectionRequired(ISelectionProvider *t, WINBOOL *b) {
+    (void)t;
+    if (!b) return E_POINTER;
+    *b = 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_selitem_Select(ISelectionItemProvider *t) {
+    a11y_elem *e = a11y_elem_of(t);
+    if (!e || e->node < 0) return S_OK;
+    a11y_post(e->win, e->node, 1, 0);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_selitem_AddToSelection(ISelectionItemProvider *t) {
+    return a11y_selitem_Select(t);
+}
+
+static HRESULT WINAPI a11y_selitem_RemoveFromSelection(ISelectionItemProvider *t) {
+    (void)t;
+    return S_OK;                     /* 单选语义：不支持反选 */
+}
+
+static HRESULT WINAPI a11y_selitem_get_IsSelected(ISelectionItemProvider *t, WINBOOL *b) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    if (!b) return E_POINTER;
+    *b = 0;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    *b = (nd.states & (A11Y_ST_SELECTED | A11Y_ST_CHECKED)) ? 1 : 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_selitem_get_SelectionContainer(ISelectionItemProvider *t, IRawElementProviderSimple **out) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    a11y_elem *c;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    c = a11y_elem_get(e->win, nd.parent >= 0 ? nd.parent : -1);
+    if (!c) return S_OK;
+    a11y_addref(c);
+    *out = (IRawElementProviderSimple *)&c->simple;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_val_SetValue(IValueProvider *t, LPCWSTR val) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    if (nd.states & A11Y_ST_READONLY) return S_OK;
+    if (!val) val = L"";
+    {
+        int n = WideCharToMultiByte(CP_UTF8, 0, val, -1, NULL, 0, NULL, NULL);
+        if (n > 0) {
+            char *u8 = (char *)malloc((size_t)n);
+            if (u8) {
+                WideCharToMultiByte(CP_UTF8, 0, val, -1, u8, n, NULL, NULL);
+                a11y_post_value_str(e->win, e->node, u8);
+                free(u8);
+            }
+        }
+    }
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_val_get_Value(IValueProvider *t, BSTR *out) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    *out = a11y_bstr(nd.value);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_val_get_IsReadOnly(IValueProvider *t, WINBOOL *b) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    if (!b) return E_POINTER;
+    *b = 0;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    *b = (nd.states & A11Y_ST_READONLY) ? 1 : 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_expand_Expand(IExpandCollapseProvider *t) {
+    a11y_elem *e = a11y_elem_of(t);
+    if (!e || e->node < 0) return S_OK;
+    a11y_post(e->win, e->node, 1, 0);      /* zfy 侧按折叠/展开切换语义处理 */
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_expand_Collapse(IExpandCollapseProvider *t) {
+    return a11y_expand_Expand(t);
+}
+
+static HRESULT WINAPI a11y_expand_get_ExpandCollapseState(IExpandCollapseProvider *t, enum ExpandCollapseState *st) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_node nd;
+    if (!st) return E_POINTER;
+    *st = ExpandCollapseState_Collapsed;
+    if (!e || !a11y_node_copy(e->win, e->node, &nd)) return S_OK;
+    *st = (nd.states & A11Y_ST_EXPANDED) ? ExpandCollapseState_Expanded : ExpandCollapseState_Collapsed;
+    return S_OK;
+}
+
+/* ---------- ITextProvider（edit）：文档区间 + 选中区间（简化实现） ---------- */
+static a11y_trange *a11y_trange_get(int win, int node);
+static HRESULT WINAPI a11y_text_get_DocumentRange(ITextProvider *t, ITextRangeProvider **out);
+
+static HRESULT WINAPI a11y_text_GetSelection(ITextProvider *t, SAFEARRAY **out) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_trange *r;
+    SAFEARRAY *sa;
+    IUnknown **pp = NULL;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e) return E_POINTER;
+    r = a11y_trange_get(e->win, e->node);
+    if (!r) return S_OK;
+    sa = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
+    if (!sa) return E_OUTOFMEMORY;
+    if (SUCCEEDED(SafeArrayAccessData(sa, (void **)&pp))) {
+        a11y_addref(r->owner);
+        pp[0] = (IUnknown *)&r->face;
+        SafeArrayUnaccessData(sa);
+    }
+    *out = sa;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_text_GetVisibleRanges(ITextProvider *t, SAFEARRAY **out) {
+    return a11y_text_GetSelection(t, out);
+}
+
+static HRESULT WINAPI a11y_text_RangeFromChild(ITextProvider *t, IRawElementProviderSimple *child, ITextRangeProvider **out) {
+    (void)t; (void)child;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI a11y_text_RangeFromPoint(ITextProvider *t, struct UiaPoint pt, ITextRangeProvider **out) {
+    (void)pt;
+    return a11y_text_get_DocumentRange(t, out);
+}
+
+static HRESULT WINAPI a11y_text_get_DocumentRange(ITextProvider *t, ITextRangeProvider **out) {
+    a11y_elem *e = a11y_elem_of(t);
+    a11y_trange *r;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!e) return E_POINTER;
+    r = a11y_trange_get(e->win, e->node);
+    if (!r) return S_OK;
+    a11y_addref(r->owner);
+    *out = (ITextRangeProvider *)&r->face;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_text_get_SupportedTextSelection(ITextProvider *t, enum SupportedTextSelection *s) {
+    (void)t;
+    if (!s) return E_POINTER;
+    *s = SupportedTextSelection_Single;
+    return S_OK;
+}
+
+static a11y_trange *a11y_trange_get(int win, int node) {
+    a11y_trange *r;
+    if (win < 0 || win >= GUI_MAXWIN || node < 0 || node >= A11Y_MAX_NODES) return NULL;
+    r = &g_a11y_ranges[win][node + 1];
+    if (!r->ready) {
+        a11y_elem *e = a11y_elem_get(win, node);
+        if (!e) return NULL;
+        r->face.lpVtbl = (const void *)&a11y_vt_textrange;
+        r->face.e = e;
+        r->owner = e;
+        r->start = 0;
+        r->end = -1;                   /* -1 = 覆盖全文 */
+        r->ready = 1;
+    }
+    return r;
+}
+
+static a11y_trange *a11y_trange_of(const void *iface) { return (a11y_trange *)iface; }
+
+static HRESULT WINAPI a11y_trange_QueryInterface(ITextRangeProvider *t, REFIID riid, void **o) {
+    if (!o) return E_POINTER;
+    *o = NULL;
+    if (!t || !riid) return E_POINTER;
+    if (IsEqualGUID(riid, &a11y_iid_unknown) || IsEqualGUID(riid, &a11y_iid_textrange)) {
+        *o = (void *)t;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI a11y_trange_AddRef(ITextRangeProvider *t) {
+    a11y_trange *r = a11y_trange_of(t);
+    return r ? a11y_addref(r->owner) : 0;
+}
+static ULONG WINAPI a11y_trange_Release(ITextRangeProvider *t) {
+    a11y_trange *r = a11y_trange_of(t);
+    return r ? a11y_release(r->owner) : 0;
+}
+
+static HRESULT WINAPI a11y_trange_Clone(ITextRangeProvider *t, ITextRangeProvider **out) {
+    a11y_trange *r = a11y_trange_of(t);
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!r || !r->owner) return E_POINTER;
+    a11y_addref(r->owner);
+    *out = (ITextRangeProvider *)&r->face;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_Compare(ITextRangeProvider *t, ITextRangeProvider *range, WINBOOL *b) {
+    a11y_trange *r = a11y_trange_of(t);
+    a11y_trange *o = a11y_trange_of(range);
+    if (!b) return E_POINTER;
+    *b = (r && o && r->owner == o->owner) ? 1 : 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_CompareEndpoints(ITextRangeProvider *t, enum TextPatternRangeEndpoint ep,
+                                                   ITextRangeProvider *range, enum TextPatternRangeEndpoint tep,
+                                                   int *v) {
+    (void)t; (void)ep; (void)range; (void)tep;
+    if (!v) return E_POINTER;
+    *v = 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_ExpandToEnclosingUnit(ITextRangeProvider *t, enum TextUnit unit) {
+    (void)t; (void)unit;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_FindAttribute(ITextRangeProvider *t, TEXTATTRIBUTEID id, VARIANT val,
+                                                WINBOOL backward, ITextRangeProvider **out) {
+    (void)t; (void)id; (void)val; (void)backward;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI a11y_trange_FindText(ITextRangeProvider *t, BSTR text, WINBOOL backward,
+                                           WINBOOL ignore_case, ITextRangeProvider **out) {
+    (void)t; (void)text; (void)backward; (void)ignore_case;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI a11y_trange_GetAttributeValue(ITextRangeProvider *t, TEXTATTRIBUTEID id, VARIANT *v) {
+    (void)t; (void)id;
+    if (!v) return E_POINTER;
+    VariantInit(v);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_GetBoundingRectangles(ITextRangeProvider *t, SAFEARRAY **out) {
+    a11y_trange *r = a11y_trange_of(t);
+    struct UiaRect rc;
+    a11y_node nd;
+    SAFEARRAY *sa;
+    double *pd = NULL;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!r || !a11y_get_node(r->owner->win, r->owner->node, &nd)) return S_OK;
+    a11y_screen_rect(r->owner->win, &nd, &rc);
+    sa = SafeArrayCreateVector(VT_R8, 0, 4);
+    if (!sa) return E_OUTOFMEMORY;
+    if (SUCCEEDED(SafeArrayAccessData(sa, (void **)&pd))) {
+        pd[0] = rc.left; pd[1] = rc.top; pd[2] = rc.width; pd[3] = rc.height;
+        SafeArrayUnaccessData(sa);
+    }
+    *out = sa;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_GetEnclosingElement(ITextRangeProvider *t, IRawElementProviderSimple **out) {
+    a11y_trange *r = a11y_trange_of(t);
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!r || !r->owner) return E_POINTER;
+    a11y_addref(r->owner);
+    *out = (IRawElementProviderSimple *)&r->owner->simple;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_GetText(ITextRangeProvider *t, int max_len, BSTR *out) {
+    a11y_trange *r = a11y_trange_of(t);
+    a11y_node nd;
+    char buf[A11Y_VAL_MAX];
+    int n;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!r || !a11y_node_copy(r->owner->win, r->owner->node, &nd)) return S_OK;
+    strncpy(buf, nd.value, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+    n = (int)strlen(buf);
+    if (max_len > 0 && n > max_len) buf[max_len] = 0;    /* 简化：按字节截断 */
+    *out = a11y_bstr(buf);
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_Move(ITextRangeProvider *t, enum TextUnit unit, int count, int *v) {
+    (void)t; (void)unit; (void)count;
+    if (!v) return E_POINTER;
+    *v = 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_MoveEndpointByUnit(ITextRangeProvider *t, enum TextPatternRangeEndpoint ep,
+                                                     enum TextUnit unit, int count, int *v) {
+    (void)t; (void)ep; (void)unit; (void)count;
+    if (!v) return E_POINTER;
+    *v = 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_MoveEndpointByRange(ITextRangeProvider *t, enum TextPatternRangeEndpoint ep,
+                                                      ITextRangeProvider *range, enum TextPatternRangeEndpoint tep) {
+    (void)t; (void)ep; (void)range; (void)tep;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_Select(ITextRangeProvider *t) { (void)t; return S_OK; }
+static HRESULT WINAPI a11y_trange_AddToSelection(ITextRangeProvider *t) { (void)t; return S_OK; }
+static HRESULT WINAPI a11y_trange_RemoveFromSelection(ITextRangeProvider *t) { (void)t; return S_OK; }
+
+static HRESULT WINAPI a11y_trange_ScrollIntoView(ITextRangeProvider *t, WINBOOL align_top) {
+    (void)t; (void)align_top;
+    return S_OK;
+}
+
+static HRESULT WINAPI a11y_trange_GetChildren(ITextRangeProvider *t, SAFEARRAY **out) {
+    (void)t;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    a11y_empty_array(out, VT_UNKNOWN);
+    return S_OK;
+}
+
+/* ---------- vtable 实例（指定初始化器：字段顺序与 SDK 头完全一致） ---------- */
+static const IRawElementProviderSimpleVtbl a11y_vt_simple = {
+    .QueryInterface = a11y_simple_QueryInterface,
+    .AddRef = a11y_simple_AddRef,
+    .Release = a11y_simple_Release,
+    .get_ProviderOptions = a11y_simple_get_ProviderOptions,
+    .GetPatternProvider = a11y_simple_GetPatternProvider,
+    .GetPropertyValue = a11y_simple_GetPropertyValue,
+    .get_HostRawElementProvider = a11y_simple_get_HostRawElementProvider
+};
+
+static const IRawElementProviderFragmentVtbl a11y_vt_frag = {
+    .QueryInterface = a11y_frag_QueryInterface,
+    .AddRef = a11y_frag_AddRef,
+    .Release = a11y_frag_Release,
+    .Navigate = a11y_frag_Navigate,
+    .GetRuntimeId = a11y_frag_GetRuntimeId,
+    .get_BoundingRectangle = a11y_frag_get_BoundingRectangle,
+    .GetEmbeddedFragmentRoots = a11y_frag_GetEmbeddedFragmentRoots,
+    .SetFocus = a11y_frag_SetFocus,
+    .get_FragmentRoot = a11y_frag_get_FragmentRoot
+};
+
+static const IRawElementProviderFragmentRootVtbl a11y_vt_root = {
+    .QueryInterface = a11y_root_QueryInterface,
+    .AddRef = a11y_root_AddRef,
+    .Release = a11y_root_Release,
+    .ElementProviderFromPoint = a11y_root_ElementProviderFromPoint,
+    .GetFocus = a11y_root_GetFocus
+};
+
+static const IInvokeProviderVtbl a11y_vt_invoke = {
+    .QueryInterface = a11y_invoke_QueryInterface,
+    .AddRef = a11y_invoke_AddRef,
+    .Release = a11y_invoke_Release,
+    .Invoke = a11y_invoke_Invoke
+};
+
+static const IToggleProviderVtbl a11y_vt_toggle = {
+    .QueryInterface = a11y_toggle_QueryInterface,
+    .AddRef = a11y_toggle_AddRef,
+    .Release = a11y_toggle_Release,
+    .Toggle = a11y_toggle_Toggle,
+    .get_ToggleState = a11y_toggle_get_ToggleState
+};
+
+static const IRangeValueProviderVtbl a11y_vt_range = {
+    .QueryInterface = a11y_range_QueryInterface,
+    .AddRef = a11y_range_AddRef,
+    .Release = a11y_range_Release,
+    .SetValue = a11y_range_SetValue,
+    .get_Value = a11y_range_get_Value,
+    .get_IsReadOnly = a11y_range_get_IsReadOnly,
+    .get_Maximum = a11y_range_get_Maximum,
+    .get_Minimum = a11y_range_get_Minimum,
+    .get_LargeChange = a11y_range_get_LargeChange,
+    .get_SmallChange = a11y_range_get_SmallChange
+};
+
+static const ISelectionProviderVtbl a11y_vt_sel = {
+    .QueryInterface = a11y_sel_QueryInterface,
+    .AddRef = a11y_sel_AddRef,
+    .Release = a11y_sel_Release,
+    .GetSelection = a11y_sel_GetSelection,
+    .get_CanSelectMultiple = a11y_sel_get_CanSelectMultiple,
+    .get_IsSelectionRequired = a11y_sel_get_IsSelectionRequired
+};
+
+static const ISelectionItemProviderVtbl a11y_vt_selitem = {
+    .QueryInterface = a11y_selitem_QueryInterface,
+    .AddRef = a11y_selitem_AddRef,
+    .Release = a11y_selitem_Release,
+    .Select = a11y_selitem_Select,
+    .AddToSelection = a11y_selitem_AddToSelection,
+    .RemoveFromSelection = a11y_selitem_RemoveFromSelection,
+    .get_IsSelected = a11y_selitem_get_IsSelected,
+    .get_SelectionContainer = a11y_selitem_get_SelectionContainer
+};
+
+static const IValueProviderVtbl a11y_vt_val = {
+    .QueryInterface = a11y_val_QueryInterface,
+    .AddRef = a11y_val_AddRef,
+    .Release = a11y_val_Release,
+    .SetValue = a11y_val_SetValue,
+    .get_Value = a11y_val_get_Value,
+    .get_IsReadOnly = a11y_val_get_IsReadOnly
+};
+
+static const IExpandCollapseProviderVtbl a11y_vt_expand = {
+    .QueryInterface = a11y_expand_QueryInterface,
+    .AddRef = a11y_expand_AddRef,
+    .Release = a11y_expand_Release,
+    .Expand = a11y_expand_Expand,
+    .Collapse = a11y_expand_Collapse,
+    .get_ExpandCollapseState = a11y_expand_get_ExpandCollapseState
+};
+
+static const ITextProviderVtbl a11y_vt_text = {
+    .QueryInterface = a11y_text_QueryInterface,
+    .AddRef = a11y_text_AddRef,
+    .Release = a11y_text_Release,
+    .GetSelection = a11y_text_GetSelection,
+    .GetVisibleRanges = a11y_text_GetVisibleRanges,
+    .RangeFromChild = a11y_text_RangeFromChild,
+    .RangeFromPoint = a11y_text_RangeFromPoint,
+    .get_DocumentRange = a11y_text_get_DocumentRange,
+    .get_SupportedTextSelection = a11y_text_get_SupportedTextSelection
+};
+
+static const ITextRangeProviderVtbl a11y_vt_textrange = {
+    .QueryInterface = a11y_trange_QueryInterface,
+    .AddRef = a11y_trange_AddRef,
+    .Release = a11y_trange_Release,
+    .Clone = a11y_trange_Clone,
+    .Compare = a11y_trange_Compare,
+    .CompareEndpoints = a11y_trange_CompareEndpoints,
+    .ExpandToEnclosingUnit = a11y_trange_ExpandToEnclosingUnit,
+    .FindAttribute = a11y_trange_FindAttribute,
+    .FindText = a11y_trange_FindText,
+    .GetAttributeValue = a11y_trange_GetAttributeValue,
+    .GetBoundingRectangles = a11y_trange_GetBoundingRectangles,
+    .GetEnclosingElement = a11y_trange_GetEnclosingElement,
+    .GetText = a11y_trange_GetText,
+    .Move = a11y_trange_Move,
+    .MoveEndpointByUnit = a11y_trange_MoveEndpointByUnit,
+    .MoveEndpointByRange = a11y_trange_MoveEndpointByRange,
+    .Select = a11y_trange_Select,
+    .AddToSelection = a11y_trange_AddToSelection,
+    .RemoveFromSelection = a11y_trange_RemoveFromSelection,
+    .ScrollIntoView = a11y_trange_ScrollIntoView,
+    .GetChildren = a11y_trange_GetChildren
+};
+
+/* ================= 公开 API：zfy 侧每帧提交节点表 ================= */
+
+/* 最近一次 begin 的窗口槽位（end / hit / take_value 作用于该窗口） */
+static int g_a11y_stage_win = -1;
+
+/* 上一帧快照（end 里做属性 diff；只在 UI 线程使用，故放静态区） */
+static a11y_node g_a11y_prev[A11Y_MAX_NODES];
+
+/* 开始本帧：清空"正在构建"的节点表。win 为 gui_self()（1..8）。 */
+void zfy_a11y_begin(int64_t win) {
+    int wi = a11y_win_idx(win);
+    if (wi < 0) return;
+    g_a11y_stage_win = wi;
+    a11y_lock();
+    memset(g_a11y[wi].stage, 0, sizeof(a11y_node) * A11Y_MAX_NODES);
+    g_a11y[wi].stage_n = 0;
+    g_a11y[wi].stage_focus = -1;
+    a11y_unlock();
+}
+
+/* 追加/覆盖一个节点。idx 由调用方从 0 递增；坐标是客户区物理像素；
+   parent 为父节点下标（-1 = 直接挂在窗口根元素下）。 */
+void zfy_a11y_push_node(int64_t win, int64_t idx, char *name, char *role, char *value,
+                        int32_t states, int32_t x, int32_t y, int32_t w, int32_t h,
+                        int32_t parent) {
+    int wi = a11y_win_idx(win);
+    a11y_node *t;
+    if (wi < 0 || idx < 0 || idx >= A11Y_MAX_NODES) return;
+    a11y_lock();
+    t = &g_a11y[wi].stage[idx];
+    memset(t, 0, sizeof(*t));
+    t->used = 1;
+    t->id = (int)idx;                       /* 回投时 zfy 侧按 idx → 组件 id 映射 */
+    t->states = states;
+    t->x = x; t->y = y;
+    t->w = w; t->h = h;
+    t->parent = (parent >= 0 && parent < A11Y_MAX_NODES) ? parent : -1;
+    strncpy(t->name,  name  ? name  : "", A11Y_NAME_MAX - 1);
+    strncpy(t->role,  role  ? role  : "", A11Y_ROLE_MAX - 1);
+    strncpy(t->value, value ? value : "", A11Y_VAL_MAX - 1);
+    if ((int)idx + 1 > g_a11y[wi].stage_n) g_a11y[wi].stage_n = (int)idx + 1;
+    a11y_unlock();
+}
+
+/* 本帧焦点节点（-1 = 无焦点）；end 时与上一帧比较并发焦点事件 */
+void zfy_a11y_set_focus(int64_t idx) {
+    int wi = g_a11y_stage_win;
+    if (wi < 0) return;
+    a11y_lock();
+    g_a11y[wi].stage_focus = (idx >= 0 && idx < A11Y_MAX_NODES) ? (int)idx : -1;
+    a11y_unlock();
+}
+
+/* 发一个 BSTR 属性变化事件（old/new 均为 UTF-8） */
+static void a11y_emit_str_prop(a11y_elem *el, PROPERTYID pid, const char *old_s, const char *new_s) {
+    VARIANT o, n;
+    if (!el || !g_uia_raise_prop) return;
+    VariantInit(&o); VariantInit(&n);
+    o.vt = VT_BSTR; o.bstrVal = a11y_bstr(old_s);
+    n.vt = VT_BSTR; n.bstrVal = a11y_bstr(new_s);
+    g_uia_raise_prop((IRawElementProviderSimple *)&el->simple, pid, o, n);
+    SysFreeString(o.bstrVal);
+    SysFreeString(n.bstrVal);
+}
+
+/* 结束本帧：提交节点表 + （仅在有人监听时）发结构/属性/焦点事件 */
+void zfy_a11y_end(void) {
+    int wi = g_a11y_stage_win;
+    int prev_n, focus_old, focus_new, n;
+    if (wi < 0 || wi >= GUI_MAXWIN) return;
+    a11y_lock();
+    prev_n = g_a11y[wi].cur_n;
+    focus_old = g_a11y[wi].focus;
+    memcpy(g_a11y_prev, g_a11y[wi].cur, sizeof(a11y_node) * A11Y_MAX_NODES);
+    memcpy(g_a11y[wi].cur, g_a11y[wi].stage, sizeof(a11y_node) * A11Y_MAX_NODES);
+    g_a11y[wi].cur_n = g_a11y[wi].stage_n;
+    focus_new = g_a11y[wi].stage_focus;
+    g_a11y[wi].focus = focus_new;
+    n = g_a11y[wi].cur_n;
+    a11y_unlock();
+
+    if (!a11y_listening()) return;
+
+    /* 结构变化：节点数量变了，通知客户端重取子树 */
+    if (prev_n != n) {
+        a11y_elem *root = a11y_elem_get(wi, -1);
+        if (root) g_uia_raise_struct((IRawElementProviderSimple *)&root->simple,
+                                     StructureChangeType_ChildrenInvalidated, NULL, 0);
+    }
+
+    /* 属性变化：名称 / 值 / 启用态 / 勾选态 */
+    for (int i = 0; i < n; i++) {
+        a11y_node *c = &g_a11y[wi].cur[i];
+        a11y_node *o = (i < prev_n) ? &g_a11y_prev[i] : NULL;
+        a11y_elem *el;
+        if (!c->used) continue;
+        el = a11y_elem_get(wi, i);
+        if (!el) continue;
+        if (o && o->used) {
+            if (strcmp(o->name, c->name))
+                a11y_emit_str_prop(el, UIA_NamePropertyId, o->name, c->name);
+            if (strcmp(o->value, c->value))
+                a11y_emit_str_prop(el, UIA_ValueValuePropertyId, o->value, c->value);
+            if ((o->states ^ c->states) & A11Y_ST_DISABLED) {
+                VARIANT ov, nv;
+                VariantInit(&ov); VariantInit(&nv);
+                ov.vt = VT_BOOL; ov.boolVal = (o->states & A11Y_ST_DISABLED) ? VARIANT_FALSE : VARIANT_TRUE;
+                nv.vt = VT_BOOL; nv.boolVal = (c->states & A11Y_ST_DISABLED) ? VARIANT_FALSE : VARIANT_TRUE;
+                g_uia_raise_prop((IRawElementProviderSimple *)&el->simple, UIA_IsEnabledPropertyId, ov, nv);
+            }
+            if ((o->states ^ c->states) & A11Y_ST_CHECKED) {
+                VARIANT ov, nv;
+                VariantInit(&ov); VariantInit(&nv);
+                ov.vt = VT_I4; ov.lVal = (o->states & A11Y_ST_CHECKED)
+                                          ? ToggleState_On : ToggleState_Off;
+                nv.vt = VT_I4; nv.lVal = (c->states & A11Y_ST_CHECKED)
+                                          ? ToggleState_On : ToggleState_Off;
+                g_uia_raise_prop((IRawElementProviderSimple *)&el->simple, UIA_ToggleToggleStatePropertyId, ov, nv);
+            }
+        }
+    }
+
+    /* 焦点变化事件（读屏软件据此跟随朗读） */
+    if (focus_new >= 0 && focus_new != focus_old) {
+        a11y_elem *el = a11y_elem_get(wi, focus_new);
+        if (el) g_uia_raise_event((IRawElementProviderSimple *)&el->simple, UIA_AutomationFocusChangedEventId);
+    }
+}
+
+/* 命中测试：客户区坐标 → 已提交节点下标（后入者优先=最上层），-1=未命中 */
+int64_t zfy_a11y_hit(int32_t x, int32_t y) {
+    int wi = a11y_win_idx(0);
+    int hit = -1;
+    if (wi < 0) return -1;
+    a11y_lock();
+    for (int i = g_a11y[wi].cur_n - 1; i >= 0; i--) {
+        a11y_node *nd = &g_a11y[wi].cur[i];
+        if (!nd->used) continue;
+        if (x >= nd->x && x < nd->x + nd->w && y >= nd->y && y < nd->y + nd->h) {
+            hit = i;
+            break;
+        }
+    }
+    a11y_unlock();
+    return hit;
+}
+
+/* 取走 UIA 文本设值（zfy 侧在 EV_A11Y_VALUE 且 key==0 时调用）
+   返回字节数（不含 \0）；0=无待取值；-2=缓冲不足（调用方扩容重试） */
+int32_t zfy_gui_a11y_take_value(int64_t idx, char *buf, int32_t cap) {
+    int wi = -1, n;
+    if (idx < 0 || idx >= A11Y_MAX_NODES) return 0;
+    a11y_lock();
+    if (g_a11y_stage_win >= 0 && g_a11y[g_a11y_stage_win].deliv_ok
+        && g_a11y[g_a11y_stage_win].deliv_idx == (int)idx)
+        wi = g_a11y_stage_win;
+    else {
+        for (int k = 0; k < GUI_MAXWIN; k++)
+            if (g_a11y[k].deliv_ok && g_a11y[k].deliv_idx == (int)idx) { wi = k; break; }
+    }
+    if (wi < 0) { a11y_unlock(); return 0; }
+    n = (int)strlen(g_a11y[wi].deliv_str);
+    if (!buf || cap <= n) { a11y_unlock(); return -2; }
+    memcpy(buf, g_a11y[wi].deliv_str, (size_t)n + 1);
+    g_a11y[wi].deliv_ok = 0;
+    a11y_unlock();
+    return n;
+}
+
+/* 窗口线程：把 UIA 投递消息翻译成既有事件队列里的 EV_A11Y_* */
+static void a11y_deliver(gui_win *w, UINT msg, WPARAM wp, LPARAM lp) {
+    int wi = (int)(w - g_wins);
+    int node = (int)wp;
+    if (wi < 0 || wi >= GUI_MAXWIN) return;
+    switch (msg) {
+    case GUI_WM_A11Y_INVOKE:
+        gui_push_ev(w, GUI_EV_A11Y_INVOKE, node, 0, 0);
+        break;
+    case GUI_WM_A11Y_VALUE:
+        if (lp == 0) {
+            /* 文本设值：待投递串搬到"已投递"槽，等 zfy 调 take_value 取走 */
+            a11y_lock();
+            g_a11y[wi].deliv_idx = node;
+            strncpy(g_a11y[wi].deliv_str, g_a11y[wi].pend_str, A11Y_VAL_MAX - 1);
+            g_a11y[wi].deliv_str[A11Y_VAL_MAX - 1] = 0;
+            g_a11y[wi].deliv_ok = 1;
+            a11y_unlock();
+            gui_push_ev(w, GUI_EV_A11Y_VALUE, node, 0, 0);
+        } else {
+            /* 数值：LPARAM = 值 + 1（避免与"文本"路径的 0 混淆） */
+            gui_push_ev(w, GUI_EV_A11Y_VALUE, node, 0, (int64_t)(lp - 1));
+        }
+        break;
+    case GUI_WM_A11Y_FOCUS:
+        gui_push_ev(w, GUI_EV_A11Y_FOCUS, node, 0, 0);
+        break;
+    default:
+        break;
+    }
 }
 
 /* ---------- 引擎初始化（首次开窗时懒创建；失败返回 0） ---------- */
@@ -4801,6 +6406,18 @@ static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     gui_win *w = gui_win_of(hw);
     if (!w) return DefWindowProcW(hw, msg, wp, lp);   /* 创建期消息 */
     switch (msg) {
+    case WM_GETOBJECT:
+        /* UIA 客户端请求本窗口的根元素：lParam == UiaRootObjectId（-25）。
+           仅当 UIAutomationCore 可用且确实有客户端监听时才返回 Provider，
+           其余情况交回默认处理（返回 0 表示"没有对象"）。 */
+        if (lp == (LPARAM)UiaRootObjectId) {
+            a11y_elem *root;
+            if (!a11y_listening()) return 0;
+            root = a11y_elem_get((int)(w - g_wins), -1);
+            if (!root || !g_uia_raw_provider) return 0;
+            return g_uia_raw_provider(hw, wp, lp, (IRawElementProviderSimple *)&root->simple);
+        }
+        break;
     case WM_SIZE:
         /* 最小化不重建；尺寸变化时重建交换链缓冲并通知业务层重布局 */
         if (w->alive && wp != SIZE_MINIMIZED) {
@@ -4878,6 +6495,12 @@ static LRESULT CALLBACK gui_wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         w->used = 0;
         w->hwnd = NULL;
         gui_rt_release(w);
+        return 0;
+    /* UIA 动作回投：UIA 线程只 PostMessage，这里在 UI 线程翻译成 EV_A11Y_* */
+    case GUI_WM_A11Y_INVOKE:
+    case GUI_WM_A11Y_VALUE:
+    case GUI_WM_A11Y_FOCUS:
+        a11y_deliver(w, msg, wp, lp);
         return 0;
     }
     return DefWindowProcW(hw, msg, wp, lp);
@@ -5767,6 +7390,20 @@ int64_t zfy_gui_image_from_rgba(void *px, int32_t wpx, int32_t hpx, int32_t stri
 #else
 /* 非 Windows：桩实现（返回失败，UI 程序可优雅降级为 TUI） */
 int32_t zfy_gui_open(int32_t w, int32_t h, char *t) { (void)w; (void)h; (void)t; return -1; }
+/* 无障碍（UIA）在非 Windows 上不可用：全部桩化，zfy 侧可无差别调用 */
+void zfy_a11y_begin(int64_t win) { (void)win; }
+void zfy_a11y_push_node(int64_t win, int64_t idx, char *name, char *role, char *value,
+                        int32_t states, int32_t x, int32_t y, int32_t w, int32_t h,
+                        int32_t parent) {
+    (void)win; (void)idx; (void)name; (void)role; (void)value; (void)states;
+    (void)x; (void)y; (void)w; (void)h; (void)parent;
+}
+void zfy_a11y_end(void) {}
+void zfy_a11y_set_focus(int64_t idx) { (void)idx; }
+int64_t zfy_a11y_hit(int32_t x, int32_t y) { (void)x; (void)y; return -1; }
+int32_t zfy_gui_a11y_take_value(int64_t idx, char *buf, int32_t cap) {
+    (void)idx; (void)buf; (void)cap; return 0;
+}
 int32_t zfy_gui_poll(int64_t *t, int64_t *x, int64_t *y, int64_t *k) { (void)t; (void)x; (void)y; (void)k; return 0; }
 int32_t zfy_gui_alive(void) { return 0; }
 int32_t zfy_gui_should_close(void) { return 1; }

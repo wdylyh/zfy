@@ -34,6 +34,10 @@ pub let i32 const EV_RUP = 5
 pub let i32 const EV_KEY = 6       // key = UTF-8 字节 / 扩展键前缀码（见 KEY_*）
 pub let i32 const EV_WHEEL = 7     // key = 滚动增量（正=向上）
 pub let i32 const EV_SIZE = 8      // x,y = 新客户区宽高（resize/DPI 变化）
+// 无障碍（UI Automation）回投：UIA 客户端动作经 C 侧投递到事件队列
+pub let i32 const EV_A11Y_INVOKE = 9    // x = 节点下标（UIA Invoke/Toggle/Select 请求）
+pub let i32 const EV_A11Y_VALUE = 10    // x = 节点下标；key>0 为数值（key-1），key==0 为文本（gui_a11y_take_value 取）
+pub let i32 const EV_A11Y_FOCUS = 11    // x = 节点下标（UIA SetFocus 请求）
 
 // 混合模式（gui_set_blend）
 pub let i32 const BLEND_SRCOVER  = 0   // 默认：源覆盖（D2D 原生）
@@ -138,6 +142,17 @@ extern "C"
     void zfy_gui_image_free(let i64 h)
     // RGBA（非预乘，4 字节/像素）内存缓冲 → 位图
     i64 zfy_gui_image_from_rgba(let void* px, let i32 w, let i32 h, let i32 stride)
+    // ===== 无障碍（UI Automation Provider）=====
+    // 每帧提交节点表：begin → push_node* → set_focus → end（win 为 gui_self()）
+    void zfy_a11y_begin(let i64 win)
+    void zfy_a11y_push_node(let i64 win, let i64 idx, let string name, let string role, let string value,
+                            let i32 states, let i32 x, let i32 y, let i32 w, let i32 h, let i32 parent)
+    void zfy_a11y_end()
+    void zfy_a11y_set_focus(let i64 idx)
+    // 客户区坐标 → 已提交节点下标；-1 = 未命中
+    i64 zfy_a11y_hit(let i32 x, let i32 y)
+    // 取 UIA 文本设值：返回字节数；0=无待取值；-2=缓冲不足（扩容重试）
+    i32 zfy_gui_a11y_take_value(let i64 idx, let string buf, let i32 cap)
 
 // ===== 包装（zfy 侧友好形态） =====
 
@@ -178,6 +193,37 @@ pub fn string gui_clip_get()
 // 写剪贴板
 pub fn void gui_clip_set(let string s)
     zfy_gui_clip_set(s)
+
+// ===== 无障碍（UI Automation Provider 的 zfy 侧薄包装） =====
+// 用法（组件层每帧调用一次）：gui_a11y_begin(gui_self()) → 对每个节点
+// gui_a11y_push_node(...) → gui_a11y_focus(焦点节点) → gui_a11y_end()
+pub fn void gui_a11y_begin(let i64 win)
+    zfy_a11y_begin(win)
+
+pub fn void gui_a11y_push_node(let i64 win, let i64 idx, let string name, let string role, let string value,
+                               let i32 states, let i32 x, let i32 y, let i32 w, let i32 h, let i32 parent)
+    zfy_a11y_push_node(win, idx, name, role, value, states, x, y, w, h, parent)
+
+pub fn void gui_a11y_end()
+    zfy_a11y_end()
+
+// 本帧焦点节点（-1=无焦点）；end 时提交并（有人监听时）发焦点事件
+pub fn void gui_a11y_focus(let i64 idx)
+    zfy_a11y_set_focus(idx)
+
+// 命中测试：客户区坐标 → 已提交节点下标；-1=未命中
+pub fn i64 gui_a11y_hit(let i32 x, let i32 y)
+    return zfy_a11y_hit(x, y)
+
+// 取 UIA 文本设值（内部按倍增造缓冲；无待取值返回 ""）
+pub fn string gui_a11y_take_value(let i64 idx)
+    let string buf = "                    "     // 20 空格起步
+    while length(buf) < 4096
+        buf = buf + buf
+    let i32 n = zfy_gui_a11y_take_value(idx, buf, length(buf))
+    if n <= 0
+        return ""
+    return buf[0, n - 1]
 
 pub fn void gui_close()
     zfy_gui_close()

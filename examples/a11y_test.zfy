@@ -1,0 +1,149 @@
+// examples/a11y_test.zfy —— 无障碍（UIA Provider）节点表与 zfy 侧快照一致性
+// 覆盖：节点数量 / find / hit / 状态位 / 焦点 / C 侧节点表与 zfy 快照的映射一致
+mod gui
+mod widgets
+use widgets::{App, Button, Checkbox, Slider, InputBox, ListBox,
+              a11y_count, a11y_get, a11y_hit, a11y_find, a11y_has_state, a11y_id_of_idx,
+              A11yNode, ROLE_BUTTON, ROLE_CHECKBOX, ROLE_SLIDER, ROLE_EDIT, ROLE_LIST,
+              A11Y_DISABLED, A11Y_CHECKED, A11Y_FOCUSED, A11Y_SELECTED,
+              focus_set, focus_get}
+use gui::{gui_frame_sleep, gui_a11y_hit, gui_a11y_take_value}
+
+fn i32 run()
+    let i32 fails = 0
+    let App app = App()
+    if app.open(480, 380, "a11y_test") != 0
+        output("FAIL open")
+        return 1
+    let Button b = Button(x=20, y=20, w=120, h=36, text="点我")
+    let i32 kb = app.add_button(b)
+    let Checkbox c = Checkbox(x=20, y=70, text="启用")
+    let i32 kc = app.add_checkbox(c)
+    let Slider s = Slider(x=20, y=110, w=200, value=40)
+    let i32 ks = app.add_slider(s)
+    let InputBox ib = InputBox(x=20, y=150, w=200, text="hi")
+    let i32 ki = app.add_input(ib)
+    let ListBox lb = ListBox(x=20, y=200, w=200, rows=3)
+    lb.add_item("a")
+    lb.add_item("b")
+    lb.add_item("c")
+    let i32 kl = app.add_list(lb)
+
+    // 有限帧（触发同步与重绘）
+    let i32 f = 0
+    while f < 20 and app.alive()
+        app.step()
+        gui_frame_sleep(app.t0)
+        f++
+
+    // 1) 节点数量
+    if a11y_count() < 5
+        output("FAIL a11y count=", a11y_count())
+        fails++
+    // 2) find：每个组件的 id 都能定位
+    let i64 bid = app.buttons[kb].id
+    if a11y_find(bid) < 0
+        output("FAIL a11y_find button")
+        fails++
+    if a11y_find(app.checks[kc].id) < 0
+        output("FAIL a11y_find checkbox")
+        fails++
+    if a11y_find(app.lists[kl].id) < 0
+        output("FAIL a11y_find list")
+        fails++
+    // 3) hit + 角色
+    let i32 hb = a11y_hit(30, 30)
+    if hb < 0
+        output("FAIL a11y_hit button")
+        fails++
+    else
+        let A11yNode hn = a11y_get(hb)
+        if hn.role != ROLE_BUTTON
+            output("FAIL a11y role button=", hn.role)
+            fails++
+    let i32 hc = a11y_hit(30, 75)
+    if hc < 0
+        output("FAIL a11y_hit checkbox")
+        fails++
+    else
+        if a11y_get(hc).role != ROLE_CHECKBOX
+            output("FAIL a11y role checkbox")
+            fails++
+    let i32 hs = a11y_hit(30, 118)
+    if hs < 0 or a11y_get(hs).role != ROLE_SLIDER
+        output("FAIL a11y slider hit/role")
+        fails++
+    let i32 hi = a11y_hit(30, 160)
+    if hi < 0 or a11y_get(hi).role != ROLE_EDIT
+        output("FAIL a11y edit hit/role")
+        fails++
+    let i32 hl = a11y_hit(30, 210)
+    if hl < 0 or a11y_get(hl).role != ROLE_LIST
+        output("FAIL a11y list hit/role")
+        fails++
+
+    // 4) C 侧节点表与 zfy 快照一致：同一个点命中同一下标
+    if gui_a11y_hit(30, 30) != cast(hb, i64)
+        output("FAIL C hit mismatch c=", gui_a11y_hit(30, 30), " zfy=", hb)
+        fails++
+
+    // 5) 下标 → 组件 id 可反查（UIA 动作回投依赖此映射）
+    if hb >= 0
+        if a11y_id_of_idx(cast(hb, i64)) != bid
+            output("FAIL a11y_id_of_idx button")
+            fails++
+
+    // 6) 焦点位：设焦点后该节点带 FOCUSED
+    focus_set(bid)
+    app.step()
+    let i32 fb = a11y_find(bid)
+    if fb < 0
+        output("FAIL a11y_find after focus")
+        fails++
+    else
+        if not a11y_has_state(fb, A11Y_FOCUSED)
+            output("FAIL a11y focus state")
+            fails++
+    if focus_get() != bid
+        output("FAIL focus_get=", focus_get())
+        fails++
+
+    // 7) 勾选位
+    app.checks[kc].checked = true
+    app.step()
+    let i32 fc = a11y_find(app.checks[kc].id)
+    if fc < 0 or not a11y_has_state(fc, A11Y_CHECKED)
+        output("FAIL a11y checked state")
+        fails++
+
+    // 8) 选中位（列表）
+    app.lists[kl].sel = 1
+    app.step()
+    let i32 fl = a11y_find(app.lists[kl].id)
+    if fl < 0 or not a11y_has_state(fl, A11Y_SELECTED)
+        output("FAIL a11y selected state")
+        fails++
+
+    // 9) 禁用位
+    app.buttons[kb].enable = false
+    app.step()
+    let i32 fd = a11y_find(bid)
+    if fd < 0 or not a11y_has_state(fd, A11Y_DISABLED)
+        output("FAIL a11y disabled state")
+        fails++
+
+    // 10) 没有 UIA 设值请求时 take_value 返回空串
+    if length(gui_a11y_take_value(cast(hb, i64))) != 0
+        output("FAIL take_value should be empty")
+        fails++
+
+    app.close()
+    return fails
+
+fn main()
+    let i32 fails = run()
+    if fails == 0
+        output("a11y_test: all PASS")
+        return 0
+    output(fails, " failures")
+    return 1

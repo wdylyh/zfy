@@ -26,7 +26,10 @@ use gui::{gui_open, gui_alive, gui_close, gui_w, gui_h, gui_dpi, gui_fill_rect, 
           gui_line, gui_line_w, gui_stroke_rect, gui_fill_circle, gui_stroke_circle, gui_fill_grad,
           gui_push_clip, gui_pop_clip, gui_draw_image, gui_image_load, gui_image_w, gui_image_h,
           Event, EV_MOVE, EV_LDOWN, EV_LUP, EV_RDOWN, EV_RUP, EV_KEY, EV_WHEEL, KEY_EXT, KEY_CTRL, KEY_SHIFT,
-          gui_clip_get, gui_clip_set}
+          EV_A11Y_INVOKE, EV_A11Y_VALUE, EV_A11Y_FOCUS,
+          gui_clip_get, gui_clip_set,
+          gui_self, gui_a11y_begin, gui_a11y_push_node, gui_a11y_end, gui_a11y_focus,
+          gui_a11y_hit, gui_a11y_take_value}
 use theme::{Theme, Style, get_theme, set_theme, theme_for, theme_dark, theme_light, theme_high_contrast,
             is_dark, widget_set_style, widget_clear_style, widget_style, widget_has_style,
             set_layout_dir, get_layout_dir, set_text_dir, get_text_dir, is_rtl, is_rtl_text,
@@ -1275,6 +1278,13 @@ pub struct App
                     i++
             if e.typ == EV_KEY
                 self.on_key(cast(e.key, i64))
+            // 无障碍（UIA 客户端动作回投；索引按上一帧节点表解析）
+            if e.typ == EV_A11Y_INVOKE
+                self.on_a11y_invoke(e.x)
+            if e.typ == EV_A11Y_VALUE
+                self.on_a11y_value(e.x, e.key)
+            if e.typ == EV_A11Y_FOCUS
+                self.on_a11y_focus(e.x)
             // L2 组件与插件：同一事件再派发一轮（顶层优先）
             let bool uc = self.dispatch_comps(e)
             let PluginHost ph = copy(self.plugins)
@@ -1435,6 +1445,158 @@ pub struct App
         let PluginHost ph2 = copy(self.plugins)
         ph2.publish_a11y()
         self.plugins = move ph2
+        // 提交本帧节点表（含焦点），UIA 客户端此后读取一致快照
+        a11y_end()
+
+    // ===== 无障碍（UIA 动作回投）=====
+
+    // id 是否指向输入框/文本域
+    fn bool a11y_is_edit(let i64 id)
+        let i32 i = 0
+        while i < length(self.inputs)
+            if self.inputs[i].id == id
+                return true
+            i++
+        i = 0
+        while i < length(self.texts)
+            if self.texts[i].id == id
+                return true
+            i++
+        return false
+
+    // 只按 id 聚焦输入框/文本域（非输入类 id 时不动任何组件）
+    fn void a11y_focus_widget(let i64 id)
+        if not self.a11y_is_edit(id)
+            return
+        let i32 i = 0
+        while i < length(self.inputs)
+            let bool want = self.inputs[i].id == id and self.inputs[i].enable and self.inputs[i].visible
+            self.inputs[i].set_focus(want)
+            if self.inputs[i].dirty
+                self.any_dirty = true
+            i++
+        i = 0
+        while i < length(self.texts)
+            let bool want2 = self.texts[i].id == id and self.texts[i].enable and self.texts[i].visible
+            self.texts[i].set_focus(want2)
+            if self.texts[i].dirty
+                self.any_dirty = true
+            i++
+        focus_set(id)
+
+    // UIA Invoke：等价一次点击（按钮/复选框），输入类聚焦，L2 组件走 Comp 合成点击
+    fn void on_a11y_invoke(let i64 idx)
+        let i64 id = a11y_id_of_idx(idx)
+        if id == 0
+            return
+        let i32 i = 0
+        while i < length(self.buttons)
+            if self.buttons[i].id == id
+                if self.buttons[i].enable and self.buttons[i].visible
+                    self.buttons[i].clicks++
+                    self.buttons[i].dirty = true
+                    self.any_dirty = true
+                    self.a11y_focus_widget(id)
+                    focus_set(id)
+                return
+            i++
+        i = 0
+        while i < length(self.checks)
+            if self.checks[i].id == id
+                if self.checks[i].enable and self.checks[i].visible
+                    self.checks[i].checked = not self.checks[i].checked
+                    self.checks[i].clicks++
+                    self.checks[i].dirty = true
+                    self.any_dirty = true
+                    self.a11y_focus_widget(id)
+                    focus_set(id)
+                return
+            i++
+        if self.a11y_is_edit(id)
+            self.a11y_focus_widget(id)
+            return
+        i = 0
+        while i < length(self.comps)
+            if self.comps[i].id == id
+                self.comps[i].a11y_invoke()
+                if self.comps[i].dirty
+                    self.any_dirty = true
+                return
+            i++
+        // 滑块/进度：Invoke 无动作
+
+    // UIA 设值：key>0 为数值（key-1），key==0 为文本（从 C 侧取走 UTF-8 串）
+    fn void on_a11y_value(let i64 idx, let i64 key)
+        let i64 id = a11y_id_of_idx(idx)
+        if id == 0
+            return
+        if key > 0
+            let i32 v = cast(key - 1, i32)
+            let i32 i = 0
+            while i < length(self.sliders)
+                if self.sliders[i].id == id
+                    if self.sliders[i].enable and self.sliders[i].visible
+                        self.sliders[i].set_value(v)
+                        if self.sliders[i].dirty
+                            self.any_dirty = true
+                    return
+                i++
+            i = 0
+            while i < length(self.comps)
+                if self.comps[i].id == id
+                    self.comps[i].a11y_set_value(v)
+                    if self.comps[i].dirty
+                        self.any_dirty = true
+                    return
+                i++
+            return
+        let string s = gui_a11y_take_value(idx)
+        let i32 j = 0
+        while j < length(self.inputs)
+            if self.inputs[j].id == id
+                if self.inputs[j].enable
+                    self.inputs[j].text = s
+                    self.inputs[j].cx = length(s)
+                    self.inputs[j].sel_a = length(s)
+                    self.inputs[j].dirty = true
+                    self.any_dirty = true
+                return
+            j++
+        j = 0
+        while j < length(self.texts)
+            if self.texts[j].id == id
+                if self.texts[j].enable
+                    self.texts[j].set_text(s)
+                    self.texts[j].dirty = true
+                    self.any_dirty = true
+                return
+            j++
+        // L2 文本框：把文本写回 Comp
+        j = 0
+        while j < length(self.comps)
+            if self.comps[j].id == id
+                if self.comps[j].enable and self.comps[j].kind == COMP_TEXTBOX
+                    self.comps[j].text = s
+                    self.comps[j].dirty = true
+                    self.any_dirty = true
+                return
+            j++
+
+    // UIA SetFocus：输入类同步内部 focus 标志，其余只进焦点链
+    fn void on_a11y_focus(let i64 idx)
+        let i64 id = a11y_id_of_idx(idx)
+        if id == 0
+            return
+        self.a11y_focus_widget(id)
+        if focus_has(id)
+            focus_set(id)
+        let i32 i = 0
+        while i < length(self.comps)
+            if self.comps[i].id == id
+                self.comps[i].dirty = true
+                self.any_dirty = true
+                return
+            i++
 
     fn void on_hover()
         // 输入框拖选：聚焦且按住左键时移动即扩展选区
@@ -2658,6 +2820,8 @@ pub let i32 const A11Y_EXPANDED = 8
 pub let i32 const A11Y_SELECTED = 16
 pub let i32 const A11Y_HOT = 32
 pub let i32 const A11Y_PRESSED = 64
+pub let i32 const A11Y_READONLY = 128   // 只读（文本/值不可编辑）
+pub let i32 const A11Y_PASSWORD = 256   // 密码字段（UIA IsPassword）
 
 pub struct A11yNode
     i64 id = 0
@@ -2673,14 +2837,48 @@ pub struct A11yNode
 // 当前帧的无障碍快照（App.step 每帧 a11y_begin 后重填）
 // 直接使用模块级全局列表（避免对全局聚合值整体 copy——那会释放野指针）
 let A11yNode[] g_a11y_nodes
+// 本帧 / 上一帧的节点 id 序列：下标 = C 侧节点表下标（UIA 动作回投时按此解析）
+let i64[] g_a11y_ids
+let i64[] g_a11y_prev_ids
+
+// zfy 状态位 → C 侧 A11Y_ST_*（前 5 位一致；READONLY/PASSWORD 在 C 侧占 32/64）
+fn i32 a11y_states_c(let i32 s)
+    let i32 r = s & 31
+    if (s & A11Y_READONLY) != 0
+        r = r | 32
+    if (s & A11Y_PASSWORD) != 0
+        r = r | 64
+    return r
 
 pub fn void a11y_begin()
     g_a11y_nodes = g_a11y_nodes[0, -1]
+    g_a11y_prev_ids = copy(g_a11y_ids)
+    g_a11y_ids = g_a11y_ids[0, -1]
+    gui_a11y_begin(cast(gui_self(), i64))
 
 pub fn void a11y_add(let i64 id, let string name, let i32 role, let string value, let i32 states,
                      let i32 x, let i32 y, let i32 w, let i32 h)
     g_a11y_nodes = push(g_a11y_nodes, A11yNode(id=id, name=name, role=role, value=value,
                                                states=states, x=x, y=y, w=w, h=h))
+    g_a11y_ids = push(g_a11y_ids, id)
+    // 同步到 C 侧 UIA Provider 节点表：下标从 0 连续递增，parent=-1 直挂窗口根元素
+    gui_a11y_push_node(cast(gui_self(), i64), cast(length(g_a11y_nodes) - 1, i64),
+                       name, role_name(role), value, a11y_states_c(states), x, y, w, h, -1)
+
+// 结束本帧节点表：提交焦点节点并（有人监听时）发焦点/结构/属性事件
+pub fn void a11y_end()
+    let i64 fid = focus_get()
+    let i32 fi = -1
+    if fid != 0
+        fi = a11y_find(fid)
+    gui_a11y_focus(cast(fi, i64))
+    gui_a11y_end()
+
+// UIA 回投的节点下标 → 组件 id（按上一帧 id 序列解析；越界返回 0）
+pub fn i64 a11y_id_of_idx(let i64 idx)
+    if idx < 0 or idx >= cast(length(g_a11y_prev_ids), i64)
+        return 0
+    return g_a11y_prev_ids[cast(idx, i32)]
 
 pub fn i32 a11y_count()
     return length(g_a11y_nodes)
@@ -4391,6 +4589,37 @@ pub struct Comp
         return -1
 
     // ===== 无障碍：每帧发布本组件的语义节点 =====
+    // UIA Invoke：按组件中心合成一次"按下 + 抬起"，复用既有交互路径
+    fn void a11y_invoke()
+        if not self.visible or not self.enable
+            return
+        if self.kind == COMP_SPLITTER
+            return
+        let i32 cx = self.x + self.w / 2
+        let i32 cy = self.y + self.h / 2
+        if self.h <= 0
+            cy = self.y + self.default_h() / 2
+        focus_set(self.id)
+        self.pressed = true
+        self.on_press(cx, cy)
+        self.pressed = false
+        self.on_release_click(cx, cy)
+        self.dirty = true
+
+    // UIA 设值（RangeValue/Value）：只处理有数值语义的 kind，取值 clamp 到 0..100
+    fn void a11y_set_value(let i32 v)
+        if not self.visible or not self.enable
+            return
+        let i32 k = self.kind
+        if k != COMP_SPINBOX and k != COMP_SPLITTER and k != COMP_PROGRESS and k != COMP_SPINNER
+            return
+        self.value = v
+        if self.value < 0
+            self.value = 0
+        if self.value > 100
+            self.value = 100
+        self.dirty = true
+
     fn void publish_a11y()
         if not self.visible
             return

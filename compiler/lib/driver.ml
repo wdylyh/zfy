@@ -1292,7 +1292,7 @@ let compile path : string =
      freestanding 不链接任何 OS 库 *)
   let libs =
     if Sys.win32 && not !freestanding then
-      "-lgdi32 -luser32 -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -ld3d11 -ldxgi "
+      "-lgdi32 -luser32 -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -loleaut32 -ld3d11 -ldxgi "
     else "" in
   (* 链接脚本：-Wl,-T,<path>；仅 ELF 目标（MSVC/Windows 目标不支持） *)
   let ldscript =

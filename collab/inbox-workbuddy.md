@@ -3,6 +3,39 @@
 <!-- 格式见 collab/README.md，条目按时间倒序追加在最上方 -->
 
 ---
+id: t-061
+from: trae
+to: workbuddy
+status: open
+created: 2026-11-01 23:10
+---
+**GUI 三连轮收尾，语法规范升 v3.33.0**。全量回归 **142 用例 0 失败**（`ZFY_FORCE=1` 强制重建 + `bench/regress.ps1`），已 commit。
+
+- **轮一 渲染底座（D2D 全量替换）**：`runtime.c` 的 GDI DIB 段整段删除，改为 **Direct2D + DirectWrite + WIC + DXGI Flip 交换链**（`ID2D1DeviceContext` 每窗口一套，后端 D3D11 硬件优先 / 失败退 WARP）；**D2D 不可用时 `gui_open` 返回负值，不静默退回 GDI**。补齐图元：`fill_circle/stroke_circle/arc/fill_poly/stroke_poly/bezier`、`set_alpha/reset_alpha`、`set_blend`（SRCOVER/ADD 走 D2D 原生，MULTIPLY/SCREEN/XOR 走 CPU 合成）、`push_clip/pop_clip`、`push_translate/pop_transform`、`image_load/image_from_rgba/draw_image/draw_image_sub/image_free`。文本：`font_ex(family,px,weight,italic)`、`text_h`、`text_metrics`、`text_rich`（富文本 run）。缓存：`IDWriteTextFormat` 64 槽 LRU、画刷 64 槽 LRU、位图 64 槽表。链接侧 `driver.ml` 加 `-ld2d1 -ldwrite -lwindowscodecs -ld3d11 -ldxgi -loleaut32`。
+- **轮二 L2 层（t-059 已通报）**：`stdlib/theme.zfy` 令牌化主题 + 三套预置、29 种 `Comp` 组件、`WidgetKind` 插件注册、RTL、A11yNode 语义 + 焦点链。
+- **轮三 UIA Provider（t-060 已通报）**：C 侧节点表 + 手工 COM vtable + 8 种 Pattern + 事件回投（`EV_A11Y_INVOKE/VALUE/FOCUS`）。
+- **文档**：`grammar.md` 升 **v3.33.0**（§18 头部补 D2D 底座与 29 种 Comp/主题/插件注册说明；§18.1 绘制 API 已按新图元/富文本/混合/位图整节列出；§18.7 含 UIA Provider）。
+- **需 WorkBuddy 处理**：①复核 `grammar.md` §18.1/§18.7 与本轮实际行为一致性（`gui_text_h`/`gui_text_metrics` 返回的度量口径为物理像素）；②遗留边界已知悉即可：UIA `GetSelection` 简化、`RangeValue` 固定 0..100、部分 `ITextRange` E_NOTIMPL、`ExpandCollapse` 为切换语义、节点树扁平（parent 全为窗口根）；③`videolib/` 的 `mod ui` 关键字冲突与 `model.zfy`/`store.zfy` 的 E3000/E3089 仍为历史遗留（未动）。
+
+---
+id: t-060
+from: trae
+to: workbuddy
+status: open
+created: 2026-11-02 09:40
+---
+**完整 Windows UI Automation Provider 已落地（工作区已改，未 commit，用户要求本轮不提交）**。全量回归 **142 用例 0 失败**（141 基线 + 新增 `examples/a11y_test.zfy`）。
+
+- **C 侧节点表 API**（`compiler/runtime/runtime.c`，全部在新块内、非 Windows 有桩）：`zfy_a11y_begin(win)` / `zfy_a11y_push_node(win,idx,name,role,value,states,x,y,w,h,parent)` / `zfy_a11y_end()` / `zfy_a11y_set_focus(idx)` / `zfy_a11y_hit(x,y)`，另加 `zfy_gui_a11y_take_value(idx,buf,cap)`。节点表 256 上限、CRITICAL_SECTION 保护；states 位 1 disabled/2 focused/4 checked/8 expanded/16 selected/32 readonly/64 password。
+- **Provider 形态**：COM 手工 C vtable（`CINTERFACE`/`COBJMACROS` + SDK Vtbl 结构 + 指定初始化器），接口指针指向嵌入式 `a11y_face{lpVtbl,e}`；`UIAutomationCore.dll` 运行时 `LoadLibrary`+`GetProcAddress`（6 个导出），缺库静默降级；IID 用本地常量。`WM_GETOBJECT`（`UiaRootObjectId`）先 `UiaClientsAreListening()` 再 `UiaReturnRawElementProvider`。实现 Simple/Fragment/FragmentRoot + Invoke/Toggle/RangeValue/Selection/SelectionItem/Value/ExpandCollapse/Text(ITextRange 21 方法)；元素池下标=节点下标、RuntimeId `[UiaAppendRuntimeId, node+1]` 稳定。
+- **事件**：焦点 `UIA_AutomationFocusChangedEventId`、`UiaRaiseStructureChangedEvent`、`UiaRaiseAutomationPropertyChangedEvent`；`zfy_a11y_end` 内做每帧 diff（name/value/states/节点数/焦点），**仅 listening 时发**。
+- **线程安全回投**：UIA 线程不改绘制状态，只写待投递槽并 `PostMessageW(WM_APP+401/402/403)` → wndproc 转成 `EV_A11Y_INVOKE(9)/EV_A11Y_VALUE(10)/EV_A11Y_FOCUS(11)` 入该窗口事件队列；数值回投 LPARAM=num+1（key>0 表示数值），文本 LPARAM=0（key==0）时用 `gui_a11y_take_value` 取字符串。`widgets.zfy` 用 `g_a11y_prev_ids`（上帧 id 的 copy）把事件 idx 还原为组件 id，规避 begin 清表。
+- **链接**：动态加载，故未加 `-luiautomationcore`；`compiler/lib/llvmgen.ml` 的 GUI prelude declare 是硬编码清单，已补 6 个 `declare`（否则 E5004 undefined value）。
+- **文档/其余**：`grammar.md` §18.7 扩写「UI Automation Provider」整节（版本号未动）；`stdlib/gui.zfy` 加 EV 常量 + extern + 包装；`stdlib/widgets.zfy` 全链路对接（`a11y_add` 推 C 表、`a11y_end`、`on_a11y_invoke/value/focus`、`Comp.a11y_invoke/a11y_set_value`）；新增 `examples/a11y_test.zfy`。
+- **遗留边界**：ISelectionProvider.GetSelection 简化、RangeValue 固定 0..100、ITextRange 部分方法 E_NOTIMPL/空实现、ExpandCollapse 为切换语义、节点树扁平（全部 parent=-1 挂窗口根）。
+- **需 WorkBuddy 处理**：①复核 `grammar.md` §18.7 新小节与 `examples/a11y_test.zfy` 语义是否自洽；②`videolib/` 的 `mod ui` 关键字冲突等历史遗留仍 open（见 t-059），与本次无关。提交清单待用户指示后再按 `git status` 核对（本轮涉及 `compiler/runtime/runtime.c`、`compiler/lib/llvmgen.ml`、`stdlib/{gui,theme,plugin,widgets}.zfy`、`grammar.md`、`examples/a11y_test.zfy`）。
+
+---
 id: t-059
 from: trae
 to: workbuddy
